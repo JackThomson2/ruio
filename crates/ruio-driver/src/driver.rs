@@ -7,7 +7,7 @@ use std::io;
 use std::mem;
 use std::rc::Rc;
 use std::task::Waker;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ruio_sys as sys;
 
@@ -33,13 +33,17 @@ const FORBIDDEN_SQE_FLAGS: u8 =
 #[derive(Clone, Debug)]
 pub struct Builder {
     entries: u32,
+    shutdown_timeout: Duration,
 }
 
 impl Builder {
     /// A builder with the default configuration: 256 submission queue
-    /// entries.
+    /// entries, and a one-second shutdown timeout.
     pub fn new() -> Self {
-        Self { entries: 256 }
+        Self {
+            entries: 256,
+            shutdown_timeout: Duration::from_secs(1),
+        }
     }
 
     /// Sets the size of the submission queue. The kernel rounds it up to a
@@ -50,6 +54,17 @@ impl Builder {
     /// submission queue is submitted early.
     pub fn entries(mut self, entries: u32) -> Self {
         self.entries = entries;
+        self
+    }
+
+    /// Sets how long dropping the driver waits for the kernel to finish with
+    /// cancelled operations.
+    ///
+    /// The memory of an operation the kernel is still using after that, such
+    /// as a read stuck in an uninterruptible wait, is leaked rather than
+    /// freed. The default is one second.
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
         self
     }
 
@@ -79,6 +94,7 @@ impl Builder {
                 wakers: Vec::new(),
                 released: Vec::new(),
                 stats: Stats::default(),
+                shutdown_timeout: self.shutdown_timeout,
             })),
         })
     }
@@ -133,6 +149,7 @@ struct Inner {
     /// Orphaned payloads released by a batch of completions, likewise.
     released: Vec<(Box<dyn Orphan>, Completion)>,
     stats: Stats,
+    shutdown_timeout: Duration,
 }
 
 impl Driver {
@@ -354,6 +371,55 @@ impl Inner {
         Ok(())
     }
 
+    /// Queues a cancellation of every request in flight.
+    fn queue_cancel_all(&mut self) -> io::Result<()> {
+        self.cancels.clear();
+        if self.ring.queued() == self.ring.sq_entries() {
+            self.submit_queued()?;
+        }
+        let sqe = self
+            .ring
+            .next_sqe()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))?;
+        sqe.opcode = sys::IORING_OP_ASYNC_CANCEL;
+        sqe.op_flags = sys::IORING_ASYNC_CANCEL_ANY;
+        sqe.flags = sys::IOSQE_CQE_SKIP_SUCCESS;
+        sqe.user_data = IGNORED;
+        Ok(())
+    }
+
+    /// Cancels everything in flight and waits, until the shutdown timeout,
+    /// for the kernel to finish with it, finishing each orphaned operation as
+    /// its completion arrives.
+    fn drain(&mut self) {
+        let deadline = Instant::now() + self.shutdown_timeout;
+        if self.queue_cancel_all().is_err() {
+            return;
+        }
+        let (mut wakers, mut released) = (Vec::new(), Vec::new());
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // Once the time is up, one last pass collects what is ready.
+            let min_complete = u32::from(!remaining.is_zero());
+            if self
+                .enter(min_complete, Some(&timespec(remaining)))
+                .is_err()
+            {
+                break;
+            }
+            self.reap(&mut wakers, &mut released);
+            for (payload, completion) in released.drain(..) {
+                payload.finish(completion);
+            }
+            if self.table.in_flight() == 0 || remaining.is_zero() {
+                break;
+            }
+        }
+        // Only orphans are in flight: every waiting operation has an `Op`,
+        // which keeps the driver alive.
+        debug_assert!(wakers.is_empty());
+    }
+
     /// Moves posted completions into the table, collecting the wakers to wake
     /// and the orphaned payloads to finish.
     fn reap(&mut self, wakers: &mut Vec<Waker>, released: &mut Vec<(Box<dyn Orphan>, Completion)>) {
@@ -372,9 +438,12 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // No `Op` is left, since each holds a handle, but the kernel may still
-        // be using the memory of dropped ones. Freeing it would be unsound;
-        // leaking it is not.
+        if self.table.in_flight() > 0 {
+            self.drain();
+        }
+        // Whatever the kernel may still be using cannot be freed. Leaking it
+        // is safe; the ring is closed after this, and the kernel cancels what
+        // is left.
         for payload in self.table.take_orphans() {
             mem::forget(payload);
         }
@@ -415,5 +484,53 @@ pub(crate) fn timespec(duration: Duration) -> sys::__kernel_timespec {
     sys::__kernel_timespec {
         tv_sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
         tv_nsec: i64::from(duration.subsec_nanos()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    static STUCK_DROPPED: AtomicBool = AtomicBool::new(false);
+
+    /// An operation the kernel never sees, standing in for one it never
+    /// finishes. It has no size, so leaking it allocates nothing that a leak
+    /// checker would report.
+    struct Stuck;
+
+    impl Drop for Stuck {
+        fn drop(&mut self) {
+            STUCK_DROPPED.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // SAFETY: never submitted; its entry would point to no memory anyway.
+    unsafe impl Operation for Stuck {
+        type Output = ();
+
+        fn prepare(&mut self, _: &mut sys::io_uring_sqe) {}
+
+        fn complete(self, _: Completion) {}
+    }
+
+    #[test]
+    fn operations_the_kernel_never_finishes_are_leaked_at_shutdown() {
+        let timeout = Duration::from_millis(50);
+        let driver = Driver::builder().shutdown_timeout(timeout).build().unwrap();
+        {
+            let mut inner = driver.inner.borrow_mut();
+            let user_data = inner.table.insert(None);
+            let _ = inner.table.orphan(user_data, Box::new(Stuck));
+        }
+
+        let start = Instant::now();
+        drop(driver);
+        assert!(start.elapsed() >= timeout);
+        assert!(
+            !STUCK_DROPPED.load(Ordering::SeqCst),
+            "freed while the kernel might still use it"
+        );
     }
 }
