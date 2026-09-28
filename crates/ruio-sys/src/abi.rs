@@ -212,6 +212,22 @@ pub struct io_uring_getevents_arg {
     pub ts: u64,
 }
 
+/// One entry of a registered resource table to set or clear.
+///
+/// With [`IORING_REGISTER_RING_FDS`], `data` is a ring's file descriptor and
+/// `offset` the slot to register it in; `u32::MAX` picks a free slot, which
+/// the kernel writes back into `offset`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct io_uring_rsrc_update {
+    /// Slot in the table.
+    pub offset: u32,
+    /// Reserved; must be zero.
+    pub resv: u32,
+    /// The resource, such as a file descriptor.
+    pub data: u64,
+}
+
 /// The kernel's 64-bit `timespec`, from `linux/time_types.h`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -231,6 +247,7 @@ const _: () = {
     assert!(size_of::<io_uring_probe_op>() == 8);
     assert!(size_of::<io_uring_probe>() == 16);
     assert!(size_of::<io_uring_getevents_arg>() == 24);
+    assert!(size_of::<io_uring_rsrc_update>() == 16);
     assert!(size_of::<__kernel_timespec>() == 16);
 };
 

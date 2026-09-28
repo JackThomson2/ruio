@@ -163,6 +163,11 @@ const LAYOUTS: &[Layout] = &[
         min_wait_usec => min_wait_usec,
         ts => ts,
     }),
+    layout!(io_uring_rsrc_update, in_header: true, {
+        offset => offset,
+        resv => resv,
+        data => data,
+    }),
     layout!(__kernel_timespec, in_header: false, {
         tv_sec => tv_sec,
         tv_nsec => tv_nsec,
