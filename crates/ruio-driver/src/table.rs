@@ -99,26 +99,38 @@ impl<P> Table<P> {
 
     /// Takes the operation's completion, freeing its slot, or, if it has not
     /// completed, arranges for `waker` to be woken when it does.
-    pub(crate) fn poll(&mut self, user_data: u64, waker: &Waker) -> Option<Completion> {
-        let index = self.index(user_data)?;
+    ///
+    /// A waker that `waker` replaces is returned rather than dropped, so the
+    /// caller can drop it after releasing the table: dropping a waker can run
+    /// arbitrary code.
+    pub(crate) fn poll(
+        &mut self,
+        user_data: u64,
+        waker: &Waker,
+    ) -> Result<Completion, Option<Waker>> {
+        let Some(index) = self.index(user_data) else {
+            debug_assert!(false, "polled an operation that is not in the table");
+            return Err(None);
+        };
         match &mut self.slots[index as usize].state {
             State::Completed(completion) => {
                 let completion = *completion;
                 self.free(index);
-                Some(completion)
+                Ok(completion)
             }
             State::Waiting(current) => {
-                if !current
+                if current
                     .as_ref()
                     .is_some_and(|current| current.will_wake(waker))
                 {
-                    *current = Some(waker.clone());
+                    Err(None)
+                } else {
+                    Err(current.replace(waker.clone()))
                 }
-                None
             }
             State::Orphaned(_) | State::Free { .. } => {
                 debug_assert!(false, "polled an operation that has no future");
-                None
+                Err(None)
             }
         }
     }
@@ -135,17 +147,23 @@ impl<P> Table<P> {
     }
 
     /// Keeps the payload of a waiting operation whose future was dropped until
-    /// the operation completes.
-    pub(crate) fn orphan(&mut self, user_data: u64, payload: P) {
+    /// the operation completes. Returns the operation's waker, for the caller
+    /// to drop after releasing the table.
+    pub(crate) fn orphan(&mut self, user_data: u64, payload: P) -> Option<Waker> {
         match self.index(user_data) {
             Some(index) if matches!(self.slots[index as usize].state, State::Waiting(_)) => {
-                self.slots[index as usize].state = State::Orphaned(payload);
+                let state = &mut self.slots[index as usize].state;
+                let State::Waiting(waker) = mem::replace(state, State::Orphaned(payload)) else {
+                    unreachable!();
+                };
+                waker
             }
             _ => {
                 // Unreachable. Leaking is the safe response: the kernel may
                 // still be using the payload.
                 debug_assert!(false, "orphaned an operation that is not waiting");
                 mem::forget(payload);
+                None
             }
         }
     }
@@ -257,13 +275,13 @@ mod tests {
         let (count, waker) = waker();
         let op = table.insert(Some(waker.clone()));
         assert_eq!(table.in_flight(), 1);
-        assert_eq!(table.poll(op, &waker), None);
+        assert!(matches!(table.poll(op, &waker), Err(None)));
 
         wake(table.complete(op, DONE));
         assert_eq!(count.0.load(Ordering::Relaxed), 1);
         assert_eq!(table.in_flight(), 0);
 
-        assert_eq!(table.poll(op, &waker), Some(DONE));
+        assert!(matches!(table.poll(op, &waker), Ok(DONE)));
         assert!(matches!(table.complete(op, DONE), Outcome::Ignore));
     }
 
@@ -273,7 +291,8 @@ mod tests {
         let (first, first_waker) = waker();
         let (second, second_waker) = waker();
         let op = table.insert(Some(first_waker));
-        assert_eq!(table.poll(op, &second_waker), None);
+        let replaced = table.poll(op, &second_waker).unwrap_err();
+        assert!(replaced.is_some(), "the first waker is handed back");
 
         wake(table.complete(op, DONE));
         assert_eq!(first.0.load(Ordering::Relaxed), 0);
@@ -295,7 +314,7 @@ mod tests {
 
         // A late completion for the first occupant must not touch the second.
         assert!(matches!(table.complete(first, DONE), Outcome::Ignore));
-        assert_eq!(table.poll(second, &waker), None);
+        assert!(matches!(table.poll(second, &waker), Err(None)));
         assert_eq!(table.in_flight(), 1);
     }
 
@@ -304,7 +323,7 @@ mod tests {
         let mut table = Table::<&str>::with_capacity(4);
         let op = table.insert(None);
         assert_eq!(table.take_completed(op), None);
-        table.orphan(op, "payload");
+        assert!(table.orphan(op, "payload").is_none());
         assert_eq!(table.in_flight(), 1);
 
         assert!(matches!(
@@ -329,7 +348,7 @@ mod tests {
         let mut table = Table::<u32>::with_capacity(4);
         let waiting = table.insert(None);
         let orphaned = table.insert(None);
-        table.orphan(orphaned, 7);
+        let _ = table.orphan(orphaned, 7);
 
         assert_eq!(table.take_orphans(), [7]);
         assert_eq!(table.in_flight(), 1);

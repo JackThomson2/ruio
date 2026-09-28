@@ -7,6 +7,7 @@ use std::io;
 use std::mem::offset_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
+use std::sync::OnceLock;
 
 use ruio_sys as sys;
 
@@ -138,6 +139,21 @@ impl Probe {
             opcodes,
             last_opcode,
         })
+    }
+
+    /// The probe of the running kernel, detected on first use and cached for
+    /// the life of the process.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Probe::detect`]. A failed detection is not cached.
+    pub fn current() -> io::Result<&'static Probe> {
+        static CURRENT: OnceLock<Probe> = OnceLock::new();
+        if let Some(probe) = CURRENT.get() {
+            return Ok(probe);
+        }
+        let probe = Self::detect()?;
+        Ok(CURRENT.get_or_init(|| probe))
     }
 
     /// The kernel release, as in `uname -r`, or `unknown` without `/proc`.
