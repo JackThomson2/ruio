@@ -23,3 +23,13 @@ jobs:
         run: cargo run --locked -p ruio-driver --example probe
       - name: Check
         run: ci/check.sh
+
+  asan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly with the standard library sources
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Test under AddressSanitizer
+        run: ci/asan.sh
