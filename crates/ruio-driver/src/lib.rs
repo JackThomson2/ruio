@@ -7,6 +7,9 @@ mod op;
 mod probe;
 // Used by the driver, which is added separately.
 #[allow(dead_code)]
+mod ring;
+// Used by the driver, which is added separately.
+#[allow(dead_code)]
 mod table;
 
 pub use op::Completion;
