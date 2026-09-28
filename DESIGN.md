@@ -134,12 +134,37 @@ its own flag set.
 - Slots are preallocated and reused, so the common path allocates nothing per
   operation. The payload (buffer, address, ...) lives in the future, not the
   slot.
-- Slot states: idle, waiting (with a `Waker`), completed (result and flags),
-  multishot (queue of completions), orphaned (the boxed payload of a dropped
-  operation).
-- Operations are lazy: nothing is submitted before the first poll, so
-  combinators such as `.timeout(d)` (a linked timeout), `.link(next)` and
-  `.fixed()` shape the SQE at no cost.
+- Slot states: free, waiting (with a `Waker`), completed (result and flags,
+  until the future collects them) and orphaned (the boxed payload of a
+  dropped operation). A multishot state, holding a queue of completions,
+  arrives with the first multishot operation.
+- Operations are lazy: nothing is queued before the first poll, which leaves
+  room for combinators such as `.timeout(d)` (a linked timeout),
+  `.link(next)` and `.fixed()` to shape the SQE at no cost. Linked entries
+  have to be queued together, so they will not go through `Operation`, whose
+  entries may not link.
+
+### Operations
+
+- An operation is a value implementing the unsafe `Operation` trait:
+  `prepare` fills in its SQE, and `complete` turns the completion into the
+  output. The contract is what makes the soundness model hold: every address
+  in the SQE stays valid until `complete` runs, even when the value moves, so
+  it may only point to heap memory the value owns (a read's `Vec`, a
+  timeout's boxed timespec) or to `'static` memory; and the SQE produces
+  exactly one completion. Multishot and zero-copy operations, which produce
+  several, will get a trait of their own.
+- `Driver::op` wraps an operation in an `Op` future, which is `Unpin`.
+  Dropping it in flight moves the operation into its slot and queues an
+  `ASYNC_CANCEL` whose success posts no completion. When the operation's own
+  completion arrives, `complete` still runs and its output is dropped, so an
+  output that owns a resource, such as a new descriptor, releases it.
+- Waking, dropping a replaced waker and finishing an orphan all run after the
+  driver's `RefCell` borrow is released, since each can run code that uses
+  the driver. An SQE left half-prepared by a panicking `prepare` becomes an
+  ignored no-op, so it cannot reach the kernel pointing at freed memory.
+- Until M3's `IoBuf` traits, `Read` and `Write` take a `Vec<u8>`; a read
+  appends to the vector's contents, filling its spare capacity.
 
 ### Kernel features
 
@@ -227,8 +252,11 @@ Owned-buffer read and write traits carry the usual helpers (`read_exact`,
   (`/usr/src/linux-headers-$(uname -r)`) over `/usr/include`; CI requires it
   to run.
 - **Drop tests.** For each operation, poll it N times and then drop it, for
-  every N up to completion, under AddressSanitizer (nightly). Miri cannot
-  model io_uring, so this is the main safety net.
+  every N up to completion, and drop pseudo-random mixes of operations on
+  small queues. A tracked read's buffer asserts, when freed, that the kernel
+  has finished with it. `ci/asan.sh` runs every test under AddressSanitizer
+  with leak detection (nightly, `-Zbuild-std`). Miri cannot model io_uring,
+  so this is the main safety net.
 - **Fault injection.** `ENOBUFS`, `EAGAIN` and `ECANCELED` completions, and
   tiny rings to force a full submission queue and completion overflow.
 - **Feature matrix.** Disable probed features to force the fallbacks, and run
@@ -259,6 +287,11 @@ request. A CI job fails on regressions.
 | M5 | Fs: open, read, write, fsync, statx, `O_DIRECT`, aligned buffers | Within about 5% of fio on 4 KiB `O_DIRECT` random reads |
 | M6 | Multi-core: builder, CPU pinning, `spawn_on`, cross-core channels, descriptor passing | Close to linear scaling up to 96 cores |
 | M7 | Compat adapters, hyper and rustls examples, documentation | A hyper server runs through the adapters |
+
+M0 and M1 are done. What M1 leaves for later: `Driver::park` without a
+timeout waits forever when nothing is in flight, since waking a parked ring
+from another thread comes with the executor (M2); multishot operations, links
+and the `IoBuf` traits are still to come.
 
 ## Open questions
 
