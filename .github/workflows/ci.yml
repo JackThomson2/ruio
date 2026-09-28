@@ -6,6 +6,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Fail instead of skipping if the ABI test finds no C compiler or header.
+  RUIO_REQUIRE_ABI_CHECK: "1"
 
 jobs:
   check:
