@@ -8,6 +8,9 @@ edition = "2024"
 rust-version = "1.97"
 publish = false
 
+[workspace.dependencies]
+libc = "0.2.189"
+
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
 missing_docs = "warn"
