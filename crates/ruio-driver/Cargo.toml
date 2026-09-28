@@ -1,0 +1,13 @@
+[package]
+name = "ruio-driver"
+description = "The io_uring driver of ruio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+ruio-sys.workspace = true
+
+[lints]
+workspace = true

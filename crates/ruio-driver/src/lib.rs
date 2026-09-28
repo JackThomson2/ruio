@@ -1,0 +1,8 @@
+//! The io_uring driver of ruio.
+//!
+//! [`Probe`] finds out what the running kernel's io_uring supports and checks
+//! it against ruio's baseline, the capabilities of Linux 6.1.
+
+mod probe;
+
+pub use probe::{BaselineError, Probe};

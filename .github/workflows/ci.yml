@@ -19,5 +19,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Show the kernel
         run: uname -a
+      - name: Report io_uring capabilities
+        run: cargo run --locked -p ruio-driver --example probe
       - name: Check
         run: ci/check.sh
