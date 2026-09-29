@@ -5,12 +5,15 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::mem;
 use std::ptr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use ruio_driver::{Driver, Unparker};
 
 use crate::task::{JoinHandle, Task};
+use crate::time::Timers;
 
 /// How many tasks run between turns of the ring, so that a flood of ready
 /// tasks cannot hold up completions.
@@ -127,6 +130,7 @@ pub(crate) struct Scheduler {
     /// Every task whose future has not been dropped; this is what keeps a
     /// task alive while nothing else refers to it.
     tasks: RefCell<Tasks>,
+    timers: Rc<Timers>,
 }
 
 impl Scheduler {
@@ -146,7 +150,12 @@ impl Scheduler {
             lifo_streak: Cell::new(0),
             running: Cell::new(ptr::null()),
             tasks: RefCell::new(Tasks::default()),
+            timers: Rc::new(Timers::new()),
         }
+    }
+
+    pub(crate) fn timers(&self) -> &Rc<Timers> {
+        &self.timers
     }
 
     pub(crate) fn driver(&self) -> &Driver {
@@ -215,9 +224,10 @@ impl Scheduler {
         !self.queue.borrow().is_empty() || self.lifo.borrow().is_some()
     }
 
-    /// Runs up to [`BUDGET`] ready tasks, then turns the ring: without
-    /// waiting if anything is ready to run, otherwise parking until a
-    /// completion arrives or another thread wakes a task.
+    /// Runs up to [`BUDGET`] ready tasks and fires the due timers, then turns
+    /// the ring: without waiting if anything is ready to run, otherwise
+    /// parking until a completion arrives, another thread wakes a task, or the
+    /// next timer is due.
     ///
     /// # Panics
     ///
@@ -232,9 +242,11 @@ impl Scheduler {
             self.running.set(ptr::null());
         }
         self.take_remote();
+        let now = Instant::now();
+        self.timers.fire(now);
         let idle = !self.has_ready_tasks() && !main_woken.load(Ordering::SeqCst);
         let turned = if idle {
-            self.driver.park(None)
+            self.driver.park(self.timers.next_timeout(now))
         } else {
             self.driver.submit()
         };
@@ -242,6 +254,7 @@ impl Scheduler {
             panic!("the io_uring driver failed: {err}");
         }
         self.take_remote();
+        self.timers.fire(Instant::now());
     }
 
     /// Moves the tasks woken on other threads into the run queue.

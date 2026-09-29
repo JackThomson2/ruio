@@ -9,6 +9,9 @@
 //! Wakers are `Send + Sync`: a task woken on another thread goes to its
 //! runtime's queue of remote wakes, and the runtime's ring is unparked.
 //!
+//! Timers ([`time`]) live in a timing wheel in user space; the kernel sees a
+//! single timeout, until the next deadline.
+//!
 //! ```
 //! use ruio_driver::ops::Nop;
 //! use ruio_executor::Runtime;
@@ -29,8 +32,7 @@ mod context;
 mod runtime;
 mod scheduler;
 mod task;
-// Used by the timers, which are added separately.
-#[allow(dead_code)]
+pub mod time;
 mod wheel;
 
 use std::future::{self, Future};
