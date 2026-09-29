@@ -19,7 +19,7 @@ an API that still reads like ordinary async Rust.
 ## Non-goals
 
 - Platforms other than Linux, and fallbacks to epoll or thread pools.
-- Kernels older than 6.1.
+- Kernels older than 6.10.
 - Being a drop-in replacement for tokio. Interoperability comes from adapters
   (milestone M7).
 
@@ -29,12 +29,12 @@ an API that still reads like ordinary async Rust.
 |---|---|---|
 | Execution model | Thread-per-core: one ring and one executor per thread; spawned tasks need not be `Send`. | `SINGLE_ISSUER` and `DEFER_TASKRUN` assume one submitting thread, registered files and buffers belong to a single ring, and the hot path needs no atomics or locks. |
 | Work stealing | Not in the first release, but kept possible (see [Keeping work stealing possible](#keeping-work-stealing-possible)). | It fights per-ring state, but some workloads want it. |
-| Minimum kernel | Linux 6.1, the oldest LTS with `DEFER_TASKRUN`. Detected by capability, not by version string. | 6.1 has everything the core needs: `SINGLE_ISSUER`, `DEFER_TASKRUN`, provided-buffer rings, multishot accept and recv, zero-copy send. Distribution kernels backport features, so version numbers mislead. |
+| Minimum kernel | Linux 6.10. Detected by capability, not by version string. | 6.1, the oldest LTS with `DEFER_TASKRUN`, had everything the core needs, but 6.10 adds bundles, which send and receive several provided buffers per request: the network path needs them to beat epoll on large messages (see [Benchmarks](#benchmarks)). It also brings `NO_SQARRAY` (6.6), multishot read (6.7) and socket options through `URING_CMD` (6.7). Distribution kernels backport features, so version numbers mislead. |
 | Bindings | Our own, in `ruio-sys`: written by hand from the kernel's uapi header and tested against it. | Full control of the ABI surface and the hot path, no bindgen at build time, and new kernel features arrive when we need them. |
 | Interop | `futures-io` and `tokio::io` adapters in `ruio-compat`, in the last milestone. | Ecosystem access matters, but must not shape the core API. |
 | Toolchain | Newest stable Rust (1.97.1), edition 2024, pinned in `rust-toolchain.toml`. Nightly only for sanitizers. | No minimum supported Rust version is required. |
 | Dependencies | `libc` only, in the core crates. | Small audit surface. |
-| Direct descriptors | Supported throughout the driver; `ruio::net` accepts them on request (`set_direct`), plain descriptors by default. | On the 6.1 baseline a direct socket can neither report its addresses nor change options (`setsockopt` through `URING_CMD` is 6.7, `getsockname` 6.19), and a full file table makes the kernel close the connection it accepted. The echo benchmark measures the file lookups they save at about 1%. |
+| Direct descriptors | Supported throughout the driver; `ruio::net` accepts them on request (`set_direct`), plain descriptors by default. | A direct socket cannot report its addresses (`getsockname` through `URING_CMD` is 6.19) and can change options only with `URING_CMD` requests, and a full file table makes the kernel close the connection it accepted. The echo benchmark measures the file lookups they save at about 1%. |
 
 ## Architecture
 
@@ -124,7 +124,7 @@ cycle.
 
 Default flags: `SINGLE_ISSUER | DEFER_TASKRUN | TASKRUN_FLAG | SUBMIT_ALL |
 CQSIZE | CLAMP`, with a completion queue four times the submission queue, plus
-`NO_SQARRAY` when the kernel has it (6.6). The ring's own descriptor is
+`NO_SQARRAY`. The ring's own descriptor is
 registered (`IORING_REGISTER_RING_FDS`) so `io_uring_enter` skips the file
 lookup on every call.
 
@@ -232,7 +232,8 @@ its own flag set.
 
 - Multishot accept, recv and poll, exposed as streams and re-armed
   automatically when the kernel ends them (no `IORING_CQE_F_MORE`) or the
-  buffer pool runs dry (`ENOBUFS`); multishot read (6.7) is still to come.
+  buffer pool runs dry (`ENOBUFS`); multishot read (6.7), in the baseline,
+  is still to come.
 - Direct descriptors: socket and accept install straight into the registered
   file table (`IORING_FILE_INDEX_ALLOC`), so later operations skip the file
   lookup; open will in M5. The driver makes them on request; see the
@@ -252,7 +253,7 @@ its own flag set.
 `ruio_driver::Probe` uses throwaway rings to learn the kernel's feature bits,
 which setup flags it accepts and which opcodes it supports
 (`IORING_REGISTER_PROBE`). `Probe::check_baseline` names every missing
-capability when the kernel is below the 6.1 baseline. Features past the
+capability when the kernel is below the 6.10 baseline. Features past the
 baseline are used only when probed.
 
 ## Executor
@@ -338,7 +339,7 @@ baseline are used only when probed.
   with `EINVAL`, so the buffer comes back with the error.
 - Still to come: a `copy` using `splice`, owned-buffer read and write traits
   that files can share, vectored sends, `bind_reuseport` (M6), and socket
-  options for direct descriptors on kernels that have them in `URING_CMD`.
+  options for direct descriptors through `URING_CMD`.
 
 ## API sketch
 
@@ -391,7 +392,7 @@ have `read_exact` and `write_all` of their own so far, and the sketch's
   the runtime a deadline, so a missing reply fails a test rather than
   hanging it.
 - **Feature matrix.** Disable probed features to force the fallbacks, and run
-  the 6.1 baseline in a VM (for example virtme-ng), since development hosts
+  the 6.10 baseline in a VM (for example virtme-ng), since development hosts
   run newer kernels.
 
 ## Benchmarks

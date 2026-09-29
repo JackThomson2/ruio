@@ -17,7 +17,7 @@
 //! there, as a [`DirectFd`].
 //!
 //! [`Probe`] reports what the running kernel supports and checks it against
-//! ruio's baseline, the capabilities of Linux 6.1.
+//! ruio's baseline, the capabilities of Linux 6.10.
 //!
 //! ```
 //! use std::pin::Pin;

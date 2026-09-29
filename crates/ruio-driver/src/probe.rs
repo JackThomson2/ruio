@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 use ruio_sys as sys;
 
-/// Every `IORING_FEAT_*` bit that Linux 6.1 reports.
+/// Every `IORING_FEAT_*` bit that Linux 6.10 reports.
 const BASELINE_FEATURES: u32 = sys::IORING_FEAT_SINGLE_MMAP
     | sys::IORING_FEAT_NODROP
     | sys::IORING_FEAT_SUBMIT_STABLE
@@ -24,7 +24,9 @@ const BASELINE_FEATURES: u32 = sys::IORING_FEAT_SINGLE_MMAP
     | sys::IORING_FEAT_NATIVE_WORKERS
     | sys::IORING_FEAT_RSRC_TAGS
     | sys::IORING_FEAT_CQE_SKIP
-    | sys::IORING_FEAT_LINKED_FILE;
+    | sys::IORING_FEAT_LINKED_FILE
+    | sys::IORING_FEAT_REG_REG_RING
+    | sys::IORING_FEAT_RECVSEND_BUNDLE;
 
 /// The setup flags of ruio's default ring configuration.
 const BASELINE_SETUP_FLAGS: u32 = sys::IORING_SETUP_CQSIZE
@@ -32,9 +34,10 @@ const BASELINE_SETUP_FLAGS: u32 = sys::IORING_SETUP_CQSIZE
     | sys::IORING_SETUP_SUBMIT_ALL
     | sys::IORING_SETUP_TASKRUN_FLAG
     | sys::IORING_SETUP_SINGLE_ISSUER
-    | sys::IORING_SETUP_DEFER_TASKRUN;
+    | sys::IORING_SETUP_DEFER_TASKRUN
+    | sys::IORING_SETUP_NO_SQARRAY;
 
-/// The opcodes ruio is built on, all of them present in Linux 6.1.
+/// The opcodes ruio is built on, all of them present in Linux 6.10.
 const BASELINE_OPCODES: &[u8] = &[
     sys::IORING_OP_NOP,
     sys::IORING_OP_READV,
@@ -70,6 +73,7 @@ const BASELINE_OPCODES: &[u8] = &[
     sys::IORING_OP_SOCKET,
     sys::IORING_OP_SEND_ZC,
     sys::IORING_OP_SENDMSG_ZC,
+    sys::IORING_OP_READ_MULTISHOT,
 ];
 
 /// The setup flags [`Probe::detect`] tries, each with the flags it requires.
@@ -198,7 +202,7 @@ impl Probe {
     }
 
     /// Checks the kernel against ruio's baseline, the capabilities of Linux
-    /// 6.1.
+    /// 6.10.
     ///
     /// # Errors
     ///
@@ -233,7 +237,7 @@ impl fmt::Display for Probe {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "kernel    {}", self.kernel_release)?;
         match self.check_baseline() {
-            Ok(()) => writeln!(f, "baseline  met: Linux 6.1 capabilities present")?,
+            Ok(()) => writeln!(f, "baseline  met: Linux 6.10 capabilities present")?,
             Err(err) => writeln!(f, "baseline  NOT met: missing {}", err.missing.join(", "))?,
         }
 
@@ -294,7 +298,7 @@ impl fmt::Display for Probe {
 
 /// The kernel lacks io_uring capabilities that ruio requires.
 ///
-/// ruio's baseline is Linux 6.1. The check looks at capabilities rather than
+/// ruio's baseline is Linux 6.10. The check looks at capabilities rather than
 /// the version number, so kernels with backports pass and kernels built
 /// without parts of io_uring fail.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -314,7 +318,7 @@ impl fmt::Display for BaselineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "io_uring on kernel {} lacks {}; ruio needs the capabilities of Linux 6.1 or newer",
+            "io_uring on kernel {} lacks {}; ruio needs the capabilities of Linux 6.10 or newer",
             self.kernel_release,
             self.missing.join(", ")
         )
@@ -458,6 +462,18 @@ mod tests {
         assert_eq!(probe.check_baseline(), Ok(()));
     }
 
+    /// Everything before 6.10 is not enough: the network path needs bundles.
+    #[test]
+    fn a_kernel_without_bundles_is_below_the_baseline() {
+        let probe = probe(
+            BASELINE_FEATURES & !sys::IORING_FEAT_RECVSEND_BUNDLE,
+            BASELINE_SETUP_FLAGS,
+            BASELINE_OPCODES,
+        );
+        let err = probe.check_baseline().unwrap_err();
+        assert_eq!(err.missing(), ["IORING_FEAT_RECVSEND_BUNDLE"]);
+    }
+
     #[test]
     fn baseline_error_names_what_is_missing() {
         let opcodes: Vec<u8> = BASELINE_OPCODES
@@ -479,7 +495,7 @@ mod tests {
                 "IORING_OP_SEND_ZC"
             ]
         );
-        assert!(err.to_string().contains("Linux 6.1"), "{err}");
+        assert!(err.to_string().contains("Linux 6.10"), "{err}");
     }
 
     /// A baseline capability without a name could not be reported missing,

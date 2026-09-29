@@ -27,13 +27,13 @@ use crate::unpark::{Notify, Unparker};
 /// The `user_data` of the poll on the eventfd that unparkers write to.
 const WAKE: u64 = IGNORED - 1;
 
-/// The setup flags of every ring, besides `IORING_SETUP_NO_SQARRAY` when the
-/// kernel has it. See DESIGN.md.
+/// The setup flags of every ring. See DESIGN.md.
 const SETUP_FLAGS: u32 = sys::IORING_SETUP_SINGLE_ISSUER
     | sys::IORING_SETUP_DEFER_TASKRUN
     | sys::IORING_SETUP_TASKRUN_FLAG
     | sys::IORING_SETUP_SUBMIT_ALL
-    | sys::IORING_SETUP_CLAMP;
+    | sys::IORING_SETUP_CLAMP
+    | sys::IORING_SETUP_NO_SQARRAY;
 
 /// Flags an [`Operation`] may not put on its entry: they would give it more
 /// or fewer than one completion, or chain it to an unrelated entry.
@@ -123,13 +123,9 @@ impl Builder {
         probe
             .check_baseline()
             .map_err(|err| io::Error::new(io::ErrorKind::Unsupported, err))?;
-        let mut flags = SETUP_FLAGS;
-        if probe.supports_setup_flags(sys::IORING_SETUP_NO_SQARRAY) {
-            flags |= sys::IORING_SETUP_NO_SQARRAY;
-        }
         let entries = self.entries.max(2);
         let cq_entries = entries.saturating_mul(4);
-        let ring = Ring::new(entries, cq_entries, flags)?;
+        let ring = Ring::new(entries, cq_entries, SETUP_FLAGS)?;
         let files = match self.files {
             Some(0) => 0,
             Some(slots) => {
