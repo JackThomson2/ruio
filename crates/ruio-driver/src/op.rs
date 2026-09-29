@@ -25,9 +25,9 @@ impl Completion {
         Self { res, flags }
     }
 
-    /// A completion reporting `err`, for an operation that could not be
+    /// A completion reporting `err`, as for an operation that could not be
     /// submitted.
-    pub(crate) fn from_error(err: &io::Error) -> Self {
+    pub fn from_error(err: &io::Error) -> Self {
         Self::new(-err.raw_os_error().unwrap_or(libc::EIO), 0)
     }
 
@@ -184,8 +184,9 @@ impl<T: Operation> Op<T> {
             .orphan(user_data, Seen { operation, timed }, false);
     }
 
-    /// The operation back, if it has not been submitted: nothing has reached
-    /// the kernel, so nothing is cancelled either.
+    /// The operation back, if it has not been submitted, so nothing reached
+    /// the kernel. Otherwise the `Op` is dropped, which cancels the
+    /// operation.
     pub fn into_inner(mut self) -> Option<T> {
         match mem::replace(&mut self.state, State::Done) {
             State::Unsubmitted(operation) => Some(operation),

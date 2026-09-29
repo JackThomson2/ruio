@@ -580,6 +580,18 @@ impl<B: IoBuf> SendZc<B> {
         self
     }
 
+    /// The buffer back, if the send has not been submitted. Otherwise the
+    /// send is dropped, which cancels it.
+    pub fn into_inner(mut self) -> Option<B> {
+        match self.stream.take()?.into_inner() {
+            Ok(request) => Some(request.buf),
+            Err(stream) => {
+                self.stream = Some(stream);
+                None
+            }
+        }
+    }
+
     /// The request, which is not armed before the first poll.
     fn request(&mut self) -> &mut ZcRequest<B> {
         self.stream
