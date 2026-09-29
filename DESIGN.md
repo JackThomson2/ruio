@@ -42,9 +42,9 @@ crates/
   ruio-sys/       kernel ABI: uapi structures and constants, raw system calls; no policy
   ruio-driver/    one ring: setup, SQ/CQ, operation table, Op<T> futures, buffers,
                   registered files, capability probe
-  ruio-executor/  per-thread scheduler, wakers, timer wheel, thread-per-core builder
+  ruio-executor/  per-thread scheduler, tasks, timer wheel, thread-per-core builder
   ruio-macros/    #[ruio::main], #[ruio::test]
-  ruio/           public API: rt, net, fs, time, buf, io
+  ruio/           public API: runtime, time, uring; later net, fs, buf, io
   ruio-compat/    futures-io and tokio::io adapters
 ```
 
@@ -192,18 +192,37 @@ baseline are used only when probed.
 ## Executor
 
 - One executor per thread, driving that thread's ring. `ruio::spawn` takes
-  futures that need not be `Send`; `spawn_on(core, future)` sends a `Send`
-  future to another core.
-- A task is one allocation holding its header, future and output. Each thread
-  has a FIFO run queue and a LIFO slot for the most recently woken task, and a
-  per-task poll budget stops one busy task from starving the rest.
-- Timers live in a hierarchical wheel in user space. The kernel sees a single
-  timeout: the wait deadline passed to `io_uring_enter`.
-- Wakers are `Send + Sync`, as the `Waker` contract requires. A wake from
-  another thread goes through an MPSC queue and, if the target thread is
-  parked, a `MSG_RING` to its ring.
-- The builder pins threads to CPUs and supports one `SO_REUSEPORT` listener
-  per core.
+  futures that need not be `Send`; `spawn_on(core, future)` (M6) sends a
+  `Send` future to another core.
+- A task is one `Arc` allocation holding its future and, once it finishes,
+  its output, and is its own waker through std's `Wake` trait. Wakers are
+  `Send + Sync`, as the `Waker` contract requires, while the future need not
+  be, so the future, output and bookkeeping are only touched on the task's
+  thread: by the scheduler and by the `JoinHandle`, which is not `Send`. The
+  scheduler holds every unfinished task until its future is dropped on that
+  thread, and the `JoinHandle` drops the output there, so a waker that
+  releases the last reference elsewhere owns nothing that is not `Send`.
+- Each loop pass runs up to 64 ready tasks, fires due timers, then turns the
+  ring: it submits without waiting if anything is runnable, and otherwise
+  parks until a completion, a wake or the next timer. A task woken by the
+  running task takes a LIFO slot and runs next, at most three in a row;
+  everything else queues in FIFO order. Every io_uring operation yields at
+  least once, so a cooperative per-task budget can wait for primitives that
+  are often ready at once, such as channels.
+- Panics in tasks are caught and reported through `JoinError`; the payload
+  only leaves by value, so `JoinError` is `Send + Sync`. Dropping the runtime
+  drops every unfinished future on its thread before the driver drains their
+  operations.
+- Timers live in a hierarchical wheel in user space, with millisecond ticks.
+  The kernel sees a single timeout: the wait deadline passed to
+  `io_uring_enter`. A thousand concurrent sleeps cost one system call.
+- A wake from another thread goes to the runtime's mutex-protected queue and
+  unparks its ring. Unparking writes to an eventfd that a parked ring has a
+  multishot poll on, which works from any thread, and costs no system call
+  unless the ring is parked. `MSG_RING` can take over for wakes between rings
+  in M6.
+- The builder (M6) pins threads to CPUs and supports one `SO_REUSEPORT`
+  listener per core.
 
 ### Keeping work stealing possible
 
@@ -288,10 +307,9 @@ request. A CI job fails on regressions.
 | M6 | Multi-core: builder, CPU pinning, `spawn_on`, cross-core channels, descriptor passing | Close to linear scaling up to 96 cores |
 | M7 | Compat adapters, hyper and rustls examples, documentation | A hyper server runs through the adapters |
 
-M0 and M1 are done. What M1 leaves for later: `Driver::park` without a
-timeout waits forever when nothing is in flight, since waking a parked ring
-from another thread comes with the executor (M2); multishot operations, links
-and the `IoBuf` traits are still to come.
+M0, M1 and M2 are done. Still to come besides the later milestones:
+multishot operations, links and the `IoBuf` traits (M3), and channels and
+other synchronization primitives, with the cooperative budget they need.
 
 ## Open questions
 
