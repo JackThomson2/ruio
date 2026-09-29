@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 ruio-driver.workspace = true
 ruio-executor.workspace = true
+ruio-macros.workspace = true
 
 [lints]
 workspace = true

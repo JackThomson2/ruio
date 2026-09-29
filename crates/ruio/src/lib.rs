@@ -27,6 +27,7 @@
 
 pub use ruio_executor::time;
 pub use ruio_executor::{Builder, JoinError, JoinHandle, Runtime, driver, spawn, yield_now};
+pub use ruio_macros::{main, test};
 
 /// The io_uring driver: operations, the futures that run them, and the types
 /// for writing new ones.
@@ -35,3 +36,39 @@ pub mod uring {
         BaselineError, Completion, Driver, Op, Operation, Probe, Stats, Unparker, ops,
     };
 }
+
+/// What the expansions of `#[ruio::main]` and `#[ruio::test]` call.
+#[doc(hidden)]
+pub mod __private {
+    use std::future::Future;
+
+    /// Runs `future` on a new runtime.
+    ///
+    /// # Panics
+    ///
+    /// If the runtime cannot start, or `future` panics.
+    pub fn block_on<F: Future>(future: F) -> F::Output {
+        crate::Runtime::new()
+            .unwrap_or_else(|err| panic!("cannot start the ruio runtime: {err}"))
+            .block_on(future)
+    }
+}
+
+/// The attributes reject what they cannot run:
+///
+/// ```compile_fail
+/// #[ruio::main]
+/// fn main() {}
+/// ```
+///
+/// ```compile_fail
+/// #[ruio::main(threads = 4)]
+/// async fn main() {}
+/// ```
+///
+/// ```compile_fail
+/// #[ruio::test]
+/// struct NotAFunction;
+/// ```
+#[cfg(doctest)]
+struct AttributeErrors;
