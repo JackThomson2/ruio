@@ -20,7 +20,7 @@ pub(crate) const BUFFER_SIZE: u32 = 16 << 10;
 pub(crate) enum Server {
     /// ruio: a multishot accept, and per connection a multishot receive
     /// into a shared pool; whatever has arrived goes back out with one
-    /// vectored send.
+    /// vectored send, written behind.
     Ruio,
     /// The same, with the connections as direct descriptors.
     RuioDirect,
@@ -95,7 +95,7 @@ fn ruio(addr: SocketAddr, buffers: u16, direct: bool) -> io::Result<()> {
                     while let Some(Ok(more)) = received.next_ready() {
                         data.append(more);
                     }
-                    if stream.write_all_vectored(data).await.0.is_err() {
+                    if stream.write_behind(data).await.is_err() {
                         break;
                     }
                 }
