@@ -228,6 +228,57 @@ pub struct io_uring_rsrc_update {
     pub data: u64,
 }
 
+/// A buffer in a provided-buffer ring.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct io_uring_buf {
+    /// The buffer's address.
+    pub addr: u64,
+    /// The buffer's length.
+    pub len: u32,
+    /// The buffer ID completions report.
+    pub bid: u16,
+    /// Reserved. In the ring's first entry, this is the ring's tail; see
+    /// [`io_uring_buf_ring`].
+    pub resv: u16,
+}
+
+/// The start of a provided-buffer ring, which is an array of
+/// [`io_uring_buf`] whose first entry holds the ring's tail in place of its
+/// `resv` field.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct io_uring_buf_ring {
+    /// Overlaps the first entry's `addr`.
+    pub resv1: u64,
+    /// Overlaps the first entry's `len`.
+    pub resv2: u32,
+    /// Overlaps the first entry's `bid`.
+    pub resv3: u16,
+    /// One past the last entry the application has added.
+    pub tail: u16,
+}
+
+/// The registration of a provided-buffer ring, for
+/// [`IORING_REGISTER_PBUF_RING`] and [`IORING_UNREGISTER_PBUF_RING`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct io_uring_buf_reg {
+    /// The ring's page-aligned address, unless the kernel allocates it
+    /// ([`IOU_PBUF_RING_MMAP`]).
+    pub ring_addr: u64,
+    /// The number of entries, a power of two below 65536.
+    pub ring_entries: u32,
+    /// The buffer group ID that submission entries select buffers by.
+    pub bgid: u16,
+    /// `IOU_PBUF_RING_*` flags.
+    pub flags: u16,
+    /// Reserved before Linux 7.0; must be zero.
+    pub min_left: u32,
+    /// Reserved; must be zero.
+    pub resv: [u32; 5],
+}
+
 /// The kernel's 64-bit `timespec`, from `linux/time_types.h`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -248,6 +299,9 @@ const _: () = {
     assert!(size_of::<io_uring_probe>() == 16);
     assert!(size_of::<io_uring_getevents_arg>() == 24);
     assert!(size_of::<io_uring_rsrc_update>() == 16);
+    assert!(size_of::<io_uring_buf>() == 16);
+    assert!(size_of::<io_uring_buf_ring>() == 16);
+    assert!(size_of::<io_uring_buf_reg>() == 40);
     assert!(size_of::<__kernel_timespec>() == 16);
 };
 
@@ -774,6 +828,17 @@ consts! {
         IORING_ACCEPT_DONTWAIT = 1 << 1,
         /// Poll for readiness before trying to accept.
         IORING_ACCEPT_POLL_FIRST = 1 << 2,
+    ];
+}
+
+consts! {
+    /// Every `IOU_PBUF_RING_*` flag, for [`io_uring_buf_reg::flags`].
+    pub const PBUF_RING_FLAGS: [u16] = [
+        /// The kernel allocates the ring, which the application maps at
+        /// [`IORING_OFF_PBUF_RING`].
+        IOU_PBUF_RING_MMAP = 1,
+        /// Buffers are consumed incrementally, across completions.
+        IOU_PBUF_RING_INC = 2,
     ];
 }
 

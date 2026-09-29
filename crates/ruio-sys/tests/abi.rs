@@ -168,6 +168,28 @@ const LAYOUTS: &[Layout] = &[
         resv => resv,
         data => data,
     }),
+    layout!(io_uring_buf, in_header: true, {
+        addr => addr,
+        len => len,
+        bid => bid,
+        resv => resv,
+    }),
+    layout!(io_uring_buf_ring, in_header: true, {
+        resv1 => resv1,
+        resv2 => resv2,
+        resv3 => resv3,
+        tail => tail,
+        bufs => resv1,
+    }),
+    // `resv` is left to the size check: before 7.0 the header declares it as
+    // three `u64`s at offset 16, where 7.0 has `min_left` and five `u32`s.
+    layout!(io_uring_buf_reg, in_header: true, {
+        ring_addr => ring_addr,
+        ring_entries => ring_entries,
+        bgid => bgid,
+        flags => flags,
+        min_left => min_left,
+    }),
     layout!(__kernel_timespec, in_header: false, {
         tv_sec => tv_sec,
         tv_nsec => tv_nsec,
@@ -207,6 +229,7 @@ fn tables() -> Vec<(&'static str, Vec<(&'static str, u64)>)> {
         ASYNC_CANCEL_FLAGS,
         RECVSEND_FLAGS,
         ACCEPT_FLAGS,
+        PBUF_RING_FLAGS,
         MSG_RING_COMMANDS,
         MSG_RING_FLAGS,
         NOP_FLAGS,
