@@ -1,9 +1,10 @@
 //! The scheduler of one thread: the tasks it owns, the queue of those ready to
 //! run, and the loop that runs them and turns the ring.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::mem;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -14,6 +15,10 @@ use crate::task::{JoinHandle, Task};
 /// How many tasks run between turns of the ring, so that a flood of ready
 /// tasks cannot hold up completions.
 const BUDGET: usize = 64;
+
+/// How many tasks in a row may come from the LIFO slot before the queue gets
+/// a turn, so that tasks waking each other cannot starve the rest.
+const LIFO_LIMIT: u32 = 3;
 
 /// A task, as the scheduler and wakers hold it.
 pub(crate) type TaskRef = Arc<dyn Runnable>;
@@ -112,6 +117,13 @@ pub(crate) struct Scheduler {
     shared: Arc<Shared>,
     /// Tasks ready to run, in the order they were woken.
     queue: RefCell<VecDeque<TaskRef>>,
+    /// The task most recently woken by the running task. It runs next, while
+    /// what the running task produced for it is likely still in the cache.
+    lifo: RefCell<Option<TaskRef>>,
+    /// How many tasks in a row came from the LIFO slot.
+    lifo_streak: Cell<u32>,
+    /// The task being polled, if any, as a thin pointer.
+    running: Cell<*const ()>,
     /// Every task whose future has not been dropped; this is what keeps a
     /// task alive while nothing else refers to it.
     tasks: RefCell<Tasks>,
@@ -130,6 +142,9 @@ impl Scheduler {
             driver,
             shared,
             queue: RefCell::new(VecDeque::new()),
+            lifo: RefCell::new(None),
+            lifo_streak: Cell::new(0),
+            running: Cell::new(ptr::null()),
             tasks: RefCell::new(Tasks::default()),
         }
     }
@@ -161,9 +176,43 @@ impl Scheduler {
         drop(task);
     }
 
-    /// Queues a task to run.
+    /// Queues a woken task. One woken by the running task, other than
+    /// itself, takes the LIFO slot; the task it displaces, and any other,
+    /// joins the back of the queue.
     pub(crate) fn schedule(&self, task: TaskRef) {
+        let running = self.running.get();
+        let task = if !running.is_null() && !ptr::eq(Arc::as_ptr(&task).cast::<()>(), running) {
+            match self.lifo.borrow_mut().replace(task) {
+                Some(displaced) => displaced,
+                None => return,
+            }
+        } else {
+            task
+        };
         self.queue.borrow_mut().push_back(task);
+    }
+
+    /// Queues a new task, at the back of the queue.
+    pub(crate) fn schedule_new(&self, task: TaskRef) {
+        self.queue.borrow_mut().push_back(task);
+    }
+
+    /// The next task to run: the LIFO slot's, unless it has had its share.
+    fn next_task(&self) -> Option<TaskRef> {
+        let lifo = self.lifo.borrow_mut().take();
+        if let Some(task) = lifo {
+            if self.lifo_streak.get() < LIFO_LIMIT {
+                self.lifo_streak.set(self.lifo_streak.get() + 1);
+                return Some(task);
+            }
+            self.queue.borrow_mut().push_back(task);
+        }
+        self.lifo_streak.set(0);
+        self.queue.borrow_mut().pop_front()
+    }
+
+    fn has_ready_tasks(&self) -> bool {
+        !self.queue.borrow().is_empty() || self.lifo.borrow().is_some()
     }
 
     /// Runs up to [`BUDGET`] ready tasks, then turns the ring: without
@@ -175,13 +224,15 @@ impl Scheduler {
     /// If the driver fails, which means completions were lost.
     pub(crate) fn tick(&self, main_woken: &AtomicBool) {
         for _ in 0..BUDGET {
-            let Some(task) = self.queue.borrow_mut().pop_front() else {
+            let Some(task) = self.next_task() else {
                 break;
             };
+            self.running.set(Arc::as_ptr(&task).cast());
             task.run(self);
+            self.running.set(ptr::null());
         }
         self.take_remote();
-        let idle = self.queue.borrow().is_empty() && !main_woken.load(Ordering::SeqCst);
+        let idle = !self.has_ready_tasks() && !main_woken.load(Ordering::SeqCst);
         let turned = if idle {
             self.driver.park(None)
         } else {
@@ -220,6 +271,7 @@ impl Scheduler {
             }
         }
         let queued = mem::take(&mut *self.queue.borrow_mut());
-        drop(queued);
+        let lifo = self.lifo.borrow_mut().take();
+        drop((queued, lifo));
     }
 }

@@ -69,7 +69,7 @@ where
         });
         let index = scheduler.adopt(Arc::clone(&task) as TaskRef);
         task.index.set(index);
-        scheduler.schedule(Arc::clone(&task) as TaskRef);
+        scheduler.schedule_new(Arc::clone(&task) as TaskRef);
         JoinHandle { task }
     }
 
