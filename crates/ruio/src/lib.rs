@@ -21,7 +21,9 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
-//! Operations on file descriptors run on the thread's ring, which
+//! [`net`] has sockets, which read and write with owned buffers and can
+//! receive into a pool of buffers that the kernel picks from.
+//! Their operations, like all others, run on the thread's ring, which
 //! [`driver`] returns; [`uring`] has the operations and the types for
 //! writing new ones.
 
@@ -30,6 +32,8 @@ pub use ruio_executor::{Builder, JoinError, JoinHandle, Runtime, driver, spawn, 
 pub use ruio_macros::{main, test};
 
 pub use ruio_driver::buf;
+
+pub mod net;
 
 /// The io_uring driver: operations, the futures that run them, and the types
 /// for writing new ones.
