@@ -36,6 +36,7 @@
 
 pub mod buf;
 mod driver;
+mod fd;
 mod fixed;
 mod mem;
 mod op;
@@ -48,6 +49,7 @@ mod table;
 mod unpark;
 
 pub use driver::{Builder, Driver, Stats};
+pub use fd::Fd;
 pub use op::{Completion, Op, Operation};
 pub use probe::{BaselineError, Probe};
 pub use stream::{MultiOp, Multishot};

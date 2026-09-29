@@ -8,9 +8,9 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use ruio_driver::Driver;
 use ruio_driver::buf::IoBuf;
 use ruio_driver::ops::{Read, Timeout, Write};
+use ruio_driver::{Driver, Fd};
 
 use support::{block_on, poll_once, settle};
 
@@ -150,6 +150,24 @@ fn errors_come_back_with_the_buffer() {
     let (read, buf) = block_on(&driver, driver.op(Read::new(-1, Vec::with_capacity(4))));
     assert_eq!(read.unwrap_err().raw_os_error(), Some(libc::EBADF));
     assert_eq!(buf.capacity(), 4);
+}
+
+/// A direct descriptor names a slot of the ring's registered file table,
+/// never the process's descriptor of the same number.
+#[test]
+fn a_direct_descriptor_is_no_plain_one() {
+    let driver = Driver::new().unwrap();
+    let (reader, mut writer) = io::pipe().unwrap();
+    writer.write_all(b"unread").unwrap();
+    let slot = u32::try_from(reader.as_raw_fd()).unwrap();
+    let read = Read::new(Fd::Direct(slot), Vec::with_capacity(8));
+    let (read, _) = block_on(&driver, driver.op(read));
+    assert_eq!(read.unwrap_err().raw_os_error(), Some(libc::EBADF));
+
+    let read = Read::new(Fd::Plain(reader.as_raw_fd()), Vec::with_capacity(8));
+    let (read, buf) = block_on(&driver, driver.op(read));
+    assert_eq!(read.unwrap(), 6);
+    assert_eq!(buf, b"unread");
 }
 
 #[test]

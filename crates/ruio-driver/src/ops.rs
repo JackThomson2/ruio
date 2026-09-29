@@ -1,6 +1,7 @@
 //! The operations the driver provides.
 //!
-//! Operations that take a raw file descriptor do not own it. The caller keeps
+//! Operations act on an [`Fd`]: a plain file descriptor, or a direct
+//! descriptor of the ring they run on. They do not own it. The caller keeps
 //! it open until the operation is submitted, at the next [`Driver::submit`]
 //! or [`Driver::park`]; after that the kernel holds its own reference to the
 //! file. A descriptor closed too early fails with `EBADF`, or reaches
@@ -15,7 +16,6 @@
 
 use std::future::poll_fn;
 use std::io;
-use std::os::fd::RawFd;
 use std::ptr;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
@@ -24,7 +24,7 @@ use ruio_sys as sys;
 
 use crate::buf::{BufLease, BufPool, BufResult, FixedIoBuf, IoBuf, IoBufMut};
 use crate::driver::timespec;
-use crate::{Completion, Driver, MultiOp, Multishot, Operation};
+use crate::{Completion, Driver, Fd, MultiOp, Multishot, Operation};
 
 /// The `off` value that makes reads and writes use the file position.
 const CURRENT_POSITION: u64 = u64::MAX;
@@ -94,20 +94,24 @@ unsafe impl Operation for Timeout {
 /// back with the result.
 #[derive(Debug)]
 pub struct Read<B> {
-    fd: RawFd,
+    fd: Fd,
     buf: B,
     offset: u64,
 }
 
 impl<B: IoBufMut> Read<B> {
     /// Reads at the file position, advancing it.
-    pub fn new(fd: RawFd, buf: B) -> Self {
+    pub fn new(fd: impl Into<Fd>, buf: B) -> Self {
         Self::at(fd, buf, CURRENT_POSITION)
     }
 
     /// Reads at `offset`, leaving the file position alone.
-    pub fn at(fd: RawFd, buf: B, offset: u64) -> Self {
-        Self { fd, buf, offset }
+    pub fn at(fd: impl Into<Fd>, buf: B, offset: u64) -> Self {
+        Self {
+            fd: fd.into(),
+            buf,
+            offset,
+        }
     }
 }
 
@@ -136,12 +140,12 @@ unsafe impl<B: IoBufMut> Operation for Read<B> {
 fn prepare_read<B: IoBufMut>(
     sqe: &mut sys::io_uring_sqe,
     opcode: u8,
-    fd: RawFd,
+    fd: Fd,
     buf: &mut B,
     offset: u64,
 ) {
     sqe.opcode = opcode;
-    sqe.fd = fd;
+    fd.apply(sqe);
     sqe.addr = buf.stable_mut_ptr().expose_provenance() as u64;
     sqe.len = u32::try_from(buf.bytes_total()).unwrap_or(u32::MAX);
     sqe.off = offset;
@@ -158,15 +162,9 @@ fn complete_read<B: IoBufMut>(mut buf: B, completion: Completion) -> BufResult<u
     (result, buf)
 }
 
-fn prepare_write<B: IoBuf>(
-    sqe: &mut sys::io_uring_sqe,
-    opcode: u8,
-    fd: RawFd,
-    buf: &B,
-    offset: u64,
-) {
+fn prepare_write<B: IoBuf>(sqe: &mut sys::io_uring_sqe, opcode: u8, fd: Fd, buf: &B, offset: u64) {
     sqe.opcode = opcode;
-    sqe.fd = fd;
+    fd.apply(sqe);
     sqe.addr = buf.stable_ptr().expose_provenance() as u64;
     sqe.len = u32::try_from(buf.bytes_init()).unwrap_or(u32::MAX);
     sqe.off = offset;
@@ -178,20 +176,24 @@ fn prepare_write<B: IoBuf>(
 /// The buffer comes back with the result.
 #[derive(Debug)]
 pub struct Write<B> {
-    fd: RawFd,
+    fd: Fd,
     buf: B,
     offset: u64,
 }
 
 impl<B: IoBuf> Write<B> {
     /// Writes at the file position, advancing it.
-    pub fn new(fd: RawFd, buf: B) -> Self {
+    pub fn new(fd: impl Into<Fd>, buf: B) -> Self {
         Self::at(fd, buf, CURRENT_POSITION)
     }
 
     /// Writes at `offset`, leaving the file position alone.
-    pub fn at(fd: RawFd, buf: B, offset: u64) -> Self {
-        Self { fd, buf, offset }
+    pub fn at(fd: impl Into<Fd>, buf: B, offset: u64) -> Self {
+        Self {
+            fd: fd.into(),
+            buf,
+            offset,
+        }
     }
 }
 
@@ -218,20 +220,24 @@ unsafe impl<B: IoBuf> Operation for Write<B> {
 /// the buffer's memory for the read.
 #[derive(Debug)]
 pub struct ReadFixed<B> {
-    fd: RawFd,
+    fd: Fd,
     buf: B,
     offset: u64,
 }
 
 impl<B: IoBufMut + FixedIoBuf> ReadFixed<B> {
     /// Reads at the file position, advancing it.
-    pub fn new(fd: RawFd, buf: B) -> Self {
+    pub fn new(fd: impl Into<Fd>, buf: B) -> Self {
         Self::at(fd, buf, CURRENT_POSITION)
     }
 
     /// Reads at `offset`, leaving the file position alone.
-    pub fn at(fd: RawFd, buf: B, offset: u64) -> Self {
-        Self { fd, buf, offset }
+    pub fn at(fd: impl Into<Fd>, buf: B, offset: u64) -> Self {
+        Self {
+            fd: fd.into(),
+            buf,
+            offset,
+        }
     }
 }
 
@@ -261,20 +267,24 @@ unsafe impl<B: IoBufMut + FixedIoBuf> Operation for ReadFixed<B> {
 /// mapping the buffer's memory for the write.
 #[derive(Debug)]
 pub struct WriteFixed<B> {
-    fd: RawFd,
+    fd: Fd,
     buf: B,
     offset: u64,
 }
 
 impl<B: IoBuf + FixedIoBuf> WriteFixed<B> {
     /// Writes at the file position, advancing it.
-    pub fn new(fd: RawFd, buf: B) -> Self {
+    pub fn new(fd: impl Into<Fd>, buf: B) -> Self {
         Self::at(fd, buf, CURRENT_POSITION)
     }
 
     /// Writes at `offset`, leaving the file position alone.
-    pub fn at(fd: RawFd, buf: B, offset: u64) -> Self {
-        Self { fd, buf, offset }
+    pub fn at(fd: impl Into<Fd>, buf: B, offset: u64) -> Self {
+        Self {
+            fd: fd.into(),
+            buf,
+            offset,
+        }
     }
 }
 
@@ -310,21 +320,21 @@ unsafe impl<B: IoBuf + FixedIoBuf> Operation for WriteFixed<B> {
 /// the file; it is `ENOBUFS` if the pool had no free buffer.
 #[derive(Debug)]
 pub struct ReadPooled {
-    fd: RawFd,
+    fd: Fd,
     pool: BufPool,
     offset: u64,
 }
 
 impl ReadPooled {
     /// Reads at the file position, advancing it.
-    pub fn new(fd: RawFd, pool: &BufPool) -> Self {
+    pub fn new(fd: impl Into<Fd>, pool: &BufPool) -> Self {
         Self::at(fd, pool, CURRENT_POSITION)
     }
 
     /// Reads at `offset`, leaving the file position alone.
-    pub fn at(fd: RawFd, pool: &BufPool, offset: u64) -> Self {
+    pub fn at(fd: impl Into<Fd>, pool: &BufPool, offset: u64) -> Self {
         Self {
-            fd,
+            fd: fd.into(),
             pool: pool.clone(),
             offset,
         }
@@ -339,8 +349,8 @@ unsafe impl Operation for ReadPooled {
 
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
         sqe.opcode = sys::IORING_OP_READ;
-        sqe.fd = self.fd;
-        sqe.flags = sys::IOSQE_BUFFER_SELECT;
+        self.fd.apply(sqe);
+        sqe.flags |= sys::IOSQE_BUFFER_SELECT;
         sqe.buf_index = self.pool.group();
         sqe.len = u32::try_from(self.pool.buffer_size()).unwrap_or(u32::MAX);
         sqe.off = self.offset;
@@ -375,15 +385,15 @@ fn pooled_data(completion: Completion, lease: Option<BufLease>) -> io::Result<Op
 /// it.
 #[derive(Debug)]
 pub struct RecvMulti {
-    fd: RawFd,
+    fd: Fd,
     pool: BufPool,
 }
 
 impl RecvMulti {
     /// Receives from `fd` into `pool`.
-    pub fn new(fd: RawFd, pool: &BufPool) -> Self {
+    pub fn new(fd: impl Into<Fd>, pool: &BufPool) -> Self {
         Self {
-            fd,
+            fd: fd.into(),
             pool: pool.clone(),
         }
     }
@@ -397,9 +407,9 @@ unsafe impl Multishot for RecvMulti {
 
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
         sqe.opcode = sys::IORING_OP_RECV;
-        sqe.fd = self.fd;
+        self.fd.apply(sqe);
         sqe.ioprio = sys::IORING_RECV_MULTISHOT;
-        sqe.flags = sys::IOSQE_BUFFER_SELECT;
+        sqe.flags |= sys::IOSQE_BUFFER_SELECT;
         sqe.buf_index = self.pool.group();
         // `len` stays zero: each receive fills up to a whole buffer.
     }
@@ -430,7 +440,7 @@ pub struct RecvStream {
 
 impl RecvStream {
     /// A stream of the data arriving on `fd`, received into `pool`.
-    pub fn new(driver: &Driver, fd: RawFd, pool: &BufPool) -> Self {
+    pub fn new(driver: &Driver, fd: impl Into<Fd>, pool: &BufPool) -> Self {
         Self {
             stream: driver.stream(RecvMulti::new(fd, pool)),
             pool: pool.clone(),
