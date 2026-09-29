@@ -7,6 +7,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::PathBuf;
 
+use ruio_driver::buf::{AlignedBuf, IoBuf};
 use ruio_driver::ops::{
     Close, Fallocate, Fsync, Ftruncate, MkdirAt, OpenAt, Read, RenameAt, Statx, UnlinkAt, Write,
 };
@@ -236,6 +237,64 @@ fn names_are_made_moved_and_removed() {
     assert_eq!(err.raw_os_error(), Some(libc::EISDIR));
     block_on(&driver, driver.op(UnlinkAt::new(&dir).unwrap().directory())).unwrap();
     assert!(!dir.exists());
+}
+
+/// Direct I/O moves data between the device and memory past the page cache,
+/// so the memory, and each transfer's offset and length, must be aligned as
+/// the file system says (`STATX_DIOALIGN`).
+#[test]
+fn direct_io_moves_aligned_buffers() {
+    let driver = Driver::new().unwrap();
+    let scratch = Scratch::new("odirect");
+    let path = scratch.path("file");
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_DIRECT;
+    let open = OpenAt::new(&path).unwrap().flags(flags).mode(0o600);
+    let file = match block_on(&driver, driver.op(open)) {
+        Ok(file) => plain(file),
+        // tmpfs, for one, has no direct I/O.
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+            eprintln!("skipped: no direct I/O in {}", scratch.0.display());
+            return;
+        }
+        Err(err) => panic!("{err}"),
+    };
+    let fd = file.as_raw_fd();
+    let dio = Statx::fd(fd).mask(libc::STATX_DIOALIGN);
+    let dio = block_on(&driver, driver.op(dio)).unwrap();
+    assert_ne!(dio.stx_mask & libc::STATX_DIOALIGN, 0);
+    let memory = dio.stx_dio_mem_align as usize;
+    let offset = dio.stx_dio_offset_align as usize;
+    assert!(memory > 0 && offset > 1, "{memory} {offset}");
+
+    let block = offset.max(4096);
+    let pattern: Vec<u8> = (0..2 * block).map(|index| (index % 251) as u8).collect();
+    let mut data = AlignedBuf::with_capacity(2 * block, memory);
+    data.extend_from_slice(&pattern);
+    let (written, _) = block_on(&driver, driver.op(Write::at(fd, data, 0)));
+    assert_eq!(written.unwrap(), 2 * block);
+    let read = Read::at(fd, AlignedBuf::with_capacity(block, memory), block as u64);
+    let (read, buf) = block_on(&driver, driver.op(read));
+    assert_eq!(read.unwrap(), block);
+    assert_eq!(&*buf, &pattern[block..]);
+
+    let off_offset = Read::at(
+        fd,
+        AlignedBuf::with_capacity(block, memory),
+        offset as u64 / 2,
+    );
+    let err = block_on(&driver, driver.op(off_offset)).0.unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EINVAL),
+        "a misaligned offset"
+    );
+    if memory > 1 {
+        let off_memory = AlignedBuf::with_capacity(block + memory, memory).slice(1..=block);
+        let err = block_on(&driver, driver.op(Read::at(fd, off_memory, 0)))
+            .0
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "misaligned memory");
+    }
 }
 
 /// A close closes its descriptor once: through the kernel once submitted,

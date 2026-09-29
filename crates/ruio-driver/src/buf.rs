@@ -18,11 +18,14 @@
 //! buffers the kernel picks from when data arrives, so waiting readers pin
 //! no memory, and hands the data back as a [`BufLease`], or a [`BufBundle`]
 //! of them. [`IoBufs`] sends several buffers as one, such as a bundle.
+//! Direct I/O (`O_DIRECT`) needs its memory aligned, as an [`AlignedBuf`]'s
+//! is, or a registered buffer's whose size is a multiple of the page size.
 
 use std::fmt;
 use std::io;
 use std::ops::{Bound, RangeBounds};
 
+pub use crate::aligned::AlignedBuf;
 pub use crate::fixed::{FixedBuf, FixedBuffers, FixedIoBuf};
 pub use crate::pool::{BufBundle, BufLease, BufPool};
 

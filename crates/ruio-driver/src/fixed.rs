@@ -52,6 +52,10 @@ impl FixedBuffers {
     /// Maps `count` buffers of `size` bytes each, zeroed, and registers them
     /// with the driver's ring.
     ///
+    /// The buffers lie one after another from the start of a mapping, which
+    /// starts at a page, so each starts at a multiple of the page size if
+    /// `size` is one: aligned for direct I/O.
+    ///
     /// # Errors
     ///
     /// `EBUSY` if the ring already has registered buffers, `ENOMEM` if the
