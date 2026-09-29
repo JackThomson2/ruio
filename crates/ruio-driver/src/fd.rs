@@ -54,7 +54,9 @@ impl From<BorrowedFd<'_>> for Fd {
 
 /// A direct descriptor: a file in a slot of one ring's registered file table,
 /// which only that ring's operations can reach, as [`Fd::Direct`]. Dropping
-/// it closes the file and frees the slot.
+/// it closes the file and frees the slot, with a request that reaches the
+/// kernel at the driver's next [`submit`](Driver::submit) or
+/// [`park`](Driver::park).
 ///
 /// Operations that create files, such as [`Socket`](crate::ops::Socket),
 /// make direct descriptors on request. One costs no file descriptor of the

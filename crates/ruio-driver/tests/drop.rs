@@ -11,16 +11,20 @@ mod support;
 use std::cell::Cell;
 use std::future::Future;
 use std::io::{self, PipeReader, PipeWriter, Write as _};
+use std::net::{self, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
-use ruio_driver::ops::{Nop, Read, Timeout, Write};
+use ruio_driver::ops::{
+    Accept, Connect, Nop, Read, Recv, RecvFrom, Send, SendTo, Shutdown, Socket, Timeout, Write,
+};
 use ruio_driver::{Completion, Driver, Op, Operation};
 use ruio_sys as sys;
 
-use support::{poll_once, settle};
+use support::{block_on, poll_once, settle};
 
 /// The only byte ever written to the test pipes, so any byte a read returns
 /// can be checked.
@@ -186,6 +190,43 @@ fn provided_operations_dropped_after_every_number_of_polls() {
             drop_after(&driver, driver.op(read).timeout(timeout), polls);
         }
     }
+    assert_eq!(driver.in_flight(), 0);
+}
+
+/// Socket operations, including those that make descriptors and those that
+/// hold addresses for the kernel to write, waiting for peers that come on
+/// some rounds and never on others.
+#[test]
+fn socket_operations_dropped_after_every_number_of_polls() {
+    let driver = Driver::new().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (stream, _peer) = UnixStream::pair().unwrap();
+    let tcp = || Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0);
+    for polls in 0..6 {
+        let _client = (polls % 2 == 0).then(|| TcpStream::connect(addr).unwrap());
+        let accept = Accept::new(listener.as_raw_fd());
+        drop_after(&driver, driver.op(accept), polls);
+        let accept = Accept::new(listener.as_raw_fd()).direct(&driver);
+        drop_after(&driver, driver.op(accept), polls);
+        drop_after(&driver, driver.op(tcp()), polls);
+        drop_after(&driver, driver.op(tcp().direct(&driver)), polls);
+        let socket = block_on(&driver, driver.op(tcp())).unwrap();
+        drop_after(&driver, driver.op(Connect::new(socket.fd(), addr)), polls);
+
+        let recv = Recv::new(stream.as_raw_fd(), Vec::with_capacity(16));
+        drop_after(&driver, driver.op(recv), polls);
+        let recv = RecvFrom::new(udp.as_raw_fd(), Vec::with_capacity(16));
+        drop_after(&driver, driver.op(recv), polls);
+        let send = Send::new(stream.as_raw_fd(), vec![FILL; 5]);
+        drop_after(&driver, driver.op(send), polls);
+        let to = udp.local_addr().unwrap();
+        let send = SendTo::new(udp.as_raw_fd(), vec![FILL; 5], to);
+        drop_after(&driver, driver.op(send), polls);
+    }
+    let shutdown = Shutdown::new(stream.as_raw_fd(), net::Shutdown::Both);
+    drop_after(&driver, driver.op(shutdown), 2);
     assert_eq!(driver.in_flight(), 0);
 }
 
