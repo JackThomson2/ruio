@@ -6,7 +6,8 @@
 //! generator in another, pinned to CPUs of their own. Each connection sends a
 //! message and waits for its echo, again and again. The report gives round
 //! trips per second, how that compares with tokio, and the 99th percentile
-//! round-trip time.
+//! round-trip time, each the median of a few runs, which the servers take
+//! in turns.
 //!
 //! The servers each run on one thread: ruio, with plain and with direct
 //! descriptors, and tokio's current-thread runtime. Runtimes across cores
@@ -15,7 +16,8 @@
 //! The server and the load generator also run on their own:
 //!
 //! ```text
-//! ruio-bench echo [--quick] [--seconds S] [--warmup S] [--server-cpu N] [--client-cpus LIST]
+//! ruio-bench echo [--quick] [--runs N] [--seconds S] [--warmup S] [--server-cpu N]
+//!                 [--client-cpus LIST]
 //! ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
 //! ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] [--warmup S]
 //!                             [--cpus LIST]
@@ -37,7 +39,7 @@ use std::time::{Duration, Instant};
 use client::Load;
 use server::{BUFFER_SIZE, Server};
 
-const USAGE: &str = "usage: ruio-bench echo [--quick] [--seconds S] [--warmup S] \
+const USAGE: &str = "usage: ruio-bench echo [--quick] [--runs N] [--seconds S] [--warmup S] \
                      [--server-cpu N] [--client-cpus LIST]
        ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
        ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] \
@@ -200,10 +202,14 @@ fn echo(options: &Options) -> Result<(), String> {
     let client_cpus: String = options.get("client-cpus", "2-25".to_owned())?;
     let seconds = options.duration("seconds", 3.0)?;
     let warmup = options.duration("warmup", 1.0)?;
+    let runs: usize = options.get("runs", 3)?;
+    if runs == 0 {
+        return Err("--runs must be at least 1".to_owned());
+    }
 
     println!(
-        "Round trips per second, and 99th percentile round-trip time; \
-         servers on CPU {server_cpu}, the client on {client_cpus}."
+        "Round trips per second, and 99th percentile round-trip time, medians of {runs} \
+         runs; servers on CPU {server_cpu}, the client on {client_cpus}."
     );
     println!();
     print!("| connections | message |");
@@ -213,21 +219,32 @@ fn echo(options: &Options) -> Result<(), String> {
     println!();
     println!("|---:|---:|{}", "---:|".repeat(Server::ALL.len()));
     for &(connections, size) in matrix {
-        let mut rows = Vec::new();
-        for server in Server::ALL {
-            eprintln!("{server}: {connections} connections, {size} B messages");
-            let run = Run {
-                exe: &exe,
-                server,
-                server_cpu,
-                client_cpus: &client_cpus,
-                connections,
-                size,
-                seconds,
-                warmup,
-            };
-            rows.push(run.measure()?);
+        // The servers take turns, run after run, so that whatever else the
+        // host does falls on all of them alike.
+        let mut samples: Vec<Vec<Row>> = Server::ALL.iter().map(|_| Vec::new()).collect();
+        for round in 1..=runs {
+            for (server, samples) in Server::ALL.into_iter().zip(&mut samples) {
+                eprintln!("{server}: {connections} connections, {size} B messages, run {round}");
+                let run = Run {
+                    exe: &exe,
+                    server,
+                    server_cpu,
+                    client_cpus: &client_cpus,
+                    connections,
+                    size,
+                    seconds,
+                    warmup,
+                };
+                samples.push(run.measure()?);
+            }
         }
+        let rows: Vec<Row> = samples
+            .iter()
+            .map(|samples| Row {
+                rate: median(samples.iter().map(|row| row.rate)),
+                p99: median(samples.iter().map(|row| row.p99)),
+            })
+            .collect();
         let tokio = rows[0].rate;
         print!("| {connections} | {} |", bytes(size));
         for (server, row) in Server::ALL.iter().zip(&rows) {
@@ -327,6 +344,18 @@ impl Run<'_> {
     }
 }
 
+/// The median of some measurements.
+fn median(values: impl Iterator<Item = f64>) -> f64 {
+    let mut values: Vec<f64> = values.collect();
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[middle]
+    } else {
+        (values[middle - 1] + values[middle]) / 2.0
+    }
+}
+
 /// A port on the loopback interface that was free a moment ago.
 fn free_addr() -> std::io::Result<SocketAddr> {
     TcpListener::bind("127.0.0.1:0")?.local_addr()
@@ -355,6 +384,13 @@ fn bytes(size: usize) -> String {
     } else {
         format!("{size} B")
     }
+}
+
+#[cfg(test)]
+#[test]
+fn medians_take_the_middle() {
+    assert_eq!(median([3.0, 1.0, 2.0].into_iter()), 2.0);
+    assert_eq!(median([4.0, 1.0, 3.0, 2.0].into_iter()), 2.5);
 }
 
 fn thousands(rate: f64) -> String {
