@@ -16,7 +16,8 @@
 //! [`FixedBuffers`] are registered with a ring once, for reads and writes
 //! that skip mapping the memory on every operation. A [`BufPool`] holds
 //! buffers the kernel picks from when data arrives, so waiting readers pin
-//! no memory, and hands the data back as a [`BufLease`].
+//! no memory, and hands the data back as a [`BufLease`], or a [`BufBundle`]
+//! of them. [`IoBufs`] sends several buffers as one, such as a bundle.
 
 use std::fmt;
 use std::io;
@@ -27,6 +28,58 @@ pub use crate::pool::{BufBundle, BufLease, BufPool};
 
 /// The result of an operation that held a buffer, and the buffer.
 pub type BufResult<T, B> = (io::Result<T>, B);
+
+/// Buffers to send one after another, as a single stream of bytes: a
+/// [`BufBundle`], or a vector of [`IoBuf`]s.
+///
+/// # Safety
+///
+/// For each buffer, as for [`IoBuf`]: `buf` must give a pointer to as many
+/// initialized bytes as it says, and that memory must stay valid, in place
+/// and unchanged from when an operation takes the buffers until it hands
+/// them back, even while they move.
+pub unsafe trait IoBufs: 'static {
+    /// How many buffers there are.
+    fn buf_count(&self) -> usize;
+
+    /// The initialized bytes of buffer `index`: where they start, and how
+    /// many there are.
+    ///
+    /// # Panics
+    ///
+    /// If there is no buffer `index`.
+    fn buf(&self, index: usize) -> (*const u8, usize);
+
+    /// How many bytes all the buffers hold.
+    fn bytes_init(&self) -> usize {
+        (0..self.buf_count()).map(|index| self.buf(index).1).sum()
+    }
+}
+
+// SAFETY: the buffers stay where the vector keeps them, on the heap, and
+// each keeps its memory in place as `IoBuf` promises.
+unsafe impl<B: IoBuf> IoBufs for Vec<B> {
+    fn buf_count(&self) -> usize {
+        self.len()
+    }
+
+    fn buf(&self, index: usize) -> (*const u8, usize) {
+        (self[index].stable_ptr(), self[index].bytes_init())
+    }
+}
+
+// SAFETY: each lease is an `IoBuf`, whose memory lies in its pool's mapping
+// wherever the lease is.
+unsafe impl IoBufs for BufBundle {
+    fn buf_count(&self) -> usize {
+        self.buffers()
+    }
+
+    fn buf(&self, index: usize) -> (*const u8, usize) {
+        let lease = self.lease(index);
+        (lease.stable_ptr(), lease.bytes_init())
+    }
+}
 
 /// A buffer the kernel may read from while an operation holds it.
 ///

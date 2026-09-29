@@ -19,7 +19,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ruio_driver::ops::{
-    Accept, Connect, Nop, Read, Recv, RecvFrom, Send, SendTo, Shutdown, Socket, Timeout, Write,
+    Accept, Connect, Nop, Read, Recv, RecvFrom, Send, SendTo, SendVectored, Shutdown, Socket,
+    Timeout, Write,
 };
 use ruio_driver::{Completion, Driver, Op, Operation};
 use ruio_sys as sys;
@@ -221,6 +222,12 @@ fn socket_operations_dropped_after_every_number_of_polls() {
         drop_after(&driver, driver.op(recv), polls);
         let send = Send::new(stream.as_raw_fd(), vec![FILL; 5]);
         drop_after(&driver, driver.op(send), polls);
+        let bufs = vec![vec![FILL; 3], vec![FILL; 2]];
+        drop_after(
+            &driver,
+            driver.op(SendVectored::new(stream.as_raw_fd(), bufs)),
+            polls,
+        );
         let to = udp.local_addr().unwrap();
         let send = SendTo::new(udp.as_raw_fd(), vec![FILL; 5], to);
         drop_after(&driver, driver.op(send), polls);

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use ruio_driver::buf::BufPool;
 use ruio_driver::ops::{
-    Accept, Connect, Recv, RecvFrom, RecvStream, Send, SendTo, Shutdown, Socket,
+    Accept, Connect, Recv, RecvFrom, RecvStream, Send, SendTo, SendVectored, Shutdown, Socket,
 };
 use ruio_driver::{Descriptor, Driver, SockAddr};
 
@@ -141,6 +141,46 @@ fn a_direct_connection_carries_data() {
     drop(client);
     assert!(block_on(&driver, stream.next()).is_none());
     assert_eq!(pool.available(), 4);
+}
+
+/// Buffers go out one after another as one stream of bytes, leaving out
+/// what was sent before; a bundle received goes back out as it came.
+#[test]
+fn vectored_sends_send_buffers_one_after_another() {
+    let driver = Driver::new().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut peer = patient(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+    let (socket, _) = listener.accept().unwrap();
+
+    let bufs = vec![b"one ".to_vec(), b"two ".to_vec(), b"three".to_vec()];
+    let send = SendVectored::new(socket.as_raw_fd(), bufs).skip(2);
+    let (sent, bufs) = block_on(&driver, driver.op(send));
+    assert_eq!(sent.unwrap(), 11);
+    // One buffer left after skipping goes as a plain send.
+    let send = SendVectored::new(socket.as_raw_fd(), bufs).skip(8);
+    let (sent, bufs) = block_on(&driver, driver.op(send));
+    assert_eq!(sent.unwrap(), 5);
+    assert_eq!(bufs.len(), 3);
+    let mut received = [0; 16];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"e two threethree");
+
+    let pool = BufPool::new(&driver, 8, 4).unwrap();
+    let data: Vec<u8> = (0..20).collect();
+    peer.write_all(&data).unwrap();
+    let mut stream = RecvStream::new(&driver, socket.as_raw_fd(), &pool);
+    let mut echoed = 0;
+    while echoed < data.len() {
+        let bundle = block_on(&driver, stream.next()).unwrap().unwrap();
+        let len = bundle.len();
+        let send = SendVectored::new(socket.as_raw_fd(), bundle).flags(libc::MSG_WAITALL);
+        assert_eq!(block_on(&driver, driver.op(send)).0.unwrap(), len);
+        echoed += len;
+    }
+    let mut received = vec![0; data.len()];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(received, data);
+    assert_eq!(pool.available(), 8);
 }
 
 #[test]

@@ -12,7 +12,7 @@ use std::task::{Context, Poll, ready};
 use ruio_sys as sys;
 
 use super::complete_read;
-use crate::buf::{BufResult, IoBuf, IoBufMut};
+use crate::buf::{BufResult, IoBuf, IoBufMut, IoBufs};
 use crate::{
     Completion, Descriptor, DirectFd, Driver, Fd, MultiOp, Multishot, Operation, SockAddr,
 };
@@ -355,6 +355,115 @@ fn prepare_send<B: IoBuf>(sqe: &mut sys::io_uring_sqe, fd: Fd, buf: &B, flags: i
     sqe.addr = buf.stable_ptr().expose_provenance() as u64;
     sqe.len = u32::try_from(buf.bytes_init()).unwrap_or(u32::MAX);
     sqe.op_flags = flags.cast_unsigned();
+}
+
+/// Sends several buffers' initialized bytes, one after another, on a
+/// connected socket, like `sendmsg(2)` with a vector of them: a stream
+/// socket sends them as one stream of bytes.
+///
+/// A single buffer, or a single one left after [`skip`](SendVectored::skip),
+/// goes as a plain [`Send`]. At most `IOV_MAX` (1024) buffers go in one
+/// send; the rest wait for another. The buffers come back with the result.
+#[derive(Debug)]
+pub struct SendVectored<V> {
+    fd: Fd,
+    bufs: V,
+    skip: usize,
+    flags: i32,
+    // Boxed, as for `Connect`: the header and vector the kernel reads.
+    msg: Box<SendMsg>,
+}
+
+/// What a `sendmsg` request points to.
+struct SendMsg {
+    header: libc::msghdr,
+    iovecs: Vec<libc::iovec>,
+}
+
+impl std::fmt::Debug for SendMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendMsg").finish_non_exhaustive()
+    }
+}
+
+/// The most buffers one `sendmsg` takes.
+const IOV_MAX: usize = 1024;
+
+impl<V: IoBufs> SendVectored<V> {
+    /// Sends `bufs` on `fd`.
+    pub fn new(fd: impl Into<Fd>, bufs: V) -> Self {
+        let iovecs = Vec::with_capacity(bufs.buf_count().min(IOV_MAX));
+        Self {
+            fd: fd.into(),
+            bufs,
+            skip: 0,
+            flags: 0,
+            msg: Box::new(SendMsg {
+                // SAFETY: all zeroes is a valid `msghdr`, with null pointers.
+                header: unsafe { mem::zeroed() },
+                iovecs,
+            }),
+        }
+    }
+
+    /// Leaves out the first `bytes` bytes, sent before.
+    pub fn skip(mut self, bytes: usize) -> Self {
+        self.skip = bytes;
+        self
+    }
+
+    /// Sets the `sendmsg(2)` flags; see [`Send::flags`].
+    pub fn flags(mut self, flags: i32) -> Self {
+        self.flags = flags;
+        self
+    }
+}
+
+// SAFETY: the entry points into the buffers, which `IoBufs` keeps valid, in
+// place and unchanged while the operation holds them, or to the boxed header,
+// which points to the boxed vector; the operation owns both, and they stay
+// put when it moves. A send posts one completion.
+unsafe impl<V: IoBufs> Operation for SendVectored<V> {
+    /// The number of bytes sent, and the buffers.
+    type Output = BufResult<usize, V>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        let msg = &mut *self.msg;
+        msg.iovecs.clear();
+        let mut skip = self.skip;
+        for index in 0..self.bufs.buf_count() {
+            let (start, len) = self.bufs.buf(index);
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            msg.iovecs.push(libc::iovec {
+                iov_base: start.wrapping_add(skip).cast_mut().cast(),
+                iov_len: len - skip,
+            });
+            skip = 0;
+            if msg.iovecs.len() == IOV_MAX {
+                break;
+            }
+        }
+        self.fd.apply(sqe);
+        sqe.op_flags = self.flags.cast_unsigned();
+        if let [iovec] = msg.iovecs[..] {
+            sqe.opcode = sys::IORING_OP_SEND;
+            sqe.addr = iovec.iov_base.expose_provenance() as u64;
+            sqe.len = u32::try_from(iovec.iov_len).unwrap_or(u32::MAX);
+            return;
+        }
+        msg.header.msg_iov = msg.iovecs.as_mut_ptr();
+        msg.header.msg_iovlen = msg.iovecs.len();
+        sqe.opcode = sys::IORING_OP_SENDMSG;
+        sqe.addr = (&raw const msg.header).expose_provenance() as u64;
+        sqe.len = 1;
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        (completion.result().map(|sent| sent as usize), self.bufs)
+    }
 }
 
 /// Sends a buffer's initialized bytes to an address, like `sendto(2)`, on a

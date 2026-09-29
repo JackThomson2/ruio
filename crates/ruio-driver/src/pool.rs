@@ -545,6 +545,18 @@ impl BufBundle {
         iter::once(&self.first).chain(&self.rest)
     }
 
+    /// Lease `index`, counting from 0.
+    ///
+    /// # Panics
+    ///
+    /// If the bundle has no lease `index`.
+    pub(crate) fn lease(&self, index: usize) -> &BufLease {
+        match index {
+            0 => &self.first,
+            _ => &self.rest[index - 1],
+        }
+    }
+
     /// The data, copied out into one vector.
     pub fn to_vec(&self) -> Vec<u8> {
         let mut data = Vec::with_capacity(self.len());
