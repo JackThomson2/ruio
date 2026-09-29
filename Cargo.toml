@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 libc = "0.2.189"
 ruio-driver = { path = "crates/ruio-driver", version = "0.0.0" }
+ruio-executor = { path = "crates/ruio-executor", version = "0.0.0" }
 ruio-sys = { path = "crates/ruio-sys", version = "0.0.0" }
 
 [workspace.lints.rust]
