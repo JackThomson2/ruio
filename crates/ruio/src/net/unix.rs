@@ -9,11 +9,13 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{self, SocketAddr};
 use std::path::Path;
 
-use ruio_driver::buf::{BufPool, BufResult, IoBuf, IoBufMut};
+use ruio_driver::buf::{BufPool, BufResult, IoBuf, IoBufMut, IoBufs};
 use ruio_driver::ops::{self, Accept, Connect, Recv, RecvFrom, Send, SendTo, Socket};
 use ruio_driver::{Descriptor, Fd, SockAddr};
 
-use super::socket::{ReadExact, RecvStream, Sock, SocketOp, ThreadBound, WriteAll};
+use super::socket::{
+    ReadExact, RecvStream, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
+};
 use super::tcp::{Incoming, listen};
 
 /// A Unix socket listening for connections.
@@ -201,6 +203,12 @@ impl UnixStream {
     /// Writes all of `buf`'s initialized bytes; see [`WriteAll`].
     pub fn write_all<B: IoBuf>(&self, buf: B) -> WriteAll<'_, B> {
         self.sock.write_all(buf)
+    }
+
+    /// Writes all of the initialized bytes of `bufs`, one buffer after
+    /// another, such as a bundle received; see [`WriteAllVectored`].
+    pub fn write_all_vectored<V: IoBufs>(&self, bufs: V) -> WriteAllVectored<'_, V> {
+        self.sock.write_all_vectored(bufs)
     }
 
     /// The data arriving on the connection, received into `pool`, which

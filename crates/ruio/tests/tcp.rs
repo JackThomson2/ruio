@@ -32,9 +32,7 @@ fn serve_echo(listener: TcpListener) -> ruio::JoinHandle<()> {
             let _detached = ruio::spawn(async move {
                 let mut received = stream.recv_stream(&pool);
                 while let Some(data) = received.next().await {
-                    for lease in data.unwrap() {
-                        stream.write_all(lease).await.0.unwrap();
-                    }
+                    stream.write_all_vectored(data.unwrap()).await.0.unwrap();
                 }
             });
         }
@@ -68,6 +66,53 @@ async fn a_server_echoes_what_its_clients_send() -> io::Result<()> {
     for client in clients {
         client.await.unwrap()?;
     }
+    Ok(())
+}
+
+/// Messages larger than a buffer arrive in bundles, which go back out whole.
+#[ruio::test]
+async fn large_messages_echo_through_bundles() -> io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let _server = serve_echo(listener);
+    let stream = within(TcpStream::connect(addr)).await?;
+    for round in 0..20 {
+        let message = pattern(64 << 10, round);
+        within(stream.write_all(message.clone())).await.0?;
+        let (read, echo) = within(stream.read_exact(Vec::with_capacity(64 << 10))).await;
+        read?;
+        assert!(echo == message, "round {round}");
+    }
+    Ok(())
+}
+
+#[ruio::test]
+async fn write_all_vectored_sends_more_than_the_socket_holds() -> io::Result<()> {
+    let (client, server) = pair().await?;
+    let bufs: Vec<Vec<u8>> = (0..3).map(|seed| pattern(8 << 20, seed)).collect();
+    let expected = bufs.concat();
+    let len = expected.len();
+    let reader = ruio::spawn(async move {
+        let (read, buf) = within(server.read_exact(Vec::with_capacity(len))).await;
+        read.map(|()| buf)
+    });
+    let (written, bufs) = within(client.write_all_vectored(bufs)).await;
+    written?;
+    assert_eq!(bufs.len(), 3);
+    assert!(reader.await.unwrap()? == expected);
+    Ok(())
+}
+
+/// More buffers than one `sendmsg` takes go out in several.
+#[ruio::test]
+async fn write_all_vectored_sends_more_buffers_than_one_send_takes() -> io::Result<()> {
+    let (client, server) = pair().await?;
+    let bufs: Vec<Vec<u8>> = (0..1500).map(|index| vec![(index % 251) as u8]).collect();
+    let expected = bufs.concat();
+    within(client.write_all_vectored(bufs)).await.0?;
+    let (read, received) = within(server.read_exact(Vec::with_capacity(1500))).await;
+    read?;
+    assert_eq!(received, expected);
     Ok(())
 }
 

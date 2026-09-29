@@ -42,11 +42,9 @@
 //!         let pool = pool.clone();
 //!         ruio::spawn(async move {
 //!             let mut received = stream.recv_stream(&pool);
-//!             'echo: while let Some(Ok(data)) = received.next().await {
-//!                 for lease in data {
-//!                     if stream.write_all(lease).await.0.is_err() {
-//!                         break 'echo;
-//!                     }
+//!             while let Some(Ok(data)) = received.next().await {
+//!                 if stream.write_all_vectored(data).await.0.is_err() {
+//!                     break;
 //!                 }
 //!             }
 //!         });
@@ -72,7 +70,7 @@ mod tcp;
 mod udp;
 mod unix;
 
-pub use socket::{ReadExact, RecvStream, SendZc, SocketOp, WriteAll};
+pub use socket::{ReadExact, RecvStream, SendZc, SocketOp, WriteAll, WriteAllVectored};
 pub use tcp::{Incoming, TcpListener, TcpStream};
 pub use udp::UdpSocket;
 pub use unix::{UnixDatagram, UnixListener, UnixStream};

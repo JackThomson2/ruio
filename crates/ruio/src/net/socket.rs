@@ -12,8 +12,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use ruio_driver::buf::{BufBundle, BufPool, BufResult, IoBuf, IoBufMut, Slice};
-use ruio_driver::ops::{self, Recv, Send, Shutdown};
+use ruio_driver::buf::{BufBundle, BufPool, BufResult, IoBuf, IoBufMut, IoBufs, Slice};
+use ruio_driver::ops::{self, Recv, Send, SendVectored, Shutdown};
 use ruio_driver::{Descriptor, DirectFd, Driver, Fd, Op, Operation};
 
 /// Makes a type `!Send` and `!Sync`: sockets belong to the thread whose ring
@@ -110,6 +110,14 @@ impl<S: AsRawFd> Sock<S> {
         let (driver, fd) = self.target();
         WriteAll {
             transfer: Transfer::new(driver, fd, buf),
+            _socket: PhantomData,
+        }
+    }
+
+    pub(crate) fn write_all_vectored<V: IoBufs>(&self, bufs: V) -> WriteAllVectored<'_, V> {
+        let (driver, fd) = self.target();
+        WriteAllVectored {
+            transfer: Transfer::new(driver, fd, bufs),
             _socket: PhantomData,
         }
     }
@@ -312,6 +320,78 @@ impl<B: IoBuf> Unpin for WriteAll<'_, B> {}
 impl<B: IoBuf> fmt::Debug for WriteAll<'_, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WriteAll").finish_non_exhaustive()
+    }
+}
+
+/// Writes several buffers to a stream socket, one after another, sending as
+/// many of them at once as the kernel takes. Made by the streams'
+/// `write_all_vectored`, as for a bundle of received data.
+///
+/// The output is the buffers, and `Ok(())` once all their initialized bytes
+/// are sent, or the error that stopped the write.
+#[must_use = "a write does nothing until polled"]
+pub struct WriteAllVectored<'a, V: IoBufs> {
+    transfer: Transfer<SendVectored<V>, V>,
+    _socket: PhantomData<&'a ()>,
+}
+
+impl<V: IoBufs> WriteAllVectored<'_, V> {
+    /// Fails the write with [`io::ErrorKind::TimedOut`] if it has not
+    /// finished `duration` after it starts; see [`WriteAll::timeout`].
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.transfer.timeout = Some(duration);
+        self
+    }
+}
+
+impl<V: IoBufs> Future for WriteAllVectored<'_, V> {
+    type Output = BufResult<(), V>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let transfer = &mut self.get_mut().transfer;
+        let send = |fd, bufs, done| {
+            SendVectored::new(fd, bufs)
+                .skip(done)
+                .flags(libc::MSG_WAITALL)
+        };
+        loop {
+            match mem::replace(&mut transfer.state, TransferState::Finished) {
+                TransferState::Start(bufs) if bufs.bytes_init() == 0 => {
+                    return Poll::Ready((Ok(()), bufs));
+                }
+                TransferState::Start(bufs) => transfer.start(bufs, 0, |fd, bufs| send(fd, bufs, 0)),
+                TransferState::Moving { mut op, done } => {
+                    let Poll::Ready((sent, bufs)) = Pin::new(&mut op).poll(cx) else {
+                        transfer.state = TransferState::Moving { op, done };
+                        return Poll::Pending;
+                    };
+                    let done = match sent {
+                        Ok(0) => {
+                            let err = io::ErrorKind::WriteZero.into();
+                            return Poll::Ready((Err(err), bufs));
+                        }
+                        Ok(sent) => done + sent,
+                        Err(err) => return Poll::Ready((Err(err), bufs)),
+                    };
+                    if done >= bufs.bytes_init() {
+                        return Poll::Ready((Ok(()), bufs));
+                    }
+                    transfer.start(bufs, done, |fd, bufs| send(fd, bufs, done));
+                }
+                TransferState::Finished => {
+                    panic!("`WriteAllVectored` polled after it completed")
+                }
+            }
+        }
+    }
+}
+
+// As for `WriteAll`.
+impl<V: IoBufs> Unpin for WriteAllVectored<'_, V> {}
+
+impl<V: IoBufs> fmt::Debug for WriteAllVectored<'_, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WriteAllVectored").finish_non_exhaustive()
     }
 }
 

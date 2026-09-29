@@ -9,11 +9,13 @@ use std::net::{self, Shutdown, SocketAddr, ToSocketAddrs};
 use std::os::fd::{AsRawFd, RawFd};
 use std::task::{Context, Poll, ready};
 
-use ruio_driver::buf::{BufPool, IoBuf, IoBufMut};
+use ruio_driver::buf::{BufPool, IoBuf, IoBufMut, IoBufs};
 use ruio_driver::ops::{self, Accept, AcceptMulti, AcceptStream, Connect, Recv, Send, Socket};
 use ruio_driver::{Descriptor, Driver, Fd};
 
-use super::socket::{ReadExact, RecvStream, SendZc, Sock, SocketOp, ThreadBound, WriteAll};
+use super::socket::{
+    ReadExact, RecvStream, SendZc, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
+};
 
 /// How many connections a listener's backlog holds, as in tokio. The
 /// standard library's 128 overflows with a burst of clients.
@@ -353,6 +355,12 @@ impl TcpStream {
     /// Writes all of `buf`'s initialized bytes; see [`WriteAll`].
     pub fn write_all<B: IoBuf>(&self, buf: B) -> WriteAll<'_, B> {
         self.sock.write_all(buf)
+    }
+
+    /// Writes all of the initialized bytes of `bufs`, one buffer after
+    /// another, such as a bundle received; see [`WriteAllVectored`].
+    pub fn write_all_vectored<V: IoBufs>(&self, bufs: V) -> WriteAllVectored<'_, V> {
+        self.sock.write_all_vectored(bufs)
     }
 
     /// Writes all of `buf`'s initialized bytes without copying them; see
