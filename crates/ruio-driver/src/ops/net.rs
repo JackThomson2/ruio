@@ -1,10 +1,11 @@
 //! Socket operations.
 
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::mem;
 use std::net;
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::pin::Pin;
 use std::ptr;
 use std::task::{Context, Poll, ready};
 
@@ -404,9 +405,128 @@ unsafe impl<B: IoBuf> Operation for SendTo<B> {
     }
 }
 
+/// Sends a buffer's initialized bytes without copying them into the kernel:
+/// a zero-copy `send(2)`, or `sendto(2)` with [`to`](SendZc::to)
+/// (`IORING_OP_SEND_ZC`).
+///
+/// The network stack sends straight from the buffer, so the kernel reports
+/// twice: the result, and later a notification that it no longer needs the
+/// buffer, which for TCP comes only once the peer has acknowledged the data.
+/// The future resolves with the buffer after both. Dropped early, it cancels
+/// the send, and the driver keeps the buffer until the notification.
+///
+/// Only TCP and UDP sockets send zero-copy; others fail with `EOPNOTSUPP`.
+/// Pinning the pages and waiting for the notification cost more than
+/// copying a small buffer.
+#[must_use = "a send does nothing until polled"]
+#[derive(Debug)]
+pub struct SendZc<B: IoBuf> {
+    /// Taken once the future has resolved.
+    stream: Option<MultiOp<ZcRequest<B>>>,
+}
+
+/// The request a [`SendZc`] runs.
+#[derive(Debug)]
+struct ZcRequest<B> {
+    fd: Fd,
+    buf: B,
+    // Boxed, as for `Connect`.
+    to: Option<Box<SockAddr>>,
+    flags: i32,
+    /// The result, once reported.
+    sent: Option<io::Result<usize>>,
+}
+
+impl<B: IoBuf> SendZc<B> {
+    /// Sends `buf` on `fd`, on `driver`'s ring.
+    pub fn new(driver: &Driver, fd: impl Into<Fd>, buf: B) -> Self {
+        let request = ZcRequest {
+            fd: fd.into(),
+            buf,
+            to: None,
+            flags: 0,
+            sent: None,
+        };
+        Self {
+            stream: Some(driver.stream(request)),
+        }
+    }
+
+    /// Sends to `addr`, as [`SendTo`] does.
+    pub fn to(mut self, addr: impl Into<SockAddr>) -> Self {
+        self.request().to = Some(Box::new(addr.into()));
+        self
+    }
+
+    /// Sets the `send(2)` flags; see [`Send::flags`].
+    pub fn flags(mut self, flags: i32) -> Self {
+        self.request().flags = flags;
+        self
+    }
+
+    /// The request, which is not armed before the first poll.
+    fn request(&mut self) -> &mut ZcRequest<B> {
+        self.stream
+            .as_mut()
+            .and_then(MultiOp::get_mut)
+            .expect("a `SendZc` is set up before it is polled")
+    }
+}
+
+impl<B: IoBuf> Future for SendZc<B> {
+    /// The number of bytes sent, and the buffer.
+    type Output = BufResult<usize, B>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let stream = this
+            .stream
+            .as_mut()
+            .expect("`SendZc` polled after it completed");
+        // The result, then the notification, which ends the request.
+        while ready!(stream.poll_next(cx)).is_some() && stream.is_armed() {}
+        let Some(Ok(request)) = this.stream.take().map(MultiOp::into_inner) else {
+            unreachable!("the request has ended");
+        };
+        let sent = request
+            .sent
+            .unwrap_or_else(|| Err(io::Error::other("the kernel reported no result")));
+        Poll::Ready((sent, request.buf))
+    }
+}
+
+// A `SendZc` never pins its request: the memory the kernel uses is not
+// inside it.
+impl<B: IoBuf> Unpin for SendZc<B> {}
+
+// SAFETY: the entry points into the buffer, which `IoBuf` keeps valid, in
+// place and unchanged while the request holds it, and to the boxed address,
+// which the request owns and which stays put when it moves; the driver keeps
+// the request until its last completion, the notification, which the kernel
+// posts once it is done with the buffer. A zero-copy send posts its result
+// with IORING_CQE_F_MORE and then the notification without it, or, if it
+// fails before it has a notification to post, just the result, without it.
+unsafe impl<B: IoBuf> Multishot for ZcRequest<B> {
+    type Item = ();
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        prepare_send(sqe, self.fd, &self.buf, self.flags);
+        sqe.opcode = sys::IORING_OP_SEND_ZC;
+        if let Some(to) = &self.to {
+            set_destination(sqe, to);
+        }
+    }
+
+    fn item(&mut self, completion: Completion) {
+        if completion.flags() & sys::IORING_CQE_F_NOTIF == 0 {
+            self.sent = Some(completion.result().map(|sent| sent as usize));
+        }
+    }
+}
+
 /// Makes a send go to `addr`: `addr2`, with the length in `addr_len`, the
 /// first half of `file_index`.
-pub(super) fn set_destination(sqe: &mut sys::io_uring_sqe, addr: &SockAddr) {
+fn set_destination(sqe: &mut sys::io_uring_sqe, addr: &SockAddr) {
     sqe.off = addr.as_ptr().expose_provenance() as u64;
     // Every address fits: the largest, `sockaddr_storage`, has 128 bytes.
     sqe.file_index = u32::from(addr.len() as u16);

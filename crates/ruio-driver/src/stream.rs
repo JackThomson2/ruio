@@ -130,6 +130,27 @@ impl<T: Multishot> MultiOp<T> {
         matches!(self.state, State::Armed { .. })
     }
 
+    /// The request, unless it is armed, when the kernel may be using it.
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        match &mut self.state {
+            State::Ready(op) | State::Ended(op) => Some(op),
+            State::Armed { .. } => None,
+            State::Taken => unreachable!("a stream's value is always in place"),
+        }
+    }
+
+    /// The request back, unless it is armed; then the stream comes back.
+    pub fn into_inner(mut self) -> Result<T, Self> {
+        match mem::replace(&mut self.state, State::Taken) {
+            State::Ready(op) | State::Ended(op) => Ok(op),
+            armed @ State::Armed { .. } => {
+                self.state = armed;
+                Err(self)
+            }
+            State::Taken => unreachable!("a stream's value is always in place"),
+        }
+    }
+
     /// Submits the request again at the next poll, once it has ended. Does
     /// nothing otherwise.
     pub fn rearm(&mut self) {
