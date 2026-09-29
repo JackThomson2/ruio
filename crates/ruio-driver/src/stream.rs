@@ -125,6 +125,23 @@ impl<T: Multishot> MultiOp<T> {
         poll_fn(|cx| self.poll_next(cx)).await
     }
 
+    /// The next item if its completion has arrived already, or `None`,
+    /// without waiting: nothing is submitted, and the waker the last
+    /// [`poll_next`](MultiOp::poll_next) left stays as it is.
+    pub fn next_ready(&mut self) -> Option<T::Item> {
+        let State::Armed { op, user_data } = &mut self.state else {
+            return None;
+        };
+        let completion = self.driver.take_stream(*user_data)?;
+        let last = completion.flags() & sys::IORING_CQE_F_MORE == 0;
+        // As in `poll_next`.
+        let item = op.item(completion);
+        if last {
+            self.end();
+        }
+        Some(item)
+    }
+
     /// Whether the request is submitted and has not ended.
     pub fn is_armed(&self) -> bool {
         matches!(self.state, State::Armed { .. })

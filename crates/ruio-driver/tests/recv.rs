@@ -5,7 +5,7 @@ mod support;
 use std::io::Write as _;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::task::Context;
+use std::task::{Context, Poll};
 use std::thread;
 
 use ruio_driver::Driver;
@@ -71,6 +71,40 @@ fn a_receive_fills_as_many_buffers_as_it_needs() {
     let buffers: usize = held.iter().map(|bundle| bundle.buffers()).sum();
     assert_eq!(pool.available(), 8 - buffers);
     drop(held);
+    assert_eq!(pool.available(), 8);
+}
+
+/// `next_ready` takes what has arrived, without waiting, and leaves the
+/// waker the last poll left, so that data still wakes the task. A message
+/// that comes in two receives is whole once both are taken.
+#[test]
+fn next_ready_takes_what_has_arrived_without_waiting() {
+    let driver = Driver::new().unwrap();
+    let pool = BufPool::new(&driver, 8, 16).unwrap();
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    let mut stream = RecvStream::new(&driver, socket.as_raw_fd(), &pool);
+    assert!(stream.next_ready().is_none(), "nothing is even submitted");
+
+    let (woken, waker) = Counter::waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(stream.poll_next(&mut cx).is_pending());
+    driver.submit().unwrap();
+    assert!(stream.next_ready().is_none());
+    let sent: Vec<u8> = (0..40).map(pattern).collect();
+    peer.write_all(&sent).unwrap();
+    driver.submit().unwrap();
+    assert_eq!(woken.count(), 1, "the poll's waker stayed");
+
+    let Poll::Ready(Some(Ok(mut data))) = stream.poll_next(&mut cx) else {
+        panic!("the data arrived");
+    };
+    while let Some(more) = stream.next_ready() {
+        data.append(more.unwrap());
+    }
+    assert_eq!(data.to_vec(), sent);
+    assert!(stream.next_ready().is_none());
+    drop((data, peer));
+    assert!(block_on(&driver, stream.next()).is_none());
     assert_eq!(pool.available(), 8);
 }
 

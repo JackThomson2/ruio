@@ -557,6 +557,14 @@ impl BufBundle {
         }
     }
 
+    /// Adds `other`'s leases after this bundle's, as for data that arrived
+    /// after it.
+    pub fn append(&mut self, other: BufBundle) {
+        self.rest.reserve(other.buffers());
+        self.rest.push(other.first);
+        self.rest.extend(other.rest);
+    }
+
     /// The data, copied out into one vector.
     pub fn to_vec(&self) -> Vec<u8> {
         let mut data = Vec::with_capacity(self.len());
@@ -661,6 +669,18 @@ mod tests {
         let bundle = pool.bundle(buffer(0), 11).unwrap();
         let lens: Vec<usize> = bundle.iter().map(BufLease::len).collect();
         assert_eq!(lens, [3, 8]);
+    }
+
+    #[test]
+    fn appended_bundles_keep_their_order() {
+        let driver = Driver::new().unwrap();
+        let pool = BufPool::new(&driver, 4, 8).unwrap();
+        let mut data = pool.bundle(buffer(0), 12).unwrap();
+        data.append(pool.bundle(buffer(2), 5).unwrap());
+        assert_eq!(bids(&data), [0, 1, 2]);
+        let lens: Vec<usize> = data.iter().map(BufLease::len).collect();
+        assert_eq!(lens, [8, 4, 5]);
+        assert_eq!((data.len(), data.buffers()), (17, 3));
     }
 
     #[test]

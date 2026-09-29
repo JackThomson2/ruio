@@ -497,4 +497,33 @@ impl RecvStream {
     pub async fn next(&mut self) -> Option<io::Result<BufBundle>> {
         poll_fn(|cx| self.poll_next(cx)).await
     }
+
+    /// The next data if it has arrived already, without waiting, or `None`:
+    /// nothing has, or the stream has ended, which the next
+    /// [`poll_next`](RecvStream::poll_next) tells. It leaves the stream as it
+    /// is otherwise, so a stream the kernel ended re-arms at the next poll.
+    ///
+    /// A message that arrives while the stream is armed can come in two
+    /// receives, since the kernel takes a single buffer when it does not
+    /// know yet how much is waiting; with this, a reader takes both at once.
+    pub fn next_ready(&mut self) -> Option<io::Result<BufBundle>> {
+        if self.finished || self.starved {
+            return None;
+        }
+        match self.stream.next_ready()? {
+            Ok(Some(bundle)) => Some(Ok(bundle)),
+            Ok(None) => {
+                self.finished = true;
+                None
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => {
+                self.starved = true;
+                None
+            }
+            Err(err) => {
+                self.finished = true;
+                Some(Err(err))
+            }
+        }
+    }
 }

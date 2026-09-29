@@ -533,6 +533,12 @@ impl Driver {
         polled.ok()
     }
 
+    /// Takes a stream's next completion if it has arrived, without
+    /// arranging for anything to be woken.
+    pub(crate) fn take_stream(&self, user_data: u64) -> Option<Completion> {
+        self.inner.borrow_mut().table.take_stream(user_data)
+    }
+
     /// Takes over the request of a stream dropped while armed: hands it the
     /// completions the stream had not taken, cancels it, and keeps it until
     /// the kernel is done.

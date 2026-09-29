@@ -225,6 +225,21 @@ impl<P> Table<P> {
         }
     }
 
+    /// Takes the stream's next completion if one is queued, freeing the slot
+    /// after the last, and leaves its waker alone.
+    pub(crate) fn take_stream(&mut self, user_data: u64) -> Option<Completion> {
+        let index = self.index(user_data)?;
+        let State::Streaming(stream) = &mut self.slots[index as usize].state else {
+            debug_assert!(false, "took from a stream that is not streaming");
+            return None;
+        };
+        let completion = stream.completions.pop_front()?;
+        if is_last(&completion) {
+            self.free(index);
+        }
+        Some(completion)
+    }
+
     /// Detaches a stream that is being dropped, handing back what it had not
     /// taken. Unless the request had ended, the slot waits for the payload,
     /// which [`Table::adopt`] gives it.
