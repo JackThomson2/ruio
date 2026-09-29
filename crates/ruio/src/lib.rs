@@ -33,6 +33,7 @@ pub use ruio_macros::{main, test};
 
 pub use ruio_driver::buf;
 
+pub mod fs;
 pub mod net;
 
 /// The io_uring driver: operations, the futures that run them, and the types

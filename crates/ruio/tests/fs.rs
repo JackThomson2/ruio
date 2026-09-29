@@ -1,0 +1,291 @@
+//! Files inside the runtime.
+
+mod support;
+
+use std::io::{self, ErrorKind};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::path::PathBuf;
+
+use ruio::buf::{AlignedBuf, FixedBuffers};
+use ruio::fs::{self, File, OpenOptions};
+
+use support::within;
+
+/// A directory of the test's own, removed when dropped.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("ruio-fs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|index| (index % 251) as u8).collect()
+}
+
+#[ruio::test]
+async fn files_are_written_and_read_back() -> io::Result<()> {
+    let scratch = Scratch::new("rw");
+    let path = scratch.path("file");
+    let file = File::create(&path).await?;
+    let data = pattern(100_000);
+    within(file.write_all_at(data.clone(), 0)).await.0?;
+    within(file.write_all_at(b"tail".to_vec(), 100_000))
+        .await
+        .0?;
+    within(file.sync_all()).await?;
+    within(file.sync_data()).await?;
+    assert_eq!(within(file.metadata()).await?.len(), 100_004);
+    within(file.close()).await?;
+
+    let file = File::open(&path).await?;
+    let (read, middle) = within(file.read_exact_at(Vec::with_capacity(1000), 50_000)).await;
+    read?;
+    assert_eq!(middle, &data[50_000..51_000]);
+    let (read, end) = within(file.read_at(Vec::with_capacity(16), 100_000)).await;
+    assert_eq!((read?, &end[..]), (4, &b"tail"[..]));
+    let (read, _) = within(file.read_at(Vec::with_capacity(16), 200_000)).await;
+    assert_eq!(read?, 0, "nothing past the end");
+    let (read, partial) = within(file.read_exact_at(Vec::with_capacity(16), 99_998)).await;
+    assert_eq!(read.unwrap_err().kind(), ErrorKind::UnexpectedEof);
+    assert_eq!(
+        partial,
+        [data[99_998], data[99_999], b't', b'a', b'i', b'l']
+    );
+    Ok(())
+}
+
+#[ruio::test]
+async fn files_grow_and_shrink() -> io::Result<()> {
+    let scratch = Scratch::new("len");
+    let path = scratch.path("file");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .await?;
+    within(file.write_all_at(vec![1; 100], 0)).await.0?;
+    within(file.set_len(40)).await?;
+    within(file.set_len(50)).await?;
+    let mut expected = vec![1; 40];
+    expected.resize(50, 0);
+    assert_eq!(fs::read(&path).await?, expected);
+    Ok(())
+}
+
+/// Reads and writes at the file's position advance it, and appending writes
+/// go to the end whatever the offset.
+#[ruio::test]
+async fn the_file_position_advances() -> io::Result<()> {
+    let scratch = Scratch::new("position");
+    let path = scratch.path("file");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await?;
+    assert_eq!(within(file.write(b"abc".to_vec())).await.0?, 3);
+    assert_eq!(within(file.write(b"def".to_vec())).await.0?, 3);
+    assert_eq!(std::fs::read(&path)?, b"abcdef");
+
+    let file = File::open(&path).await?;
+    let (_, first) = within(file.read(Vec::with_capacity(2))).await;
+    let (_, second) = within(file.read(Vec::with_capacity(8))).await;
+    assert_eq!((&first[..], &second[..]), (&b"ab"[..], &b"cdef"[..]));
+
+    let appending = OpenOptions::new().append(true).open(&path).await?;
+    within(appending.write_all_at(b"!".to_vec(), 0)).await.0?;
+    assert_eq!(std::fs::read(&path)?, b"abcdef!");
+    Ok(())
+}
+
+/// The options mean what the standard library's do.
+#[ruio::test]
+async fn options_follow_the_standard_library() -> io::Result<()> {
+    let scratch = Scratch::new("options");
+    let path = scratch.path("file");
+    let created = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .await?;
+    drop(created);
+    let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+    assert_eq!(mode & !0o600, 0, "{mode:o}");
+
+    let again = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await;
+    assert_eq!(again.unwrap_err().kind(), ErrorKind::AlreadyExists);
+    let missing = File::open(scratch.path("missing")).await;
+    assert_eq!(missing.unwrap_err().kind(), ErrorKind::NotFound);
+    for options in [
+        OpenOptions::new(),
+        OpenOptions::new().read(true).truncate(true).clone(),
+        OpenOptions::new().read(true).create(true).clone(),
+        OpenOptions::new().append(true).truncate(true).clone(),
+    ] {
+        let err = options.open(&path).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{options:?}");
+    }
+    Ok(())
+}
+
+#[ruio::test]
+async fn metadata_reports_on_files() -> io::Result<()> {
+    let scratch = Scratch::new("metadata");
+    let path = scratch.path("file");
+    let link = scratch.path("link");
+    std::fs::write(&path, pattern(5000))?;
+    symlink(&path, &link)?;
+    let expected = std::fs::metadata(&path)?;
+
+    let found = fs::metadata(&path).await?;
+    assert!(found.is_file() && !found.is_dir() && !found.is_symlink());
+    assert_eq!(
+        (found.len(), found.ino(), found.dev()),
+        (5000, expected.ino(), expected.dev())
+    );
+    assert_eq!(found.mode(), expected.mode());
+    assert_eq!(found.modified()?, expected.modified()?);
+    assert_eq!(found.nlink(), 1);
+    assert!(fs::metadata(&link).await?.is_file());
+    assert!(fs::symlink_metadata(&link).await?.is_symlink());
+    assert!(fs::metadata(&scratch.0).await?.is_dir());
+    let opened = File::open(&path).await?.metadata().await?;
+    assert_eq!((opened.len(), opened.ino()), (5000, expected.ino()));
+    Ok(())
+}
+
+/// A direct descriptor reads and writes as a plain one does, and has no
+/// metadata to ask for.
+#[ruio::test]
+async fn files_open_as_direct_descriptors() -> io::Result<()> {
+    let scratch = Scratch::new("direct");
+    let path = scratch.path("file");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .direct_descriptor(true)
+        .open(&path)
+        .await?;
+    assert!(file.is_direct());
+    within(file.write_all_at(b"direct".to_vec(), 0)).await.0?;
+    let (read, data) = within(file.read_exact_at(Vec::with_capacity(6), 0)).await;
+    read?;
+    assert_eq!(data, b"direct");
+    assert_eq!(
+        file.metadata().await.unwrap_err().kind(),
+        ErrorKind::Unsupported
+    );
+    assert!(file.as_std().is_err());
+    within(file.close()).await?;
+    assert_eq!(std::fs::read(&path)?, b"direct");
+    Ok(())
+}
+
+/// Direct I/O, past the page cache, with aligned buffers and with
+/// registered ones.
+#[ruio::test]
+async fn direct_io_reads_and_writes_aligned_buffers() -> io::Result<()> {
+    let scratch = Scratch::new("odirect");
+    let path = scratch.path("file");
+    let opened = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(&path)
+        .await;
+    let file = match opened {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::InvalidInput => {
+            eprintln!("skipped: no direct I/O in {}", scratch.0.display());
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    // SAFETY: F_GETFL reads the file's status flags and changes nothing.
+    let flags = unsafe { libc::fcntl(file.as_std()?.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(flags & libc::O_DIRECT, 0, "opened for direct I/O");
+    let alignment = file
+        .metadata()
+        .await?
+        .dio_alignment()
+        .expect("a file system that opens files for direct I/O says how to align it");
+    let block = alignment.offset.max(4096);
+    let data = pattern(4 * block);
+    let mut aligned = AlignedBuf::with_capacity(4 * block, alignment.memory);
+    aligned.extend_from_slice(&data);
+    within(file.write_all_at(aligned, 0)).await.0?;
+    let buf = AlignedBuf::with_capacity(2 * block, alignment.memory);
+    let (read, buf) = within(file.read_exact_at(buf, block as u64)).await;
+    read?;
+    assert_eq!(&*buf, &data[block..3 * block]);
+
+    let registered = FixedBuffers::new(&ruio::driver(), 2, block)?;
+    let buf = registered.check_out(1).unwrap();
+    let (read, buf) = within(file.read_fixed_at(buf, 3 * block as u64)).await;
+    assert_eq!(read?, block);
+    assert_eq!(&*buf, &data[3 * block..]);
+    Ok(())
+}
+
+#[ruio::test]
+async fn names_are_made_changed_and_removed() -> io::Result<()> {
+    let scratch = Scratch::new("names");
+    let nested = scratch.path("a/b/c");
+    fs::create_dir_all(&nested).await?;
+    fs::create_dir_all(&nested).await?;
+    assert!(nested.is_dir());
+    let err = fs::create_dir(&nested).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+
+    let file = nested.join("file");
+    fs::write(&file, "contents").await?;
+    assert_eq!(fs::read_to_string(&file).await?, "contents");
+    let renamed = scratch.path("a/renamed");
+    fs::rename(&file, &renamed).await?;
+    assert!(!file.exists());
+    assert_eq!(fs::read(&renamed).await?, b"contents");
+    fs::remove_file(&renamed).await?;
+    assert_eq!(
+        fs::remove_file(&renamed).await.unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+    for dir in ["a/b/c", "a/b", "a"] {
+        fs::remove_dir(scratch.path(dir)).await?;
+    }
+    assert!(!scratch.path("a").exists());
+
+    let big = pattern(300_000);
+    fs::write(scratch.path("big"), big.clone()).await?;
+    assert!(fs::read(scratch.path("big")).await? == big);
+    std::fs::write(scratch.path("binary"), [0xff, 0xfe])?;
+    let err = fs::read_to_string(scratch.path("binary"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    Ok(())
+}

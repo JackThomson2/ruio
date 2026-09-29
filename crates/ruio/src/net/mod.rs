@@ -78,6 +78,7 @@ mod unix;
 
 pub use behind::{Flush, WriteBehind};
 pub use socket::{ReadExact, RecvStream, SendZc, SocketOp, WriteAll, WriteAllVectored};
+pub(crate) use socket::{Sock, ThreadBound};
 pub use tcp::{Incoming, TcpListener, TcpStream};
 pub use udp::UdpSocket;
 pub use unix::{UnixDatagram, UnixListener, UnixStream};

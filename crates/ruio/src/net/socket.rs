@@ -32,11 +32,12 @@ fn poll_gate(gate: &mut Option<&Behind>, cx: &mut Context<'_>) -> Poll<io::Resul
     Poll::Ready(result)
 }
 
-/// Makes a type `!Send` and `!Sync`: sockets belong to the thread whose ring
-/// their I/O runs on. See DESIGN.md on keeping work stealing possible.
+/// Makes a type `!Send` and `!Sync`: sockets and files belong to the thread
+/// whose ring their I/O runs on. See DESIGN.md on keeping work stealing
+/// possible.
 pub(crate) type ThreadBound = PhantomData<*const ()>;
 
-/// A socket's descriptor: a plain one, as the standard library's socket
+/// A socket's or a file's descriptor: a plain one, as the standard library's
 /// type, which does what the ring cannot, or a direct descriptor.
 pub(crate) enum Sock<S> {
     Plain(S),
@@ -67,7 +68,7 @@ impl<S: AsRawFd> Sock<S> {
 
     /// The ring to run an operation on, and the descriptor to give it: the
     /// thread's for a plain descriptor, and its own for a direct one.
-    fn target(&self) -> (Driver, Fd) {
+    pub(crate) fn target(&self) -> (Driver, Fd) {
         match self {
             Sock::Plain(socket) => (crate::driver(), Fd::Plain(socket.as_raw_fd())),
             Sock::Direct(fd) => match fd.driver() {
