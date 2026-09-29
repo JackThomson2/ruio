@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 libc = "0.2.189"
+ruio = { path = "crates/ruio", version = "0.0.0" }
 ruio-driver = { path = "crates/ruio-driver", version = "0.0.0" }
 ruio-executor = { path = "crates/ruio-executor", version = "0.0.0" }
 ruio-macros = { path = "crates/ruio-macros", version = "0.0.0" }

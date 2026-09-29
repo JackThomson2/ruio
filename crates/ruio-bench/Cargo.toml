@@ -1,0 +1,17 @@
+[package]
+name = "ruio-bench"
+description = "Benchmarks of ruio against other runtimes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The only crate that depends on another runtime: it is what ruio is
+# measured against.
+[dependencies]
+libc.workspace = true
+ruio.workspace = true
+tokio = { version = "1.53.1", features = ["io-util", "net", "rt", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

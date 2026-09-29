@@ -1,0 +1,366 @@
+//! Benchmarks of ruio against other runtimes, as DESIGN.md describes them.
+//!
+//! `ruio-bench echo` runs the TCP echo benchmark over the loopback interface.
+//! For each number of connections and message size, and for each server, it
+//! starts the server in a process of its own, pinned to one CPU, and the load
+//! generator in another, pinned to CPUs of their own. Each connection sends a
+//! message and waits for its echo, again and again. The report gives round
+//! trips per second, how that compares with tokio, and the 99th percentile
+//! round-trip time.
+//!
+//! The servers each run on one thread: ruio, with plain and with direct
+//! descriptors, and tokio's current-thread runtime. Runtimes across cores
+//! are milestone M6.
+//!
+//! The server and the load generator also run on their own:
+//!
+//! ```text
+//! ruio-bench echo [--quick] [--seconds S] [--warmup S] [--server-cpu N] [--client-cpus LIST]
+//! ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
+//! ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] [--warmup S]
+//!                             [--cpus LIST]
+//! ```
+
+mod client;
+mod server;
+mod sys;
+
+use std::env;
+use std::fmt::Display;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
+use std::process::{self, Child, Command, Stdio};
+use std::str::FromStr;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use client::Load;
+use server::{BUFFER_SIZE, Server};
+
+const USAGE: &str = "usage: ruio-bench echo [--quick] [--seconds S] [--warmup S] \
+                     [--server-cpu N] [--client-cpus LIST]
+       ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
+       ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] \
+                     [--warmup S] [--cpus LIST]";
+
+fn main() {
+    let mut args = env::args().skip(1);
+    let command = args.next();
+    let result = Options::parse(args).and_then(|options| match command.as_deref() {
+        Some("echo") => echo(&options),
+        Some("echo-server") => echo_server(&options),
+        Some("echo-client") => echo_client(&options),
+        _ => Err(USAGE.to_owned()),
+    });
+    if let Err(err) = result {
+        eprintln!("ruio-bench: {err}");
+        process::exit(2);
+    }
+}
+
+/// Positional arguments, then `--name value` options and `--flag`s.
+struct Options {
+    positional: Vec<String>,
+    named: Vec<(String, String)>,
+    flags: Vec<String>,
+}
+
+impl Options {
+    /// Options that take no value.
+    const FLAGS: &[&str] = &["quick"];
+
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut options = Self {
+            positional: Vec::new(),
+            named: Vec::new(),
+            flags: Vec::new(),
+        };
+        let mut args = args.peekable();
+        while let Some(arg) = args.next() {
+            let Some(name) = arg.strip_prefix("--") else {
+                options.positional.push(arg);
+                continue;
+            };
+            if Self::FLAGS.contains(&name) {
+                options.flags.push(name.to_owned());
+            } else {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("--{name} needs a value"))?;
+                options.named.push((name.to_owned(), value));
+            }
+        }
+        Ok(options)
+    }
+
+    fn get<T: FromStr>(&self, name: &str, default: T) -> Result<T, String>
+    where
+        T::Err: Display,
+    {
+        match self.named.iter().rev().find(|(named, _)| named == name) {
+            Some((_, value)) => value
+                .parse()
+                .map_err(|err| format!("--{name} {value}: {err}")),
+            None => Ok(default),
+        }
+    }
+
+    fn duration(&self, name: &str, default: f64) -> Result<Duration, String> {
+        let seconds = self.get(name, default)?;
+        Duration::try_from_secs_f64(seconds).map_err(|err| format!("--{name}: {err}"))
+    }
+
+    fn flag(&self, name: &str) -> bool {
+        self.flags.iter().any(|flag| flag == name)
+    }
+
+    fn positional<T: FromStr>(&self, index: usize, what: &str) -> Result<T, String>
+    where
+        T::Err: Display,
+    {
+        let value = self
+            .positional
+            .get(index)
+            .ok_or_else(|| format!("missing {what}\n{USAGE}"))?;
+        value
+            .parse()
+            .map_err(|err| format!("{what} {value}: {err}"))
+    }
+}
+
+fn echo_server(options: &Options) -> Result<(), String> {
+    let server: Server = options.positional(0, "server")?;
+    let addr: SocketAddr = options.positional(1, "address")?;
+    let cpu = options.get("cpu", 0)?;
+    let buffers = options.get("buffers", 1024)?;
+    sys::pin(&[cpu]).map_err(|err| format!("pinning to CPU {cpu}: {err}"))?;
+    sys::raise_file_limit().map_err(|err| format!("raising the file limit: {err}"))?;
+    server::run(server, addr, buffers).map_err(|err| format!("{server} echo server: {err}"))
+}
+
+fn echo_client(options: &Options) -> Result<(), String> {
+    let addr: SocketAddr = options.positional(0, "address")?;
+    let connections: usize = options.get("connections", 1)?;
+    let cpus = sys::parse_cpus(&options.get("cpus", "2-25".to_owned())?)?;
+    let load = Load {
+        connections,
+        size: options.get("size", 64)?,
+        warmup: options.duration("warmup", 1.0)?,
+        measure: options.duration("seconds", 3.0)?,
+        threads: cpus.len().min(connections).max(1),
+    };
+    sys::pin(&cpus).map_err(|err| format!("pinning to CPUs {cpus:?}: {err}"))?;
+    sys::raise_file_limit().map_err(|err| format!("raising the file limit: {err}"))?;
+    let measured = client::run(addr, load).map_err(|err| format!("echo client: {err}"))?;
+    println!(
+        "rate={:.0} p50={:.1} p99={:.1}",
+        measured.rate(),
+        measured.percentile(0.5),
+        measured.percentile(0.99)
+    );
+    Ok(())
+}
+
+/// The connection counts and message sizes of DESIGN.md.
+const MATRIX: &[(usize, usize)] = &[
+    (1, 64),
+    (1, 1024),
+    (1, 16 << 10),
+    (1, 64 << 10),
+    (16, 64),
+    (16, 1024),
+    (16, 16 << 10),
+    (16, 64 << 10),
+    (256, 64),
+    (256, 1024),
+    (256, 16 << 10),
+    (256, 64 << 10),
+    (1024, 64),
+    (1024, 1024),
+    (1024, 16 << 10),
+    (1024, 64 << 10),
+    (10_000, 64),
+    (10_000, 1024),
+    (10_000, 16 << 10),
+    (10_000, 64 << 10),
+];
+
+const QUICK: &[(usize, usize)] = &[(1, 64), (256, 1024), (1024, 16 << 10)];
+
+/// One server's result for one load.
+struct Row {
+    rate: f64,
+    p99: f64,
+}
+
+fn echo(options: &Options) -> Result<(), String> {
+    let exe = env::current_exe().map_err(|err| err.to_string())?;
+    let matrix = if options.flag("quick") { QUICK } else { MATRIX };
+    let server_cpu: usize = options.get("server-cpu", 0)?;
+    let client_cpus: String = options.get("client-cpus", "2-25".to_owned())?;
+    let seconds = options.duration("seconds", 3.0)?;
+    let warmup = options.duration("warmup", 1.0)?;
+
+    println!(
+        "Round trips per second, and 99th percentile round-trip time; \
+         servers on CPU {server_cpu}, the client on {client_cpus}."
+    );
+    println!();
+    print!("| connections | message |");
+    for server in Server::ALL {
+        print!(" {server} |");
+    }
+    println!();
+    println!("|---:|---:|{}", "---:|".repeat(Server::ALL.len()));
+    for &(connections, size) in matrix {
+        let mut rows = Vec::new();
+        for server in Server::ALL {
+            eprintln!("{server}: {connections} connections, {size} B messages");
+            let run = Run {
+                exe: &exe,
+                server,
+                server_cpu,
+                client_cpus: &client_cpus,
+                connections,
+                size,
+                seconds,
+                warmup,
+            };
+            rows.push(run.measure()?);
+        }
+        let tokio = rows[0].rate;
+        print!("| {connections} | {} |", bytes(size));
+        for (server, row) in Server::ALL.iter().zip(&rows) {
+            let versus = if *server == Server::Tokio {
+                String::new()
+            } else {
+                format!(", {:.2}x", row.rate / tokio)
+            };
+            print!(" {}{versus}, {:.0} µs |", thousands(row.rate), row.p99);
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// One measurement: a server in a process of its own, and the client in
+/// another.
+struct Run<'a> {
+    exe: &'a Path,
+    server: Server,
+    server_cpu: usize,
+    client_cpus: &'a str,
+    connections: usize,
+    size: usize,
+    seconds: Duration,
+    warmup: Duration,
+}
+
+impl Run<'_> {
+    fn measure(&self) -> Result<Row, String> {
+        let addr = free_addr().map_err(|err| format!("finding a free port: {err}"))?;
+        let mut server = Command::new(self.exe)
+            .arg("echo-server")
+            .arg(self.server.to_string())
+            .arg(addr.to_string())
+            .args(["--cpu", &self.server_cpu.to_string()])
+            .args(["--buffers", &self.pool_buffers().to_string()])
+            .stdin(Stdio::null())
+            .spawn()
+            .map_err(|err| format!("starting the {} server: {err}", self.server))?;
+        let measured = self.client(addr, &mut server);
+        let _ = server.kill();
+        let _ = server.wait();
+        measured
+    }
+
+    fn client(&self, addr: SocketAddr, server: &mut Child) -> Result<Row, String> {
+        wait_until_listening(addr, server)?;
+        let output = Command::new(self.exe)
+            .arg("echo-client")
+            .arg(addr.to_string())
+            .args(["--connections", &self.connections.to_string()])
+            .args(["--size", &self.size.to_string()])
+            .args(["--seconds", &self.seconds.as_secs_f64().to_string()])
+            .args(["--warmup", &self.warmup.as_secs_f64().to_string()])
+            .args(["--cpus", self.client_cpus])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|err| format!("running the client: {err}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            return Err(format!(
+                "the client failed against {}: {}",
+                self.server,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let field = |name: &str| -> Result<f64, String> {
+            stdout
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| format!("no {name} in the client's report {stdout:?}"))
+        };
+        Ok(Row {
+            rate: field("rate")?,
+            p99: field("p99")?,
+        })
+    }
+
+    /// Buffers enough for two messages per connection, within what a pool
+    /// can have.
+    ///
+    /// A connection needs room for two: the client can send its next
+    /// message before the server has seen its echo sent and returned the
+    /// buffer, and a pool that runs dry ends the multishot receives until
+    /// buffers come back. Much more costs throughput too: the kernel takes
+    /// buffers from a pool's ring in the order they went back, so every
+    /// buffer of the pool is in use in turn, and a pool larger than its load
+    /// spreads the copies over more memory than the cache holds. With 64 KiB
+    /// buffers, 256 connections and 64 KiB messages, 4096 buffers where 256
+    /// would do cost a quarter of the throughput.
+    fn pool_buffers(&self) -> u16 {
+        let per_message = self.size.div_ceil(BUFFER_SIZE as usize);
+        let wanted = (self.connections * per_message * 2).clamp(64, 1 << 15);
+        wanted.next_power_of_two().min(1 << 15) as u16
+    }
+}
+
+/// A port on the loopback interface that was free a moment ago.
+fn free_addr() -> std::io::Result<SocketAddr> {
+    TcpListener::bind("127.0.0.1:0")?.local_addr()
+}
+
+/// Waits until the server accepts connections, or has died.
+fn wait_until_listening(addr: SocketAddr, server: &mut Child) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if TcpStream::connect(addr).is_ok() {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = server.try_wait() {
+            return Err(format!("the server exited with {status}"));
+        }
+        if Instant::now() > deadline {
+            return Err("the server did not start listening".to_owned());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn bytes(size: usize) -> String {
+    if size >= 1024 && size.is_multiple_of(1024) {
+        format!("{} KiB", size / 1024)
+    } else {
+        format!("{size} B")
+    }
+}
+
+fn thousands(rate: f64) -> String {
+    if rate >= 1e6 {
+        format!("{:.2}M", rate / 1e6)
+    } else {
+        format!("{:.0}k", rate / 1e3)
+    }
+}
