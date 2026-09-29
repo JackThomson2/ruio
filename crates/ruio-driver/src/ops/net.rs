@@ -1,16 +1,20 @@
 //! Socket operations.
 
+use std::future::poll_fn;
 use std::io;
 use std::mem;
 use std::net;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::ptr;
+use std::task::{Context, Poll, ready};
 
 use ruio_sys as sys;
 
 use super::complete_read;
 use crate::buf::{BufResult, IoBuf, IoBufMut};
-use crate::{Completion, Descriptor, DirectFd, Driver, Fd, Operation, SockAddr};
+use crate::{
+    Completion, Descriptor, DirectFd, Driver, Fd, MultiOp, Multishot, Operation, SockAddr,
+};
 
 /// Where an operation that makes a file puts it.
 #[derive(Clone, Copy, Debug)]
@@ -205,6 +209,97 @@ unsafe impl Operation for Accept {
     fn complete(self, completion: Completion) -> Self::Output {
         let descriptor = self.install.descriptor(completion.result()?);
         Ok((descriptor, *self.peer))
+    }
+}
+
+/// Accepts connections on a listening socket again and again as they
+/// arrive: a multishot `accept4(2)` (`IORING_ACCEPT_MULTISHOT`).
+///
+/// Each item is a connection, a plain descriptor closed on `exec` unless
+/// [`direct`](AcceptMulti::direct) asks for direct descriptors. Peers'
+/// addresses are not reported: each connection would overwrite the last
+/// one's before it could be read. [`AcceptStream`] keeps the request armed.
+#[derive(Debug)]
+pub struct AcceptMulti {
+    fd: Fd,
+    install: Install,
+}
+
+impl AcceptMulti {
+    /// Accepts connections on `fd`.
+    pub fn new(fd: impl Into<Fd>) -> Self {
+        Self {
+            fd: fd.into(),
+            install: Install::Plain,
+        }
+    }
+
+    /// Makes each connection a direct descriptor, in a free slot of the
+    /// registered file table of `driver`'s ring, where the request must run;
+    /// see [`Socket::direct`].
+    ///
+    /// Once the table is full, the kernel closes the connection it could not
+    /// put in it, and ends the request with `ENFILE`.
+    pub fn direct(mut self, driver: &Driver) -> Self {
+        self.install = Install::Direct(driver.id());
+        self
+    }
+}
+
+// SAFETY: the entry points to no memory, since it asks for no addresses,
+// and a multishot accept's completions carry IORING_CQE_F_MORE until the
+// last.
+unsafe impl Multishot for AcceptMulti {
+    type Item = io::Result<Descriptor>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_ACCEPT;
+        self.fd.apply(sqe);
+        sqe.ioprio = sys::IORING_ACCEPT_MULTISHOT;
+        sqe.op_flags = self.install.accept_flags();
+        sqe.file_index = self.install.file_index();
+    }
+
+    fn item(&mut self, completion: Completion) -> Self::Item {
+        completion.result().map(|res| self.install.descriptor(res))
+    }
+}
+
+/// The connections arriving on a listening socket, accepted by a multishot
+/// accept that the stream keeps armed.
+///
+/// The kernel ends a multishot accept now and then for reasons of its own,
+/// such as a full completion queue; the stream re-arms it at once, and the
+/// connections that arrived meanwhile wait in the listener's backlog. An
+/// error ends the request too: the stream yields it, and re-arms the request
+/// when polled again, so that a server can carry on past errors such as
+/// `EMFILE`, as it would with `accept(2)`. The stream never ends.
+#[derive(Debug)]
+pub struct AcceptStream {
+    stream: MultiOp<AcceptMulti>,
+}
+
+impl AcceptStream {
+    /// A stream of the connections `request` accepts.
+    pub fn new(driver: &Driver, request: AcceptMulti) -> Self {
+        Self {
+            stream: driver.stream(request),
+        }
+    }
+
+    /// The next connection, or the error that ended the request.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Descriptor>> {
+        loop {
+            match ready!(self.stream.poll_next(cx)) {
+                Some(accepted) => return Poll::Ready(accepted),
+                None => self.stream.rearm(),
+            }
+        }
+    }
+
+    /// The next connection; see [`poll_next`](AcceptStream::poll_next).
+    pub async fn next(&mut self) -> io::Result<Descriptor> {
+        poll_fn(|cx| self.poll_next(cx)).await
     }
 }
 
