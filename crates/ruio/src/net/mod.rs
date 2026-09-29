@@ -68,7 +68,9 @@
 mod socket;
 mod tcp;
 mod udp;
+mod unix;
 
 pub use socket::{ReadExact, RecvStream, SendZc, SocketOp, WriteAll};
 pub use tcp::{Incoming, TcpListener, TcpStream};
 pub use udp::UdpSocket;
+pub use unix::{UnixDatagram, UnixListener, UnixStream};

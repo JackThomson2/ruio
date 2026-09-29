@@ -137,7 +137,8 @@ impl fmt::Debug for TcpListener {
 }
 
 /// The connections arriving on a listener, accepted by a multishot accept
-/// that the stream keeps armed. Made by [`TcpListener::incoming`].
+/// that the stream keeps armed. Made by [`TcpListener::incoming`] and
+/// [`UnixListener::incoming`](super::UnixListener::incoming).
 ///
 /// Errors are yielded, and the stream carries on after them, as a server
 /// would after a failed `accept(2)`; it never ends. Peers' addresses are not
