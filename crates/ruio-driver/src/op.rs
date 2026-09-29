@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::mem;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ruio_sys as sys;
@@ -155,6 +155,66 @@ impl<T: Operation> Op<T> {
         self.timeout = Some(duration);
         self
     }
+
+    /// Leaves the operation to finish with nobody waiting for it: submits it
+    /// if it has not been, and hands it to the driver, which drops its output
+    /// once the kernel is done. Unlike dropping the `Op`, this does not cancel
+    /// the operation. An operation that should say how it went can record
+    /// that in its `complete`.
+    pub fn detach(mut self) {
+        let (operation, user_data, timed) = match mem::replace(&mut self.state, State::Done) {
+            State::Unsubmitted(mut operation) => {
+                match self
+                    .driver
+                    .queue(&mut operation, self.timeout, Waker::noop())
+                {
+                    Ok(user_data) => (operation, user_data, self.timeout.is_some()),
+                    Err(err) => return drop(operation.complete(Completion::from_error(&err))),
+                }
+            }
+            State::Submitted {
+                operation,
+                user_data,
+                timed,
+            } => (operation, user_data, timed),
+            State::Done => return,
+        };
+        // Cancelled means timed out for a timed operation detached too.
+        self.driver
+            .orphan(user_data, Seen { operation, timed }, false);
+    }
+
+    /// The operation back, if it has not been submitted: nothing has reached
+    /// the kernel, so nothing is cancelled either.
+    pub fn into_inner(mut self) -> Option<T> {
+        match mem::replace(&mut self.state, State::Done) {
+            State::Unsubmitted(operation) => Some(operation),
+            submitted => {
+                self.state = submitted;
+                None
+            }
+        }
+    }
+}
+
+/// A detached operation, which completes as the `Op` would have seen it.
+struct Seen<T> {
+    operation: T,
+    timed: bool,
+}
+
+// SAFETY: a detached operation has been submitted already, so it is never
+// prepared again, and it completes as the operation it holds does.
+unsafe impl<T: Operation> Operation for Seen<T> {
+    type Output = T::Output;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        self.operation.prepare(sqe);
+    }
+
+    fn complete(self, completion: Completion) -> T::Output {
+        self.operation.complete(seen(completion, self.timed))
+    }
 }
 
 /// The completion as the operation sees it. For an operation with a linked
@@ -215,7 +275,7 @@ impl<T: Operation> Drop for Op<T> {
             ..
         } = mem::replace(&mut self.state, State::Done)
         {
-            self.driver.orphan(user_data, operation);
+            self.driver.orphan(user_data, operation, true);
         }
     }
 }

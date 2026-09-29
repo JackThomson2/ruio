@@ -586,8 +586,9 @@ impl Driver {
         polled.ok()
     }
 
-    /// Takes over the operation of an `Op` dropped while in flight.
-    pub(crate) fn orphan<T: Operation>(&self, user_data: u64, operation: T) {
+    /// Takes over the operation of an `Op` dropped while in flight, and
+    /// cancels it unless `cancel` is false, when it runs to completion.
+    pub(crate) fn orphan<T: Operation>(&self, user_data: u64, operation: T, cancel: bool) {
         let Ok(mut inner) = self.inner.try_borrow_mut() else {
             // Dropped by code running inside the driver, such as a waker's
             // destructor. The kernel may still use the operation's memory, so
@@ -602,7 +603,9 @@ impl Driver {
             }
             None => {
                 let waker = inner.table.orphan(user_data, Box::new(Some(operation)));
-                inner.cancels.push(user_data);
+                if cancel {
+                    inner.cancels.push(user_data);
+                }
                 drop(inner);
                 drop(waker);
             }

@@ -2,15 +2,18 @@
 
 mod support;
 
+use std::cell::Cell;
 use std::fs::{self, File};
 use std::io::{self, Read as _, Seek, SeekFrom, Write as _};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ruio_driver::buf::IoBuf;
 use ruio_driver::ops::{Read, Timeout, Write};
-use ruio_driver::{Driver, Fd};
+use ruio_driver::{Completion, Driver, Fd, Operation};
+use ruio_sys as sys;
 
 use support::{block_on, poll_once, settle};
 
@@ -150,6 +153,95 @@ fn errors_come_back_with_the_buffer() {
     let (read, buf) = block_on(&driver, driver.op(Read::new(-1, Vec::with_capacity(4))));
     assert_eq!(read.unwrap_err().raw_os_error(), Some(libc::EBADF));
     assert_eq!(buf.capacity(), 4);
+}
+
+/// An operation that records the result it completed with.
+struct Tracked<T> {
+    operation: T,
+    result: Rc<Cell<Option<i32>>>,
+}
+
+fn tracked<T>(operation: T) -> (Tracked<T>, Rc<Cell<Option<i32>>>) {
+    let result = Rc::new(Cell::new(None));
+    (
+        Tracked {
+            operation,
+            result: Rc::clone(&result),
+        },
+        result,
+    )
+}
+
+// SAFETY: as for the operation it wraps.
+unsafe impl<T: Operation> Operation for Tracked<T> {
+    type Output = ();
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        self.operation.prepare(sqe);
+    }
+
+    fn complete(self, completion: Completion) {
+        self.result.set(Some(completion.res()));
+        drop(self.operation.complete(completion));
+    }
+}
+
+/// Detached before or after it is submitted, an operation runs to its end,
+/// where dropping it would cancel it.
+#[test]
+fn a_detached_operation_runs_to_completion() {
+    let driver = Driver::new().unwrap();
+    let (reader, mut writer) = io::pipe().unwrap();
+    for submitted in [false, true] {
+        let (read, result) = tracked(Read::new(reader.as_raw_fd(), Vec::with_capacity(8)));
+        let mut op = driver.op(read);
+        if submitted {
+            assert!(poll_once(&mut op).is_pending());
+            driver.submit().unwrap();
+        }
+        op.detach();
+        driver.submit().unwrap();
+        assert_eq!(result.get(), None, "waiting for data");
+        writer.write_all(b"data").unwrap();
+        settle(&driver);
+        assert_eq!(result.get(), Some(4), "submitted first: {submitted}");
+    }
+
+    let (read, result) = tracked(Read::new(reader.as_raw_fd(), Vec::with_capacity(8)));
+    let mut op = driver.op(read);
+    assert!(poll_once(&mut op).is_pending());
+    driver.submit().unwrap();
+    drop(op);
+    settle(&driver);
+    assert_eq!(result.get(), Some(-libc::ECANCELED));
+}
+
+#[test]
+fn a_detached_operation_times_out_as_a_polled_one_does() {
+    let driver = Driver::new().unwrap();
+    let (reader, _writer) = io::pipe().unwrap();
+    let (read, result) = tracked(Read::new(reader.as_raw_fd(), Vec::with_capacity(8)));
+    driver.op(read).timeout(Duration::from_millis(10)).detach();
+    settle(&driver);
+    assert_eq!(result.get(), Some(-libc::ETIMEDOUT));
+}
+
+/// Only an operation that has not been submitted comes back.
+#[test]
+fn an_operation_comes_back_only_before_it_is_submitted() {
+    let driver = Driver::new().unwrap();
+    let (reader, _writer) = io::pipe().unwrap();
+    let (read, result) = tracked(Read::new(reader.as_raw_fd(), Vec::with_capacity(8)));
+    assert!(driver.op(read).into_inner().is_some());
+    assert_eq!(driver.stats().operations, 0);
+    assert_eq!(result.get(), None);
+
+    let (read, result) = tracked(Read::new(reader.as_raw_fd(), Vec::with_capacity(8)));
+    let mut op = driver.op(read);
+    assert!(poll_once(&mut op).is_pending());
+    assert!(op.into_inner().is_none());
+    settle(&driver);
+    assert_eq!(result.get(), Some(-libc::ECANCELED));
 }
 
 /// A direct descriptor names a slot of the ring's registered file table,
