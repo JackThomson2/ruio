@@ -29,6 +29,9 @@ mod context;
 mod runtime;
 mod scheduler;
 mod task;
+// Used by the timers, which are added separately.
+#[allow(dead_code)]
+mod wheel;
 
 use std::future::{self, Future};
 use std::task::Poll;
