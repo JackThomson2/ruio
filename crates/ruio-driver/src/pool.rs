@@ -206,17 +206,17 @@ impl BufPool {
             first < pool.count && pool.in_ring[usize::from(first)].get(),
             "the kernel reported buffer {first}, which is not in the ring"
         );
-        let mut position = pool.positions[usize::from(first)].get();
-        let mut left = usize::try_from(res).unwrap_or(0);
-        // Walk the slots from the first buffer's, as the kernel filled them,
-        // each to the length its entry holds: the kernel shortens the last
-        // buffer of a bundle to the data it expects. Every buffer is read
-        // before any is taken, since taking one can let spare buffers into
-        // slots.
-        let mut taken: Vec<(u16, usize)> = Vec::new();
+        let start = pool.positions[usize::from(first)].get();
+        let total = usize::try_from(res).unwrap_or(0);
+        // The slots from the first buffer's on hold the buffers the kernel
+        // filled, each to the length its entry gives: the kernel shortens the
+        // last buffer it maps to the data it expects. The first walk checks
+        // each slot still holds what the kernel took from it, a buffer in the
+        // ring put there at that position, and counts them.
+        let mut count: u16 = 0;
+        let mut left = total;
         loop {
-            // The slot still holds what the kernel took from it if that is
-            // in the ring, put there at this position.
+            let position = start.wrapping_add(count);
             let bid = pool.slots[pool.slot(position)].get();
             let in_ring = pool.in_ring[usize::from(bid)].get()
                 && pool.positions[usize::from(bid)].get() == position;
@@ -225,22 +225,28 @@ impl BufPool {
                 "the kernel reported {res} bytes from buffer {first}, more than its buffers \
                  after it in the ring hold"
             );
-            let len = left.min(pool.entry_len(position));
-            taken.push((bid, len));
-            left -= len;
+            left -= left.min(pool.entry_len(position));
+            count += 1;
             if left == 0 {
                 break;
             }
-            position = position.wrapping_add(1);
         }
-        let mut leases = taken.into_iter().map(|(bid, len)| {
+        // The second walk takes them. Taking puts spare buffers only in the
+        // slot of the tail, whose last position was reported taken before
+        // any of these, so it is none of theirs.
+        let mut left = total;
+        let mut lease = |index: u16| {
+            let position = start.wrapping_add(index);
+            let bid = pool.slots[pool.slot(position)].get();
+            let len = left.min(pool.entry_len(position));
+            left -= len;
             pool.take(bid);
             pool.lease_taken(bid, len)
-        });
-        let first = leases.next()?;
+        };
+        let first = lease(0);
         Some(BufBundle {
             first,
-            rest: leases.collect(),
+            rest: (1..count).map(lease).collect(),
         })
     }
 }

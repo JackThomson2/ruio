@@ -370,8 +370,9 @@ pub struct SendVectored<V> {
     bufs: V,
     skip: usize,
     flags: i32,
-    // Boxed, as for `Connect`: the header and vector the kernel reads.
-    msg: Box<SendMsg>,
+    // Boxed, as for `Connect`: the header and vector the kernel reads, made
+    // only for a send of more than one buffer.
+    msg: Option<Box<SendMsg>>,
 }
 
 /// What a `sendmsg` request points to.
@@ -392,17 +393,12 @@ const IOV_MAX: usize = 1024;
 impl<V: IoBufs> SendVectored<V> {
     /// Sends `bufs` on `fd`.
     pub fn new(fd: impl Into<Fd>, bufs: V) -> Self {
-        let iovecs = Vec::with_capacity(bufs.buf_count().min(IOV_MAX));
         Self {
             fd: fd.into(),
             bufs,
             skip: 0,
             flags: 0,
-            msg: Box::new(SendMsg {
-                // SAFETY: all zeroes is a valid `msghdr`, with null pointers.
-                header: unsafe { mem::zeroed() },
-                iovecs,
-            }),
+            msg: None,
         }
     }
 
@@ -428,31 +424,42 @@ unsafe impl<V: IoBufs> Operation for SendVectored<V> {
     type Output = BufResult<usize, V>;
 
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
-        let msg = &mut *self.msg;
+        let bufs = &self.bufs;
+        let count = bufs.buf_count();
+        // Where the data left starts: a buffer, and an offset in it.
+        let mut first = 0;
+        let mut offset = self.skip;
+        while first < count && offset >= bufs.buf(first).1 {
+            offset -= bufs.buf(first).1;
+            first += 1;
+        }
+        self.fd.apply(sqe);
+        sqe.op_flags = self.flags.cast_unsigned();
+        if first + 1 >= count {
+            let (start, len) = match first {
+                last if last < count => bufs.buf(last),
+                _ => (ptr::null(), 0),
+            };
+            sqe.opcode = sys::IORING_OP_SEND;
+            sqe.addr = start.wrapping_add(offset).expose_provenance() as u64;
+            sqe.len = u32::try_from(len - offset.min(len)).unwrap_or(u32::MAX);
+            return;
+        }
+        let msg = self.msg.get_or_insert_with(|| {
+            Box::new(SendMsg {
+                // SAFETY: all zeroes is a valid `msghdr`, with null pointers.
+                header: unsafe { mem::zeroed() },
+                iovecs: Vec::with_capacity((count - first).min(IOV_MAX)),
+            })
+        });
         msg.iovecs.clear();
-        let mut skip = self.skip;
-        for index in 0..self.bufs.buf_count() {
-            let (start, len) = self.bufs.buf(index);
-            if skip >= len {
-                skip -= len;
-                continue;
-            }
+        for index in first..count.min(first + IOV_MAX) {
+            let (start, len) = bufs.buf(index);
+            let skip = if index == first { offset } else { 0 };
             msg.iovecs.push(libc::iovec {
                 iov_base: start.wrapping_add(skip).cast_mut().cast(),
                 iov_len: len - skip,
             });
-            skip = 0;
-            if msg.iovecs.len() == IOV_MAX {
-                break;
-            }
-        }
-        self.fd.apply(sqe);
-        sqe.op_flags = self.flags.cast_unsigned();
-        if let [iovec] = msg.iovecs[..] {
-            sqe.opcode = sys::IORING_OP_SEND;
-            sqe.addr = iovec.iov_base.expose_provenance() as u64;
-            sqe.len = u32::try_from(iovec.iov_len).unwrap_or(u32::MAX);
-            return;
         }
         msg.header.msg_iov = msg.iovecs.as_mut_ptr();
         msg.header.msg_iovlen = msg.iovecs.len();
