@@ -36,12 +36,14 @@ pub use ruio_driver::buf;
 pub mod net;
 
 /// The io_uring driver: operations, the futures that run them, and the types
-/// for writing new ones.
+/// for writing new ones, down to the kernel's own structures in
+/// [`sys`](uring::sys).
 pub mod uring {
     pub use ruio_driver::{
         BaselineError, Completion, Descriptor, DirectFd, Driver, Fd, MultiOp, Multishot, Op,
         Operation, Probe, SockAddr, Stats, Unparker, ops,
     };
+    pub use ruio_sys as sys;
 }
 
 /// What the expansions of `#[ruio::main]` and `#[ruio::test]` call.

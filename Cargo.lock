@@ -39,6 +39,7 @@ dependencies = [
  "ruio-driver",
  "ruio-executor",
  "ruio-macros",
+ "ruio-sys",
 ]
 
 [[package]]

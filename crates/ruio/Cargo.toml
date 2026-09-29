@@ -11,6 +11,7 @@ libc.workspace = true
 ruio-driver.workspace = true
 ruio-executor.workspace = true
 ruio-macros.workspace = true
+ruio-sys.workspace = true
 
 [lints]
 workspace = true
