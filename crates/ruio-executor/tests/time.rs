@@ -122,16 +122,18 @@ fn dropped_and_endless_sleeps_do_not_hold_the_runtime() {
 fn timers_cost_the_kernel_one_timeout() {
     let runtime = Runtime::new().unwrap();
     runtime.block_on(async {
-        let tasks: Vec<_> = (0..1000)
-            .map(|_| spawn(sleep(Duration::from_millis(20))))
-            .collect();
+        // One deadline for all, however long spawning takes: with a deadline
+        // each, a slow machine spreads them over several ticks, and the
+        // ring is entered once per tick.
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let tasks: Vec<_> = (0..1000).map(|_| spawn(sleep_until(deadline))).collect();
         for task in tasks {
             task.await.unwrap();
         }
     });
     let stats = runtime.driver().stats();
-    // No kernel operations at all: one wait for the ring, or a few if the
-    // deadlines straddle a tick.
+    // No kernel operations at all: one wait for the ring, or a few if it is
+    // woken early.
     assert_eq!(stats.operations, 0);
     assert!(stats.enters <= 3, "{stats:?}");
 }
