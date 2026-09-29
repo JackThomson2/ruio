@@ -2,10 +2,12 @@
 //! submits them and delivers their completions.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt;
 use std::io;
 use std::mem;
+use std::panic::{self, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::task::Waker;
@@ -16,6 +18,7 @@ use ruio_sys as sys;
 use crate::Probe;
 use crate::op::{Completion, Op, Operation, Orphan};
 use crate::ring::Ring;
+use crate::stream::{MultiOp, Multishot, Stranded};
 use crate::table::{IGNORED, Outcome, Table};
 use crate::unpark::{Notify, Unparker};
 
@@ -103,6 +106,7 @@ impl Builder {
                 cancels: Vec::new(),
                 wakers: Vec::new(),
                 released: Vec::new(),
+                deliveries: Vec::new(),
                 stats: Stats::default(),
                 shutdown_timeout: self.shutdown_timeout,
             })),
@@ -179,6 +183,8 @@ struct Inner {
     wakers: Vec<Waker>,
     /// Orphaned payloads released by a batch of completions, likewise.
     released: Vec<(Box<dyn Orphan>, Completion)>,
+    /// Orphaned streams with completions to hand over, likewise.
+    deliveries: Vec<u64>,
     stats: Stats,
     shutdown_timeout: Duration,
 }
@@ -201,6 +207,12 @@ impl Driver {
     /// Wraps `operation` in a future that queues it when first polled.
     pub fn op<T: Operation>(&self, operation: T) -> Op<T> {
         Op::new(self.clone(), operation)
+    }
+
+    /// Wraps a multishot request in a stream that queues it when first
+    /// polled.
+    pub fn stream<T: Multishot>(&self, request: T) -> MultiOp<T> {
+        MultiOp::new(self.clone(), request)
     }
 
     /// Submits the queued operations, and delivers the completions that are
@@ -309,27 +321,122 @@ impl Driver {
     /// finishes orphaned operations. Both run code the driver does not
     /// control, which may use the driver, so they run after it is released.
     fn deliver(&self) {
-        let (mut wakers, mut released) = {
+        let (mut wakers, mut released, mut deliveries) = {
             let mut inner = self.inner.borrow_mut();
             let mut wakers = mem::take(&mut inner.wakers);
             let mut released = mem::take(&mut inner.released);
-            inner.reap(&mut wakers, &mut released);
-            (wakers, released)
+            let mut deliveries = mem::take(&mut inner.deliveries);
+            inner.reap(&mut wakers, &mut released, &mut deliveries);
+            (wakers, released, deliveries)
         };
         for waker in wakers.drain(..) {
             waker.wake();
         }
-        for (payload, completion) in released.drain(..) {
-            payload.finish(completion);
+        for (mut payload, completion) in released.drain(..) {
+            payload.deliver(completion);
+        }
+        for user_data in deliveries.drain(..) {
+            self.deliver_stream(user_data);
         }
         let mut inner = self.inner.borrow_mut();
         inner.wakers = wakers;
         inner.released = released;
+        // Anything abandoned meanwhile waits for the next delivery.
+        deliveries.append(&mut inner.deliveries);
+        inner.deliveries = deliveries;
+    }
+
+    /// Hands an orphaned stream's payload the completions queued for it,
+    /// outside the driver, since the payload runs code of its own.
+    fn deliver_stream(&self, user_data: u64) {
+        loop {
+            let taken = self.inner.borrow_mut().table.take_deliveries(user_data);
+            let Some((mut payload, completions, ended)) = taken else {
+                return;
+            };
+            if !hand_over(&mut payload, completions) {
+                // The kernel may still write where the payload points.
+                mem::forget(payload);
+                return;
+            }
+            if ended {
+                return;
+            }
+            let adopted = self.inner.borrow_mut().table.adopt(user_data, payload);
+            match adopted {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(payload) => {
+                    drop(payload);
+                    return;
+                }
+            }
+        }
     }
 
     /// Queues an operation's entry, returning its `user_data`.
     pub(crate) fn queue<T: Operation>(&self, operation: &mut T, waker: &Waker) -> io::Result<u64> {
-        self.inner.borrow_mut().queue(operation, waker)
+        self.inner
+            .borrow_mut()
+            .queue_entry(|sqe| operation.prepare(sqe), false, waker)
+    }
+
+    /// Queues a multishot request's entry, returning its `user_data`.
+    pub(crate) fn queue_stream<T: Multishot>(
+        &self,
+        request: &mut T,
+        waker: &Waker,
+    ) -> io::Result<u64> {
+        self.inner
+            .borrow_mut()
+            .queue_entry(|sqe| request.prepare(sqe), true, waker)
+    }
+
+    /// Takes a stream's next completion, or arranges for `waker` to be woken
+    /// when one arrives.
+    pub(crate) fn poll_stream(&self, user_data: u64, waker: &Waker) -> Option<Completion> {
+        let polled = self.inner.borrow_mut().table.poll_stream(user_data, waker);
+        // A replaced waker is dropped here, after the driver is released.
+        polled.ok()
+    }
+
+    /// Takes over the request of a stream dropped while armed: hands it the
+    /// completions the stream had not taken, cancels it, and keeps it until
+    /// the kernel is done.
+    pub(crate) fn abandon<T: Multishot>(&self, user_data: u64, request: T) {
+        let Ok(mut inner) = self.inner.try_borrow_mut() else {
+            // Dropped by code running inside the driver; see `orphan`.
+            mem::forget(request);
+            return;
+        };
+        let Some(abandoned) = inner.table.abandon(user_data) else {
+            // The last completion was taken, so the kernel is done with it.
+            drop(inner);
+            drop(request);
+            return;
+        };
+        if !abandoned.ended {
+            inner.cancels.push(user_data);
+        }
+        drop(inner);
+        drop(abandoned.waker);
+        let mut payload: Box<dyn Orphan> = Box::new(Stranded(request));
+        if !hand_over(&mut payload, abandoned.completions) {
+            mem::forget(payload);
+            return;
+        }
+        if abandoned.ended {
+            return;
+        }
+        let mut inner = self.inner.borrow_mut();
+        match inner.table.adopt(user_data, payload) {
+            Ok(true) => inner.deliveries.push(user_data),
+            Ok(false) => {}
+            Err(payload) => {
+                drop(inner);
+                drop(payload);
+            }
+        }
     }
 
     /// Takes the operation's completion, or arranges for `waker` to be woken
@@ -355,7 +462,7 @@ impl Driver {
                 drop(operation.complete(completion));
             }
             None => {
-                let waker = inner.table.orphan(user_data, Box::new(operation));
+                let waker = inner.table.orphan(user_data, Box::new(Some(operation)));
                 inner.cancels.push(user_data);
                 drop(inner);
                 drop(waker);
@@ -364,8 +471,25 @@ impl Driver {
     }
 }
 
+/// Hands a payload its completions, in order. Returns `false` if it panicked,
+/// in which case the payload must not be freed: the kernel may still use
+/// memory it owns.
+fn hand_over(payload: &mut Box<dyn Orphan>, completions: VecDeque<Completion>) -> bool {
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        for completion in completions {
+            payload.deliver(completion);
+        }
+    }))
+    .is_ok()
+}
+
 impl Inner {
-    fn queue<T: Operation>(&mut self, operation: &mut T, waker: &Waker) -> io::Result<u64> {
+    fn queue_entry(
+        &mut self,
+        prepare: impl FnOnce(&mut sys::io_uring_sqe),
+        stream: bool,
+        waker: &Waker,
+    ) -> io::Result<u64> {
         if self.ring.queued() == self.ring.sq_entries() {
             self.submit_queued()?;
         }
@@ -377,10 +501,14 @@ impl Inner {
             sqe,
             prepared: false,
         };
-        operation.prepare(entry.sqe);
+        prepare(entry.sqe);
         debug_assert_eq!(entry.sqe.flags & FORBIDDEN_SQE_FLAGS, 0);
         entry.sqe.flags &= !FORBIDDEN_SQE_FLAGS;
-        let user_data = self.table.insert(Some(waker.clone()));
+        let user_data = if stream {
+            self.table.insert_stream(Some(waker.clone()))
+        } else {
+            self.table.insert(Some(waker.clone()))
+        };
         entry.sqe.user_data = user_data;
         entry.prepared = true;
         self.stats.operations += 1;
@@ -502,7 +630,7 @@ impl Inner {
         if self.queue_cancel_all().is_err() {
             return;
         }
-        let (mut wakers, mut released) = (Vec::new(), Vec::new());
+        let (mut wakers, mut released, mut deliveries) = (Vec::new(), Vec::new(), Vec::new());
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             // Once the time is up, one last pass collects what is ready.
@@ -513,9 +641,13 @@ impl Inner {
             {
                 break;
             }
-            self.reap(&mut wakers, &mut released);
-            for (payload, completion) in released.drain(..) {
-                payload.finish(completion);
+            self.reap(&mut wakers, &mut released, &mut deliveries);
+            for (mut payload, completion) in released.drain(..) {
+                payload.deliver(completion);
+            }
+            deliveries.append(&mut self.deliveries);
+            for user_data in deliveries.drain(..) {
+                self.deliver_stream(user_data);
             }
             if self.table.in_flight() == 0 || remaining.is_zero() {
                 break;
@@ -526,9 +658,38 @@ impl Inner {
         debug_assert!(wakers.is_empty());
     }
 
-    /// Moves posted completions into the table, collecting the wakers to wake
-    /// and the orphaned payloads to finish.
-    fn reap(&mut self, wakers: &mut Vec<Waker>, released: &mut Vec<(Box<dyn Orphan>, Completion)>) {
+    /// Hands an orphaned stream's payload its completions while the driver is
+    /// being dropped, when nothing else can reach it; see
+    /// [`Driver::deliver_stream`].
+    fn deliver_stream(&mut self, user_data: u64) {
+        while let Some((mut payload, completions, ended)) = self.table.take_deliveries(user_data) {
+            if !hand_over(&mut payload, completions) {
+                mem::forget(payload);
+                return;
+            }
+            if ended {
+                return;
+            }
+            match self.table.adopt(user_data, payload) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(payload) => {
+                    drop(payload);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Moves posted completions into the table, collecting the wakers to wake,
+    /// the orphaned payloads to finish and the orphaned streams to deliver
+    /// to.
+    fn reap(
+        &mut self,
+        wakers: &mut Vec<Waker>,
+        released: &mut Vec<(Box<dyn Orphan>, Completion)>,
+        deliveries: &mut Vec<u64>,
+    ) {
         while let Some(cqe) = self.ring.pop_cqe() {
             self.stats.completions += 1;
             if cqe.user_data == WAKE {
@@ -544,6 +705,7 @@ impl Inner {
                 Outcome::Wake(Some(waker)) => wakers.push(waker),
                 Outcome::Wake(None) | Outcome::Ignore => {}
                 Outcome::Release(payload) => released.push((payload, completion)),
+                Outcome::Deliver(user_data) => deliveries.push(user_data),
             }
         }
         self.ring.release_cqes();
@@ -609,9 +771,9 @@ mod tests {
 
     static STUCK_DROPPED: AtomicBool = AtomicBool::new(false);
 
-    /// An operation the kernel never sees, standing in for one it never
-    /// finishes. It has no size, so leaking it allocates nothing that a leak
-    /// checker would report.
+    /// The payload of an operation the kernel never sees, standing in for one
+    /// it never finishes. It has no size, so leaking it allocates nothing
+    /// that a leak checker would report.
     struct Stuck;
 
     impl Drop for Stuck {
@@ -620,13 +782,8 @@ mod tests {
         }
     }
 
-    // SAFETY: never submitted; its entry would point to no memory anyway.
-    unsafe impl Operation for Stuck {
-        type Output = ();
-
-        fn prepare(&mut self, _: &mut sys::io_uring_sqe) {}
-
-        fn complete(self, _: Completion) {}
+    impl Orphan for Stuck {
+        fn deliver(&mut self, _: Completion) {}
     }
 
     #[test]

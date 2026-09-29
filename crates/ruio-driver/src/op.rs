@@ -84,15 +84,20 @@ pub unsafe trait Operation: 'static {
     fn complete(self, completion: Completion) -> Self::Output;
 }
 
-/// The payload of an operation whose [`Op`] was dropped before completion.
+/// The payload of a request whose future was dropped before the kernel
+/// finished with it.
 pub(crate) trait Orphan {
-    /// Delivers the completion and drops the output.
-    fn finish(self: Box<Self>, completion: Completion);
+    /// Hands the payload one of its completions; after the last, the driver
+    /// drops it.
+    fn deliver(&mut self, completion: Completion);
 }
 
-impl<T: Operation> Orphan for T {
-    fn finish(self: Box<Self>, completion: Completion) {
-        drop(Operation::complete(*self, completion));
+/// A single-shot operation, until its completion arrives.
+impl<T: Operation> Orphan for Option<T> {
+    fn deliver(&mut self, completion: Completion) {
+        if let Some(operation) = self.take() {
+            drop(operation.complete(completion));
+        }
     }
 }
 

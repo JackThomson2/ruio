@@ -43,10 +43,12 @@ pub mod ops;
 mod pool;
 mod probe;
 mod ring;
+mod stream;
 mod table;
 mod unpark;
 
 pub use driver::{Builder, Driver, Stats};
 pub use op::{Completion, Op, Operation};
 pub use probe::{BaselineError, Probe};
+pub use stream::{MultiOp, Multishot};
 pub use unpark::Unparker;

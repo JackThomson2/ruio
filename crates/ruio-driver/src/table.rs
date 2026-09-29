@@ -5,8 +5,11 @@
 //! is freed, so a completion for an earlier occupant of the slot is recognised
 //! as stale.
 
+use std::collections::VecDeque;
 use std::mem;
 use std::task::Waker;
+
+use ruio_sys as sys;
 
 use crate::op::Completion;
 
@@ -26,7 +29,7 @@ pub(crate) struct Table<P> {
     slots: Vec<Slot<P>>,
     /// Head of the list of free slots, threaded through `State::Free`.
     free: u32,
-    /// Slots that are waiting or orphaned.
+    /// Slots whose request the kernel has not finished.
     in_flight: usize,
 }
 
@@ -45,6 +48,31 @@ enum State<P> {
     Completed(Completion),
     /// Submitted, and its future dropped; the payload waits for completion.
     Orphaned(P),
+    /// A multishot request; its completions queue until its stream takes
+    /// them.
+    Streaming(Stream),
+    /// A multishot request whose stream was dropped: its payload handles the
+    /// completions still to come.
+    OrphanedStream(OrphanStream<P>),
+}
+
+struct Stream {
+    completions: VecDeque<Completion>,
+    waker: Option<Waker>,
+    /// Whether the last completion, without `IORING_CQE_F_MORE`, arrived.
+    ended: bool,
+}
+
+struct OrphanStream<P> {
+    /// Absent while the driver hands it completions.
+    payload: Option<P>,
+    completions: VecDeque<Completion>,
+    ended: bool,
+}
+
+/// Whether `completion` is the last of its request.
+fn is_last(completion: &Completion) -> bool {
+    completion.flags() & sys::IORING_CQE_F_MORE == 0
 }
 
 /// What a completion means for the table.
@@ -53,8 +81,20 @@ pub(crate) enum Outcome<P> {
     Wake(Option<Waker>),
     /// An orphaned operation completed; its payload can be released.
     Release(P),
+    /// An orphaned stream has completions for its payload.
+    Deliver(u64),
     /// The completion belongs to no current operation.
     Ignore,
+}
+
+/// What orphaning a stream found.
+pub(crate) struct Abandoned {
+    /// The stream's waker, for the caller to drop after releasing the table.
+    pub(crate) waker: Option<Waker>,
+    /// Completions the stream had not taken, for its payload.
+    pub(crate) completions: VecDeque<Completion>,
+    /// Whether the request had ended; if so the slot is freed.
+    pub(crate) ended: bool,
 }
 
 impl<P> Table<P> {
@@ -73,6 +113,19 @@ impl<P> Table<P> {
 
     /// Adds a submitted operation and returns its `user_data`.
     pub(crate) fn insert(&mut self, waker: Option<Waker>) -> u64 {
+        self.occupy(State::Waiting(waker))
+    }
+
+    /// Adds a submitted multishot request and returns its `user_data`.
+    pub(crate) fn insert_stream(&mut self, waker: Option<Waker>) -> u64 {
+        self.occupy(State::Streaming(Stream {
+            completions: VecDeque::new(),
+            waker,
+            ended: false,
+        }))
+    }
+
+    fn occupy(&mut self, state: State<P>) -> u64 {
         let index = if self.free == NONE {
             let index = u32::try_from(self.slots.len())
                 .ok()
@@ -80,7 +133,7 @@ impl<P> Table<P> {
                 .expect("operation table is full");
             self.slots.push(Slot {
                 generation: 1,
-                state: State::Waiting(waker),
+                state,
             });
             index
         } else {
@@ -90,7 +143,7 @@ impl<P> Table<P> {
                 unreachable!("free list points at a slot in use");
             };
             self.free = next;
-            slot.state = State::Waiting(waker);
+            slot.state = state;
             index
         };
         self.in_flight += 1;
@@ -128,10 +181,115 @@ impl<P> Table<P> {
                     Err(current.replace(waker.clone()))
                 }
             }
-            State::Orphaned(_) | State::Free { .. } => {
+            State::Orphaned(_)
+            | State::Streaming(_)
+            | State::OrphanedStream(_)
+            | State::Free { .. } => {
                 debug_assert!(false, "polled an operation that has no future");
                 Err(None)
             }
+        }
+    }
+
+    /// Takes the stream's next completion, freeing the slot after the last,
+    /// or, if none is queued, arranges for `waker` to be woken when one
+    /// arrives. A replaced waker is returned, as by [`Table::poll`].
+    pub(crate) fn poll_stream(
+        &mut self,
+        user_data: u64,
+        waker: &Waker,
+    ) -> Result<Completion, Option<Waker>> {
+        let Some(index) = self.index(user_data) else {
+            debug_assert!(false, "polled a stream that is not in the table");
+            return Err(None);
+        };
+        let State::Streaming(stream) = &mut self.slots[index as usize].state else {
+            debug_assert!(false, "polled a stream that is not streaming");
+            return Err(None);
+        };
+        match stream.completions.pop_front() {
+            Some(completion) => {
+                if is_last(&completion) {
+                    self.free(index);
+                }
+                Ok(completion)
+            }
+            None if stream
+                .waker
+                .as_ref()
+                .is_some_and(|current| current.will_wake(waker)) =>
+            {
+                Err(None)
+            }
+            None => Err(stream.waker.replace(waker.clone())),
+        }
+    }
+
+    /// Detaches a stream that is being dropped, handing back what it had not
+    /// taken. Unless the request had ended, the slot waits for the payload,
+    /// which [`Table::adopt`] gives it.
+    pub(crate) fn abandon(&mut self, user_data: u64) -> Option<Abandoned> {
+        let index = self.index(user_data)?;
+        let state = &mut self.slots[index as usize].state;
+        let State::Streaming(stream) = state else {
+            debug_assert!(false, "abandoned a stream that is not streaming");
+            return None;
+        };
+        let abandoned = Abandoned {
+            waker: stream.waker.take(),
+            completions: mem::take(&mut stream.completions),
+            ended: stream.ended,
+        };
+        if abandoned.ended {
+            self.free(index);
+        } else {
+            *state = State::OrphanedStream(OrphanStream {
+                payload: None,
+                completions: VecDeque::new(),
+                ended: false,
+            });
+        }
+        Some(abandoned)
+    }
+
+    /// Gives an abandoned stream's slot its payload, or hands the payload back
+    /// if the slot is gone. Returns whether completions arrived meanwhile.
+    pub(crate) fn adopt(&mut self, user_data: u64, payload: P) -> Result<bool, P> {
+        match self.orphan_stream(user_data) {
+            Some(orphan) if orphan.payload.is_none() => {
+                orphan.payload = Some(payload);
+                Ok(!orphan.completions.is_empty())
+            }
+            _ => Err(payload),
+        }
+    }
+
+    /// Takes an orphaned stream's payload and the completions queued for it,
+    /// freeing the slot if the last has arrived. The payload goes back with
+    /// [`Table::adopt`] unless the request has ended.
+    pub(crate) fn take_deliveries(
+        &mut self,
+        user_data: u64,
+    ) -> Option<(P, VecDeque<Completion>, bool)> {
+        let index = self.index(user_data)?;
+        let orphan = self.orphan_stream(user_data)?;
+        if orphan.completions.is_empty() {
+            return None;
+        }
+        let payload = orphan.payload.take()?;
+        let completions = mem::take(&mut orphan.completions);
+        let ended = orphan.ended;
+        if ended {
+            self.free(index);
+        }
+        Some((payload, completions, ended))
+    }
+
+    fn orphan_stream(&mut self, user_data: u64) -> Option<&mut OrphanStream<P>> {
+        let index = self.index(user_data)?;
+        match &mut self.slots[index as usize].state {
+            State::OrphanedStream(orphan) => Some(orphan),
+            _ => None,
         }
     }
 
@@ -188,6 +346,22 @@ impl<P> Table<P> {
                 self.in_flight -= 1;
                 Outcome::Release(payload)
             }
+            State::Streaming(stream) => {
+                if is_last(&completion) {
+                    stream.ended = true;
+                    self.in_flight -= 1;
+                }
+                stream.completions.push_back(completion);
+                Outcome::Wake(stream.waker.take())
+            }
+            State::OrphanedStream(orphan) => {
+                if is_last(&completion) {
+                    orphan.ended = true;
+                    self.in_flight -= 1;
+                }
+                orphan.completions.push_back(completion);
+                Outcome::Deliver(user_data)
+            }
             State::Completed(_) | State::Free { .. } => {
                 debug_assert!(false, "second completion for {user_data:#x}");
                 Outcome::Ignore
@@ -200,12 +374,23 @@ impl<P> Table<P> {
     pub(crate) fn take_orphans(&mut self) -> Vec<P> {
         let mut orphans = Vec::new();
         for index in 0..self.slots.len() {
-            if matches!(self.slots[index].state, State::Orphaned(_)) {
-                let State::Orphaned(payload) = self.free(index as u32) else {
-                    unreachable!();
-                };
-                self.in_flight -= 1;
-                orphans.push(payload);
+            match &mut self.slots[index].state {
+                State::Orphaned(_) => {
+                    let State::Orphaned(payload) = self.free(index as u32) else {
+                        unreachable!();
+                    };
+                    self.in_flight -= 1;
+                    orphans.push(payload);
+                }
+                State::OrphanedStream(orphan) => {
+                    let (payload, ended) = (orphan.payload.take(), orphan.ended);
+                    self.free(index as u32);
+                    if !ended {
+                        self.in_flight -= 1;
+                    }
+                    orphans.extend(payload);
+                }
+                _ => {}
             }
         }
         orphans
