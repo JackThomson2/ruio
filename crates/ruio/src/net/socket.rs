@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use ruio_driver::buf::{BufLease, BufPool, BufResult, IoBuf, IoBufMut, Slice};
+use ruio_driver::buf::{BufBundle, BufPool, BufResult, IoBuf, IoBufMut, Slice};
 use ruio_driver::ops::{self, Recv, Send, Shutdown};
 use ruio_driver::{Descriptor, DirectFd, Driver, Fd, Op, Operation};
 
@@ -420,8 +420,9 @@ impl<B: IoBuf> fmt::Debug for SendZc<'_, B> {
 /// multishot receive that the stream keeps armed. Made by the sockets'
 /// `recv_stream`; see [`ops::RecvStream`].
 ///
-/// Each item is one receive's data, as a lease on a buffer of the pool. The
-/// stream ends when the peer shuts down, or after yielding an error.
+/// Each item is one receive's data, as a bundle of leases on buffers of the
+/// pool: as many as the data waiting fills. The stream ends when the peer
+/// shuts down, or after yielding an error.
 #[derive(Debug)]
 pub struct RecvStream<'a> {
     stream: ops::RecvStream,
@@ -431,12 +432,12 @@ pub struct RecvStream<'a> {
 impl RecvStream<'_> {
     /// The next data, or `None` once the peer has shut down or an error has
     /// been yielded.
-    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufLease>>> {
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufBundle>>> {
         self.stream.poll_next(cx)
     }
 
     /// The next data; see [`poll_next`](RecvStream::poll_next).
-    pub async fn next(&mut self) -> Option<io::Result<BufLease>> {
+    pub async fn next(&mut self) -> Option<io::Result<BufBundle>> {
         poll_fn(|cx| self.poll_next(cx)).await
     }
 }

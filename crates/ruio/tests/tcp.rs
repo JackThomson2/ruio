@@ -32,7 +32,9 @@ fn serve_echo(listener: TcpListener) -> ruio::JoinHandle<()> {
             let _detached = ruio::spawn(async move {
                 let mut received = stream.recv_stream(&pool);
                 while let Some(data) = received.next().await {
-                    stream.write_all(data.unwrap()).await.0.unwrap();
+                    for lease in data.unwrap() {
+                        stream.write_all(lease).await.0.unwrap();
+                    }
                 }
             });
         }

@@ -23,7 +23,7 @@ use std::io;
 use std::ops::{Bound, RangeBounds};
 
 pub use crate::fixed::{FixedBuf, FixedBuffers, FixedIoBuf};
-pub use crate::pool::{BufLease, BufPool};
+pub use crate::pool::{BufBundle, BufLease, BufPool};
 
 /// The result of an operation that held a buffer, and the buffer.
 pub type BufResult<T, B> = (io::Result<T>, B);

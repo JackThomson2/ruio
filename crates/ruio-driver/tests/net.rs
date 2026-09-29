@@ -128,8 +128,9 @@ fn a_direct_connection_carries_data() {
     client.write_all(b"hello").unwrap();
     let pool = BufPool::new(&driver, 4, 64).unwrap();
     let mut stream = RecvStream::new(&driver, server.fd(), &pool);
-    let lease = block_on(&driver, stream.next()).unwrap().unwrap();
-    assert_eq!(&*lease, b"hello");
+    let bundle = block_on(&driver, stream.next()).unwrap().unwrap();
+    assert_eq!(bundle.to_vec(), b"hello");
+    let lease = bundle.into_iter().next().unwrap();
     let (sent, lease) = block_on(&driver, driver.op(Send::new(server.fd(), lease)));
     assert_eq!(sent.unwrap(), 5);
     drop(lease);

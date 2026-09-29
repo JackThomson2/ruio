@@ -78,8 +78,8 @@ async fn a_pair_streams_into_a_pool() -> io::Result<()> {
     drop(a);
     let mut received = Vec::new();
     let mut stream = b.recv_stream(&pool);
-    while let Some(lease) = within(stream.next()).await {
-        received.extend_from_slice(&lease?);
+    while let Some(bundle) = within(stream.next()).await {
+        received.extend(bundle?.to_vec());
     }
     assert_eq!(received, b"0123456789");
     Ok(())

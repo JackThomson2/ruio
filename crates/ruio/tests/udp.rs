@@ -55,7 +55,7 @@ async fn a_recv_stream_takes_datagram_after_datagram() -> io::Result<()> {
     let mut datagrams = receiver.recv_stream(&pool);
     for size in 1..=10 {
         let datagram = within(datagrams.next()).await.unwrap()?;
-        assert_eq!(&*datagram, &vec![size as u8; size][..]);
+        assert_eq!(datagram.to_vec(), vec![size as u8; size]);
     }
     Ok(())
 }

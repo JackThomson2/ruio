@@ -42,9 +42,11 @@
 //!         let pool = pool.clone();
 //!         ruio::spawn(async move {
 //!             let mut received = stream.recv_stream(&pool);
-//!             while let Some(Ok(data)) = received.next().await {
-//!                 if stream.write_all(data).await.0.is_err() {
-//!                     break;
+//!             'echo: while let Some(Ok(data)) = received.next().await {
+//!                 for lease in data {
+//!                     if stream.write_all(lease).await.0.is_err() {
+//!                         break 'echo;
+//!                     }
 //!                 }
 //!             }
 //!         });

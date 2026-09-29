@@ -20,8 +20,8 @@ async fn a_task_receives_what_another_sends() -> io::Result<()> {
         async move {
             let mut stream = RecvStream::new(&ruio::driver(), socket.as_raw_fd(), &pool);
             let mut received = Vec::new();
-            while let Some(lease) = stream.next().await {
-                received.extend_from_slice(&lease?);
+            while let Some(bundle) = stream.next().await {
+                received.extend(bundle?.to_vec());
             }
             io::Result::Ok(received)
         }
