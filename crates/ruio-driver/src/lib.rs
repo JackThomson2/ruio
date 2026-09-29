@@ -11,6 +11,11 @@
 //! keeps the operation's memory until the kernel is done with it. An
 //! [`Unparker`] wakes a parked driver from any thread.
 //!
+//! Operations act on an [`Fd`]: a plain file descriptor, or a direct
+//! descriptor, a slot of the ring's registered file table, which saves the
+//! kernel looking the file up. Operations that make files can put them
+//! there, as a [`DirectFd`].
+//!
 //! [`Probe`] reports what the running kernel supports and checks it against
 //! ruio's baseline, the capabilities of Linux 6.1.
 //!
@@ -49,7 +54,7 @@ mod table;
 mod unpark;
 
 pub use driver::{Builder, Driver, Stats};
-pub use fd::Fd;
+pub use fd::{Descriptor, DirectFd, Fd};
 pub use op::{Completion, Op, Operation};
 pub use probe::{BaselineError, Probe};
 pub use stream::{MultiOp, Multishot};

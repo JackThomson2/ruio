@@ -8,8 +8,10 @@ use std::fmt;
 use std::io;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
+use std::ptr;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
@@ -38,20 +40,36 @@ const SETUP_FLAGS: u32 = sys::IORING_SETUP_SINGLE_ISSUER
 const FORBIDDEN_SQE_FLAGS: u8 =
     sys::IOSQE_IO_LINK | sys::IOSQE_IO_HARDLINK | sys::IOSQE_CQE_SKIP_SUCCESS;
 
+/// The most slots a registered file table gets unless asked for more.
+const DEFAULT_FILES: u32 = 4096;
+
+/// The ID the next driver gets. IDs are never reused.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// The drivers of this thread by ID, for resources that name their ring
+    /// without keeping it alive, such as direct descriptors.
+    static DRIVERS: RefCell<Vec<(u64, Weak<RefCell<Inner>>)>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Configures and creates a [`Driver`].
 #[derive(Clone, Debug)]
 pub struct Builder {
     entries: u32,
     shutdown_timeout: Duration,
+    /// The size of the registered file table, if set.
+    files: Option<u32>,
 }
 
 impl Builder {
     /// A builder with the default configuration: 256 submission queue
-    /// entries, and a one-second shutdown timeout.
+    /// entries, a one-second shutdown timeout, and a registered file table
+    /// of the default size.
     pub fn new() -> Self {
         Self {
             entries: 256,
             shutdown_timeout: Duration::from_secs(1),
+            files: None,
         }
     }
 
@@ -78,13 +96,28 @@ impl Builder {
         self
     }
 
+    /// Sets the number of slots in the ring's registered file table, which
+    /// holds its direct descriptors ([`Fd::Direct`](crate::Fd::Direct)); 0
+    /// leaves the ring without one.
+    ///
+    /// The kernel refuses a table larger than the process's soft
+    /// `RLIMIT_NOFILE`, although direct descriptors do not count against
+    /// it. Unless set, the table has 4096 slots, or as many as that limit
+    /// allows if it is lower, and a ring whose table the kernel refuses goes
+    /// without one.
+    pub fn files(mut self, slots: u32) -> Self {
+        self.files = Some(slots);
+        self
+    }
+
     /// Creates the driver.
     ///
     /// # Errors
     ///
     /// Fails with [`io::ErrorKind::Unsupported`] if the kernel is below ruio's
     /// baseline (see [`Probe::check_baseline`]), or with the system's error if
-    /// the ring cannot be created.
+    /// the ring, or a file table of the size set by [`Builder::files`],
+    /// cannot be created.
     pub fn build(&self) -> io::Result<Driver> {
         let probe = Probe::current()?;
         probe
@@ -97,23 +130,78 @@ impl Builder {
         let entries = self.entries.max(2);
         let cq_entries = entries.saturating_mul(4);
         let ring = Ring::new(entries, cq_entries, flags)?;
+        let files = match self.files {
+            Some(0) => 0,
+            Some(slots) => {
+                register_files(&ring, slots)?;
+                slots
+            }
+            None => {
+                let slots = DEFAULT_FILES.min(soft_nofile_limit());
+                match register_files(&ring, slots) {
+                    Ok(()) => slots,
+                    Err(_) => 0,
+                }
+            }
+        };
         let notify = Arc::new(Notify::new()?);
-        Ok(Driver {
-            inner: Rc::new(RefCell::new(Inner {
-                table: Table::with_capacity(cq_entries as usize),
-                ring,
-                notify,
-                wake_armed: false,
-                next_group: 0,
-                cancels: Vec::new(),
-                wakers: Vec::new(),
-                released: Vec::new(),
-                deliveries: Vec::new(),
-                stats: Stats::default(),
-                shutdown_timeout: self.shutdown_timeout,
-            })),
-        })
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let inner = Rc::new(RefCell::new(Inner {
+            id,
+            table: Table::with_capacity(cq_entries as usize),
+            ring,
+            files,
+            notify,
+            wake_armed: false,
+            next_group: 0,
+            cancels: Vec::new(),
+            wakers: Vec::new(),
+            released: Vec::new(),
+            deliveries: Vec::new(),
+            stats: Stats::default(),
+            shutdown_timeout: self.shutdown_timeout,
+        }));
+        DRIVERS.with(|drivers| {
+            let mut drivers = drivers.borrow_mut();
+            drivers.retain(|(_, driver)| driver.strong_count() > 0);
+            drivers.push((id, Rc::downgrade(&inner)));
+        });
+        Ok(Driver { inner })
     }
+}
+
+/// Registers a table of `slots` empty slots for direct descriptors.
+fn register_files(ring: &Ring, slots: u32) -> io::Result<()> {
+    let mut table = sys::io_uring_rsrc_register {
+        nr: slots,
+        flags: sys::IORING_RSRC_REGISTER_SPARSE,
+        ..Default::default()
+    };
+    let size = size_of::<sys::io_uring_rsrc_register>() as u32;
+    // SAFETY: `table` is one valid registration for the kernel to read, and
+    // a sparse table takes no memory of ours.
+    unsafe {
+        ring.register(
+            sys::IORING_REGISTER_FILES2,
+            ptr::from_mut(&mut table).cast(),
+            size,
+        )
+    }?;
+    Ok(())
+}
+
+/// The process's soft limit on open files, which also bounds the size of a
+/// registered file table.
+fn soft_nofile_limit() -> u32 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes one `rlimit` to the pointer it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 0;
+    }
+    u32::try_from(limit.rlim_cur).unwrap_or(u32::MAX)
 }
 
 impl Default for Builder {
@@ -170,7 +258,11 @@ impl WeakDriver {
 }
 
 struct Inner {
+    /// The driver's ID, unique in the process.
+    id: u64,
     ring: Ring,
+    /// The number of slots in the registered file table.
+    files: u32,
     /// Every operation the kernel may still own.
     table: Table<Box<dyn Orphan>>,
     /// What the driver shares with its unparkers.
@@ -263,6 +355,43 @@ impl Driver {
     /// Counts of the driver's work so far.
     pub fn stats(&self) -> Stats {
         self.inner.borrow().stats
+    }
+
+    /// The number of slots in the ring's registered file table, which holds
+    /// its direct descriptors; see [`Builder::files`].
+    pub fn files(&self) -> u32 {
+        self.inner.borrow().files
+    }
+
+    /// A number that identifies the driver's ring among every ring the
+    /// process has had.
+    pub fn id(&self) -> u64 {
+        self.inner.borrow().id
+    }
+
+    /// The driver of this thread with ID `id`, if it still exists.
+    pub(crate) fn find(id: u64) -> Option<Driver> {
+        DRIVERS
+            .try_with(|drivers| {
+                let drivers = drivers.try_borrow().ok()?;
+                let (_, inner) = drivers.iter().find(|(driver, _)| *driver == id)?;
+                inner.upgrade().map(|inner| Driver { inner })
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Frees slot `slot` of the registered file table, closing the direct
+    /// descriptor in it, with a request queued now, so that it reaches the
+    /// kernel before anything queued later.
+    ///
+    /// If the driver is busy, as it is when code it runs drops a direct
+    /// descriptor, the slot stays taken until the ring is closed.
+    pub(crate) fn close_direct(&self, slot: u32) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            // Without room even after submitting, the slot stays taken.
+            let _ = inner.queue_close(slot);
+        }
     }
 
     /// A provided-buffer group ID for a new pool.
@@ -638,6 +767,24 @@ impl Inner {
         Ok(())
     }
 
+    /// Queues a close of the direct descriptor in `slot`, which frees the
+    /// slot.
+    fn queue_close(&mut self, slot: u32) -> io::Result<()> {
+        if self.ring.sq_space() == 0 {
+            self.submit_queued(1)?;
+        }
+        let sqe = self
+            .ring
+            .next_sqe()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))?;
+        sqe.opcode = sys::IORING_OP_CLOSE;
+        // Slots count from 1 here; 0 would mean a plain descriptor.
+        sqe.file_index = slot + 1;
+        sqe.flags = sys::IOSQE_CQE_SKIP_SUCCESS;
+        sqe.user_data = IGNORED;
+        Ok(())
+    }
+
     /// Queues a cancellation of every request in flight.
     fn queue_cancel_all(&mut self) -> io::Result<()> {
         self.cancels.clear();
@@ -756,6 +903,12 @@ impl Drop for Inner {
         for payload in self.table.take_orphans() {
             mem::forget(payload);
         }
+        let id = self.id;
+        let _ = DRIVERS.try_with(|drivers| {
+            if let Ok(mut drivers) = drivers.try_borrow_mut() {
+                drivers.retain(|&(driver, _)| driver != id);
+            }
+        });
     }
 }
 

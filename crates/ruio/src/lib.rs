@@ -35,8 +35,8 @@ pub use ruio_driver::buf;
 /// for writing new ones.
 pub mod uring {
     pub use ruio_driver::{
-        BaselineError, Completion, Driver, Fd, MultiOp, Multishot, Op, Operation, Probe, Stats,
-        Unparker, ops,
+        BaselineError, Completion, Descriptor, DirectFd, Driver, Fd, MultiOp, Multishot, Op,
+        Operation, Probe, Stats, Unparker, ops,
     };
 }
 

@@ -26,6 +26,10 @@ use crate::buf::{BufLease, BufPool, BufResult, FixedIoBuf, IoBuf, IoBufMut};
 use crate::driver::timespec;
 use crate::{Completion, Driver, Fd, MultiOp, Multishot, Operation};
 
+mod net;
+
+pub use net::Socket;
+
 /// The `off` value that makes reads and writes use the file position.
 const CURRENT_POSITION: u64 = u64::MAX;
 
