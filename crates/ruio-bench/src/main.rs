@@ -37,7 +37,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use client::Load;
-use server::{BUFFER_SIZE, Server};
+use server::Server;
 
 const USAGE: &str = "usage: ruio-bench echo [--quick] [--runs N] [--seconds S] [--warmup S] \
                      [--server-cpu N] [--client-cpus LIST]
@@ -325,22 +325,22 @@ impl Run<'_> {
         })
     }
 
-    /// Buffers enough for two messages per connection, within what a pool
+    /// A buffer per connection, as tokio's server has, within what a pool
     /// can have.
     ///
-    /// A connection needs room for two: the client can send its next
-    /// message before the server has seen its echo sent and returned the
-    /// buffer, and a pool that runs dry ends the multishot receives until
-    /// buffers come back. Much more costs throughput too: the kernel takes
-    /// buffers from a pool's ring in the order they went back, so every
-    /// buffer of the pool is in use in turn, and a pool larger than its load
-    /// spreads the copies over more memory than the cache holds. With 64 KiB
-    /// buffers, 256 connections and 64 KiB messages, 4096 buffers where 256
-    /// would do cost a quarter of the throughput.
+    /// That is enough whatever the size of the messages: the server writes
+    /// its echoes behind, so a buffer goes back once the kernel has sent its
+    /// data, and data a pool has no room for yet waits in the socket. More
+    /// costs throughput: the kernel takes buffers from a pool's ring in the
+    /// order they went back, so every buffer of the pool is in use in turn,
+    /// and a pool larger than its load spreads the copies over more memory
+    /// than the cache holds. With 1024 connections and 64 KiB messages, 8192
+    /// buffers where 1024 do cost a fifth of the throughput.
     fn pool_buffers(&self) -> u16 {
-        let per_message = self.size.div_ceil(BUFFER_SIZE as usize);
-        let wanted = (self.connections * per_message * 2).clamp(64, 1 << 15);
-        wanted.next_power_of_two().min(1 << 15) as u16
+        self.connections
+            .clamp(64, 1 << 15)
+            .next_power_of_two()
+            .min(1 << 15) as u16
     }
 }
 
