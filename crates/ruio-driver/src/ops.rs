@@ -24,14 +24,49 @@ use ruio_sys as sys;
 
 use crate::buf::{BufBundle, BufLease, BufPool, BufResult, FixedIoBuf, IoBuf, IoBufMut};
 use crate::driver::timespec;
-use crate::{Completion, Driver, Fd, MultiOp, Multishot, Operation};
+use crate::{Completion, Descriptor, DirectFd, Driver, Fd, MultiOp, Multishot, Operation};
 
+mod fs;
 mod net;
 
+pub(crate) use fs::CloseSlot;
+pub use fs::{Close, Fallocate, Fsync, Ftruncate, MkdirAt, OpenAt, RenameAt, Statx, UnlinkAt};
 pub use net::{
     Accept, AcceptMulti, AcceptStream, Connect, Recv, RecvFrom, Send, SendTo, SendVectored, SendZc,
     Shutdown, Socket,
 };
+
+/// Where an operation that makes a file puts it.
+#[derive(Clone, Copy, Debug)]
+enum Install {
+    /// In a new file descriptor of the process, closed on `exec`.
+    Plain,
+    /// In a free slot of the registered file table of the ring with this
+    /// ID.
+    Direct(u64),
+}
+
+impl Install {
+    /// The entry's `file_index`.
+    fn file_index(self) -> u32 {
+        match self {
+            Install::Plain => 0,
+            Install::Direct(_) => sys::IORING_FILE_INDEX_ALLOC,
+        }
+    }
+
+    /// Takes ownership of the file the kernel made, which the result names.
+    fn descriptor(self, res: u32) -> Descriptor {
+        match self {
+            Install::Plain => {
+                // SAFETY: the kernel made the descriptor for this operation,
+                // and nothing else owns it.
+                Descriptor::Plain(unsafe { std::os::fd::FromRawFd::from_raw_fd(res.cast_signed()) })
+            }
+            Install::Direct(ring) => Descriptor::Direct(DirectFd::new(ring, res)),
+        }
+    }
+}
 
 /// The `off` value that makes reads and writes use the file position.
 const CURRENT_POSITION: u64 = u64::MAX;

@@ -19,8 +19,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ruio_driver::ops::{
-    Accept, Connect, Nop, Read, Recv, RecvFrom, Send, SendTo, SendVectored, Shutdown, Socket,
-    Timeout, Write,
+    Accept, Close, Connect, Fallocate, Fsync, Ftruncate, MkdirAt, Nop, OpenAt, Read, Recv,
+    RecvFrom, RenameAt, Send, SendTo, SendVectored, Shutdown, Socket, Statx, Timeout, UnlinkAt,
+    Write,
 };
 use ruio_driver::{Completion, Driver, Op, Operation};
 use ruio_sys as sys;
@@ -252,6 +253,47 @@ impl Lcg {
 }
 
 type Task = Pin<Box<dyn Future<Output = ()>>>;
+
+/// File operations, most of which the kernel runs in an io-wq worker, and
+/// statx, which writes its buffer when it completes, dropped at every stage.
+/// Their results do not matter; the memory they point to does.
+#[test]
+fn file_operations_dropped_after_every_number_of_polls() {
+    let driver = Driver::new().unwrap();
+    let dir = std::env::temp_dir().join(format!("ruio-driver-drop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("file");
+    std::fs::write(&path, [FILL; 64]).unwrap();
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let fd = file.as_raw_fd();
+    for polls in 0..4 {
+        drop_after(&driver, driver.op(OpenAt::new(&path).unwrap()), polls);
+        drop_after(&driver, driver.op(Statx::new(&path).unwrap()), polls);
+        drop_after(&driver, driver.op(Statx::fd(fd)), polls);
+        drop_after(&driver, driver.op(Fsync::new(fd)), polls);
+        drop_after(&driver, driver.op(Fallocate::new(fd, 0, 4096)), polls);
+        drop_after(&driver, driver.op(Ftruncate::new(fd, 64)), polls);
+        let sub = dir.join(format!("sub{polls}"));
+        drop_after(&driver, driver.op(MkdirAt::new(&sub).unwrap()), polls);
+        let moved = dir.join(format!("moved{polls}"));
+        drop_after(
+            &driver,
+            driver.op(RenameAt::new(&sub, &moved).unwrap()),
+            polls,
+        );
+        let removed = UnlinkAt::new(&moved).unwrap().directory();
+        drop_after(&driver, driver.op(removed), polls);
+        let closed = std::fs::File::open(&path).unwrap();
+        drop_after(&driver, driver.op(Close::new(closed.into())), polls);
+    }
+    drop(file);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
 
 fn task<T: Operation>(op: Op<T>) -> Task {
     Box::pin(async move { drop(op.await) })

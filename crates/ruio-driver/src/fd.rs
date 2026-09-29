@@ -2,12 +2,15 @@
 //! descriptors, which name slots of a ring's registered file table.
 
 use std::fmt;
+use std::io;
 use std::marker::PhantomData;
+use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use ruio_sys as sys;
 
 use crate::Driver;
+use crate::ops::CloseSlot;
 
 /// The file an operation acts on: a plain file descriptor, or a direct
 /// descriptor, a slot of the registered file table of the ring the operation
@@ -103,6 +106,27 @@ impl DirectFd {
     /// dropped.
     pub fn driver(&self) -> Option<Driver> {
         Driver::find(self.ring)
+    }
+
+    /// Closes the file, on its ring, reporting what closing it found, such
+    /// as an error writing back data, where dropping the descriptor closes
+    /// it without saying.
+    ///
+    /// A ring that is gone took its file table with it, so there is nothing
+    /// to close. The future does nothing until polled, and dropped before
+    /// then it closes the file as dropping the descriptor does.
+    ///
+    /// # Errors
+    ///
+    /// What `close(2)` reports.
+    pub async fn close(self) -> io::Result<()> {
+        let Some(driver) = self.driver() else {
+            return Ok(());
+        };
+        let slot = self.slot;
+        // The close below takes over from the descriptor's drop.
+        mem::forget(self);
+        driver.op(CloseSlot(slot)).await
     }
 }
 

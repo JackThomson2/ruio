@@ -57,6 +57,7 @@ const BASELINE_OPCODES: &[u8] = &[
     sys::IORING_OP_CONNECT,
     sys::IORING_OP_FALLOCATE,
     sys::IORING_OP_OPENAT,
+    sys::IORING_OP_OPENAT2,
     sys::IORING_OP_CLOSE,
     sys::IORING_OP_FILES_UPDATE,
     sys::IORING_OP_STATX,
@@ -74,6 +75,7 @@ const BASELINE_OPCODES: &[u8] = &[
     sys::IORING_OP_SEND_ZC,
     sys::IORING_OP_SENDMSG_ZC,
     sys::IORING_OP_READ_MULTISHOT,
+    sys::IORING_OP_FTRUNCATE,
 ];
 
 /// The setup flags [`Probe::detect`] tries, each with the flags it requires.

@@ -4,28 +4,15 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::mem;
 use std::net;
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::ptr;
 use std::task::{Context, Poll, ready};
 
 use ruio_sys as sys;
 
-use super::complete_read;
+use super::{Install, complete_read};
 use crate::buf::{BufResult, IoBuf, IoBufMut, IoBufs};
-use crate::{
-    Completion, Descriptor, DirectFd, Driver, Fd, MultiOp, Multishot, Operation, SockAddr,
-};
-
-/// Where an operation that makes a file puts it.
-#[derive(Clone, Copy, Debug)]
-enum Install {
-    /// In a new file descriptor of the process, closed on `exec`.
-    Plain,
-    /// In a free slot of the registered file table of the ring with this
-    /// ID.
-    Direct(u64),
-}
+use crate::{Completion, Descriptor, Driver, Fd, MultiOp, Multishot, Operation, SockAddr};
 
 impl Install {
     /// The entry's `accept_flags`: the kernel refuses close-on-exec for a
@@ -34,26 +21,6 @@ impl Install {
         match self {
             Install::Plain => libc::SOCK_CLOEXEC.cast_unsigned(),
             Install::Direct(_) => 0,
-        }
-    }
-
-    /// The entry's `file_index`.
-    fn file_index(self) -> u32 {
-        match self {
-            Install::Plain => 0,
-            Install::Direct(_) => sys::IORING_FILE_INDEX_ALLOC,
-        }
-    }
-
-    /// Takes ownership of the file the kernel made, which the result names.
-    fn descriptor(self, res: u32) -> Descriptor {
-        match self {
-            Install::Plain => {
-                // SAFETY: the kernel made the descriptor for this operation,
-                // and nothing else owns it.
-                Descriptor::Plain(unsafe { OwnedFd::from_raw_fd(res.cast_signed()) })
-            }
-            Install::Direct(ring) => Descriptor::Direct(DirectFd::new(ring, res)),
         }
     }
 }
