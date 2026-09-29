@@ -34,6 +34,7 @@ an API that still reads like ordinary async Rust.
 | Interop | `futures-io` and `tokio::io` adapters in `ruio-compat`, in the last milestone. | Ecosystem access matters, but must not shape the core API. |
 | Toolchain | Newest stable Rust (1.97.1), edition 2024, pinned in `rust-toolchain.toml`. Nightly only for sanitizers. | No minimum supported Rust version is required. |
 | Dependencies | `libc` only, in the core crates. | Small audit surface. |
+| Direct descriptors | Supported throughout the driver; `ruio::net` accepts them on request (`set_direct`), plain descriptors by default. | On the 6.1 baseline a direct socket can neither report its addresses nor change options (`setsockopt` through `URING_CMD` is 6.7, `getsockname` 6.19), and a full file table makes the kernel close the connection it accepted. The echo benchmark measures the file lookups they save at about 1%. |
 
 ## Architecture
 
@@ -44,7 +45,8 @@ crates/
                   registered files, capability probe
   ruio-executor/  per-thread scheduler, tasks, timer wheel, thread-per-core builder
   ruio-macros/    #[ruio::main], #[ruio::test]
-  ruio/           public API: runtime, time, uring; later net, fs, buf, io
+  ruio/           public API: runtime, time, uring, buf, net; later fs, io
+  ruio-bench/     benchmarks against other runtimes, the one crate that depends on them
   ruio-compat/    futures-io and tokio::io adapters
 ```
 
@@ -81,7 +83,12 @@ it is dropped. Three rules follow.
    length reads into the spare capacity. A slice clamps itself to its buffer
    whenever it is used, and zeroes any gap before its start when it marks
    bytes initialized, so a vector never counts memory nothing wrote.
-   `bytes::BytesMut` can come as an optional feature.
+   `bytes::BytesMut` can come as an optional feature. Socket addresses, and
+   the `msghdr` and iovec of a `recvmsg`, are boxed in the operation. The
+   one exception is a linked timeout's duration, which the kernel copies
+   when it consumes the entry (`IORING_FEAT_SUBMIT_STABLE`): it lives in the
+   ring's memory for that entry's slot, which is not reused before then, so
+   a timeout allocates nothing.
 2. **Dropping an in-flight operation hands its resources to the driver.** The
    future moves them into its slot in the operation table, marks the slot
    orphaned and queues a cancellation. They are freed when the final CQE
@@ -121,6 +128,13 @@ CQSIZE | CLAMP`, with a completion queue four times the submission queue, plus
 registered (`IORING_REGISTER_RING_FDS`) so `io_uring_enter` skips the file
 lookup on every call.
 
+Every ring registers a sparse file table for direct descriptors
+(`IORING_REGISTER_FILES2` with `IORING_RSRC_REGISTER_SPARSE`): 4096 slots by
+default, or fewer if the process's soft `RLIMIT_NOFILE` is lower, since the
+kernel refuses larger tables. `Builder::files` sets the size, 0 for none; a
+ring whose default table is refused goes without. A ring has at least two
+submission queue entries, room for an operation and its linked timeout.
+
 `SQPOLL` and NAPI busy polling (6.9) are opt-in. The kernel rejects
 `DEFER_TASKRUN` and `TASKRUN_FLAG` together with `SQPOLL`, so that mode uses
 its own flag set.
@@ -135,7 +149,8 @@ its own flag set.
   cost is one system call per pass whether one or a thousand operations were
   queued.
 - A full submission queue is submitted early instead of failing the
-  operation.
+  operation. An operation with a linked timeout needs two entries that reach
+  the kernel together, so queueing makes room for both.
 - The completion queue is drained fully on every pass. Overflow is handled
   (`NODROP` backlog, `IORING_SQ_CQ_OVERFLOW`) rather than assumed away;
   multishot operations make it realistic.
@@ -153,10 +168,16 @@ its own flag set.
   orphaned stream (the payload of a dropped stream, handed each completion
   until the last).
 - Operations are lazy: nothing is queued before the first poll, which leaves
-  room for combinators such as `.timeout(d)` (a linked timeout),
-  `.link(next)` and `.fixed()` to shape the SQE at no cost. Linked entries
-  have to be queued together, so they will not go through `Operation`, whose
-  entries may not link.
+  room for combinators to shape the SQE at no cost. `Op::timeout(d)` queues
+  the operation with `IOSQE_IO_LINK` and an `IORING_OP_LINK_TIMEOUT` behind
+  it, which posts no completion when disarmed (`IOSQE_CQE_SKIP_SUCCESS`),
+  and any it posts is ignored. An operation it cancels completes with
+  `ECANCELED`, which the `Op` reports as `ETIMEDOUT`, since nothing else
+  cancels an operation whose `Op` exists; and it hands back its buffer, which
+  a timer in user space cannot, as it can only drop the `Op`. The driver
+  builds the chain itself: an `Operation`'s entry may not link. A general
+  `.link(next)` is not built. What `.fixed()` would have chosen is the
+  operation's `Fd`.
 
 ### Operations
 
@@ -173,8 +194,22 @@ its own flag set.
   re-armed. Dropping an armed stream hands the completions it had not taken
   to the request, cancels it, and keeps handing it completions until the
   last, so items that own resources, such as leased buffers, release them.
-  Zero-copy sends, which post a notification after their result, will need
-  a similar trait.
+  Zero-copy sends fit the same contract, their result carrying
+  `IORING_CQE_F_MORE` and the notification ending the request, so `SendZc`
+  runs as a stream and resolves with its buffer after the notification.
+- Operations act on an `Fd`: a plain descriptor, or a direct one, which goes
+  in the SQE with `IOSQE_FIXED_FILE`. `Socket`, `Accept` and `AcceptMulti`
+  make a `Descriptor`, plain or, on request, direct (a `DirectFd`, in a slot
+  the kernel picks with `IORING_FILE_INDEX_ALLOC`). Dropping a `DirectFd`
+  queues an `IORING_OP_CLOSE` of its slot at once, so the close reaches the
+  kernel before anything queued later.
+- The socket operations are `Socket`, `Connect`, `Accept`, `AcceptMulti`,
+  `Send`, `SendTo` (`addr2`, 6.1), `SendZc`, `Recv`, `RecvFrom` (through
+  `recvmsg`, for the sender's address) and `Shutdown`. With `MSG_WAITALL` the
+  kernel carries on through short sends and receives on a stream socket, so
+  one request moves a whole buffer. `SockAddr` holds an address as the
+  kernel reads and writes it, and converts exactly to and from the standard
+  library's internet and Unix socket addresses.
 - `Driver::op` wraps an operation in an `Op` future, which is `Unpin`.
   Dropping it in flight moves the operation into its slot and queues an
   `ASYNC_CANCEL` whose success posts no completion. When the operation's own
@@ -188,19 +223,27 @@ its own flag set.
   ends it with `ENOBUFS` it waits for a lease to return a buffer (the pool
   wakes waiters), and when the kernel ends it for its own reasons it re-arms
   at once. The data waits in the socket meanwhile, so none is lost.
+  `AcceptStream` does the same for a multishot accept, which the kernel ends
+  when the completion queue is full; the connections wait in the backlog.
+  It yields an error that ends the request and re-arms when polled again, as
+  a server carries on after a failed `accept(2)`.
 
 ### Kernel features
 
-- Multishot accept, recv, read (6.7) and poll, exposed as streams and re-armed
+- Multishot accept, recv and poll, exposed as streams and re-armed
   automatically when the kernel ends them (no `IORING_CQE_F_MORE`) or the
-  buffer pool runs dry (`ENOBUFS`).
-- Direct descriptors: accept, socket and open install straight into the
-  registered file table (`IORING_FILE_INDEX_ALLOC`), so later operations skip
-  the file lookup. Plain descriptors on request.
+  buffer pool runs dry (`ENOBUFS`); multishot read (6.7) is still to come.
+- Direct descriptors: socket and accept install straight into the registered
+  file table (`IORING_FILE_INDEX_ALLOC`), so later operations skip the file
+  lookup; open will in M5. The driver makes them on request; see the
+  decision above for why sockets have plain ones by default.
 - Provided-buffer rings, with incremental consumption (6.12) and send/recv
   bundles (6.10) when available.
-- Zero-copy send, with the notification CQE keeping the buffer alive; used
-  above a size threshold chosen by benchmark.
+- Zero-copy send, with the notification CQE keeping the buffer alive, on
+  request (`send_zc`). Over loopback the kernel copies the data when it
+  reaches the peer's socket, so only a network card can show where
+  zero-copy starts to pay; the size threshold for choosing it automatically
+  waits for a benchmark across two machines.
 - Registered buffers for file I/O (`READ_FIXED`, `WRITE_FIXED`).
 - `MSG_RING` for waking other rings and passing descriptors between them.
 
@@ -253,12 +296,49 @@ baseline are used only when probed.
   `Waker::wake`.
 - I/O types are `!Send` through an explicit marker, not because they happen to
   contain an `Rc`, so a work-stealing mode can lift the restriction without
-  changing their layout.
+  changing their layout. The sockets and `DirectFd` do this.
 - Handles to registered resources (files, buffers) record which ring owns
   them, so an operation from a migrated task can be routed back to that ring
-  (`MSG_RING`) or fall back to a plain descriptor.
+  (`MSG_RING`) or fall back to a plain descriptor. A `DirectFd` names its
+  ring by ID and finds it in its thread's registry of drivers, so it neither
+  keeps the ring open nor holds an `Rc`; once the ring is gone, a socket
+  aims its operations at a slot no table has, so they fail with `EBADF`
+  rather than reach the file in the same slot of a later ring.
 - The executor sits behind the driver's waker interface in its own crate, so
   another scheduler can be added without touching the driver.
+
+## Networking
+
+`ruio::net` has `TcpListener`, `TcpStream`, `UdpSocket`, `UnixListener`,
+`UnixStream` and `UnixDatagram`, running on the ring of the thread's runtime.
+
+- Reads and writes take owned buffers and hand them back with the result.
+  `write_all` and `read_exact` ask for `MSG_WAITALL`, and send again what
+  the kernel still leaves undone, which also surfaces why it stopped.
+  `recv_stream` receives into a `BufPool` with one multishot request, and a
+  listener's `incoming` accepts with one; `accept` takes one connection and
+  reports the peer. TCP and UDP sockets send zero-copy with `send_zc`.
+- Every operation borrows its socket, so the descriptor stays open until the
+  kernel has the operation: dropping the socket first does not compile.
+- `SocketOp::timeout` sets an operation's linked timeout. `WriteAll` and
+  `ReadExact` take one for the whole transfer, each request getting the time
+  left. A send cut short part of the way reports the bytes it sent rather
+  than `ECANCELED`; the next request, with no time left, is what fails with
+  `TimedOut`, and the buffer still comes back.
+- Listeners bind with a backlog of 1024, as tokio's do, instead of the
+  standard library's 128, which a burst of clients overflows. On request
+  (`set_direct`) they accept direct descriptors, which cannot report their
+  local address or change socket options, and know the peer's address only
+  from `accept`. When the file table is full the kernel closes the
+  connection it could not install and fails the accept with `ENFILE`;
+  `Incoming` yields that and carries on with plain descriptors.
+- Addresses resolve through `ToSocketAddrs`, so a host name blocks the
+  thread, as in the standard library. A Unix datagram sent to a path that
+  makes no address goes to the kernel as the unnamed address, which fails
+  with `EINVAL`, so the buffer comes back with the error.
+- Still to come: a `copy` using `splice`, owned-buffer read and write traits
+  that files can share, vectored sends, `bind_reuseport` (M6), and socket
+  options for direct descriptors on kernels that have them in `URING_CMD`.
 
 ## API sketch
 
@@ -284,7 +364,9 @@ async fn main() -> std::io::Result<()> {
 ```
 
 Owned-buffer read and write traits carry the usual helpers (`read_exact`,
-`write_all`, and `copy` using `splice` between descriptors).
+`write_all`, and `copy` using `splice` between descriptors). The sockets
+have `read_exact` and `write_all` of their own so far, and the sketch's
+`send_all(chunk).timeout(d)` is `write_all(chunk).timeout(d)`.
 
 ## Verification
 
@@ -300,7 +382,14 @@ Owned-buffer read and write traits carry the usual helpers (`read_exact`,
   with leak detection (nightly, `-Zbuild-std`). Miri cannot model io_uring,
   so this is the main safety net.
 - **Fault injection.** `ENOBUFS`, `EAGAIN` and `ECANCELED` completions, and
-  tiny rings to force a full submission queue and completion overflow.
+  tiny rings to force a full submission queue and completion overflow, and
+  to end multishot accepts with a burst of connections. Tiny file tables
+  force `ENFILE`, and zero-length linked timeouts time operations out at
+  once.
+- **Sockets.** Socket tests run over the loopback interface and Unix
+  sockets. Blocking std sockets in them have read timeouts, and waits inside
+  the runtime a deadline, so a missing reply fails a test rather than
+  hanging it.
 - **Feature matrix.** Disable probed features to force the fallbacks, and run
   the 6.1 baseline in a VM (for example virtme-ng), since development hosts
   run newer kernels.
@@ -317,6 +406,76 @@ Compared against tokio (epoll), monoio, compio and glommio:
 Measured: throughput, p99 latency, system calls per operation and CPU time per
 request. A CI job fails on regressions.
 
+### TCP echo, as built in M4
+
+`ruio-bench echo` runs each server in a process of its own on one CPU, with
+its SMT sibling idle, and the load generator, on tokio's multi-threaded
+runtime, on 24 other CPUs. Each connection sends a message and waits for its
+echo, again and again, for 3 seconds after 1 second of warm-up, and the
+client checks every echo. The servers are single-threaded: ruio with plain
+and with direct descriptors, and tokio's current-thread runtime. Both
+receive into 16 KiB buffers, ruio from a pool with room for two messages per
+connection, tokio into a buffer per connection, and both set `TCP_NODELAY`
+on the listener. Round trips per second, measured on a Xeon Platinum 8488C
+with Linux 7.0, over loopback:
+
+| Connections | Message | tokio | ruio | ruio, direct | p99 tokio (µs) | p99 ruio (µs) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 64 B | 48k | 47k (0.99×) | 1.03× | 28 | 28 |
+| 1 | 1 KiB | 45k | 46k (1.03×) | 1.03× | 28 | 28 |
+| 1 | 16 KiB | 31k | 33k (1.06×) | 1.04× | 40 | 38 |
+| 1 | 64 KiB | 19k | 16k (0.86×) | 0.89× | 68 | 74 |
+| 16 | 64 B | 212k | 209k (0.98×) | 0.99× | 94 | 136 |
+| 16 | 1 KiB | 201k | 197k (0.98×) | 0.99× | 100 | 142 |
+| 16 | 16 KiB | 117k | 122k (1.05×) | 1.05× | 189 | 177 |
+| 16 | 64 KiB | 42k | 31k (0.74×) | 0.67× | 559 | 660 |
+| 256 | 64 B | 205k | 203k (0.99×) | 1.00× | 1304 | 1795 |
+| 256 | 1 KiB | 196k | 195k (1.00×) | 1.00× | 1377 | 1875 |
+| 256 | 16 KiB | 155k | 147k (0.95×) | 0.95× | 1810 | 2487 |
+| 256 | 64 KiB | 49k | 26k (0.53×) | 0.53× | 5535 | 10358 |
+| 1,024 | 64 B | 222k | 214k (0.96×) | 0.96× | 4792 | 6643 |
+| 1,024 | 1 KiB | 220k | 215k (0.98×) | 0.97× | 4787 | 6596 |
+| 1,024 | 16 KiB | 140k | 135k (0.96×) | 0.96× | 7494 | 10261 |
+| 1,024 | 64 KiB | 37k | 22k (0.59×) | 0.59× | 28103 | 47903 |
+| 10,000 | 64 B | 219k | 181k (0.83×) | 0.83× | 46868 | 79848 |
+| 10,000 | 1 KiB | 187k | 155k (0.83×) | 0.83× | 55582 | 92246 |
+| 10,000 | 16 KiB | 93k | 79k (0.85×) | 0.84× | 109911 | 168502 |
+| 10,000 | 64 KiB | 33k | 18k (0.56×) | 0.55× | 309906 | 761477 |
+
+ruio is not ahead of tokio. Loaded, both servers spend 95% of their CPU in
+the kernel: over loopback a server's CPU runs the transmit path of every
+echo and the receive processing of the client's socket too, and profiles
+put 85% to 90% of its time in the network stack (connection tracking
+included, which this host has on) and 5% in copying. What the runtimes
+spend comes to about 10% each: tokio 4% in epoll, 2% entering system calls
+(cheap with enhanced IBRS) and 4% in user space; ruio a similar share in
+io_uring's bookkeeping and 5% in user space. Within that slice ruio loses
+where its structure costs it:
+
+- Each piece of a message takes a trip through the loop: the received piece
+  wakes the task, and the completion of its send wakes it again, while a
+  tokio task reads and writes the whole message in one poll. With 64 KiB
+  buffers, 256 connections with 64 KiB messages go from 0.53× to 0.73×, and
+  to 0.97× with a pool of 256 buffers, one per connection, as well.
+- A pool's ring hands out buffers in the order they came back, so every
+  buffer of the pool is in use in turn, and a pool larger than its load
+  spreads the copies over more memory than the cache holds: with 64 KiB
+  buffers, 4096 of them where 256 would do cost a quarter of the throughput.
+  A pool of one buffer per connection runs dry instead, since the next
+  message can arrive before the echo's buffer is back, and costs a tenth
+  with small messages.
+- Sends reach the kernel at the end of a loop pass, after up to 64 tasks
+  have run, which puts off every echo in the pass; that shows in the p99.
+
+Direct descriptors save the kernel's file lookups, about 1% here, within the
+noise. What could move the rest: bundles (6.10), which receive and send
+several buffers per entry; a pool that hands out the buffers returned last
+first, keeping only a shallow ring filled from spares, or incremental
+consumption (6.12), which packs receives into fewer buffers; vectored and
+linked sends; and submitting earlier in a pass for latency. Across two
+machines the server no longer does the client's receive processing, which
+leaves the runtime a larger share of its time; multi-core runtimes are M6.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -330,10 +489,13 @@ request. A CI job fails on regressions.
 | M6 | Multi-core: builder, CPU pinning, `spawn_on`, cross-core channels, descriptor passing | Close to linear scaling up to 96 cores |
 | M7 | Compat adapters, hyper and rustls examples, documentation | A hyper server runs through the adapters |
 
-M0 to M3 are done. Still to come besides the later milestones: linked
-operations and the `.timeout(d)` combinator, which M4 needs for network
-timeouts; the probed extras for buffers (multishot read from 6.7, bundles
-from 6.10, incremental consumption from 6.12); and channels and other
+M0 to M3 are done. M4's scope is built, with linked timeouts and the
+`.timeout(d)` combinator, but not its criterion: the echo benchmark finds
+ruio level with tokio for small messages and behind for 64 KiB messages and
+at 10,000 connections (see [TCP echo, as built in M4](#tcp-echo-as-built-in-m4)).
+Still to come besides the later milestones: the probed extras for buffers
+(multishot read from 6.7, bundles from 6.10, incremental consumption from
+6.12); general linked operations (`.link(next)`); and channels and other
 synchronization primitives, with the cooperative budget they need.
 
 ## Open questions
