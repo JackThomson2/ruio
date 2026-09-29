@@ -1,12 +1,14 @@
 //! An io_uring instance with its queues mapped into memory.
 
-use std::ffi::c_int;
+use std::ffi::{c_int, c_void};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::ptr::{self, NonNull};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ruio_sys as sys;
+
+use crate::mem::Mapping;
 
 /// Setup flags [`Ring`] cannot work with: they change the memory layout, who
 /// consumes the submission queue, or how the ring is entered.
@@ -35,8 +37,8 @@ pub(crate) struct Ring {
     enter_flags: u32,
     // Declared after the queues, which point into them, and before the
     // descriptor, so they are unmapped before it is closed.
-    _rings: Mmap,
-    _sqes: Mmap,
+    _rings: Mapping,
+    _sqes: Mapping,
     fd: OwnedFd,
 }
 
@@ -101,9 +103,9 @@ impl Ring {
         };
         let cq_len =
             cq_off.cqes as usize + params.cq_entries as usize * size_of::<sys::io_uring_cqe>();
-        let rings = Mmap::new(&fd, sys::IORING_OFF_SQ_RING, sq_len.max(cq_len))?;
-        let sqes = Mmap::new(
-            &fd,
+        let rings = Mapping::shared(fd.as_fd(), sys::IORING_OFF_SQ_RING, sq_len.max(cq_len))?;
+        let sqes = Mapping::shared(
+            fd.as_fd(),
             sys::IORING_OFF_SQES,
             params.sq_entries as usize * size_of::<sys::io_uring_sqe>(),
         )?;
@@ -158,6 +160,22 @@ impl Ring {
     /// skips looking it up.
     pub(crate) fn is_registered(&self) -> bool {
         self.enter_flags != 0
+    }
+
+    /// Registers resources with the ring, or queries or configures it; see
+    /// [`sys::io_uring_register`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`sys::io_uring_register`].
+    pub(crate) unsafe fn register(
+        &self,
+        opcode: u32,
+        arg: *mut c_void,
+        nr_args: u32,
+    ) -> io::Result<u32> {
+        // SAFETY: the caller upholds the contract of `io_uring_register`.
+        unsafe { sys::io_uring_register(self.fd.as_raw_fd(), opcode, arg, nr_args) }
     }
 
     /// The number of submission queue slots.
@@ -321,45 +339,6 @@ fn register(fd: &OwnedFd) -> Option<c_int> {
 unsafe fn atomic<'a>(ptr: *mut u32) -> &'a AtomicU32 {
     // SAFETY: the caller's guarantees are the requirements of `from_ptr`.
     unsafe { AtomicU32::from_ptr(ptr) }
-}
-
-/// A shared mapping of ring memory, unmapped on drop.
-struct Mmap {
-    ptr: NonNull<u8>,
-    len: usize,
-}
-
-impl Mmap {
-    fn new(fd: &OwnedFd, offset: u64, len: usize) -> io::Result<Self> {
-        // SAFETY: this creates a new mapping and affects no existing memory.
-        let ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
-                fd.as_raw_fd(),
-                offset as libc::off_t,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let ptr = NonNull::new(ptr.cast()).ok_or_else(|| io::Error::other("mmap returned null"))?;
-        Ok(Self { ptr, len })
-    }
-
-    fn ptr(&self) -> *mut u8 {
-        self.ptr.as_ptr()
-    }
-}
-
-impl Drop for Mmap {
-    fn drop(&mut self) {
-        // SAFETY: the mapping came from `mmap` with this length, and the ring
-        // that pointed into it is being dropped.
-        unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
-    }
 }
 
 #[cfg(test)]

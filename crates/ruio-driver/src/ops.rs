@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use ruio_sys as sys;
 
-use crate::buf::{BufResult, IoBuf, IoBufMut};
+use crate::buf::{BufResult, FixedIoBuf, IoBuf, IoBufMut};
 use crate::driver::timespec;
 use crate::{Completion, Operation};
 
@@ -117,23 +117,57 @@ unsafe impl<B: IoBufMut> Operation for Read<B> {
     type Output = BufResult<usize, B>;
 
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
-        sqe.opcode = sys::IORING_OP_READ;
-        sqe.fd = self.fd;
-        sqe.addr = self.buf.stable_mut_ptr().expose_provenance() as u64;
-        sqe.len = u32::try_from(self.buf.bytes_total()).unwrap_or(u32::MAX);
-        sqe.off = self.offset;
+        prepare_read(
+            sqe,
+            sys::IORING_OP_READ,
+            self.fd,
+            &mut self.buf,
+            self.offset,
+        );
     }
 
-    fn complete(mut self, completion: Completion) -> Self::Output {
-        let result = completion.result().map(|read| {
-            let read = (read as usize).min(self.buf.bytes_total());
-            // SAFETY: the kernel initialized the first `read` bytes, which
-            // are within the buffer.
-            unsafe { self.buf.set_init(read) };
-            read
-        });
-        (result, self.buf)
+    fn complete(self, completion: Completion) -> Self::Output {
+        complete_read(self.buf, completion)
     }
+}
+
+fn prepare_read<B: IoBufMut>(
+    sqe: &mut sys::io_uring_sqe,
+    opcode: u8,
+    fd: RawFd,
+    buf: &mut B,
+    offset: u64,
+) {
+    sqe.opcode = opcode;
+    sqe.fd = fd;
+    sqe.addr = buf.stable_mut_ptr().expose_provenance() as u64;
+    sqe.len = u32::try_from(buf.bytes_total()).unwrap_or(u32::MAX);
+    sqe.off = offset;
+}
+
+fn complete_read<B: IoBufMut>(mut buf: B, completion: Completion) -> BufResult<usize, B> {
+    let result = completion.result().map(|read| {
+        let read = (read as usize).min(buf.bytes_total());
+        // SAFETY: the kernel initialized the first `read` bytes, which are
+        // within the buffer.
+        unsafe { buf.set_init(read) };
+        read
+    });
+    (result, buf)
+}
+
+fn prepare_write<B: IoBuf>(
+    sqe: &mut sys::io_uring_sqe,
+    opcode: u8,
+    fd: RawFd,
+    buf: &B,
+    offset: u64,
+) {
+    sqe.opcode = opcode;
+    sqe.fd = fd;
+    sqe.addr = buf.stable_ptr().expose_provenance() as u64;
+    sqe.len = u32::try_from(buf.bytes_init()).unwrap_or(u32::MAX);
+    sqe.off = offset;
 }
 
 /// Writes a buffer's initialized bytes to a file descriptor, like `write(2)`,
@@ -167,11 +201,96 @@ unsafe impl<B: IoBuf> Operation for Write<B> {
     type Output = BufResult<usize, B>;
 
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
-        sqe.opcode = sys::IORING_OP_WRITE;
-        sqe.fd = self.fd;
-        sqe.addr = self.buf.stable_ptr().expose_provenance() as u64;
-        sqe.len = u32::try_from(self.buf.bytes_init()).unwrap_or(u32::MAX);
-        sqe.off = self.offset;
+        prepare_write(sqe, sys::IORING_OP_WRITE, self.fd, &self.buf, self.offset);
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        (
+            completion.result().map(|written| written as usize),
+            self.buf,
+        )
+    }
+}
+
+/// Reads into a registered buffer, like [`Read`], without the kernel mapping
+/// the buffer's memory for the read.
+#[derive(Debug)]
+pub struct ReadFixed<B> {
+    fd: RawFd,
+    buf: B,
+    offset: u64,
+}
+
+impl<B: IoBufMut + FixedIoBuf> ReadFixed<B> {
+    /// Reads at the file position, advancing it.
+    pub fn new(fd: RawFd, buf: B) -> Self {
+        Self::at(fd, buf, CURRENT_POSITION)
+    }
+
+    /// Reads at `offset`, leaving the file position alone.
+    pub fn at(fd: RawFd, buf: B, offset: u64) -> Self {
+        Self { fd, buf, offset }
+    }
+}
+
+// SAFETY: as for `Read`; the buffer index names registered memory, which the
+// kernel checks the buffer lies in.
+unsafe impl<B: IoBufMut + FixedIoBuf> Operation for ReadFixed<B> {
+    /// The number of bytes read, and the buffer.
+    type Output = BufResult<usize, B>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        prepare_read(
+            sqe,
+            sys::IORING_OP_READ_FIXED,
+            self.fd,
+            &mut self.buf,
+            self.offset,
+        );
+        sqe.buf_index = self.buf.buf_index();
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        complete_read(self.buf, completion)
+    }
+}
+
+/// Writes from a registered buffer, like [`Write`], without the kernel
+/// mapping the buffer's memory for the write.
+#[derive(Debug)]
+pub struct WriteFixed<B> {
+    fd: RawFd,
+    buf: B,
+    offset: u64,
+}
+
+impl<B: IoBuf + FixedIoBuf> WriteFixed<B> {
+    /// Writes at the file position, advancing it.
+    pub fn new(fd: RawFd, buf: B) -> Self {
+        Self::at(fd, buf, CURRENT_POSITION)
+    }
+
+    /// Writes at `offset`, leaving the file position alone.
+    pub fn at(fd: RawFd, buf: B, offset: u64) -> Self {
+        Self { fd, buf, offset }
+    }
+}
+
+// SAFETY: as for `Write`; the buffer index names registered memory, which the
+// kernel checks the buffer lies in.
+unsafe impl<B: IoBuf + FixedIoBuf> Operation for WriteFixed<B> {
+    /// The number of bytes written, and the buffer.
+    type Output = BufResult<usize, B>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        prepare_write(
+            sqe,
+            sys::IORING_OP_WRITE_FIXED,
+            self.fd,
+            &self.buf,
+            self.offset,
+        );
+        sqe.buf_index = self.buf.buf_index();
     }
 
     fn complete(self, completion: Completion) -> Self::Output {

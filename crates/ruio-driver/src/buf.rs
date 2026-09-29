@@ -12,10 +12,15 @@
 //! initialized. A write sends a buffer's initialized bytes. [`IoBuf::slice`]
 //! narrows either to part of a buffer: `vec.slice(vec.len()..)` reads into a
 //! vector's spare capacity, after its contents.
+//!
+//! [`FixedBuffers`] are registered with a ring once, for reads and writes
+//! that skip mapping the memory on every operation.
 
 use std::fmt;
 use std::io;
 use std::ops::{Bound, RangeBounds};
+
+pub use crate::fixed::{FixedBuf, FixedBuffers, FixedIoBuf};
 
 /// The result of an operation that held a buffer, and the buffer.
 pub type BufResult<T, B> = (io::Result<T>, B);

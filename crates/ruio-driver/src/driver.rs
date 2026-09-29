@@ -2,10 +2,11 @@
 //! submits them and delivers their completions.
 
 use std::cell::RefCell;
+use std::ffi::c_void;
 use std::fmt;
 use std::io;
 use std::mem;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::task::Waker;
 use std::time::{Duration, Instant};
@@ -146,6 +147,21 @@ pub struct Driver {
     inner: Rc<RefCell<Inner>>,
 }
 
+/// A handle to a driver that does not keep it alive, for resources that
+/// outlive their use of the ring, such as registered memory, and would
+/// otherwise keep the ring alive in a cycle through operations that hold
+/// them.
+#[derive(Clone)]
+pub(crate) struct WeakDriver {
+    inner: Weak<RefCell<Inner>>,
+}
+
+impl WeakDriver {
+    pub(crate) fn upgrade(&self) -> Option<Driver> {
+        self.inner.upgrade().map(|inner| Driver { inner })
+    }
+}
+
 struct Inner {
     ring: Ring,
     /// Every operation the kernel may still own.
@@ -230,6 +246,36 @@ impl Driver {
     /// Counts of the driver's work so far.
     pub fn stats(&self) -> Stats {
         self.inner.borrow().stats
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakDriver {
+        WeakDriver {
+            inner: Rc::downgrade(&self.inner),
+        }
+    }
+
+    /// Registers resources with the ring, or queries or configures it.
+    ///
+    /// # Errors
+    ///
+    /// `EBUSY` if called from code running inside the driver, or what the
+    /// kernel reports.
+    ///
+    /// # Safety
+    ///
+    /// As for [`sys::io_uring_register`].
+    pub(crate) unsafe fn register(
+        &self,
+        opcode: u32,
+        arg: *mut c_void,
+        nr_args: u32,
+    ) -> io::Result<u32> {
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
+        // SAFETY: the caller upholds the contract of `io_uring_register`.
+        unsafe { inner.ring.register(opcode, arg, nr_args) }
     }
 
     fn enter(&self, min_complete: u32, timeout: Option<Duration>) -> io::Result<()> {

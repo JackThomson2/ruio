@@ -36,6 +36,8 @@
 
 pub mod buf;
 mod driver;
+mod fixed;
+mod mem;
 mod op;
 pub mod ops;
 mod probe;
