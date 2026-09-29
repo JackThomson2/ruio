@@ -520,4 +520,25 @@ impl RecvStream<'_> {
     pub async fn next(&mut self) -> Option<io::Result<BufBundle>> {
         poll_fn(|cx| self.poll_next(cx)).await
     }
+
+    /// The next data if it has arrived already, or `None`, without waiting;
+    /// see [`ops::RecvStream::next_ready`]. On a stream socket, appending it
+    /// to the data taken before gathers everything that has arrived:
+    ///
+    /// ```no_run
+    /// # async fn echo(stream: ruio::net::TcpStream, pool: ruio::buf::BufPool) {
+    /// let mut received = stream.recv_stream(&pool);
+    /// while let Some(Ok(mut data)) = received.next().await {
+    ///     while let Some(Ok(more)) = received.next_ready() {
+    ///         data.append(more);
+    ///     }
+    ///     if stream.write_all_vectored(data).await.0.is_err() {
+    ///         break;
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub fn next_ready(&mut self) -> Option<io::Result<BufBundle>> {
+        self.stream.next_ready()
+    }
 }

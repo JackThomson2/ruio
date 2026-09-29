@@ -42,7 +42,11 @@
 //!         let pool = pool.clone();
 //!         ruio::spawn(async move {
 //!             let mut received = stream.recv_stream(&pool);
-//!             while let Some(Ok(data)) = received.next().await {
+//!             while let Some(Ok(mut data)) = received.next().await {
+//!                 // Whatever else has arrived goes with it.
+//!                 while let Some(Ok(more)) = received.next_ready() {
+//!                     data.append(more);
+//!                 }
 //!                 if stream.write_all_vectored(data).await.0.is_err() {
 //!                     break;
 //!                 }
