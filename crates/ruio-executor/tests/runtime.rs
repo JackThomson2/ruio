@@ -12,6 +12,14 @@ use std::time::{Duration, Instant};
 use ruio_driver::ops::{Nop, Timeout};
 use ruio_executor::{Runtime, spawn, yield_now};
 
+#[test]
+fn the_builder_sizes_the_file_table() {
+    let runtime = Runtime::builder().files(3).build().unwrap();
+    assert_eq!(runtime.driver().files(), 3);
+    let runtime = Runtime::builder().files(0).build().unwrap();
+    assert_eq!(runtime.driver().files(), 0);
+}
+
 /// Sets its flag when dropped.
 struct DropFlag(Rc<Cell<bool>>);
 

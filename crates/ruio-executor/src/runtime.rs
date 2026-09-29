@@ -34,6 +34,13 @@ impl Builder {
         self
     }
 
+    /// Sets the number of slots in the ring's registered file table, which
+    /// holds direct descriptors; see [`ruio_driver::Builder::files`].
+    pub fn files(mut self, slots: u32) -> Self {
+        self.driver = self.driver.files(slots);
+        self
+    }
+
     /// Creates the runtime.
     ///
     /// # Errors
