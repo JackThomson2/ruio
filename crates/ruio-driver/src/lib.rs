@@ -34,6 +34,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+pub mod buf;
 mod driver;
 mod op;
 pub mod ops;

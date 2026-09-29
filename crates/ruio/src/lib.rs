@@ -29,6 +29,8 @@ pub use ruio_executor::time;
 pub use ruio_executor::{Builder, JoinError, JoinHandle, Runtime, driver, spawn, yield_now};
 pub use ruio_macros::{main, test};
 
+pub use ruio_driver::buf;
+
 /// The io_uring driver: operations, the futures that run them, and the types
 /// for writing new ones.
 pub mod uring {
