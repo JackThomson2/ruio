@@ -47,7 +47,8 @@
 //!                 while let Some(Ok(more)) = received.next_ready() {
 //!                     data.append(more);
 //!                 }
-//!                 if stream.write_all_vectored(data).await.0.is_err() {
+//!                 // Nothing needs the buffers back: write without waiting.
+//!                 if stream.write_behind(data).await.is_err() {
 //!                     break;
 //!                 }
 //!             }
@@ -69,11 +70,13 @@
 //! assert_send::<ruio::net::TcpStream>();
 //! ```
 
+mod behind;
 mod socket;
 mod tcp;
 mod udp;
 mod unix;
 
+pub use behind::{Flush, WriteBehind};
 pub use socket::{ReadExact, RecvStream, SendZc, SocketOp, WriteAll, WriteAllVectored};
 pub use tcp::{Incoming, TcpListener, TcpStream};
 pub use udp::UdpSocket;

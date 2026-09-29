@@ -7,12 +7,14 @@ use std::io;
 use std::marker::PhantomData;
 use std::net::{self, Shutdown, SocketAddr, ToSocketAddrs};
 use std::os::fd::{AsRawFd, RawFd};
+use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
 use ruio_driver::buf::{BufPool, IoBuf, IoBufMut, IoBufs};
 use ruio_driver::ops::{self, Accept, AcceptMulti, AcceptStream, Connect, Recv, Send, Socket};
 use ruio_driver::{Descriptor, Driver, Fd};
 
+use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
     ReadExact, RecvStream, SendZc, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
 };
@@ -211,12 +213,16 @@ impl<S> fmt::Debug for Incoming<'_, S> {
 ///
 /// Reads and writes take owned buffers and hand them back with the result.
 /// [`recv_stream`](TcpStream::recv_stream) receives into a [`BufPool`]
-/// instead, with one multishot request.
+/// instead, with one multishot request, and
+/// [`write_behind`](TcpStream::write_behind) writes without waiting for the
+/// kernel.
 pub struct TcpStream {
     sock: Sock<net::TcpStream>,
     /// The peer's address, where the kernel told it: a direct descriptor
     /// cannot ask.
     peer: Option<SocketAddr>,
+    /// The writes behind the stream, which every write waits for.
+    behind: Rc<Behind>,
     _thread: ThreadBound,
 }
 
@@ -225,6 +231,7 @@ impl TcpStream {
         Self {
             sock: Sock::new(descriptor),
             peer,
+            behind: Rc::default(),
             _thread: PhantomData,
         }
     }
@@ -272,6 +279,7 @@ impl TcpStream {
         Self {
             sock: Sock::Plain(stream),
             peer: None,
+            behind: Rc::default(),
             _thread: PhantomData,
         }
     }
@@ -348,25 +356,45 @@ impl TcpStream {
     }
 
     /// Writes `buf`'s initialized bytes, or as many as the socket takes.
+    ///
+    /// Like every write, it waits for a [`write_behind`](Self::write_behind)
+    /// in flight, and fails if one failed.
     pub fn write<B: IoBuf>(&self, buf: B) -> SocketOp<'_, Send<B>> {
-        self.sock.write(buf)
+        self.sock.write(buf).behind(&self.behind)
     }
 
     /// Writes all of `buf`'s initialized bytes; see [`WriteAll`].
     pub fn write_all<B: IoBuf>(&self, buf: B) -> WriteAll<'_, B> {
-        self.sock.write_all(buf)
+        self.sock.write_all(buf).behind(&self.behind)
     }
 
     /// Writes all of the initialized bytes of `bufs`, one buffer after
     /// another, such as a bundle received; see [`WriteAllVectored`].
     pub fn write_all_vectored<V: IoBufs>(&self, bufs: V) -> WriteAllVectored<'_, V> {
-        self.sock.write_all_vectored(bufs)
+        self.sock.write_all_vectored(bufs).behind(&self.behind)
+    }
+
+    /// Writes all of the initialized bytes of `bufs` without waiting for the
+    /// kernel to be done with them, which frees the task from waking up for
+    /// it; see [`WriteBehind`].
+    ///
+    /// How the write went comes out later: a failure, or a write cut short,
+    /// fails the next write, [`flush`](Self::flush) or
+    /// [`shutdown`](Self::shutdown), and every one after it.
+    pub fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V> {
+        self.sock.write_behind(&self.behind, bufs)
+    }
+
+    /// Waits for a [`write_behind`](Self::write_behind) in flight to finish,
+    /// and reports whether one failed; see [`Flush`].
+    pub fn flush(&self) -> Flush<'_> {
+        Flush::new(&self.behind)
     }
 
     /// Writes all of `buf`'s initialized bytes without copying them; see
     /// [`ops::SendZc`].
     pub fn send_zc<B: IoBuf>(&self, buf: B) -> SendZc<'_, B> {
-        self.sock.send_zc(buf)
+        self.sock.send_zc(buf).behind(&self.behind)
     }
 
     /// The data arriving on the connection, received into `pool`, which
@@ -375,9 +403,10 @@ impl TcpStream {
         self.sock.recv_stream(pool)
     }
 
-    /// Shuts down the reading or writing half of the connection, or both.
+    /// Shuts down the reading or writing half of the connection, or both,
+    /// once a [`write_behind`](Self::write_behind) in flight has finished.
     pub fn shutdown(&self, how: Shutdown) -> SocketOp<'_, ops::Shutdown> {
-        self.sock.shutdown(how)
+        self.sock.shutdown(how).behind(&self.behind)
     }
 }
 

@@ -8,11 +8,13 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{self, SocketAddr};
 use std::path::Path;
+use std::rc::Rc;
 
 use ruio_driver::buf::{BufPool, BufResult, IoBuf, IoBufMut, IoBufs};
 use ruio_driver::ops::{self, Accept, Connect, Recv, RecvFrom, Send, SendTo, Socket};
 use ruio_driver::{Descriptor, Fd, SockAddr};
 
+use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
     ReadExact, RecvStream, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
 };
@@ -108,6 +110,8 @@ impl fmt::Debug for UnixListener {
 /// it cannot send zero-copy.
 pub struct UnixStream {
     sock: Sock<net::UnixStream>,
+    /// The writes behind the stream, which every write waits for.
+    behind: Rc<Behind>,
     _thread: ThreadBound,
 }
 
@@ -115,6 +119,7 @@ impl UnixStream {
     fn new(descriptor: Descriptor) -> Self {
         Self {
             sock: Sock::new(descriptor),
+            behind: Rc::default(),
             _thread: PhantomData,
         }
     }
@@ -149,6 +154,7 @@ impl UnixStream {
     pub fn from_std(stream: net::UnixStream) -> Self {
         Self {
             sock: Sock::Plain(stream),
+            behind: Rc::default(),
             _thread: PhantomData,
         }
     }
@@ -197,18 +203,31 @@ impl UnixStream {
 
     /// Writes `buf`'s initialized bytes, or as many as the socket takes.
     pub fn write<B: IoBuf>(&self, buf: B) -> SocketOp<'_, Send<B>> {
-        self.sock.write(buf)
+        self.sock.write(buf).behind(&self.behind)
     }
 
     /// Writes all of `buf`'s initialized bytes; see [`WriteAll`].
     pub fn write_all<B: IoBuf>(&self, buf: B) -> WriteAll<'_, B> {
-        self.sock.write_all(buf)
+        self.sock.write_all(buf).behind(&self.behind)
     }
 
     /// Writes all of the initialized bytes of `bufs`, one buffer after
     /// another, such as a bundle received; see [`WriteAllVectored`].
     pub fn write_all_vectored<V: IoBufs>(&self, bufs: V) -> WriteAllVectored<'_, V> {
-        self.sock.write_all_vectored(bufs)
+        self.sock.write_all_vectored(bufs).behind(&self.behind)
+    }
+
+    /// Writes all of the initialized bytes of `bufs` without waiting for the
+    /// kernel to be done with them; see
+    /// [`TcpStream::write_behind`](super::TcpStream::write_behind).
+    pub fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V> {
+        self.sock.write_behind(&self.behind, bufs)
+    }
+
+    /// Waits for a [`write_behind`](Self::write_behind) in flight to finish,
+    /// and reports whether one failed; see [`Flush`].
+    pub fn flush(&self) -> Flush<'_> {
+        Flush::new(&self.behind)
     }
 
     /// The data arriving on the connection, received into `pool`, which
@@ -219,7 +238,7 @@ impl UnixStream {
 
     /// Shuts down the reading or writing half of the connection, or both.
     pub fn shutdown(&self, how: Shutdown) -> SocketOp<'_, ops::Shutdown> {
-        self.sock.shutdown(how)
+        self.sock.shutdown(how).behind(&self.behind)
     }
 }
 

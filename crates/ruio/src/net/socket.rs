@@ -9,12 +9,28 @@ use std::mem;
 use std::net;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
 use ruio_driver::buf::{BufBundle, BufPool, BufResult, IoBuf, IoBufMut, IoBufs, Slice};
 use ruio_driver::ops::{self, Recv, Send, SendVectored, Shutdown};
-use ruio_driver::{Descriptor, DirectFd, Driver, Fd, Op, Operation};
+use ruio_driver::{Completion, Descriptor, DirectFd, Driver, Fd, Op, Operation};
+
+use std::rc::Rc;
+
+use super::behind::{Behind, WriteBehind};
+
+/// Waits for the writes behind the stream, if the write has a gate still:
+/// ready once none is in flight, with the error one failed with. The gate is
+/// gone then, as the write goes ahead or fails.
+fn poll_gate(gate: &mut Option<&Behind>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    let Some(behind) = *gate else {
+        return Poll::Ready(Ok(()));
+    };
+    let result = ready!(behind.poll_done(cx));
+    *gate = None;
+    Poll::Ready(result)
+}
 
 /// Makes a type `!Send` and `!Sync`: sockets belong to the thread whose ring
 /// their I/O runs on. See DESIGN.md on keeping work stealing possible.
@@ -110,7 +126,7 @@ impl<S: AsRawFd> Sock<S> {
         let (driver, fd) = self.target();
         WriteAll {
             transfer: Transfer::new(driver, fd, buf),
-            _socket: PhantomData,
+            gate: None,
         }
     }
 
@@ -118,13 +134,21 @@ impl<S: AsRawFd> Sock<S> {
         let (driver, fd) = self.target();
         WriteAllVectored {
             transfer: Transfer::new(driver, fd, bufs),
-            _socket: PhantomData,
+            gate: None,
         }
     }
 
     pub(crate) fn send_zc<B: IoBuf>(&self, buf: B) -> SendZc<'_, B> {
         let (driver, fd) = self.target();
         SendZc::new(ops::SendZc::new(&driver, fd, buf).flags(libc::MSG_WAITALL))
+    }
+
+    pub(crate) fn write_behind<'a, V: IoBufs>(
+        &self,
+        behind: &'a Rc<Behind>,
+        bufs: V,
+    ) -> WriteBehind<'a, V> {
+        WriteBehind::new(behind, self.target(), bufs)
     }
 
     pub(crate) fn recv_stream(&self, pool: &BufPool) -> RecvStream<'_> {
@@ -156,18 +180,28 @@ impl<S: fmt::Debug> fmt::Debug for Sock<S> {
 /// it.
 #[must_use = "an operation does nothing until polled"]
 pub struct SocketOp<'a, T: Operation, U = <T as Operation>::Output> {
-    op: Op<T>,
+    /// Taken if the operation fails before it is submitted.
+    op: Option<Op<T>>,
     output: fn(T::Output) -> U,
-    _socket: PhantomData<&'a ()>,
+    /// The writes behind the stream, which a write waits for before it is
+    /// submitted.
+    gate: Option<&'a Behind>,
 }
 
-impl<T: Operation, U> SocketOp<'_, T, U> {
+impl<'a, T: Operation, U> SocketOp<'a, T, U> {
     pub(crate) fn new(op: Op<T>, output: fn(T::Output) -> U) -> Self {
         Self {
-            op,
+            op: Some(op),
             output,
-            _socket: PhantomData,
+            gate: None,
         }
+    }
+
+    /// Submits the operation only once the writes behind the stream have
+    /// finished, and fails it with the error one failed with.
+    pub(crate) fn behind(mut self, gate: &'a Behind) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Cancels the operation if the kernel has not completed it `duration`
@@ -177,7 +211,7 @@ impl<T: Operation, U> SocketOp<'_, T, U> {
     /// buffer it holds comes back, as with any other error.
     pub fn timeout(self, duration: Duration) -> Self {
         Self {
-            op: self.op.timeout(duration),
+            op: self.op.map(|op| op.timeout(duration)),
             ..self
         }
     }
@@ -188,7 +222,20 @@ impl<T: Operation, U> Future for SocketOp<'_, T, U> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<U> {
         let this = self.get_mut();
-        Pin::new(&mut this.op).poll(cx).map(this.output)
+        if let Err(err) = ready!(poll_gate(&mut this.gate, cx)) {
+            let operation = this
+                .op
+                .take()
+                .and_then(Op::into_inner)
+                .expect("`SocketOp` polled after it completed");
+            let output = operation.complete(Completion::from_error(&err));
+            return Poll::Ready((this.output)(output));
+        }
+        let op = this
+            .op
+            .as_mut()
+            .expect("`SocketOp` polled after it completed");
+        Pin::new(op).poll(cx).map(this.output)
     }
 }
 
@@ -196,6 +243,7 @@ impl<T: Operation, U> fmt::Debug for SocketOp<'_, T, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SocketOp")
             .field("op", &self.op)
+            .field("gate", &self.gate)
             .finish_non_exhaustive()
     }
 }
@@ -253,6 +301,15 @@ impl<T: Operation, B> Transfer<T, B> {
         }
         self.state = TransferState::Moving { op, done };
     }
+
+    /// The buffer of a transfer that has not started, which it gives up: a
+    /// write whose gate failed it.
+    fn unstarted(&mut self) -> B {
+        match mem::replace(&mut self.state, TransferState::Finished) {
+            TransferState::Start(buf) => buf,
+            _ => unreachable!("a transfer starts only once its gate opens"),
+        }
+    }
 }
 
 /// Writes a whole buffer to a stream socket. Made by the sockets'
@@ -263,10 +320,18 @@ impl<T: Operation, B> Transfer<T, B> {
 #[must_use = "a write does nothing until polled"]
 pub struct WriteAll<'a, B: IoBuf> {
     transfer: Transfer<Send<Slice<B>>, B>,
-    _socket: PhantomData<&'a ()>,
+    /// The writes behind the stream, which the write waits for.
+    gate: Option<&'a Behind>,
 }
 
-impl<B: IoBuf> WriteAll<'_, B> {
+impl<'a, B: IoBuf> WriteAll<'a, B> {
+    /// Starts the write only once the writes behind the stream have
+    /// finished, and fails it with the error one failed with.
+    pub(crate) fn behind(mut self, gate: &'a Behind) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
     /// Fails the write with [`io::ErrorKind::TimedOut`] if it has not
     /// finished `duration` after it starts, cancelling the send in flight
     /// with a linked timeout; see [`SocketOp::timeout`].
@@ -280,7 +345,11 @@ impl<B: IoBuf> Future for WriteAll<'_, B> {
     type Output = BufResult<(), B>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let transfer = &mut self.get_mut().transfer;
+        let this = self.get_mut();
+        if let Err(err) = ready!(poll_gate(&mut this.gate, cx)) {
+            return Poll::Ready((Err(err), this.transfer.unstarted()));
+        }
+        let transfer = &mut this.transfer;
         let send = |fd, buf: B, done| Send::new(fd, buf.slice(done..)).flags(libc::MSG_WAITALL);
         loop {
             match mem::replace(&mut transfer.state, TransferState::Finished) {
@@ -332,10 +401,17 @@ impl<B: IoBuf> fmt::Debug for WriteAll<'_, B> {
 #[must_use = "a write does nothing until polled"]
 pub struct WriteAllVectored<'a, V: IoBufs> {
     transfer: Transfer<SendVectored<V>, V>,
-    _socket: PhantomData<&'a ()>,
+    /// The writes behind the stream, which the write waits for.
+    gate: Option<&'a Behind>,
 }
 
-impl<V: IoBufs> WriteAllVectored<'_, V> {
+impl<'a, V: IoBufs> WriteAllVectored<'a, V> {
+    /// As for [`WriteAll`].
+    pub(crate) fn behind(mut self, gate: &'a Behind) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
     /// Fails the write with [`io::ErrorKind::TimedOut`] if it has not
     /// finished `duration` after it starts; see [`WriteAll::timeout`].
     pub fn timeout(mut self, duration: Duration) -> Self {
@@ -348,7 +424,11 @@ impl<V: IoBufs> Future for WriteAllVectored<'_, V> {
     type Output = BufResult<(), V>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let transfer = &mut self.get_mut().transfer;
+        let this = self.get_mut();
+        if let Err(err) = ready!(poll_gate(&mut this.gate, cx)) {
+            return Poll::Ready((Err(err), this.transfer.unstarted()));
+        }
+        let transfer = &mut this.transfer;
         let send = |fd, bufs, done| {
             SendVectored::new(fd, bufs)
                 .skip(done)
@@ -468,16 +548,24 @@ impl<B: IoBufMut> fmt::Debug for ReadExact<'_, B> {
 /// `send_zc`; see [`ops::SendZc`].
 #[must_use = "a send does nothing until polled"]
 pub struct SendZc<'a, B: IoBuf> {
-    send: ops::SendZc<B>,
-    _socket: PhantomData<&'a ()>,
+    /// Taken if the send fails before it is submitted.
+    send: Option<ops::SendZc<B>>,
+    /// The writes behind the stream, which the send waits for.
+    gate: Option<&'a Behind>,
 }
 
-impl<B: IoBuf> SendZc<'_, B> {
+impl<'a, B: IoBuf> SendZc<'a, B> {
     pub(crate) fn new(send: ops::SendZc<B>) -> Self {
         Self {
-            send,
-            _socket: PhantomData,
+            send: Some(send),
+            gate: None,
         }
+    }
+
+    /// As for [`WriteAll`].
+    pub(crate) fn behind(mut self, gate: &'a Behind) -> Self {
+        self.gate = Some(gate);
+        self
     }
 }
 
@@ -486,7 +574,20 @@ impl<B: IoBuf> Future for SendZc<'_, B> {
     type Output = BufResult<usize, B>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.get_mut().send).poll(cx)
+        let this = self.get_mut();
+        if let Err(err) = ready!(poll_gate(&mut this.gate, cx)) {
+            let buf = this
+                .send
+                .take()
+                .and_then(ops::SendZc::into_inner)
+                .expect("`SendZc` polled after it completed");
+            return Poll::Ready((Err(err), buf));
+        }
+        let send = this
+            .send
+            .as_mut()
+            .expect("`SendZc` polled after it completed");
+        Pin::new(send).poll(cx)
     }
 }
 

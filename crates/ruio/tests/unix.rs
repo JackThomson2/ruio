@@ -36,6 +36,38 @@ impl Drop for Scratch {
 }
 
 #[ruio::test]
+async fn streams_write_behind_in_order() -> io::Result<()> {
+    let (writer, reader) = UnixStream::pair()?;
+    for round in 0..10u8 {
+        within(writer.write_behind(vec![vec![round; 1000]])).await?;
+    }
+    within(writer.flush()).await?;
+    let (read, received) = within(reader.read_exact(Vec::with_capacity(10_000))).await;
+    read?;
+    for (round, chunk) in received.chunks(1000).enumerate() {
+        assert!(chunk.iter().all(|&byte| usize::from(byte) == round));
+    }
+    Ok(())
+}
+
+/// The other writes wait for a write behind in flight.
+#[ruio::test]
+async fn stream_writes_wait_for_the_write_behind_in_flight() -> io::Result<()> {
+    let (writer, reader) = UnixStream::pair()?;
+    let large: Vec<u8> = (0..8 << 20).map(|index| (index % 251) as u8).collect();
+    let expected = [&large[..], b"tail"].concat();
+    let len = expected.len();
+    let read = ruio::spawn(async move {
+        let (read, received) = within(reader.read_exact(Vec::with_capacity(len))).await;
+        read.map(|()| received)
+    });
+    within(writer.write_behind(vec![large])).await?;
+    within(writer.write_all(b"tail".to_vec())).await.0?;
+    assert!(read.await.unwrap()? == expected);
+    Ok(())
+}
+
+#[ruio::test]
 async fn streams_connect_to_a_listener() -> io::Result<()> {
     let path = Scratch::new("stream");
     let listener = UnixListener::bind(&path.0)?;

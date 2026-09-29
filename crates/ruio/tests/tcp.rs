@@ -21,7 +21,8 @@ async fn pair() -> io::Result<(TcpStream, TcpStream)> {
     Ok((client.await.unwrap()?, server))
 }
 
-/// Echoes every connection `listener` accepts, through a pool.
+/// Echoes every connection `listener` accepts, through a pool, writing
+/// behind.
 fn serve_echo(listener: TcpListener) -> ruio::JoinHandle<()> {
     ruio::spawn(async move {
         let pool = BufPool::new(&ruio::driver(), 16, 1024).unwrap();
@@ -36,8 +37,9 @@ fn serve_echo(listener: TcpListener) -> ruio::JoinHandle<()> {
                     while let Some(more) = received.next_ready() {
                         data.append(more.unwrap());
                     }
-                    stream.write_all_vectored(data).await.0.unwrap();
+                    stream.write_behind(data).await.unwrap();
                 }
+                stream.flush().await.unwrap();
             });
         }
     })
@@ -104,6 +106,106 @@ async fn write_all_vectored_sends_more_than_the_socket_holds() -> io::Result<()>
     written?;
     assert_eq!(bufs.len(), 3);
     assert!(reader.await.unwrap()? == expected);
+    Ok(())
+}
+
+/// Writes behind go out in order, one at a time, whatever their sizes: a
+/// large one is still in flight when the next is written, which waits.
+#[ruio::test]
+async fn writes_behind_arrive_in_order() -> io::Result<()> {
+    let (client, server) = pair().await?;
+    let messages: Vec<Vec<u8>> = (0..40)
+        .map(|index| {
+            pattern(
+                if index % 8 == 0 {
+                    4 << 20
+                } else {
+                    1 + index * 97
+                },
+                index,
+            )
+        })
+        .collect();
+    let expected = messages.concat();
+    let len = expected.len();
+    let reader = ruio::spawn(async move {
+        let (read, received) = within(server.read_exact(Vec::with_capacity(len))).await;
+        read.map(|()| received)
+    });
+    for message in messages {
+        within(client.write_behind(vec![message])).await?;
+    }
+    within(client.flush()).await?;
+    assert!(reader.await.unwrap()? == expected);
+    Ok(())
+}
+
+/// The other writes wait for a write behind in flight.
+#[ruio::test]
+async fn writes_wait_for_the_write_behind_in_flight() -> io::Result<()> {
+    let (client, server) = pair().await?;
+    let large = pattern(8 << 20, 1);
+    let expected = [&large[..], b"tail"].concat();
+    let len = expected.len();
+    let reader = ruio::spawn(async move {
+        let (read, received) = within(server.read_exact(Vec::with_capacity(len))).await;
+        read.map(|()| received)
+    });
+    within(client.write_behind(vec![large])).await?;
+    within(client.write_all(b"tail".to_vec())).await.0?;
+    assert!(reader.await.unwrap()? == expected);
+    Ok(())
+}
+
+/// A write behind that fails, here by timing out against a peer that does
+/// not read, fails every write after it, handing buffers back unsent, and
+/// the stream's shutdown.
+#[ruio::test]
+async fn a_failed_write_behind_fails_what_comes_after() -> io::Result<()> {
+    let (client, _server) = pair().await?;
+    let bufs = vec![vec![7; 64 << 20]];
+    within(client.write_behind(bufs).timeout(Duration::from_millis(50))).await?;
+    let err = within(client.flush()).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+
+    let (written, buf) = within(client.write_all(b"after".to_vec())).await;
+    assert_eq!(written.unwrap_err().kind(), ErrorKind::TimedOut);
+    assert_eq!(buf, b"after");
+    let (written, buf) = within(client.write(b"after".to_vec())).await;
+    assert_eq!(written.unwrap_err().kind(), ErrorKind::TimedOut);
+    assert_eq!(buf, b"after");
+    let (sent, buf) = within(client.send_zc(b"after".to_vec())).await;
+    assert_eq!(sent.unwrap_err().kind(), ErrorKind::TimedOut);
+    assert_eq!(buf, b"after");
+    let err = within(client.write_behind(vec![b"after".to_vec()]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+    let err = within(client.shutdown(Shutdown::Write)).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+    Ok(())
+}
+
+/// A peer that resets the connection part of the way through a write behind
+/// cuts it short, which fails the stream's writes from then on.
+#[ruio::test]
+async fn a_write_behind_cut_short_by_the_peer_fails() -> io::Result<()> {
+    let (client, server) = pair().await?;
+    within(client.write_behind(vec![vec![7; 64 << 20]])).await?;
+    let (read, _) = within(server.read_exact(Vec::with_capacity(1 << 20))).await;
+    read?;
+    // Closed with data unread, the socket resets the connection.
+    drop(server);
+    let err = within(client.flush()).await.unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+        ),
+        "{err}"
+    );
+    let (written, _) = within(client.write_all(b"after".to_vec())).await;
+    assert_eq!(written.unwrap_err().kind(), err.kind());
     Ok(())
 }
 
