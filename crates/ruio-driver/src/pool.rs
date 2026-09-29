@@ -1,15 +1,16 @@
 //! Provided-buffer pools: buffers the kernel picks for reads and receives
 //! when data arrives.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::io;
-use std::mem::offset_of;
+use std::mem::{self, offset_of};
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::rc::Rc;
 use std::slice;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use ruio_sys as sys;
 
@@ -47,6 +48,8 @@ struct Pool {
     tail: Cell<u16>,
     /// Buffers in the ring, which the kernel may pick.
     available: Cell<usize>,
+    /// Tasks waiting for a buffer to return to the ring.
+    waiters: RefCell<Vec<Waker>>,
 }
 
 impl BufPool {
@@ -75,6 +78,7 @@ impl BufPool {
             size,
             tail: Cell::new(0),
             available: Cell::new(0),
+            waiters: RefCell::new(Vec::new()),
         };
         for bid in 0..count {
             pool.put(bid);
@@ -113,6 +117,19 @@ impl BufPool {
     /// The number of buffers the kernel may pick, which are not leased.
     pub fn available(&self) -> usize {
         self.pool.available.get()
+    }
+
+    /// Whether a buffer is available; if not, arranges for the task to be
+    /// woken when one returns.
+    pub fn poll_available(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.available() > 0 {
+            return Poll::Ready(());
+        }
+        let mut waiters = self.pool.waiters.borrow_mut();
+        if !waiters.iter().any(|waiter| waiter.will_wake(cx.waker())) {
+            waiters.push(cx.waker().clone());
+        }
+        Poll::Pending
     }
 
     /// The buffer group ID that submission entries select from.
@@ -183,6 +200,10 @@ impl Pool {
         // pairs with to publish the entry.
         unsafe { AtomicU16::from_ptr(tail_field) }.store(tail, Ordering::Release);
         self.available.set(self.available.get() + 1);
+        let waiters = mem::take(&mut *self.waiters.borrow_mut());
+        for waiter in waiters {
+            waiter.wake();
+        }
     }
 }
 

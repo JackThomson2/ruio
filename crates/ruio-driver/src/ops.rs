@@ -13,16 +13,18 @@
 //! [`Driver::submit`]: crate::Driver::submit
 //! [`Driver::park`]: crate::Driver::park
 
+use std::future::poll_fn;
 use std::io;
 use std::os::fd::RawFd;
 use std::ptr;
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use ruio_sys as sys;
 
 use crate::buf::{BufLease, BufPool, BufResult, FixedIoBuf, IoBuf, IoBufMut};
 use crate::driver::timespec;
-use crate::{Completion, Operation};
+use crate::{Completion, Driver, MultiOp, Multishot, Operation};
 
 /// The `off` value that makes reads and writes use the file position.
 const CURRENT_POSITION: u64 = u64::MAX;
@@ -349,11 +351,127 @@ unsafe impl Operation for ReadPooled {
         // Taken before looking at the result, so that a buffer the read
         // consumed returns to the pool whatever happened.
         let lease = self.pool.lease(completion.flags(), len);
-        match completion.result()? {
-            0 => Ok(None),
-            _ => lease
-                .map(Some)
-                .ok_or_else(|| io::Error::other("a pooled read returned no buffer")),
+        pooled_data(completion, lease)
+    }
+}
+
+/// The data of a completion into a pool: the lease, `None` at the end of the
+/// data, or the error.
+fn pooled_data(completion: Completion, lease: Option<BufLease>) -> io::Result<Option<BufLease>> {
+    match completion.result()? {
+        0 => Ok(None),
+        _ => lease
+            .map(Some)
+            .ok_or_else(|| io::Error::other("the kernel filled no pooled buffer")),
+    }
+}
+
+/// Receives from a socket into a [`BufPool`] again and again as data
+/// arrives: a multishot `recv(2)` (`IORING_RECV_MULTISHOT`).
+///
+/// Each item is one receive's data, as a lease, or `None` once the peer has
+/// shut down, which ends the request. When the pool runs dry the kernel ends
+/// the request with `ENOBUFS`; [`RecvStream`] waits for a buffer and re-arms
+/// it.
+#[derive(Debug)]
+pub struct RecvMulti {
+    fd: RawFd,
+    pool: BufPool,
+}
+
+impl RecvMulti {
+    /// Receives from `fd` into `pool`.
+    pub fn new(fd: RawFd, pool: &BufPool) -> Self {
+        Self {
+            fd,
+            pool: pool.clone(),
         }
+    }
+}
+
+// SAFETY: the entry points to no memory of its own: the kernel writes into
+// buffers of the pool, which the request keeps alive. A multishot receive's
+// completions carry IORING_CQE_F_MORE until the last.
+unsafe impl Multishot for RecvMulti {
+    type Item = io::Result<Option<BufLease>>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_RECV;
+        sqe.fd = self.fd;
+        sqe.ioprio = sys::IORING_RECV_MULTISHOT;
+        sqe.flags = sys::IOSQE_BUFFER_SELECT;
+        sqe.buf_index = self.pool.group();
+        // `len` stays zero: each receive fills up to a whole buffer.
+    }
+
+    fn item(&mut self, completion: Completion) -> Self::Item {
+        let len = usize::try_from(completion.res()).unwrap_or(0);
+        let lease = self.pool.lease(completion.flags(), len);
+        pooled_data(completion, lease)
+    }
+}
+
+/// The data arriving on a socket, received into a [`BufPool`] by a multishot
+/// receive that the stream keeps armed.
+///
+/// The kernel ends a multishot receive when the pool runs dry, and now and
+/// then for reasons of its own, such as a full completion queue. The stream
+/// then waits for a buffer to return, if it must, and re-arms the request, so
+/// the data keeps arriving in order and none is lost. The stream ends when
+/// the peer shuts down, or after yielding an error.
+#[derive(Debug)]
+pub struct RecvStream {
+    stream: MultiOp<RecvMulti>,
+    pool: BufPool,
+    /// The pool ran dry; the request re-arms once a buffer returns.
+    starved: bool,
+    finished: bool,
+}
+
+impl RecvStream {
+    /// A stream of the data arriving on `fd`, received into `pool`.
+    pub fn new(driver: &Driver, fd: RawFd, pool: &BufPool) -> Self {
+        Self {
+            stream: driver.stream(RecvMulti::new(fd, pool)),
+            pool: pool.clone(),
+            starved: false,
+            finished: false,
+        }
+    }
+
+    /// The next data, or `None` once the peer has shut down or an error has
+    /// been yielded.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufLease>>> {
+        loop {
+            if self.finished {
+                return Poll::Ready(None);
+            }
+            if self.starved {
+                ready!(self.pool.poll_available(cx));
+                self.starved = false;
+                self.stream.rearm();
+            }
+            match ready!(self.stream.poll_next(cx)) {
+                Some(Ok(Some(lease))) => return Poll::Ready(Some(Ok(lease))),
+                Some(Ok(None)) => {
+                    self.finished = true;
+                    return Poll::Ready(None);
+                }
+                Some(Err(err)) if err.raw_os_error() == Some(libc::ENOBUFS) => {
+                    self.starved = true;
+                }
+                Some(Err(err)) => {
+                    self.finished = true;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                // Ended by the kernel for its own reasons: carry on.
+                None => self.stream.rearm(),
+            }
+        }
+    }
+
+    /// The next data; see [`poll_next`](RecvStream::poll_next).
+    pub async fn next(&mut self) -> Option<io::Result<BufLease>> {
+        poll_fn(|cx| self.poll_next(cx)).await
     }
 }
