@@ -78,7 +78,10 @@ unsafe impl Operation for TrackedRead {
                 self.buf
             );
         } else {
-            assert_eq!(res, -libc::ECANCELED, "the read failed");
+            assert!(
+                [-libc::ECANCELED, -libc::ETIMEDOUT].contains(&res),
+                "the read failed with {res}"
+            );
         }
         self.track.result.set(Some(res));
         res
@@ -176,6 +179,12 @@ fn provided_operations_dropped_after_every_number_of_polls() {
         drop_after(&driver, driver.op(read), polls);
         let write = Write::new(writer.as_raw_fd(), vec![FILL; 5]);
         drop_after(&driver, driver.op(write), polls);
+        // With linked timeouts that fire at once, and that never do.
+        for timeout in [Duration::ZERO, Duration::from_secs(60)] {
+            drop_after(&driver, driver.op(Nop).timeout(timeout), polls);
+            let read = Read::new(reader.as_raw_fd(), Vec::with_capacity(64));
+            drop_after(&driver, driver.op(read).timeout(timeout), polls);
+        }
     }
     assert_eq!(driver.in_flight(), 0);
 }
@@ -215,17 +224,24 @@ fn interleaved_operations_dropped_at_random_points() {
             let mut tasks: Vec<Task> = (0..12)
                 .map(|_| {
                     let (reader, writer) = &pipes[rng.below(pipes.len() as u64) as usize];
-                    match rng.below(4) {
+                    match rng.below(5) {
                         0 => task(driver.op(Nop)),
                         1 => {
                             let wait = Duration::from_micros(rng.below(2_000));
                             task(driver.op(Timeout::new(wait)))
                         }
                         2 => task(driver.op(Write::new(writer.as_raw_fd(), vec![FILL; 3]))),
-                        _ => {
+                        3 => {
                             let (read, track) = TrackedRead::new(reader.as_raw_fd());
                             tracks.push(track);
                             task(driver.op(read))
+                        }
+                        _ => {
+                            let (read, track) = TrackedRead::new(reader.as_raw_fd());
+                            tracks.push(track);
+                            // A third fire at once, before the read is dropped.
+                            let wait = Duration::from_millis(rng.below(3));
+                            task(driver.op(read).timeout(wait))
                         }
                     }
                 })
@@ -250,10 +266,12 @@ fn interleaved_operations_dropped_at_random_points() {
     let count = |outcome: fn(&Track) -> bool| tracks.iter().filter(|track| outcome(track)).count();
     let unsubmitted = count(|track| !track.prepared.get());
     let cancelled = count(|track| track.result.get() == Some(-libc::ECANCELED));
+    let timed_out = count(|track| track.result.get() == Some(-libc::ETIMEDOUT));
     let read = count(|track| track.result.get().is_some_and(|res| res > 0));
     eprintln!(
-        "{} tracked reads: {unsubmitted} unsubmitted, {cancelled} cancelled, {read} read data",
+        "{} tracked reads: {unsubmitted} unsubmitted, {cancelled} cancelled, \
+         {timed_out} timed out, {read} read data",
         tracks.len()
     );
-    assert!(unsubmitted > 0 && cancelled > 0 && read > 0);
+    assert!(unsubmitted > 0 && cancelled > 0 && timed_out > 0 && read > 0);
 }

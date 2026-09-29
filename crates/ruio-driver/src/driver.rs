@@ -56,8 +56,9 @@ impl Builder {
     }
 
     /// Sets the size of the submission queue. The kernel rounds it up to a
-    /// power of two and caps it at 32768; the completion queue is four times
-    /// as large.
+    /// power of two and caps it at 32768, and it is at least 2, so that an
+    /// operation and its linked timeout fit; the completion queue is four
+    /// times as large.
     ///
     /// This does not limit how many operations can be in flight: a full
     /// submission queue is submitted early.
@@ -93,8 +94,9 @@ impl Builder {
         if probe.supports_setup_flags(sys::IORING_SETUP_NO_SQARRAY) {
             flags |= sys::IORING_SETUP_NO_SQARRAY;
         }
-        let cq_entries = self.entries.saturating_mul(4);
-        let ring = Ring::new(self.entries, cq_entries, flags)?;
+        let entries = self.entries.max(2);
+        let cq_entries = entries.saturating_mul(4);
+        let ring = Ring::new(entries, cq_entries, flags)?;
         let notify = Arc::new(Notify::new()?);
         Ok(Driver {
             inner: Rc::new(RefCell::new(Inner {
@@ -374,11 +376,17 @@ impl Driver {
         }
     }
 
-    /// Queues an operation's entry, returning its `user_data`.
-    pub(crate) fn queue<T: Operation>(&self, operation: &mut T, waker: &Waker) -> io::Result<u64> {
+    /// Queues an operation's entry, followed by a linked timeout if it has
+    /// one, returning its `user_data`.
+    pub(crate) fn queue<T: Operation>(
+        &self,
+        operation: &mut T,
+        timeout: Option<Duration>,
+        waker: &Waker,
+    ) -> io::Result<u64> {
         self.inner
             .borrow_mut()
-            .queue_entry(|sqe| operation.prepare(sqe), false, waker)
+            .queue_entry(|sqe| operation.prepare(sqe), false, timeout, waker)
     }
 
     /// Queues a multishot request's entry, returning its `user_data`.
@@ -389,7 +397,7 @@ impl Driver {
     ) -> io::Result<u64> {
         self.inner
             .borrow_mut()
-            .queue_entry(|sqe| request.prepare(sqe), true, waker)
+            .queue_entry(|sqe| request.prepare(sqe), true, None, waker)
     }
 
     /// Takes a stream's next completion, or arranges for `waker` to be woken
@@ -484,14 +492,24 @@ fn hand_over(payload: &mut Box<dyn Orphan>, completions: VecDeque<Completion>) -
 }
 
 impl Inner {
+    /// Queues an entry that `prepare` fills in, followed by a linked timeout
+    /// if `timeout` is set, and returns the entry's `user_data`.
+    ///
+    /// The linked timeout posts no completion when it is cancelled because
+    /// the entry completed first (`IOSQE_CQE_SKIP_SUCCESS`), and any it does
+    /// post is ignored: the entry's own completion tells whether it timed
+    /// out.
     fn queue_entry(
         &mut self,
         prepare: impl FnOnce(&mut sys::io_uring_sqe),
         stream: bool,
+        timeout: Option<Duration>,
         waker: &Waker,
     ) -> io::Result<u64> {
-        if self.ring.queued() == self.ring.sq_entries() {
-            self.submit_queued()?;
+        // An entry and its linked timeout reach the kernel together.
+        let needed = if timeout.is_some() { 2 } else { 1 };
+        if self.ring.sq_space() < needed {
+            self.submit_queued(needed)?;
         }
         let sqe = self
             .ring
@@ -504,6 +522,9 @@ impl Inner {
         prepare(entry.sqe);
         debug_assert_eq!(entry.sqe.flags & FORBIDDEN_SQE_FLAGS, 0);
         entry.sqe.flags &= !FORBIDDEN_SQE_FLAGS;
+        if timeout.is_some() {
+            entry.sqe.flags |= sys::IOSQE_IO_LINK;
+        }
         let user_data = if stream {
             self.table.insert_stream(Some(waker.clone()))
         } else {
@@ -511,6 +532,16 @@ impl Inner {
         };
         entry.sqe.user_data = user_data;
         entry.prepared = true;
+        drop(entry);
+        if let Some(timeout) = timeout {
+            // The room was made above, and nothing has taken it since.
+            let link = self
+                .ring
+                .next_link_timeout(timespec(timeout))
+                .expect("no room for a linked timeout");
+            link.flags = sys::IOSQE_CQE_SKIP_SUCCESS;
+            link.user_data = IGNORED;
+        }
         self.stats.operations += 1;
         Ok(user_data)
     }
@@ -532,7 +563,9 @@ impl Inner {
         // SAFETY: every queued entry was prepared by an `Operation`, whose
         // contract keeps the memory it points to valid while the operation
         // exists, and the table keeps the operation until its completion; or
-        // it is an internal cancellation or no-op, which points to no memory.
+        // it is an internal cancellation or no-op, which points to no memory;
+        // or a linked timeout, whose duration the kernel copies as it
+        // consumes the entry and the ring keeps until then.
         let entered = unsafe { self.ring.enter(min_complete, timeout) };
         match entered {
             Ok(_) => Ok(()),
@@ -550,9 +583,9 @@ impl Inner {
         }
     }
 
-    /// Submits the queued entries, without waiting, to make room in the
-    /// submission queue.
-    fn submit_queued(&mut self) -> io::Result<()> {
+    /// Submits the queued entries, without waiting, to make room for
+    /// `needed` more in the submission queue.
+    fn submit_queued(&mut self, needed: u32) -> io::Result<()> {
         self.stats.enters += 1;
         // SAFETY: as in `Inner::enter`.
         let entered = unsafe { self.ring.enter(0, None) };
@@ -561,7 +594,7 @@ impl Inner {
         {
             return Err(err);
         }
-        if self.ring.queued() == self.ring.sq_entries() {
+        if self.ring.sq_space() < needed {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         Ok(())
@@ -570,7 +603,7 @@ impl Inner {
     fn queue_cancels(&mut self) -> io::Result<()> {
         while let Some(&user_data) = self.cancels.last() {
             let Some(sqe) = self.ring.next_sqe() else {
-                self.submit_queued()?;
+                self.submit_queued(1)?;
                 continue;
             };
             sqe.opcode = sys::IORING_OP_ASYNC_CANCEL;
@@ -589,8 +622,8 @@ impl Inner {
         if self.wake_armed {
             return Ok(());
         }
-        if self.ring.queued() == self.ring.sq_entries() {
-            self.submit_queued()?;
+        if self.ring.sq_space() == 0 {
+            self.submit_queued(1)?;
         }
         let sqe = self
             .ring
@@ -608,8 +641,8 @@ impl Inner {
     /// Queues a cancellation of every request in flight.
     fn queue_cancel_all(&mut self) -> io::Result<()> {
         self.cancels.clear();
-        if self.ring.queued() == self.ring.sq_entries() {
-            self.submit_queued()?;
+        if self.ring.sq_space() == 0 {
+            self.submit_queued(1)?;
         }
         let sqe = self
             .ring

@@ -53,6 +53,9 @@ struct SubmissionQueue {
     /// One past the last entry written. Entries up to here reach the kernel
     /// when [`Ring::enter`] publishes the tail.
     local_tail: u32,
+    /// The duration of each slot's linked timeout, which the slot's entry
+    /// points to; see [`Ring::next_link_timeout`].
+    link_timeouts: Box<[sys::__kernel_timespec]>,
 }
 
 /// The application's side of the completion queue.
@@ -133,6 +136,8 @@ impl Ring {
             entries: params.sq_entries,
             sqes: sqes.ptr().cast(),
             local_tail: 0,
+            link_timeouts: vec![sys::__kernel_timespec::default(); params.sq_entries as usize]
+                .into_boxed_slice(),
         };
         let cq = CompletionQueue {
             head: field(cq_off.head),
@@ -178,11 +183,6 @@ impl Ring {
         unsafe { sys::io_uring_register(self.fd.as_raw_fd(), opcode, arg, nr_args) }
     }
 
-    /// The number of submission queue slots.
-    pub(crate) fn sq_entries(&self) -> u32 {
-        self.sq.entries
-    }
-
     /// The `IORING_SQ_*` flags.
     pub(crate) fn sq_flags(&self) -> u32 {
         // SAFETY: `sq.flags` points to the flags field in the live mapping.
@@ -194,6 +194,11 @@ impl Ring {
         // SAFETY: `sq.head` points to the head field in the live mapping.
         let head = unsafe { atomic(self.sq.head) }.load(Ordering::Acquire);
         self.sq.local_tail.wrapping_sub(head)
+    }
+
+    /// Free submission queue slots.
+    pub(crate) fn sq_space(&self) -> u32 {
+        self.sq.entries - self.queued()
     }
 
     /// The next submission queue entry, zeroed, or `None` if the queue is
@@ -216,6 +221,35 @@ impl Ring {
         Some(sqe)
     }
 
+    /// The next submission queue entry, filled in as a linked timeout
+    /// (`IORING_OP_LINK_TIMEOUT`) of `duration`, or `None` if the queue is
+    /// full. It bounds the entry before it, which must carry
+    /// `IOSQE_IO_LINK`.
+    ///
+    /// The duration is kept in memory of the entry's slot, which the entry
+    /// points to. That is enough: the kernel copies the duration when it
+    /// consumes the entry (`IORING_FEAT_SUBMIT_STABLE`), and the slot is not
+    /// reused, so the duration not rewritten, before then.
+    pub(crate) fn next_link_timeout(
+        &mut self,
+        duration: sys::__kernel_timespec,
+    ) -> Option<&mut sys::io_uring_sqe> {
+        // A full queue's next slot holds an entry the kernel has yet to
+        // consume, whose duration must stay as it is.
+        if self.sq_space() == 0 {
+            return None;
+        }
+        let slot = (self.sq.local_tail & self.sq.mask) as usize;
+        let stored = &mut self.sq.link_timeouts[slot];
+        *stored = duration;
+        let addr = ptr::from_mut(stored).expose_provenance() as u64;
+        let sqe = self.next_sqe()?;
+        sqe.opcode = sys::IORING_OP_LINK_TIMEOUT;
+        sqe.addr = addr;
+        sqe.len = 1;
+        Some(sqe)
+    }
+
     /// Publishes the queued entries and enters the kernel, submitting them
     /// and waiting until `min_complete` completions are ready or `timeout`
     /// passes. Returns the number of entries submitted.
@@ -225,8 +259,10 @@ impl Ring {
     ///
     /// # Safety
     ///
-    /// Every queued entry must point only to memory that stays valid until
-    /// its request completes.
+    /// Every queued entry must point only to memory that stays valid for as
+    /// long as the kernel uses it: until its request completes, or, for what
+    /// the kernel copies when it consumes the entry, until then. The ring
+    /// keeps a linked timeout's duration that long.
     pub(crate) unsafe fn enter(
         &mut self,
         min_complete: u32,
@@ -401,11 +437,14 @@ mod tests {
     #[test]
     fn a_full_queue_has_no_free_entry_until_submitted() {
         let mut ring = ring(4, FLAGS);
-        assert_eq!(ring.sq_entries(), 4);
+        assert_eq!(ring.sq_space(), 4);
         for user_data in 0..4 {
             queue_nop(&mut ring, user_data);
         }
+        assert_eq!(ring.sq_space(), 0);
         assert!(ring.next_sqe().is_none());
+        let timeout = sys::__kernel_timespec::default();
+        assert!(ring.next_link_timeout(timeout).is_none());
         assert_eq!(complete(&mut ring, 4).len(), 4);
         assert!(ring.next_sqe().is_some());
     }

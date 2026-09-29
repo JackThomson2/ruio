@@ -6,6 +6,7 @@ use std::io;
 use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use ruio_sys as sys;
 
@@ -107,15 +108,25 @@ impl<T: Operation> Orphan for Option<T> {
 /// Dropping an `Op` whose operation is in flight cancels the operation. The
 /// driver keeps the operation, and the memory the kernel may still be using,
 /// until the kernel reports it done.
+///
+/// [`timeout`](Op::timeout) bounds how long the kernel may take over the
+/// operation, at no cost until then: nothing is submitted before the first
+/// poll.
 #[must_use = "an operation does nothing until polled"]
 pub struct Op<T: Operation> {
     driver: Driver,
     state: State<T>,
+    timeout: Option<Duration>,
 }
 
 enum State<T> {
     Unsubmitted(T),
-    Submitted { operation: T, user_data: u64 },
+    Submitted {
+        operation: T,
+        user_data: u64,
+        /// Whether a linked timeout went to the kernel with it.
+        timed: bool,
+    },
     Done,
 }
 
@@ -124,7 +135,36 @@ impl<T: Operation> Op<T> {
         Self {
             driver,
             state: State::Unsubmitted(operation),
+            timeout: None,
         }
+    }
+
+    /// Cancels the operation if it has not completed `duration` after it is
+    /// submitted, with a linked timeout (`IORING_OP_LINK_TIMEOUT`) that goes
+    /// to the kernel with it.
+    ///
+    /// An operation cancelled this way fails with `ETIMEDOUT`
+    /// ([`io::ErrorKind::TimedOut`]), and hands back what it holds, such as
+    /// its buffer, as it does with any other error. Dropping the `Op`
+    /// instead, as a timer in user space would, gives the operation to the
+    /// driver, and its buffer with it. An operation that the kernel cannot
+    /// interrupt completes as usual, however long it takes.
+    ///
+    /// This has no effect once the operation has been submitted.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout = Some(duration);
+        self
+    }
+}
+
+/// The completion as the operation sees it. For an operation with a linked
+/// timeout, cancelled means timed out: nothing else cancels an operation
+/// whose `Op` still exists.
+fn seen(completion: Completion, timed: bool) -> Completion {
+    if timed && completion.res() == -libc::ECANCELED {
+        Completion::new(-libc::ETIMEDOUT, completion.flags())
+    } else {
+        completion
     }
 }
 
@@ -135,11 +175,12 @@ impl<T: Operation> Future for Op<T> {
         let this = self.get_mut();
         match mem::replace(&mut this.state, State::Done) {
             State::Unsubmitted(mut operation) => {
-                match this.driver.queue(&mut operation, cx.waker()) {
+                match this.driver.queue(&mut operation, this.timeout, cx.waker()) {
                     Ok(user_data) => {
                         this.state = State::Submitted {
                             operation,
                             user_data,
+                            timed: this.timeout.is_some(),
                         };
                         Poll::Pending
                     }
@@ -149,12 +190,14 @@ impl<T: Operation> Future for Op<T> {
             State::Submitted {
                 operation,
                 user_data,
+                timed,
             } => match this.driver.poll_completion(user_data, cx.waker()) {
-                Some(completion) => Poll::Ready(operation.complete(completion)),
+                Some(completion) => Poll::Ready(operation.complete(seen(completion, timed))),
                 None => {
                     this.state = State::Submitted {
                         operation,
                         user_data,
+                        timed,
                     };
                     Poll::Pending
                 }
@@ -169,6 +212,7 @@ impl<T: Operation> Drop for Op<T> {
         if let State::Submitted {
             operation,
             user_data,
+            ..
         } = mem::replace(&mut self.state, State::Done)
         {
             self.driver.orphan(user_data, operation);
@@ -189,6 +233,7 @@ impl<T: Operation> fmt::Debug for Op<T> {
         };
         f.debug_struct("Op")
             .field("state", &state)
+            .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
 }
@@ -202,6 +247,15 @@ mod tests {
         assert_eq!(Completion::new(7, 0).result().unwrap(), 7);
         let err = Completion::new(-2, 0).result().unwrap_err();
         assert_eq!(err.raw_os_error(), Some(2));
+    }
+
+    #[test]
+    fn only_timed_operations_see_cancellation_as_a_timeout() {
+        let cancelled = Completion::new(-libc::ECANCELED, 0);
+        assert_eq!(seen(cancelled, true).res(), -libc::ETIMEDOUT);
+        assert_eq!(seen(cancelled, false), cancelled);
+        let done = Completion::new(3, 0);
+        assert_eq!(seen(done, true), done);
     }
 
     #[test]
