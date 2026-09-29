@@ -74,8 +74,14 @@ it is dropped. Three rules follow.
 
    The unsafe `IoBuf` and `IoBufMut` traits promise a stable address and
    length while the kernel holds the buffer. They are implemented for
-   `Vec<u8>`, `Box<[u8]>`, `&'static [u8]`, `bytes::BytesMut` (optional
-   feature), sub-slices of those, and registered buffers.
+   `Vec<u8>` and `Box<[u8]>`, for `&'static [u8]`, `&'static str` and
+   `String` (writes), for `Slice`s of any buffer, for registered buffers
+   (`FixedBuf`) and for pool leases (`BufLease`). A read fills a buffer from
+   its start and marks what it read as initialized; slicing a vector from its
+   length reads into the spare capacity. A slice clamps itself to its buffer
+   whenever it is used, and zeroes any gap before its start when it marks
+   bytes initialized, so a vector never counts memory nothing wrote.
+   `bytes::BytesMut` can come as an optional feature.
 2. **Dropping an in-flight operation hands its resources to the driver.** The
    future moves them into its slot in the operation table, marks the slot
    orphaned and queues a cancellation. They are freed when the final CQE
@@ -85,9 +91,16 @@ it is dropped. Three rules follow.
    within a bound (a regular-file read stuck in an io-wq worker, say) is
    leaked, never freed, and only then is the ring closed.
 
-Receives let the kernel choose the buffer from a provided-buffer ring, so idle
-connections do not pin memory. A completed receive yields a `BufLease` that
-returns its buffer to the ring when dropped.
+Receives let the kernel choose the buffer from a provided-buffer ring
+(`BufPool`), so idle connections do not pin memory. A completed receive
+yields a `BufLease` that returns its buffer to the ring when dropped.
+
+Memory registered with the kernel (registered buffers, pools) stays
+registered and mapped for as long as anything that might let the kernel
+write to it exists: every buffer, lease and operation using it holds a
+reference, orphaned operations included. The registration refers to the
+driver weakly, so an orphan holding it cannot keep the ring alive in a
+cycle.
 
 ### Unsafe code policy
 
@@ -135,9 +148,10 @@ its own flag set.
   operation. The payload (buffer, address, ...) lives in the future, not the
   slot.
 - Slot states: free, waiting (with a `Waker`), completed (result and flags,
-  until the future collects them) and orphaned (the boxed payload of a
-  dropped operation). A multishot state, holding a queue of completions,
-  arrives with the first multishot operation.
+  until the future collects them), orphaned (the boxed payload of a dropped
+  operation), streaming (the queued completions of a multishot request) and
+  orphaned stream (the payload of a dropped stream, handed each completion
+  until the last).
 - Operations are lazy: nothing is queued before the first poll, which leaves
   room for combinators such as `.timeout(d)` (a linked timeout),
   `.link(next)` and `.fixed()` to shape the SQE at no cost. Linked entries
@@ -152,8 +166,15 @@ its own flag set.
   in the SQE stays valid until `complete` runs, even when the value moves, so
   it may only point to heap memory the value owns (a read's `Vec`, a
   timeout's boxed timespec) or to `'static` memory; and the SQE produces
-  exactly one completion. Multishot and zero-copy operations, which produce
-  several, will get a trait of their own.
+  exactly one completion.
+- Multishot requests implement `Multishot` instead: `item` turns each
+  completion into an item, and `Driver::stream` makes a `MultiOp` stream of
+  them, which ends when a completion lacks `IORING_CQE_F_MORE` and can be
+  re-armed. Dropping an armed stream hands the completions it had not taken
+  to the request, cancels it, and keeps handing it completions until the
+  last, so items that own resources, such as leased buffers, release them.
+  Zero-copy sends, which post a notification after their result, will need
+  a similar trait.
 - `Driver::op` wraps an operation in an `Op` future, which is `Unpin`.
   Dropping it in flight moves the operation into its slot and queues an
   `ASYNC_CANCEL` whose success posts no completion. When the operation's own
@@ -163,8 +184,10 @@ its own flag set.
   driver's `RefCell` borrow is released, since each can run code that uses
   the driver. An SQE left half-prepared by a panicking `prepare` becomes an
   ignored no-op, so it cannot reach the kernel pointing at freed memory.
-- Until M3's `IoBuf` traits, `Read` and `Write` take a `Vec<u8>`; a read
-  appends to the vector's contents, filling its spare capacity.
+- `RecvStream` keeps a multishot receive into a pool armed: when the kernel
+  ends it with `ENOBUFS` it waits for a lease to return a buffer (the pool
+  wakes waiters), and when the kernel ends it for its own reasons it re-arms
+  at once. The data waits in the socket meanwhile, so none is lost.
 
 ### Kernel features
 
@@ -307,9 +330,11 @@ request. A CI job fails on regressions.
 | M6 | Multi-core: builder, CPU pinning, `spawn_on`, cross-core channels, descriptor passing | Close to linear scaling up to 96 cores |
 | M7 | Compat adapters, hyper and rustls examples, documentation | A hyper server runs through the adapters |
 
-M0, M1 and M2 are done. Still to come besides the later milestones:
-multishot operations, links and the `IoBuf` traits (M3), and channels and
-other synchronization primitives, with the cooperative budget they need.
+M0 to M3 are done. Still to come besides the later milestones: linked
+operations and the `.timeout(d)` combinator, which M4 needs for network
+timeouts; the probed extras for buffers (multishot read from 6.7, bundles
+from 6.10, incremental consumption from 6.12); and channels and other
+synchronization primitives, with the cooperative budget they need.
 
 ## Open questions
 
