@@ -212,6 +212,28 @@ pub struct io_uring_getevents_arg {
     pub ts: u64,
 }
 
+/// A registered resource table to create, for [`IORING_REGISTER_FILES2`]
+/// and [`IORING_REGISTER_BUFFERS2`], whose size argument is the size of this
+/// structure.
+///
+/// With [`IORING_RSRC_REGISTER_SPARSE`] and a null `data`, the table has `nr`
+/// empty slots.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct io_uring_rsrc_register {
+    /// The number of slots.
+    pub nr: u32,
+    /// `IORING_RSRC_REGISTER_*` flags.
+    pub flags: u32,
+    /// Reserved; must be zero.
+    pub resv2: u64,
+    /// Address of the resources to register: `nr` file descriptors or
+    /// iovecs, or 0.
+    pub data: u64,
+    /// Address of `nr` tags to report when the resources are released, or 0.
+    pub tags: u64,
+}
+
 /// One entry of a registered resource table to set or clear.
 ///
 /// With [`IORING_REGISTER_RING_FDS`], `data` is a ring's file descriptor and
@@ -298,6 +320,7 @@ const _: () = {
     assert!(size_of::<io_uring_probe_op>() == 8);
     assert!(size_of::<io_uring_probe>() == 16);
     assert!(size_of::<io_uring_getevents_arg>() == 24);
+    assert!(size_of::<io_uring_rsrc_register>() == 32);
     assert!(size_of::<io_uring_rsrc_update>() == 16);
     assert!(size_of::<io_uring_buf>() == 16);
     assert!(size_of::<io_uring_buf_ring>() == 16);
@@ -737,6 +760,15 @@ consts! {
         IORING_REGISTER_BPF_FILTER = 37,
         /// Flag for the opcode: `fd` is a registered ring index.
         IORING_REGISTER_USE_REGISTERED_RING = 1 << 31,
+    ];
+}
+
+consts! {
+    /// Every `IORING_RSRC_REGISTER_*` flag, for
+    /// [`io_uring_rsrc_register::flags`].
+    pub const RSRC_REGISTER_FLAGS: [u32] = [
+        /// Create the table with every slot empty; `data` must be 0.
+        IORING_RSRC_REGISTER_SPARSE = 1 << 0,
     ];
 }
 

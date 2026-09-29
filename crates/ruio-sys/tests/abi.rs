@@ -163,6 +163,13 @@ const LAYOUTS: &[Layout] = &[
         min_wait_usec => min_wait_usec,
         ts => ts,
     }),
+    layout!(io_uring_rsrc_register, in_header: true, {
+        nr => nr,
+        flags => flags,
+        resv2 => resv2,
+        data => data,
+        tags => tags,
+    }),
     layout!(io_uring_rsrc_update, in_header: true, {
         offset => offset,
         resv => resv,
@@ -223,6 +230,7 @@ fn tables() -> Vec<(&'static str, Vec<(&'static str, u64)>)> {
         CQ_RING_FLAGS,
         MMAP_OFFSETS,
         REGISTER_OPS,
+        RSRC_REGISTER_FLAGS,
         FSYNC_FLAGS,
         TIMEOUT_FLAGS,
         POLL_FLAGS,
