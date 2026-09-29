@@ -7,6 +7,9 @@
 //! whatever file reused its number, which misdirects the I/O but cannot
 //! corrupt memory.
 //!
+//! Operations that move data take their buffer by value, as an
+//! [`IoBuf`] or [`IoBufMut`], and hand it back with the result.
+//!
 //! [`Driver::submit`]: crate::Driver::submit
 //! [`Driver::park`]: crate::Driver::park
 
@@ -17,6 +20,7 @@ use std::time::Duration;
 
 use ruio_sys as sys;
 
+use crate::buf::{BufResult, IoBuf, IoBufMut};
 use crate::driver::timespec;
 use crate::{Completion, Operation};
 
@@ -79,93 +83,94 @@ unsafe impl Operation for Timeout {
     }
 }
 
-/// Reads from a file descriptor into a buffer's spare capacity, like
-/// `read(2)`, or `pread(2)` with an offset.
+/// Reads from a file descriptor into a buffer, like `read(2)`, or `pread(2)`
+/// with an offset.
 ///
-/// The bytes read are appended to the buffer's contents, up to its spare
-/// capacity, and the buffer comes back with the result.
+/// The read fills the buffer from its start, up to
+/// [`bytes_total`](IoBuf::bytes_total), and marks the bytes it read as
+/// initialized; slice the buffer to read elsewhere in it. The buffer comes
+/// back with the result.
 #[derive(Debug)]
-pub struct Read {
+pub struct Read<B> {
     fd: RawFd,
-    buf: Vec<u8>,
+    buf: B,
     offset: u64,
 }
 
-impl Read {
+impl<B: IoBufMut> Read<B> {
     /// Reads at the file position, advancing it.
-    pub fn new(fd: RawFd, buf: Vec<u8>) -> Self {
+    pub fn new(fd: RawFd, buf: B) -> Self {
         Self::at(fd, buf, CURRENT_POSITION)
     }
 
     /// Reads at `offset`, leaving the file position alone.
-    pub fn at(fd: RawFd, buf: Vec<u8>, offset: u64) -> Self {
+    pub fn at(fd: RawFd, buf: B, offset: u64) -> Self {
         Self { fd, buf, offset }
     }
 }
 
-// SAFETY: the entry points to the vector's spare capacity, on the heap, which
-// stays put when the operation moves; nothing reallocates the vector until
-// `complete`. A read posts one completion.
-unsafe impl Operation for Read {
+// SAFETY: the entry points into the buffer, which `IoBufMut` keeps valid and
+// in place while the operation holds it, even as it moves. A read posts one
+// completion.
+unsafe impl<B: IoBufMut> Operation for Read<B> {
     /// The number of bytes read, and the buffer.
-    type Output = (io::Result<usize>, Vec<u8>);
+    type Output = BufResult<usize, B>;
 
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
-        let spare = self.buf.spare_capacity_mut();
         sqe.opcode = sys::IORING_OP_READ;
         sqe.fd = self.fd;
-        sqe.addr = spare.as_mut_ptr().expose_provenance() as u64;
-        sqe.len = u32::try_from(spare.len()).unwrap_or(u32::MAX);
+        sqe.addr = self.buf.stable_mut_ptr().expose_provenance() as u64;
+        sqe.len = u32::try_from(self.buf.bytes_total()).unwrap_or(u32::MAX);
         sqe.off = self.offset;
     }
 
     fn complete(mut self, completion: Completion) -> Self::Output {
         let result = completion.result().map(|read| {
-            let spare = self.buf.capacity() - self.buf.len();
-            let read = (read as usize).min(spare);
-            // SAFETY: the kernel initialized `read` bytes of the spare
-            // capacity, which begins at the end of the contents.
-            unsafe { self.buf.set_len(self.buf.len() + read) };
+            let read = (read as usize).min(self.buf.bytes_total());
+            // SAFETY: the kernel initialized the first `read` bytes, which
+            // are within the buffer.
+            unsafe { self.buf.set_init(read) };
             read
         });
         (result, self.buf)
     }
 }
 
-/// Writes a buffer's contents to a file descriptor, like `write(2)`, or
-/// `pwrite(2)` with an offset.
+/// Writes a buffer's initialized bytes to a file descriptor, like `write(2)`,
+/// or `pwrite(2)` with an offset.
 ///
 /// The buffer comes back with the result.
 #[derive(Debug)]
-pub struct Write {
+pub struct Write<B> {
     fd: RawFd,
-    buf: Vec<u8>,
+    buf: B,
     offset: u64,
 }
 
-impl Write {
+impl<B: IoBuf> Write<B> {
     /// Writes at the file position, advancing it.
-    pub fn new(fd: RawFd, buf: Vec<u8>) -> Self {
+    pub fn new(fd: RawFd, buf: B) -> Self {
         Self::at(fd, buf, CURRENT_POSITION)
     }
 
     /// Writes at `offset`, leaving the file position alone.
-    pub fn at(fd: RawFd, buf: Vec<u8>, offset: u64) -> Self {
+    pub fn at(fd: RawFd, buf: B, offset: u64) -> Self {
         Self { fd, buf, offset }
     }
 }
 
-// SAFETY: the entry points to the vector's contents, on the heap, which stay
-// put when the operation moves. A write posts one completion.
-unsafe impl Operation for Write {
+// SAFETY: the entry points into the buffer, which `IoBuf` keeps valid, in
+// place and unchanged while the operation holds it. A write posts one
+// completion.
+unsafe impl<B: IoBuf> Operation for Write<B> {
     /// The number of bytes written, and the buffer.
-    type Output = (io::Result<usize>, Vec<u8>);
+    type Output = BufResult<usize, B>;
 
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
         sqe.opcode = sys::IORING_OP_WRITE;
         sqe.fd = self.fd;
-        sqe.addr = self.buf.as_ptr().expose_provenance() as u64;
-        sqe.len = u32::try_from(self.buf.len()).unwrap_or(u32::MAX);
+        sqe.addr = self.buf.stable_ptr().expose_provenance() as u64;
+        sqe.len = u32::try_from(self.buf.bytes_init()).unwrap_or(u32::MAX);
         sqe.off = self.offset;
     }
 

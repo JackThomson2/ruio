@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ruio_driver::Driver;
+use ruio_driver::buf::IoBuf;
 use ruio_driver::ops::{Read, Timeout, Write};
 
 use support::{block_on, poll_once, settle};
@@ -61,29 +62,66 @@ fn bytes_written_to_a_pipe_can_be_read_back() {
 }
 
 #[test]
-fn a_read_appends_to_the_buffer_contents() {
+fn a_read_fills_the_buffer_from_its_start() {
+    let driver = Driver::new().unwrap();
+    let (reader, mut writer) = io::pipe().unwrap();
+    writer.write_all(b"new data").unwrap();
+
+    let buf = Vec::from(b"old".to_vec().into_boxed_slice());
+    let (read, buf) = block_on(&driver, driver.op(Read::new(reader.as_raw_fd(), buf)));
+    assert_eq!(read.unwrap(), 3);
+    assert_eq!(buf, b"new");
+}
+
+#[test]
+fn a_read_into_the_spare_capacity_appends() {
     let driver = Driver::new().unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     writer.write_all(b"cd").unwrap();
 
     let mut buf = Vec::with_capacity(8);
     buf.extend_from_slice(b"ab");
-    let (read, buf) = block_on(&driver, driver.op(Read::new(reader.as_raw_fd(), buf)));
+    let spare = buf.slice(2..);
+    let (read, spare) = block_on(&driver, driver.op(Read::new(reader.as_raw_fd(), spare)));
     assert_eq!(read.unwrap(), 2);
-    assert_eq!(buf, b"abcd");
+    assert_eq!(spare.into_inner(), b"abcd");
 }
 
 #[test]
-fn a_read_without_spare_capacity_reads_nothing() {
+fn an_empty_slice_reads_nothing() {
     let driver = Driver::new().unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     writer.write_all(b"unread").unwrap();
 
-    let buf = b"full".to_vec();
-    let buf = Vec::from(buf.into_boxed_slice());
+    let buf = Vec::from(b"full".to_vec().into_boxed_slice()).slice(4..);
     let (read, buf) = block_on(&driver, driver.op(Read::new(reader.as_raw_fd(), buf)));
     assert_eq!(read.unwrap(), 0);
-    assert_eq!(buf, b"full");
+    assert_eq!(buf.into_inner(), b"full");
+}
+
+#[test]
+fn writes_take_any_buffer_or_part_of_one() {
+    let driver = Driver::new().unwrap();
+    let (mut reader, writer) = io::pipe().unwrap();
+    let fd = writer.as_raw_fd();
+    assert_eq!(
+        block_on(&driver, driver.op(Write::new(fd, "static ")))
+            .0
+            .unwrap(),
+        7
+    );
+    let part = b"<boxed>".to_vec().into_boxed_slice().slice(1..6);
+    assert_eq!(
+        block_on(&driver, driver.op(Write::new(fd, part)))
+            .0
+            .unwrap(),
+        5
+    );
+    drop(writer);
+
+    let mut written = String::new();
+    reader.read_to_string(&mut written).unwrap();
+    assert_eq!(written, "static boxed");
 }
 
 #[test]
