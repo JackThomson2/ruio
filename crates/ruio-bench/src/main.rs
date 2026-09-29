@@ -13,6 +13,12 @@
 //! descriptors, and tokio's current-thread runtime. Runtimes across cores
 //! are milestone M6.
 //!
+//! `ruio-bench randread` compares random reads with direct I/O against fio's,
+//! on a file or block device: for each queue depth, ruio's reader and fio's
+//! io_uring engine each run in a process of their own on the same CPU, with
+//! registered buffers and files, in turns. The report gives reads per second
+//! and how ruio's compare.
+//!
 //! The server and the load generator also run on their own:
 //!
 //! ```text
@@ -24,6 +30,7 @@
 //! ```
 
 mod client;
+mod randread;
 mod server;
 mod sys;
 
@@ -43,7 +50,9 @@ const USAGE: &str = "usage: ruio-bench echo [--quick] [--runs N] [--seconds S] [
                      [--server-cpu N] [--client-cpus LIST]
        ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
        ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] \
-                     [--warmup S] [--cpus LIST]";
+                     [--warmup S] [--cpus LIST]
+       ruio-bench randread PATH [--depths LIST] [--block BYTES] [--runs N] [--seconds S] \
+                     [--warmup S] [--cpu N] [--fio FIO]";
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -52,6 +61,8 @@ fn main() {
         Some("echo") => echo(&options),
         Some("echo-server") => echo_server(&options),
         Some("echo-client") => echo_client(&options),
+        Some("randread") => randread(&options),
+        Some("randread-ruio") => randread_ruio(&options),
         _ => Err(USAGE.to_owned()),
     });
     if let Err(err) = result {
@@ -128,6 +139,90 @@ impl Options {
             .parse()
             .map_err(|err| format!("{what} {value}: {err}"))
     }
+}
+
+/// The load of a random-read run, from the options.
+fn read_load(options: &Options, depth: usize) -> Result<randread::Load, String> {
+    Ok(randread::Load {
+        path: options.positional::<String>(0, "path")?.into(),
+        depth,
+        block: options.get("block", 4096)?,
+        warmup: options.duration("warmup", 1.0)?,
+        measure: options.duration("seconds", 5.0)?,
+        cpu: options.get("cpu", 0)?,
+    })
+}
+
+/// Compares ruio's random reads with fio's, each in a process of its own on
+/// the same CPU, run by run in turns, for each queue depth.
+fn randread(options: &Options) -> Result<(), String> {
+    let exe = env::current_exe().map_err(|err| err.to_string())?;
+    let fio: String = options.get("fio", "fio".to_owned())?;
+    let runs: usize = options.get("runs", 3)?;
+    let depths: String = options.get("depths", "1,4,16,32,64,128".to_owned())?;
+    let depths = sys::parse_cpus(&depths)?;
+    let load = read_load(options, 1)?;
+    randread::check_direct_io(&load.path, load.block)
+        .map_err(|err| format!("{} does not take direct I/O: {err}", load.path.display()))?;
+    println!(
+        "{} B random reads of {}, direct, on CPU {}: reads per second, medians of {runs} runs.",
+        load.block,
+        load.path.display(),
+        load.cpu
+    );
+    println!();
+    println!("| depth | fio | ruio |");
+    println!("|---:|---:|---:|");
+    for depth in depths {
+        let load = read_load(options, depth)?;
+        let (mut fio_runs, mut ruio_runs) = (Vec::new(), Vec::new());
+        for round in 1..=runs {
+            eprintln!("depth {depth}, run {round}");
+            fio_runs.push(randread::fio(&fio, &load)?);
+            ruio_runs.push(read_child(&exe, &load)?);
+        }
+        let (fio, ruio) = (median(fio_runs.into_iter()), median(ruio_runs.into_iter()));
+        println!(
+            "| {depth} | {} | {} ({:.2}x) |",
+            thousands(fio),
+            thousands(ruio),
+            ruio / fio
+        );
+    }
+    Ok(())
+}
+
+/// Runs ruio's reader in a process of its own, and returns its rate.
+fn read_child(exe: &Path, load: &randread::Load) -> Result<f64, String> {
+    let output = Command::new(exe)
+        .arg("randread-ruio")
+        .arg(&load.path)
+        .args(["--depth", &load.depth.to_string()])
+        .args(["--block", &load.block.to_string()])
+        .args(["--warmup", &load.warmup.as_secs_f64().to_string()])
+        .args(["--seconds", &load.measure.as_secs_f64().to_string()])
+        .args(["--cpu", &load.cpu.to_string()])
+        .output()
+        .map_err(|err| format!("could not run the reader: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .trim()
+        .strip_prefix("rate=")
+        .and_then(|rate| rate.parse().ok())
+        .ok_or_else(|| {
+            format!(
+                "the reader failed: {}{}",
+                stdout,
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+}
+
+fn randread_ruio(options: &Options) -> Result<(), String> {
+    let load = read_load(options, options.get("depth", 32)?)?;
+    let rate = randread::ruio(&load).map_err(|err| err.to_string())?;
+    println!("rate={rate:.0}");
+    Ok(())
 }
 
 fn echo_server(options: &Options) -> Result<(), String> {
