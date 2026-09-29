@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use ruio_sys as sys;
 
-use crate::buf::{BufResult, FixedIoBuf, IoBuf, IoBufMut};
+use crate::buf::{BufLease, BufPool, BufResult, FixedIoBuf, IoBuf, IoBufMut};
 use crate::driver::timespec;
 use crate::{Completion, Operation};
 
@@ -298,5 +298,62 @@ unsafe impl<B: IoBuf + FixedIoBuf> Operation for WriteFixed<B> {
             completion.result().map(|written| written as usize),
             self.buf,
         )
+    }
+}
+
+/// Reads from a file descriptor into a buffer the kernel picks from a
+/// [`BufPool`] once data arrives, like [`Read`].
+///
+/// The output is the data, as a lease on the buffer, or `None` at the end of
+/// the file; it is `ENOBUFS` if the pool had no free buffer.
+#[derive(Debug)]
+pub struct ReadPooled {
+    fd: RawFd,
+    pool: BufPool,
+    offset: u64,
+}
+
+impl ReadPooled {
+    /// Reads at the file position, advancing it.
+    pub fn new(fd: RawFd, pool: &BufPool) -> Self {
+        Self::at(fd, pool, CURRENT_POSITION)
+    }
+
+    /// Reads at `offset`, leaving the file position alone.
+    pub fn at(fd: RawFd, pool: &BufPool, offset: u64) -> Self {
+        Self {
+            fd,
+            pool: pool.clone(),
+            offset,
+        }
+    }
+}
+
+// SAFETY: the entry points to no memory of its own: the kernel writes into a
+// buffer of the pool, which the operation keeps alive. A read posts one
+// completion.
+unsafe impl Operation for ReadPooled {
+    type Output = io::Result<Option<BufLease>>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_READ;
+        sqe.fd = self.fd;
+        sqe.flags = sys::IOSQE_BUFFER_SELECT;
+        sqe.buf_index = self.pool.group();
+        sqe.len = u32::try_from(self.pool.buffer_size()).unwrap_or(u32::MAX);
+        sqe.off = self.offset;
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        let len = usize::try_from(completion.res()).unwrap_or(0);
+        // Taken before looking at the result, so that a buffer the read
+        // consumed returns to the pool whatever happened.
+        let lease = self.pool.lease(completion.flags(), len);
+        match completion.result()? {
+            0 => Ok(None),
+            _ => lease
+                .map(Some)
+                .ok_or_else(|| io::Error::other("a pooled read returned no buffer")),
+        }
     }
 }

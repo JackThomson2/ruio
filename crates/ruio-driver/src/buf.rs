@@ -14,13 +14,16 @@
 //! vector's spare capacity, after its contents.
 //!
 //! [`FixedBuffers`] are registered with a ring once, for reads and writes
-//! that skip mapping the memory on every operation.
+//! that skip mapping the memory on every operation. A [`BufPool`] holds
+//! buffers the kernel picks from when data arrives, so waiting readers pin
+//! no memory, and hands the data back as a [`BufLease`].
 
 use std::fmt;
 use std::io;
 use std::ops::{Bound, RangeBounds};
 
 pub use crate::fixed::{FixedBuf, FixedBuffers, FixedIoBuf};
+pub use crate::pool::{BufLease, BufPool};
 
 /// The result of an operation that held a buffer, and the buffer.
 pub type BufResult<T, B> = (io::Result<T>, B);

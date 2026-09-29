@@ -99,6 +99,7 @@ impl Builder {
                 ring,
                 notify,
                 wake_armed: false,
+                next_group: 0,
                 cancels: Vec::new(),
                 wakers: Vec::new(),
                 released: Vec::new(),
@@ -170,6 +171,8 @@ struct Inner {
     notify: Arc<Notify>,
     /// Whether the multishot poll on the unparkers' eventfd is in flight.
     wake_armed: bool,
+    /// The provided-buffer group ID the next pool gets.
+    next_group: u16,
     /// Dropped operations to cancel, by `user_data`.
     cancels: Vec<u64>,
     /// Wakers of a batch of completions, kept to reuse the allocation.
@@ -246,6 +249,14 @@ impl Driver {
     /// Counts of the driver's work so far.
     pub fn stats(&self) -> Stats {
         self.inner.borrow().stats
+    }
+
+    /// A provided-buffer group ID for a new pool.
+    pub(crate) fn next_buffer_group(&self) -> u16 {
+        let mut inner = self.inner.borrow_mut();
+        let group = inner.next_group;
+        inner.next_group = group.wrapping_add(1);
+        group
     }
 
     pub(crate) fn downgrade(&self) -> WeakDriver {

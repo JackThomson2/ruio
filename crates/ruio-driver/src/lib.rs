@@ -40,6 +40,7 @@ mod fixed;
 mod mem;
 mod op;
 pub mod ops;
+mod pool;
 mod probe;
 mod ring;
 mod table;
