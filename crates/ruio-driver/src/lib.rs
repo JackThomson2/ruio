@@ -8,7 +8,8 @@
 //! completed.
 //!
 //! Dropping an [`Op`] whose operation is in flight cancels it, and the driver
-//! keeps the operation's memory until the kernel is done with it.
+//! keeps the operation's memory until the kernel is done with it. An
+//! [`Unparker`] wakes a parked driver from any thread.
 //!
 //! [`Probe`] reports what the running kernel supports and checks it against
 //! ruio's baseline, the capabilities of Linux 6.1.
@@ -39,7 +40,9 @@ pub mod ops;
 mod probe;
 mod ring;
 mod table;
+mod unpark;
 
 pub use driver::{Builder, Driver, Stats};
 pub use op::{Completion, Op, Operation};
 pub use probe::{BaselineError, Probe};
+pub use unpark::Unparker;

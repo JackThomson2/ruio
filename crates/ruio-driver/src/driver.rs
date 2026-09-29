@@ -6,6 +6,7 @@ use std::fmt;
 use std::io;
 use std::mem;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,10 @@ use crate::Probe;
 use crate::op::{Completion, Op, Operation, Orphan};
 use crate::ring::Ring;
 use crate::table::{IGNORED, Outcome, Table};
+use crate::unpark::{Notify, Unparker};
+
+/// The `user_data` of the poll on the eventfd that unparkers write to.
+const WAKE: u64 = IGNORED - 1;
 
 /// The setup flags of every ring, besides `IORING_SETUP_NO_SQARRAY` when the
 /// kernel has it. See DESIGN.md.
@@ -86,10 +91,13 @@ impl Builder {
         }
         let cq_entries = self.entries.saturating_mul(4);
         let ring = Ring::new(self.entries, cq_entries, flags)?;
+        let notify = Arc::new(Notify::new()?);
         Ok(Driver {
             inner: Rc::new(RefCell::new(Inner {
                 table: Table::with_capacity(cq_entries as usize),
                 ring,
+                notify,
+                wake_armed: false,
                 cancels: Vec::new(),
                 wakers: Vec::new(),
                 released: Vec::new(),
@@ -142,6 +150,10 @@ struct Inner {
     ring: Ring,
     /// Every operation the kernel may still own.
     table: Table<Box<dyn Orphan>>,
+    /// What the driver shares with its unparkers.
+    notify: Arc<Notify>,
+    /// Whether the multishot poll on the unparkers' eventfd is in flight.
+    wake_armed: bool,
     /// Dropped operations to cancel, by `user_data`.
     cancels: Vec<u64>,
     /// Wakers of a batch of completions, kept to reuse the allocation.
@@ -184,15 +196,29 @@ impl Driver {
     }
 
     /// Submits the queued operations, waits until at least one completion is
-    /// ready or `timeout` passes, and delivers the completions.
+    /// ready, an [`Unparker`] is used or `timeout` passes, and delivers the
+    /// completions.
     ///
-    /// With nothing in flight and no timeout, this waits forever.
+    /// If an unpark arrived since the last park, this returns without
+    /// waiting.
     ///
     /// # Errors
     ///
     /// As for [`Driver::submit`]. Timing out is not an error.
     pub fn park(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.enter(1, timeout)
+        let notify = Arc::clone(&self.inner.borrow().notify);
+        if !notify.begin_park() {
+            return self.enter(0, None);
+        }
+        let armed = self.inner.borrow_mut().arm_wake();
+        let result = armed.and_then(|()| self.enter(1, timeout));
+        notify.end_park();
+        result
+    }
+
+    /// A handle that wakes this driver from any thread.
+    pub fn unparker(&self) -> Unparker {
+        Unparker::new(Arc::clone(&self.inner.borrow().notify))
     }
 
     /// The number of operations the kernel may still own, including those
@@ -371,6 +397,29 @@ impl Inner {
         Ok(())
     }
 
+    /// Queues the multishot poll on the unparkers' eventfd, unless it is in
+    /// flight. The eventfd is never read: each write completes the poll once,
+    /// and a poll armed while the eventfd is readable completes at once.
+    fn arm_wake(&mut self) -> io::Result<()> {
+        if self.wake_armed {
+            return Ok(());
+        }
+        if self.ring.queued() == self.ring.sq_entries() {
+            self.submit_queued()?;
+        }
+        let sqe = self
+            .ring
+            .next_sqe()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))?;
+        sqe.opcode = sys::IORING_OP_POLL_ADD;
+        sqe.fd = self.notify.eventfd();
+        sqe.op_flags = libc::POLLIN as u32;
+        sqe.len = sys::IORING_POLL_ADD_MULTI;
+        sqe.user_data = WAKE;
+        self.wake_armed = true;
+        Ok(())
+    }
+
     /// Queues a cancellation of every request in flight.
     fn queue_cancel_all(&mut self) -> io::Result<()> {
         self.cancels.clear();
@@ -425,6 +474,14 @@ impl Inner {
     fn reap(&mut self, wakers: &mut Vec<Waker>, released: &mut Vec<(Box<dyn Orphan>, Completion)>) {
         while let Some(cqe) = self.ring.pop_cqe() {
             self.stats.completions += 1;
+            if cqe.user_data == WAKE {
+                // An unparker's write. Without IORING_CQE_F_MORE the poll
+                // has ended, and the next park arms another.
+                if cqe.flags & sys::IORING_CQE_F_MORE == 0 {
+                    self.wake_armed = false;
+                }
+                continue;
+            }
             let completion = Completion::new(cqe.res, cqe.flags);
             match self.table.complete(cqe.user_data, completion) {
                 Outcome::Wake(Some(waker)) => wakers.push(waker),
