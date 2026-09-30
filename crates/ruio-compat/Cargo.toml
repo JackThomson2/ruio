@@ -1,0 +1,22 @@
+[package]
+name = "ruio-compat"
+description = "Adapters from ruio's streams to the futures-io and tokio::io traits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["futures-io"]
+# `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of futures-io.
+futures-io = ["dep:futures-io"]
+
+[dependencies]
+futures-io = { version = "0.3.34", optional = true }
+ruio.workspace = true
+
+[dev-dependencies]
+futures-util = { version = "0.3.34", default-features = false, features = ["io"] }
+
+[lints]
+workspace = true

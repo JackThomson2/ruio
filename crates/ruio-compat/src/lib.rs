@@ -1,0 +1,319 @@
+//! Adapters from ruio's streams to the poll-based I/O traits that the
+//! ecosystem builds on: `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of
+//! [`futures-io`](https://docs.rs/futures-io), with the `futures-io`
+//! feature, which is on by default.
+//!
+//! ruio's I/O is completion-based: an operation takes a buffer of its own,
+//! the kernel fills or sends it, and the operation hands it back. The
+//! poll-based traits lend the caller's buffer for one call instead, which
+//! the kernel cannot use once the call returns. [`Compat`] bridges the two
+//! with buffers of its own:
+//!
+//! - A read receives into the adapter's buffer, and copies out as much as
+//!   the caller's takes; the rest waits for the next read, and
+//!   `AsyncBufRead` lends it out as it is. A receive stays in flight from
+//!   one poll to the next, however long the caller takes to poll again, so
+//!   nothing it receives is lost; dropping the adapter cancels it.
+//! - A write copies the caller's bytes and writes them behind the stream,
+//!   as [`TcpStream::write_behind`] does: it is done, as far as the caller
+//!   can tell, once the send is on its way, and the next write waits for it
+//!   to finish. How the send went comes out later: a failure fails the
+//!   writes, flushes and closes after it. Dropping the adapter leaves the
+//!   send to finish, and the stream closes after it.
+//! - A flush has nothing to wait for, since the adapter holds nothing back:
+//!   it reports a failure if one is known, as a socket's flush would. Were
+//!   it to wait for the send to finish, each flush would cost its task
+//!   another wake-up, which a server flushing every response pays dearly for
+//!   with many connections.
+//! - Closing waits for the send in flight, then shuts down the writing half
+//!   of the connection.
+//!
+//! Like the streams, an adapter belongs to its thread, whose runtime's ring
+//! runs its I/O.
+//!
+//! ```no_run
+//! use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+//! use ruio::net::TcpStream;
+//! use ruio_compat::Compat;
+//!
+//! #[ruio::main]
+//! async fn main() -> std::io::Result<()> {
+//!     let mut stream = Compat::new(TcpStream::connect("127.0.0.1:7878").await?);
+//!     stream.write_all(b"hello").await?;
+//!     stream.close().await?;
+//!     let mut reply = Vec::new();
+//!     stream.read_to_end(&mut reply).await?;
+//!     Ok(())
+//! }
+//! ```
+
+use std::fmt;
+use std::future::Future;
+use std::io::{self, IoSlice};
+use std::mem;
+use std::net::Shutdown;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker, ready};
+
+use ruio::net::{Flush, TcpStream, UnixStream, WriteBehind};
+use ruio::uring::ops::{self, Recv};
+use ruio::uring::{Driver, Fd, Op};
+
+#[cfg(feature = "futures-io")]
+mod futures_impls;
+
+/// How many bytes a read asks the kernel for, unless the adapter was made
+/// [`with_capacity`](Compat::with_capacity).
+const DEFAULT_CAPACITY: usize = 16 << 10;
+
+/// The most bytes a write takes at once, and copies: a bound on the memory
+/// a write in flight holds.
+const MAX_WRITE: usize = 256 << 10;
+
+/// A stream socket of ruio's that a [`Compat`] adapts: a [`TcpStream`] or a
+/// [`UnixStream`].
+pub trait StreamSocket: sealed::Sealed {}
+
+impl StreamSocket for TcpStream {}
+impl StreamSocket for UnixStream {}
+
+mod sealed {
+    use super::*;
+
+    /// What an adapter needs of its stream.
+    pub trait Sealed {
+        fn fd(&self) -> Fd;
+
+        fn write_behind(&self, bufs: Vec<Vec<u8>>) -> WriteBehind<'_, Vec<Vec<u8>>>;
+
+        fn flush(&self) -> Flush<'_>;
+    }
+
+    impl Sealed for TcpStream {
+        fn fd(&self) -> Fd {
+            TcpStream::fd(self)
+        }
+
+        fn write_behind(&self, bufs: Vec<Vec<u8>>) -> WriteBehind<'_, Vec<Vec<u8>>> {
+            TcpStream::write_behind(self, bufs)
+        }
+
+        fn flush(&self) -> Flush<'_> {
+            TcpStream::flush(self)
+        }
+    }
+
+    impl Sealed for UnixStream {
+        fn fd(&self) -> Fd {
+            UnixStream::fd(self)
+        }
+
+        fn write_behind(&self, bufs: Vec<Vec<u8>>) -> WriteBehind<'_, Vec<Vec<u8>>> {
+            UnixStream::write_behind(self, bufs)
+        }
+
+        fn flush(&self) -> Flush<'_> {
+            UnixStream::flush(self)
+        }
+    }
+}
+
+/// A ruio stream with the poll-based I/O traits: `AsyncRead`,
+/// `AsyncBufRead` and `AsyncWrite` of futures-io; see the
+/// [crate documentation](crate) for how they map to the ring.
+///
+/// Reads go through a buffer of the adapter's, 16 KiB unless made
+/// [`with_capacity`](Compat::with_capacity), which a receive fills with
+/// whatever has arrived; writes copy up to 256 KiB at a time, and are
+/// written behind the stream.
+pub struct Compat<S> {
+    // Fields drop in order: the operations, which cancel, then the stream,
+    // which closes after them.
+    /// The receive in flight, which holds the read buffer meanwhile.
+    read: Option<Op<Recv<Vec<u8>>>>,
+    /// The shutdown in flight.
+    shutdown: Option<Op<ops::Shutdown>>,
+    /// What was read and not yet taken: `buf[pos..]`.
+    buf: Vec<u8>,
+    pos: usize,
+    /// How many bytes a receive asks for.
+    capacity: usize,
+    /// Whether the writing half of the connection has been shut down.
+    closed: bool,
+    /// The ring the adapter's own operations run on: the thread's, taken at
+    /// the first of them. Holding it keeps the ring open, and a direct
+    /// descriptor's slot with it.
+    driver: Option<Driver>,
+    stream: S,
+}
+
+impl<S: StreamSocket> Compat<S> {
+    /// Adapts `stream`, reading 16 KiB at a time.
+    pub fn new(stream: S) -> Self {
+        Self::with_capacity(DEFAULT_CAPACITY, stream)
+    }
+
+    /// Adapts `stream`, reading up to `capacity` bytes at a time into a
+    /// buffer that size.
+    ///
+    /// # Panics
+    ///
+    /// If `capacity` is 0.
+    pub fn with_capacity(capacity: usize, stream: S) -> Self {
+        assert!(capacity > 0, "a read buffer holds at least one byte");
+        Self {
+            read: None,
+            shutdown: None,
+            buf: Vec::new(),
+            pos: 0,
+            capacity,
+            closed: false,
+            driver: None,
+            stream,
+        }
+    }
+
+    /// The stream.
+    pub fn get_ref(&self) -> &S {
+        &self.stream
+    }
+
+    /// The data read from the stream and not yet taken.
+    pub fn buffer(&self) -> &[u8] {
+        &self.buf[self.pos..]
+    }
+
+    /// The stream back. A receive in flight is cancelled, and what it and
+    /// earlier receives brought in and nobody took is lost, as the
+    /// [`buffer`](Compat::buffer) says; a write in flight carries on.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
+    /// The ring to run an operation on, and the stream's descriptor for it.
+    fn target(&mut self) -> (Driver, Fd) {
+        let driver = self.driver.get_or_insert_with(ruio::driver).clone();
+        (driver, self.stream.fd())
+    }
+
+    /// Ready once the buffer holds data, or the stream has ended, which
+    /// leaves it empty.
+    fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.pos < self.buf.len() {
+            return Poll::Ready(Ok(()));
+        }
+        if self.read.is_none() {
+            let mut buf = mem::take(&mut self.buf);
+            buf.clear();
+            buf.reserve(self.capacity);
+            self.pos = 0;
+            let (driver, fd) = self.target();
+            self.read = Some(driver.op(Recv::new(fd, buf)));
+        }
+        let read = self.read.as_mut().expect("a receive is in flight");
+        let (received, buf) = ready!(Pin::new(read).poll(cx));
+        self.read = None;
+        self.buf = buf;
+        Poll::Ready(received.map(drop))
+    }
+
+    /// The data read and not yet taken, reading more first if there is
+    /// none; empty once the stream has ended.
+    fn poll_fill_buf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        ready!(self.poll_fill(cx))?;
+        Poll::Ready(Ok(self.buffer()))
+    }
+
+    /// Takes `amount` bytes of the buffer.
+    fn consume(&mut self, amount: usize) {
+        self.pos = (self.pos + amount).min(self.buf.len());
+    }
+
+    /// Reads into `dst`, as much as the buffer holds and `dst` takes.
+    fn poll_read(&mut self, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<io::Result<usize>> {
+        if dst.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let data = ready!(self.poll_fill_buf(cx))?;
+        let len = data.len().min(dst.len());
+        dst[..len].copy_from_slice(&data[..len]);
+        self.consume(len);
+        Poll::Ready(Ok(len))
+    }
+
+    /// Writes as many of the bytes of `bufs`, one after another, as one
+    /// write takes, once the write before has finished.
+    fn poll_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let total = bufs.iter().map(|buf| buf.len()).sum::<usize>();
+        if total == 0 {
+            return Poll::Ready(Ok(0));
+        }
+        if self.closed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        ready!(self.poll_behind(cx))?;
+        let len = total.min(MAX_WRITE);
+        let mut data = Vec::with_capacity(len);
+        for buf in bufs {
+            let take = buf.len().min(len - data.len());
+            data.extend_from_slice(&buf[..take]);
+        }
+        // Nothing is in flight now, so the write goes ahead at once.
+        ready!(Pin::new(&mut self.stream.write_behind(vec![data])).poll(cx))?;
+        Poll::Ready(Ok(len))
+    }
+
+    /// Waits for the write in flight, and reports how the writes went.
+    fn poll_behind(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream.flush()).poll(cx)
+    }
+
+    /// Reports how the writes went, as far as is known, without waiting for
+    /// the write in flight, whose failure the next write, flush or close
+    /// reports.
+    fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Asked with a waker that does nothing, as nobody waits here.
+        let mut asking = Context::from_waker(Waker::noop());
+        match Pin::new(&mut self.stream.flush()).poll(&mut asking) {
+            Poll::Pending => Poll::Ready(Ok(())),
+            known => known,
+        }
+    }
+
+    /// Waits for the write in flight, then shuts down the writing half of
+    /// the connection.
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.closed {
+            return Poll::Ready(Ok(()));
+        }
+        if self.shutdown.is_none() {
+            ready!(self.poll_behind(cx))?;
+            let (driver, fd) = self.target();
+            self.shutdown = Some(driver.op(ops::Shutdown::new(fd, Shutdown::Write)));
+        }
+        let shutdown = self.shutdown.as_mut().expect("a shutdown is in flight");
+        let result = ready!(Pin::new(shutdown).poll(cx));
+        self.shutdown = None;
+        self.closed = result.is_ok();
+        Poll::Ready(result)
+    }
+}
+
+// Nothing is pinned: the operations are `Unpin`, and the stream is only
+// ever borrowed.
+impl<S> Unpin for Compat<S> {}
+
+impl<S: fmt::Debug> fmt::Debug for Compat<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Compat")
+            .field("stream", &self.stream)
+            .field("buffered", &(self.buf.len() - self.pos))
+            .field("reading", &self.read.is_some())
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
+    }
+}
