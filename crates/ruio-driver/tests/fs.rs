@@ -3,6 +3,7 @@
 mod support;
 
 use std::fs;
+use std::io::Read as _;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::PathBuf;
@@ -348,4 +349,29 @@ fn a_close_closes_its_descriptor_once() {
     drop(close);
     settle(&driver);
     assert!(is_open(reused.as_raw_fd()), "the reused number stays open");
+}
+
+/// A descriptor closed in order stays open for the operations queued before
+/// the close, and is closed once the kernel has taken them.
+#[test]
+fn a_descriptor_closed_in_order_outlasts_what_was_queued_before() {
+    let driver = Driver::new().unwrap();
+    let (mut reader, writer) = std::io::pipe().unwrap();
+    let writer = OwnedFd::from(writer);
+    let raw = writer.as_raw_fd();
+    let mut write = driver.op(Write::new(raw, b"queued".to_vec()));
+    assert!(poll_once(&mut write).is_pending());
+    driver.close_in_order(writer);
+    assert!(is_open(raw), "the close waits for the next submission");
+
+    let (written, _) = block_on(&driver, write);
+    assert_eq!(written.unwrap(), 6);
+    // Without a writer left, the pipe ends after the data; with one, the
+    // read fails with `EAGAIN` rather than block.
+    // SAFETY: F_SETFL changes the flags of the reader, which the test owns.
+    let set = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+    assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"queued");
 }

@@ -7,6 +7,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::io;
 use std::mem;
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::rc::{Rc, Weak};
@@ -443,6 +444,24 @@ impl Driver {
             })
             .ok()
             .flatten()
+    }
+
+    /// Closes `fd`, a plain descriptor, with a request queued now: the kernel
+    /// takes every operation queued before it, which may name the
+    /// descriptor, before the number is free for another file. Dropping the
+    /// descriptor instead closes it at once, and an operation still queued
+    /// then reaches the kernel naming no file, or whichever file took the
+    /// number meanwhile.
+    ///
+    /// Nothing reports how the close went, as nothing does for dropping the
+    /// descriptor; [`ops::Close`](crate::ops::Close) does. If the driver is
+    /// busy, as it is when code it runs closes a descriptor, or has no room
+    /// for the request even after submitting, `fd` is closed at once.
+    pub fn close_in_order(&self, fd: OwnedFd) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            // Without room for the request, the descriptor is dropped here.
+            let _ = inner.queue_close_fd(fd);
+        }
     }
 
     /// Frees slot `slot` of the registered file table, closing the direct
@@ -896,6 +915,23 @@ impl Inner {
         sqe.opcode = sys::IORING_OP_CLOSE;
         // Slots count from 1 here; 0 would mean a plain descriptor.
         sqe.file_index = slot + 1;
+        sqe.flags = sys::IOSQE_CQE_SKIP_SUCCESS;
+        sqe.user_data = IGNORED;
+        Ok(())
+    }
+
+    /// Queues a close of the plain descriptor `fd`; see
+    /// [`Driver::close_in_order`]. Hands it back if there is no room.
+    fn queue_close_fd(&mut self, fd: OwnedFd) -> Result<(), OwnedFd> {
+        if self.ring.sq_space() == 0 && self.submit_queued(1).is_err() {
+            return Err(fd);
+        }
+        let Some(sqe) = self.ring.next_sqe() else {
+            return Err(fd);
+        };
+        sqe.opcode = sys::IORING_OP_CLOSE;
+        // From here the kernel closes the descriptor.
+        sqe.fd = fd.into_raw_fd();
         sqe.flags = sys::IOSQE_CQE_SKIP_SUCCESS;
         sqe.user_data = IGNORED;
         Ok(())
