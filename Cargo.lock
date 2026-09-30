@@ -96,6 +96,7 @@ dependencies = [
  "futures-io",
  "futures-util",
  "ruio",
+ "tokio",
 ]
 
 [[package]]

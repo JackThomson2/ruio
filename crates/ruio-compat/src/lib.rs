@@ -1,7 +1,9 @@
 //! Adapters from ruio's streams to the poll-based I/O traits that the
 //! ecosystem builds on: `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of
-//! [`futures-io`](https://docs.rs/futures-io), with the `futures-io`
-//! feature, which is on by default.
+//! [`tokio::io`](https://docs.rs/tokio/latest/tokio/io/), with the `tokio`
+//! feature, and of [`futures-io`](https://docs.rs/futures-io), with the
+//! `futures-io` feature. Both are on by default. tokio's traits need none of
+//! its runtime, which ruio's takes the place of.
 //!
 //! ruio's I/O is completion-based: an operation takes a buffer of its own,
 //! the kernel fills or sends it, and the operation hands it back. The
@@ -32,20 +34,25 @@
 //! runs its I/O.
 //!
 //! ```no_run
-//! use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 //! use ruio::net::TcpStream;
 //! use ruio_compat::Compat;
+//! use tokio::io::{AsyncReadExt, AsyncWriteExt};
 //!
 //! #[ruio::main]
 //! async fn main() -> std::io::Result<()> {
 //!     let mut stream = Compat::new(TcpStream::connect("127.0.0.1:7878").await?);
 //!     stream.write_all(b"hello").await?;
-//!     stream.close().await?;
+//!     stream.shutdown().await?;
 //!     let mut reply = Vec::new();
 //!     stream.read_to_end(&mut reply).await?;
 //!     Ok(())
 //! }
 //! ```
+//!
+//! With both families implemented, a method such as `write_all` is
+//! ambiguous where the extension traits of both are in scope: import one
+//! family's, or call through the trait, as in
+//! `futures_util::AsyncWriteExt::write_all(&mut stream, data)`.
 
 use std::fmt;
 use std::future::Future;
@@ -61,6 +68,8 @@ use ruio::uring::{Driver, Fd, Op};
 
 #[cfg(feature = "futures-io")]
 mod futures_impls;
+#[cfg(feature = "tokio")]
+mod tokio_impls;
 
 /// How many bytes a read asks the kernel for, unless the adapter was made
 /// [`with_capacity`](Compat::with_capacity).
@@ -119,8 +128,8 @@ mod sealed {
 }
 
 /// A ruio stream with the poll-based I/O traits: `AsyncRead`,
-/// `AsyncBufRead` and `AsyncWrite` of futures-io; see the
-/// [crate documentation](crate) for how they map to the ring.
+/// `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io; see
+/// the [crate documentation](crate) for how they map to the ring.
 ///
 /// Reads go through a buffer of the adapter's, 16 KiB unless made
 /// [`with_capacity`](Compat::with_capacity), which a receive fills with

@@ -7,16 +7,21 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-default = ["futures-io"]
+default = ["futures-io", "tokio"]
 # `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of futures-io.
 futures-io = ["dep:futures-io"]
+# `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io`, which need
+# none of tokio's runtime.
+tokio = ["dep:tokio"]
 
 [dependencies]
 futures-io = { version = "0.3.34", optional = true }
 ruio.workspace = true
+tokio = { version = "1.53.1", default-features = false, optional = true }
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["io"] }
+tokio = { version = "1.53.1", features = ["io-util"] }
 
 [lints]
 workspace = true
