@@ -86,7 +86,14 @@ where
 ///
 /// If the thread is not inside [`Runtime::block_on`].
 pub fn driver() -> Driver {
-    context::current().expect(OUTSIDE).driver().clone()
+    try_driver().expect(OUTSIDE)
+}
+
+/// The io_uring driver of the thread's runtime, or `None` if the thread is
+/// not inside one, as when code that may run anywhere, such as a
+/// destructor, has I/O for the ring if there is one.
+pub fn try_driver() -> Option<Driver> {
+    context::current().map(|scheduler| scheduler.driver().clone())
 }
 
 /// Lets the other ready tasks run before the current one continues.

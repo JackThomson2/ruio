@@ -88,6 +88,39 @@ fn block_on_returns_the_output() {
     runtime.block_on(runtime.driver().op(Nop)).unwrap();
 }
 
+/// Records, when dropped, the ID of the driver the thread finds then.
+struct FindsDriver(Rc<Cell<Option<u64>>>);
+
+impl Drop for FindsDriver {
+    fn drop(&mut self) {
+        self.0
+            .set(ruio_executor::try_driver().map(|driver| driver.id()));
+    }
+}
+
+/// Code inside a runtime finds its driver, destructors that the runtime
+/// runs as it drops unfinished tasks included, and code outside finds none.
+#[test]
+fn the_thread_finds_its_runtimes_driver_only_inside_it() {
+    assert!(ruio_executor::try_driver().is_none());
+    let runtime = Runtime::new().unwrap();
+    let id = runtime.driver().id();
+    assert!(ruio_executor::try_driver().is_none());
+    let inside = runtime.block_on(async { ruio_executor::try_driver().map(|driver| driver.id()) });
+    assert_eq!(inside, Some(id));
+
+    let found = Rc::new(Cell::new(None));
+    let finds = FindsDriver(found.clone());
+    drop(runtime.spawn(async move {
+        let _finds = finds;
+        std::future::pending::<()>().await;
+    }));
+    runtime.block_on(yield_now());
+    drop(runtime);
+    assert_eq!(found.get(), Some(id));
+    assert!(ruio_executor::try_driver().is_none());
+}
+
 #[test]
 fn spawned_tasks_run_and_are_joined() {
     let runtime = Runtime::new().unwrap();
