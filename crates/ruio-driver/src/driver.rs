@@ -27,6 +27,26 @@ use crate::unpark::{Notify, Unparker};
 /// The `user_data` of the poll on the eventfd that unparkers write to.
 const WAKE: u64 = IGNORED - 1;
 
+/// The `user_data` of the timeout that wakes the ring at a deadline; see
+/// [`Driver::wake_at`].
+const TIMER: u64 = IGNORED - 2;
+
+/// The time on the `CLOCK_MONOTONIC` clock, from its zero: the clock that
+/// [`Driver::wake_at`] takes deadlines on, and that `Instant` counts on
+/// Linux.
+pub fn monotonic_now() -> Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes the one timespec it is given.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    Duration::new(
+        u64::try_from(now.tv_sec).unwrap_or(0),
+        u32::try_from(now.tv_nsec).unwrap_or(0),
+    )
+}
+
 /// The setup flags of every ring. See DESIGN.md.
 const SETUP_FLAGS: u32 = sys::IORING_SETUP_SINGLE_ISSUER
     | sys::IORING_SETUP_DEFER_TASKRUN
@@ -149,6 +169,9 @@ impl Builder {
             files,
             notify,
             wake_armed: false,
+            timer: None,
+            timer_at: Box::default(),
+            timer_fired: false,
             next_group: 0,
             cancels: Vec::new(),
             wakers: Vec::new(),
@@ -265,6 +288,15 @@ struct Inner {
     notify: Arc<Notify>,
     /// Whether the multishot poll on the unparkers' eventfd is in flight.
     wake_armed: bool,
+    /// The deadline the wake timer is armed for, while it is in flight, on
+    /// `CLOCK_MONOTONIC`; see [`Driver::wake_at`].
+    timer: Option<Duration>,
+    /// Where the kernel reads the wake timer's deadline from as it takes an
+    /// entry that arms or moves it: always the latest deadline.
+    timer_at: Box<sys::__kernel_timespec>,
+    /// Whether the wake timer has fired since [`Driver::timer_fired`] last
+    /// said so.
+    timer_fired: bool,
     /// The provided-buffer group ID the next pool gets.
     next_group: u16,
     /// Dropped operations to cancel, by `user_data`.
@@ -335,6 +367,31 @@ impl Driver {
         let result = armed.and_then(|()| self.enter(1, timeout));
         notify.end_park();
         result
+    }
+
+    /// Makes sure the ring wakes by `deadline`, a time on the
+    /// `CLOCK_MONOTONIC` clock (see [`monotonic_now`]), with a timeout of
+    /// the kernel's: a park returns by then however long it would have
+    /// waited, and [`timer_fired`](Driver::timer_fired) then says so.
+    ///
+    /// The ring has one such timer. A deadline earlier than the one it is
+    /// armed for moves it, which takes an entry; a later one changes
+    /// nothing, as waking early does no harm. A runtime, whose timers need
+    /// the ring woken for the earliest only, so spares every park a timeout
+    /// of its own, which the kernel would copy in on every wait.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Driver::submit`], if the submission queue is full and
+    /// submitting it fails.
+    pub fn wake_at(&self, deadline: Duration) -> io::Result<()> {
+        self.inner.borrow_mut().wake_at(deadline)
+    }
+
+    /// Whether the timer [`wake_at`](Driver::wake_at) armed has fired since
+    /// this was last asked. Asking clears it.
+    pub fn timer_fired(&self) -> bool {
+        mem::take(&mut self.inner.borrow_mut().timer_fired)
     }
 
     /// A handle that wakes this driver from any thread.
@@ -699,7 +756,9 @@ impl Inner {
         // exists, and the table keeps the operation until its completion; or
         // it is an internal cancellation or no-op, which points to no memory;
         // or a linked timeout, whose duration the kernel copies as it
-        // consumes the entry and the ring keeps until then.
+        // consumes the entry and the ring keeps until then; or the wake
+        // timer's, whose deadline the kernel copies likewise, from memory the
+        // driver keeps.
         let entered = unsafe { self.ring.enter(min_complete, timeout) };
         match entered {
             Ok(_) => Ok(()),
@@ -746,6 +805,43 @@ impl Inner {
             sqe.user_data = IGNORED;
             self.cancels.pop();
         }
+        Ok(())
+    }
+
+    /// Arms the wake timer for `deadline`, or moves it there if it is armed
+    /// for later; see [`Driver::wake_at`].
+    fn wake_at(&mut self, deadline: Duration) -> io::Result<()> {
+        if self.timer.is_some_and(|armed| armed <= deadline) {
+            return Ok(());
+        }
+        // An entry queued for an earlier deadline, and not yet submitted,
+        // reads this one instead, which is as well.
+        *self.timer_at = timespec(deadline);
+        let at = (&raw const *self.timer_at).expose_provenance() as u64;
+        let moving = self.timer.is_some();
+        let sqe = loop {
+            match self.ring.next_sqe() {
+                Some(sqe) => break sqe,
+                None => self.submit_queued(1)?,
+            }
+        };
+        if moving {
+            // Should the timer fire first, the update finds nothing to
+            // move, and fails into the ignored `user_data`.
+            sqe.opcode = sys::IORING_OP_TIMEOUT_REMOVE;
+            sqe.addr = TIMER;
+            sqe.off = at;
+            sqe.op_flags = sys::IORING_TIMEOUT_UPDATE | sys::IORING_TIMEOUT_ABS;
+            sqe.flags = sys::IOSQE_CQE_SKIP_SUCCESS;
+            sqe.user_data = IGNORED;
+        } else {
+            sqe.opcode = sys::IORING_OP_TIMEOUT;
+            sqe.addr = at;
+            sqe.len = 1;
+            sqe.op_flags = sys::IORING_TIMEOUT_ABS;
+            sqe.user_data = TIMER;
+        }
+        self.timer = Some(deadline);
         Ok(())
     }
 
@@ -883,6 +979,13 @@ impl Inner {
                 if cqe.flags & sys::IORING_CQE_F_MORE == 0 {
                     self.wake_armed = false;
                 }
+                continue;
+            }
+            if cqe.user_data == TIMER {
+                // The wake timer has ended: fired, or cancelled as the ring
+                // shuts down.
+                self.timer = None;
+                self.timer_fired |= cqe.res == -libc::ETIME;
                 continue;
             }
             let completion = Completion::new(cqe.res, cqe.flags);

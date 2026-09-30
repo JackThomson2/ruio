@@ -117,6 +117,47 @@ fn parking_with_nothing_in_flight_times_out() {
     assert!(start.elapsed() >= Duration::from_millis(20));
 }
 
+/// The ring's timer wakes a park that has no timeout of its own, at the
+/// deadline; a later deadline does not move it, an earlier one does, and
+/// the driver says once that it fired.
+#[test]
+fn the_wake_timer_ends_a_park_at_its_deadline() {
+    let driver = Driver::new().unwrap();
+    let deadline = |after| ruio_driver::monotonic_now() + after;
+
+    let start = Instant::now();
+    driver.wake_at(deadline(Duration::from_millis(20))).unwrap();
+    driver.wake_at(deadline(Duration::from_secs(60))).unwrap();
+    assert!(!driver.timer_fired());
+    driver.park(None).unwrap();
+    let waited = start.elapsed();
+    assert!(waited >= Duration::from_millis(20), "{waited:?}");
+    assert!(
+        waited < Duration::from_secs(10),
+        "the later deadline moved it"
+    );
+    assert!(driver.timer_fired());
+    assert!(!driver.timer_fired(), "asking clears it");
+
+    let start = Instant::now();
+    driver.wake_at(deadline(Duration::from_secs(60))).unwrap();
+    driver.submit().unwrap();
+    driver.wake_at(deadline(Duration::from_millis(20))).unwrap();
+    driver.park(None).unwrap();
+    let waited = start.elapsed();
+    assert!(waited >= Duration::from_millis(20), "{waited:?}");
+    assert!(
+        waited < Duration::from_secs(10),
+        "the earlier deadline moved it"
+    );
+    assert!(driver.timer_fired());
+    assert_eq!(
+        driver.stats().operations,
+        0,
+        "the timer is not an operation"
+    );
+}
+
 #[test]
 fn a_driver_outlives_its_handles_while_ops_exist() {
     let driver = Driver::new().unwrap();

@@ -55,7 +55,7 @@ mod stream;
 mod table;
 mod unpark;
 
-pub use driver::{Builder, Driver, Stats};
+pub use driver::{Builder, Driver, Stats, monotonic_now};
 pub use fd::{Descriptor, DirectFd, Fd};
 pub use op::{Completion, Op, Operation};
 pub use probe::{BaselineError, Probe};
