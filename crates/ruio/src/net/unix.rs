@@ -16,7 +16,7 @@ use ruio_driver::{Descriptor, Fd, SockAddr};
 
 use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
-    ReadExact, RecvStream, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
+    Plain, ReadExact, RecvStream, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
 };
 use super::tcp::{Incoming, listen};
 
@@ -26,7 +26,7 @@ use super::tcp::{Incoming, listen};
 /// at a time or as they come, as plain descriptors or, on request, direct
 /// ones.
 pub struct UnixListener {
-    socket: net::UnixListener,
+    socket: Plain<net::UnixListener>,
     direct: Cell<bool>,
     _thread: ThreadBound,
 }
@@ -46,7 +46,7 @@ impl UnixListener {
     /// Wraps a listening socket from the standard library.
     pub fn from_std(socket: net::UnixListener) -> Self {
         Self {
-            socket,
+            socket: Plain::new(socket),
             direct: Cell::new(false),
             _thread: PhantomData,
         }
@@ -153,7 +153,7 @@ impl UnixStream {
     /// Wraps a connected socket from the standard library.
     pub fn from_std(stream: net::UnixStream) -> Self {
         Self {
-            sock: Sock::Plain(stream),
+            sock: Sock::from_std(stream),
             behind: Rc::default(),
             _thread: PhantomData,
         }
@@ -294,7 +294,7 @@ impl UnixDatagram {
     /// Wraps a socket from the standard library.
     pub fn from_std(socket: net::UnixDatagram) -> Self {
         Self {
-            sock: Sock::Plain(socket),
+            sock: Sock::from_std(socket),
             _thread: PhantomData,
         }
     }

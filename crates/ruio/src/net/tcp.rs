@@ -16,8 +16,8 @@ use ruio_driver::{Descriptor, Driver, Fd};
 
 use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
-    ReadExact, RecvStream, SendZc, Sent, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
-    bind_reuseport,
+    Plain, ReadExact, RecvStream, SendZc, Sent, Sock, SocketOp, ThreadBound, WriteAll,
+    WriteAllVectored, bind_reuseport,
 };
 
 /// How many connections a listener's backlog holds, as in tokio. The
@@ -44,7 +44,7 @@ pub(crate) fn listen(fd: RawFd) -> io::Result<()> {
 /// The connections are plain descriptors unless
 /// [`set_direct`](TcpListener::set_direct) asks for direct ones.
 pub struct TcpListener {
-    socket: net::TcpListener,
+    socket: Plain<net::TcpListener>,
     direct: Cell<bool>,
     _thread: ThreadBound,
 }
@@ -86,7 +86,7 @@ impl TcpListener {
     /// Wraps a listening socket from the standard library.
     pub fn from_std(socket: net::TcpListener) -> Self {
         Self {
-            socket,
+            socket: Plain::new(socket),
             direct: Cell::new(false),
             _thread: PhantomData,
         }
@@ -295,7 +295,7 @@ impl TcpStream {
     /// Wraps a connected socket from the standard library.
     pub fn from_std(stream: net::TcpStream) -> Self {
         Self {
-            sock: Sock::Plain(stream),
+            sock: Sock::from_std(stream),
             peer: None,
             behind: Rc::default(),
             _thread: PhantomData,

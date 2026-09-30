@@ -7,6 +7,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem;
 use std::net;
+use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::ptr;
@@ -107,23 +108,87 @@ fn enable(socket: &OwnedFd, option: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// A plain descriptor, as the standard library's type, which closes after
+/// the operations queued on it: with a request on the ring of the thread's
+/// runtime, if the thread is inside one, and at once otherwise.
+///
+/// Closed at once, as the standard library's type closes, the descriptor
+/// would be gone before an operation still queued on it reached the kernel,
+/// which would find no file, or another that took the number: what a stream
+/// wrote behind just before it was dropped would be lost.
+pub(crate) struct Plain<S: Into<OwnedFd>>(
+    /// Taken only as the descriptor closes, or leaves.
+    Option<S>,
+);
+
+impl<S: Into<OwnedFd>> Plain<S> {
+    pub(crate) fn new(socket: S) -> Self {
+        Self(Some(socket))
+    }
+
+    /// The standard library's type, which closes the descriptor at once when
+    /// dropped.
+    pub(crate) fn into_inner(mut self) -> S {
+        self.0
+            .take()
+            .expect("a plain descriptor is taken only once")
+    }
+}
+
+impl<S: Into<OwnedFd>> Deref for Plain<S> {
+    type Target = S;
+
+    fn deref(&self) -> &S {
+        self.0
+            .as_ref()
+            .expect("a plain descriptor is used only until it is taken")
+    }
+}
+
+impl<S: Into<OwnedFd>> Drop for Plain<S> {
+    fn drop(&mut self) {
+        let Some(socket) = self.0.take() else {
+            return;
+        };
+        match ruio_executor::try_driver() {
+            Some(driver) => driver.close_in_order(socket.into()),
+            None => drop(socket),
+        }
+    }
+}
+
+impl<S: Into<OwnedFd> + fmt::Debug> fmt::Debug for Plain<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(socket) => socket.fmt(f),
+            None => f.write_str("closed"),
+        }
+    }
+}
+
 /// A socket's or a file's descriptor: a plain one, as the standard library's
-/// type, which does what the ring cannot, or a direct descriptor.
-pub(crate) enum Sock<S> {
-    Plain(S),
+/// type, which does what the ring cannot, or a direct descriptor. Either
+/// closes after the operations queued on it.
+pub(crate) enum Sock<S: Into<OwnedFd>> {
+    Plain(Plain<S>),
     Direct(DirectFd),
 }
 
-impl<S: From<OwnedFd>> Sock<S> {
+impl<S: Into<OwnedFd> + From<OwnedFd>> Sock<S> {
     pub(crate) fn new(descriptor: Descriptor) -> Self {
         match descriptor {
-            Descriptor::Plain(fd) => Sock::Plain(S::from(fd)),
+            Descriptor::Plain(fd) => Sock::from_std(S::from(fd)),
             Descriptor::Direct(fd) => Sock::Direct(fd),
         }
     }
 }
 
-impl<S> Sock<S> {
+impl<S: Into<OwnedFd>> Sock<S> {
+    /// Wraps a plain descriptor, as the standard library's type.
+    pub(crate) fn from_std(socket: S) -> Self {
+        Sock::Plain(Plain::new(socket))
+    }
+
     /// Sends the socket to core `core` of the thread's run: a plain
     /// descriptor as it is, and a direct one to that core's ring.
     ///
@@ -149,12 +214,12 @@ impl<S> Sock<S> {
 /// A socket on its way to another core. A direct descriptor is in that
 /// core's ring's file table, so only that core can take it.
 #[derive(Debug)]
-pub(crate) enum Sent<S> {
-    Plain(S),
+pub(crate) enum Sent<S: Into<OwnedFd>> {
+    Plain(Plain<S>),
     Direct(SentFd),
 }
 
-impl<S> Sent<S> {
+impl<S: Into<OwnedFd>> Sent<S> {
     /// The socket, on the core it was sent to.
     ///
     /// # Panics
@@ -171,7 +236,7 @@ impl<S> Sent<S> {
     }
 }
 
-impl<S: AsRawFd> Sock<S> {
+impl<S: AsRawFd + Into<OwnedFd>> Sock<S> {
     /// The descriptor, for operations on the socket's ring.
     pub(crate) fn fd(&self) -> Fd {
         match self {
@@ -292,7 +357,7 @@ impl<S: AsRawFd> Sock<S> {
     }
 }
 
-impl<S: fmt::Debug> fmt::Debug for Sock<S> {
+impl<S: Into<OwnedFd> + fmt::Debug> fmt::Debug for Sock<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Sock::Plain(socket) => socket.fmt(f),

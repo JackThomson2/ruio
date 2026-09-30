@@ -107,7 +107,7 @@ impl File {
     /// Wraps a file from the standard library.
     pub fn from_std(file: std::fs::File) -> Self {
         Self {
-            sock: Sock::Plain(file),
+            sock: Sock::from_std(file),
             _thread: PhantomData,
         }
     }
@@ -246,7 +246,10 @@ impl File {
     /// What `close(2)` reports.
     pub async fn close(self) -> io::Result<()> {
         match self.sock {
-            Sock::Plain(file) => crate::driver().op(ops::Close::new(file.into())).await,
+            Sock::Plain(file) => {
+                let file = file.into_inner();
+                crate::driver().op(ops::Close::new(file.into())).await
+            }
             Sock::Direct(fd) => fd.close().await,
         }
     }

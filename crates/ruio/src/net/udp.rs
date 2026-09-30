@@ -49,7 +49,7 @@ impl UdpSocket {
     /// Wraps a socket from the standard library.
     pub fn from_std(socket: net::UdpSocket) -> Self {
         Self {
-            sock: Sock::Plain(socket),
+            sock: Sock::from_std(socket),
             _thread: PhantomData,
         }
     }

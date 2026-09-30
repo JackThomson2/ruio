@@ -211,6 +211,22 @@ async fn a_write_behind_cut_short_by_the_peer_fails() -> io::Result<()> {
     Ok(())
 }
 
+/// A stream dropped just after a write behind, before the send has reached
+/// the kernel, closes only after it: the data arrives, then the end of the
+/// stream.
+#[ruio::test]
+async fn a_write_behind_arrives_though_the_stream_is_dropped() -> io::Result<()> {
+    let (client, server) = pair().await?;
+    within(client.write_behind(vec![b"last words".to_vec()])).await?;
+    drop(client);
+    let (read, received) = within(server.read_exact(Vec::with_capacity(10))).await;
+    read?;
+    assert_eq!(received, b"last words");
+    let (read, _) = within(server.read(Vec::with_capacity(1))).await;
+    assert_eq!(read?, 0, "the stream ends");
+    Ok(())
+}
+
 /// More buffers than one `sendmsg` takes go out in several.
 #[ruio::test]
 async fn write_all_vectored_sends_more_buffers_than_one_send_takes() -> io::Result<()> {
