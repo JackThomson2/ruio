@@ -45,7 +45,7 @@ crates/
                   registered files, capability probe
   ruio-executor/  per-thread scheduler, tasks, timer wheel, thread-per-core builder
   ruio-macros/    #[ruio::main], #[ruio::test]
-  ruio/           public API: runtime, time, uring, buf, net; later fs, io
+  ruio/           public API: runtime, time, uring, buf, net, fs; later io
   ruio-bench/     benchmarks against other runtimes, the one crate that depends on them
   ruio-compat/    futures-io and tokio::io adapters
 ```
@@ -152,9 +152,11 @@ its own flag set.
   costs no system call.
 - The executor calls the driver once per scheduler pass. One `io_uring_enter`
   submits everything queued and, if no task is runnable, waits for a
-  completion with the next timer deadline as its timeout (`EXT_ARG`). The
-  cost is one system call per pass whether one or a thousand operations were
-  queued.
+  completion. The cost is one system call per pass whether one or a thousand
+  operations were queued. Timers wake the ring through its own timer
+  (`Driver::wake_at`), a timeout of the kernel's at the earliest deadline,
+  so the wait passes no timeout (`EXT_ARG`), which the kernel would copy in
+  on every wait.
 - A full submission queue is submitted early instead of failing the
   operation. An operation with a linked timeout needs two entries that reach
   the kernel together, so queueing makes room for both.
@@ -221,9 +223,18 @@ its own flag set.
   `IoBufs`, such as a bundle), `SendZc`, `Recv`, `RecvFrom` (through
   `recvmsg`, for the sender's address) and `Shutdown`. With `MSG_WAITALL` the
   kernel carries on through short sends and receives on a stream socket, so
-  one request moves a whole buffer, or a whole vector. `SockAddr` holds an address as the
-  kernel reads and writes it, and converts exactly to and from the standard
-  library's internet and Unix socket addresses.
+  one request moves a whole buffer, or a whole vector. `SockAddr` holds an
+  address as the kernel reads and writes it, and converts exactly to and from
+  the standard library's internet and Unix socket addresses.
+- The file operations are `OpenAt` (`openat2`, relative to a directory, with
+  `RESOLVE_*` flags, into a plain or a direct descriptor), `Statx` (into a
+  buffer the operation owns, which the kernel writes as it completes),
+  `Fsync`, `Fallocate`, `Ftruncate` (6.9), `UnlinkAt`, `MkdirAt`, `RenameAt`
+  and `Close`. The kernel copies paths as it takes the entry, and resolves
+  them against plain descriptors only. `Close` owns its descriptor and gives
+  it up to the kernel as its entry is prepared, so that the number, which
+  another file may have by then, is never closed twice; `DirectFd::close`
+  closes a direct descriptor with a result, on its own ring.
 - `Driver::op` wraps an operation in an `Op` future, which is `Unpin`.
   Dropping it in flight moves the operation into its slot and queues an
   `ASYNC_CANCEL` whose success posts no completion. When the operation's own
@@ -254,7 +265,7 @@ its own flag set.
   is still to come.
 - Direct descriptors: socket and accept install straight into the registered
   file table (`IORING_FILE_INDEX_ALLOC`), so later operations skip the file
-  lookup; open will in M5. The driver makes them on request; see the
+  lookup, and so does open. The driver makes them on request; see the
   decision above for why sockets have plain ones by default.
 - Provided-buffer rings, which receives fill in bundles (6.10). Vectored
   sends take bundles back out rather than send bundles, which would need a
@@ -282,13 +293,21 @@ baseline are used only when probed.
   futures that need not be `Send`; `spawn_on(core, future)` (M6) sends a
   `Send` future to another core.
 - A task is one `Arc` allocation holding its future and, once it finishes,
-  its output, and is its own waker through std's `Wake` trait. Wakers are
-  `Send + Sync`, as the `Waker` contract requires, while the future need not
-  be, so the future, output and bookkeeping are only touched on the task's
-  thread: by the scheduler and by the `JoinHandle`, which is not `Send`. The
-  scheduler holds every unfinished task until its future is dropped on that
-  thread, and the `JoinHandle` drops the output there, so a waker that
-  releases the last reference elsewhere owns nothing that is not `Send`.
+  its output, and is its own waker, through a waker vtable of its own. Wakers
+  are `Send + Sync`, as the `Waker` contract requires, while the future need
+  not be, so the future, output and bookkeeping are only touched on the
+  task's thread: by the scheduler and by the `JoinHandle`, which is not
+  `Send`. The scheduler holds every unfinished task until its future is
+  dropped on that thread, and the `JoinHandle` drops the output there, so a
+  waker that releases the last reference elsewhere owns nothing that is not
+  `Send`.
+- Waking and running a task on its own thread takes no atomic operation. A
+  run lends its poll a waker that borrows the scheduler's reference to the
+  task, and takes a reference only when the future clones it. A wake on the
+  task's thread queues it with a plain flag; a wake from another thread sets
+  an atomic one and queues it on the remote queue, and a run clears that
+  flag, with a full barrier, only if it is set. Moving remote wakes to the
+  run queue checks the plain flag, so a task is never queued twice.
 - Each loop pass runs up to 64 ready tasks, fires due timers, then turns the
   ring: it submits without waiting if anything is runnable, and otherwise
   parks until a completion, a wake or the next timer. A task woken by the
@@ -301,10 +320,15 @@ baseline are used only when probed.
   drops every unfinished future on its thread before the driver drains their
   operations.
 - Timers live in a hierarchical wheel in user space, with millisecond ticks.
-  The kernel sees a single timeout: the wait deadline passed to
-  `io_uring_enter`. A thousand concurrent sleeps cost one system call.
-- A wake from another thread goes to the runtime's mutex-protected queue and
-  unparks its ring. Unparking writes to an eventfd that a parked ring has a
+  The kernel sees a single timeout, the ring's timer at the wheel's next
+  deadline, which moves only for an earlier one: a thousand concurrent
+  sleeps cost one. A pass reads the clock and fires timers only once that
+  timer has fired; before the wheel's next deadline, firing does nothing,
+  not even move the wheel's time on, and a timer queued meanwhile goes on a
+  higher level and moves down as time comes to it.
+- A wake from another thread goes to the runtime's mutex-protected queue,
+  sets a flag so that a pass takes the lock only when the queue may hold
+  tasks, and unparks its ring. Unparking writes to an eventfd that a parked ring has a
   multishot poll on, which works from any thread, and costs no system call
   unless the ring is parked. `MSG_RING` can take over for wakes between rings
   in M6.
@@ -375,6 +399,38 @@ baseline are used only when probed.
   that files can share, `bind_reuseport` (M6), and socket options for direct
   descriptors through `URING_CMD`.
 
+## Files
+
+`ruio::fs` has `File`, `OpenOptions` and `Metadata`, and the functions
+`metadata`, `symlink_metadata`, `read`, `read_to_string`, `write`,
+`create_dir`, `create_dir_all`, `remove_file`, `remove_dir` and `rename`,
+running on the ring of the thread's runtime.
+
+- Reads and writes take owned buffers and hand them back with the result, at
+  an offset, so any number can run at once. `read_exact_at` and
+  `write_all_at` take as many as a buffer needs; `read_fixed_at` and
+  `write_fixed_at` read and write registered buffers. `read` and `write` use
+  the file's position, which nothing orders when they overlap.
+- Every operation borrows its file, so the file cannot close before the
+  kernel has the operation. `close` closes it with a result, which dropping
+  it cannot report.
+- `OpenOptions` mean what the standard library's do, and take custom flags,
+  such as `O_DIRECT`, and `direct_descriptor`, which opens the file into the
+  ring's table: its operations skip the file lookup, but it has no status to
+  ask for, as statx takes plain descriptors only. Opening goes through
+  `openat2`, which refuses a mode unless the open creates the file; the
+  driver passes one only then, as `openat` ignores it otherwise.
+- Direct I/O needs memory, offsets and lengths aligned as
+  `Metadata::dio_alignment` says (`STATX_DIOALIGN`): an `AlignedBuf`, or a
+  registered buffer whose size is a multiple of the page size. The kernel
+  refuses anything else with `EINVAL`.
+- The kernel always runs statx, fsync, fallocate, ftruncate and the
+  operations on names in an io-wq worker, and an open whose lookup is not
+  cached; so buffered reads and writes that miss the page cache. A direct
+  read goes to the device from the ring.
+- Still to come: reading directories, which io_uring has no operation for,
+  `copy` with `splice`, links and permissions.
+
 ## API sketch
 
 Illustrative only; names will change as the API is built.
@@ -421,6 +477,9 @@ have `read_exact` and `write_all` of their own so far, and the sketch's
   to end multishot accepts with a burst of connections. Tiny file tables
   force `ENFILE`, and zero-length linked timeouts time operations out at
   once.
+- **Files.** File tests run on files in scratch directories under the
+  temporary directory, including direct I/O, at the alignment the file
+  system reports; a file system without direct I/O skips those.
 - **Sockets.** Socket tests run over the loopback interface and Unix
   sockets. Blocking std sockets in them have read timeouts, and waits inside
   the runtime a deadline, so a missing reply fails a test rather than
@@ -544,6 +603,51 @@ Across two machines the server no longer does the client's receive
 processing, which leaves the runtime a larger share of its time; runtimes
 across cores are M6.
 
+### Random reads with direct I/O
+
+`ruio-bench randread PATH` compares 4 KiB random reads with direct I/O
+against the io_uring engine of fio 3.43, each in a process of its own pinned
+to the same CPU, three runs each in turns, and reports the medians. The
+device is the kernel's null block device (`null_blk`, 16 GiB, 4 KiB blocks,
+completing reads inline with `irqmode=0`), which moves no data, so what the
+comparison measures is what each spends per read. fio runs at its best:
+registered buffers and files, no latency statistics (`gtod_reduce`), and
+reads submitted up to 32 at a time; by default it enters the kernel for every
+read, and reads about 1.3M a second whatever the depth. ruio's reader runs a
+task per outstanding read, each reading a registered buffer at a random
+offset of a file opened for direct I/O as a direct descriptor. Reads per
+second, on a Xeon Platinum 8488C with Linux 7.0:
+
+| Depth | fio | ruio |
+|---:|---:|---:|
+| 1 | 1.32M | 1.33M (1.01×) |
+| 4 | 1.89M | 1.93M (1.02×) |
+| 16 | 2.33M | 2.34M (1.00×) |
+| 32 | 2.49M | 2.51M (1.01×) |
+| 64 | 2.51M | 2.42M (0.97×) |
+| 128 | 2.41M | 2.28M (0.95×) |
+
+ruio is within 5% of fio at every depth, and level with it up to 32. It
+started at 0.82× at depth 1 and 0.93× at 32, where its user space took 29%
+of the CPU; four things were in the way, all of them the runtime's:
+
+- Waking and running a task took six locked instructions, which serialize
+  the pipeline. On the task's own thread four of them are gone (see
+  [Executor](#executor)), which gained 5% at depth 32; cloning the waker an
+  operation keeps, and dropping the scheduler's reference after a run,
+  remain.
+- With a timer pending, as the benchmark's own measuring sleep is, a pass
+  read the clock twice, walked the wheel twice, and parked with a timeout the
+  kernel copied in on every wait: a tenth of a read at depth 1, where every
+  read is a pass. The ring's timer now does it with one kernel timeout.
+- Each pass took the lock of the remote wake queue twice, to find it empty.
+- Each operation on a direct descriptor searched the thread's drivers for
+  its ring.
+
+At depth 64 and above ruio falls 3% to 5% behind, for a reason still to
+find; the kernel runs at most 20 items of deferred work per entry, which
+both sides live with.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -557,14 +661,18 @@ across cores are M6.
 | M6 | Multi-core: builder, CPU pinning, `spawn_on`, cross-core channels, descriptor passing | Close to linear scaling up to 96 cores |
 | M7 | Compat adapters, hyper and rustls examples, documentation | A hyper server runs through the adapters |
 
-M0 to M4 are done: M4 built linked timeouts and the `.timeout(d)`
+M0 to M5 are done. M4 built linked timeouts and the `.timeout(d)`
 combinator, bundles on the 6.10 baseline and writing behind, and the echo
 benchmark finds ruio ahead of tokio from 256 connections on, bar 10,000 with
 large messages, and level with fewer, bar one connection with 64 KiB messages,
-where tokio's echo is cut-through (see [TCP echo](#tcp-echo)). Still to come
+where tokio's echo is cut-through (see [TCP echo](#tcp-echo)). M5 built
+`ruio::fs` and buffers aligned for direct I/O, and ruio's direct reads keep
+within 5% of fio at every queue depth (see
+[Random reads with direct I/O](#random-reads-with-direct-io)). Still to come
 besides the later milestones: multishot read (6.7) and incremental
-consumption (6.12); general linked operations (`.link(next)`); and channels
-and other synchronization primitives, with the cooperative budget they need.
+consumption (6.12); general linked operations (`.link(next)`); reading
+directories; and channels and other synchronization primitives, with the
+cooperative budget they need.
 
 ## Open questions
 
