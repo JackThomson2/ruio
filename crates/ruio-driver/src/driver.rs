@@ -19,6 +19,7 @@ use ruio_sys as sys;
 
 use crate::Probe;
 use crate::op::{Completion, Op, Operation, Orphan};
+use crate::remote::{Remote, RemoteRing};
 use crate::ring::Ring;
 use crate::stream::{MultiOp, Multishot, Stranded};
 use crate::table::{IGNORED, Outcome, Table};
@@ -162,12 +163,14 @@ impl Builder {
         };
         let notify = Arc::new(Notify::new()?);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let remote = Remote::new(id, ring.raw_fd(), Unparker::new(Arc::clone(&notify)));
         let inner = Rc::new(RefCell::new(Inner {
             id,
             table: Table::with_capacity(cq_entries as usize),
             ring,
             files,
             notify,
+            remote,
             wake_armed: false,
             timer: None,
             timer_at: Box::default(),
@@ -286,6 +289,8 @@ struct Inner {
     table: Table<Box<dyn Orphan>>,
     /// What the driver shares with its unparkers.
     notify: Arc<Notify>,
+    /// What the driver shares with the threads that send it descriptors.
+    remote: Arc<Remote>,
     /// Whether the multishot poll on the unparkers' eventfd is in flight.
     wake_armed: bool,
     /// The deadline the wake timer is armed for, while it is in flight, on
@@ -397,6 +402,12 @@ impl Driver {
     /// A handle that wakes this driver from any thread.
     pub fn unparker(&self) -> Unparker {
         Unparker::new(Arc::clone(&self.inner.borrow().notify))
+    }
+
+    /// The driver's ring as other threads see it, for them to send direct
+    /// descriptors to with [`DirectFd::send_to`](crate::DirectFd::send_to).
+    pub fn remote(&self) -> RemoteRing {
+        RemoteRing::new(Arc::clone(&self.inner.borrow().remote))
     }
 
     /// The number of operations the kernel may still own, including those
@@ -746,6 +757,10 @@ impl Inner {
         timeout: Option<&sys::__kernel_timespec>,
     ) -> io::Result<()> {
         self.queue_cancels()?;
+        // Descriptors sent here, which other threads dropped unclaimed.
+        for slot in self.remote.take_closes() {
+            self.queue_close(slot)?;
+        }
         let pending = sys::IORING_SQ_TASKRUN | sys::IORING_SQ_CQ_OVERFLOW;
         if min_complete == 0 && self.ring.queued() == 0 && self.ring.sq_flags() & pending == 0 {
             return Ok(());
@@ -1002,6 +1017,8 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        // Before the ring closes its descriptor, which senders duplicate.
+        self.remote.close();
         if self.table.in_flight() > 0 {
             self.drain();
         }

@@ -72,7 +72,7 @@ pub mod net;
 pub mod uring {
     pub use ruio_driver::{
         BaselineError, Completion, Descriptor, DirectFd, Driver, Fd, MultiOp, Multishot, Op,
-        Operation, Probe, SockAddr, Stats, Unparker, ops,
+        Operation, Probe, RemoteRing, SentFd, SockAddr, Stats, Unparker, ops,
     };
     pub use ruio_sys as sys;
 }

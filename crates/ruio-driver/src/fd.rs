@@ -11,6 +11,7 @@ use ruio_sys as sys;
 
 use crate::Driver;
 use crate::ops::CloseSlot;
+use crate::remote::{RemoteRing, SendDirect, SentFd};
 
 /// The file an operation acts on: a plain file descriptor, or a direct
 /// descriptor, a slot of the registered file table of the ring the operation
@@ -133,6 +134,23 @@ impl DirectFd {
         // The close below takes over from the descriptor's drop.
         mem::forget(self);
         driver.op(CloseSlot(slot)).await
+    }
+
+    /// Sends the descriptor to another ring's file table, with
+    /// `IORING_OP_MSG_RING` on its own ring: the kernel puts the file in a
+    /// free slot there, this ring lets go of it, and the output is a
+    /// [`SentFd`] for the other ring's thread to claim.
+    ///
+    /// # Errors
+    ///
+    /// Hands the descriptor back with the error: `EBADF` if either ring is
+    /// closed, `ENFILE` if the other's table is full, `EOWNERDEAD` if its
+    /// thread has exited, and `EINVAL` if it is this ring.
+    pub async fn send_to(self, to: &RemoteRing) -> Result<SentFd, (io::Error, DirectFd)> {
+        let Some(driver) = self.driver() else {
+            return Err((io::Error::from_raw_os_error(libc::EBADF), self));
+        };
+        driver.op(SendDirect::new(self, to)?).await
     }
 }
 

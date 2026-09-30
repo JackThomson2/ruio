@@ -167,6 +167,11 @@ impl Ring {
         self.enter_flags != 0
     }
 
+    /// The ring's own descriptor, which other rings send messages to.
+    pub(crate) fn raw_fd(&self) -> c_int {
+        self.fd.as_raw_fd()
+    }
+
     /// Registers resources with the ring, or queries or configures it; see
     /// [`sys::io_uring_register`].
     ///
