@@ -277,7 +277,11 @@ its own flag set.
   zero-copy starts to pay; the size threshold for choosing it automatically
   waits for a benchmark across two machines.
 - Registered buffers for file I/O (`READ_FIXED`, `WRITE_FIXED`).
-- `MSG_RING` for waking other rings and passing descriptors between them.
+- `MSG_RING` to move direct descriptors from one ring's file table to
+  another's (`DirectFd::send_to`). The other ring posts no completion
+  (`IORING_MSG_RING_CQE_SKIP`): the sender's says which slot the file went
+  to, and comes only once it is there. Waking other rings with `MSG_RING`
+  is still to come.
 
 ### Capability probe
 
@@ -290,8 +294,10 @@ baseline are used only when probed.
 ## Executor
 
 - One executor per thread, driving that thread's ring. `ruio::spawn` takes
-  futures that need not be `Send`; `spawn_on(core, future)` (M6) sends a
-  `Send` future to another core.
+  futures that need not be `Send`; `spawn_on(core, future)` sends a `Send`
+  future to another core, and `Handle::spawn_with` a closure that makes
+  the future there, which then need not be `Send`: it can hold a socket of
+  that core's ring across its awaits.
 - A task is one `Arc` allocation holding its future and, once it finishes,
   its output, and is its own waker, through a waker vtable of its own. Wakers
   are `Send + Sync`, as the `Waker` contract requires, while the future need
@@ -328,12 +334,24 @@ baseline are used only when probed.
   higher level and moves down as time comes to it.
 - A wake from another thread goes to the runtime's mutex-protected queue,
   sets a flag so that a pass takes the lock only when the queue may hold
-  tasks, and unparks its ring. Unparking writes to an eventfd that a parked ring has a
-  multishot poll on, which works from any thread, and costs no system call
-  unless the ring is parked. `MSG_RING` can take over for wakes between rings
-  in M6.
-- The builder (M6) pins threads to CPUs and supports one `SO_REUSEPORT`
-  listener per core.
+  tasks, and unparks its ring. Unparking writes to an eventfd that a parked
+  ring has a multishot poll on, which works from any thread, and costs no
+  system call unless the ring is parked. Spawns from other threads go the
+  same way, and their thread makes them tasks outside the queue's lock.
+- `Cores` runs a runtime on each of several CPUs, thread per core: every
+  CPU the process may run on (its main thread's, as `taskset` or a cgroup's
+  cpuset limit them, whichever thread asks), the first few, or a list.
+  Each core's thread is pinned to its CPU before its runtime is built, so
+  that the ring is local to it and has the thread as its one submitter.
+  The cores meet before any `main` starts, each putting in its `Handle`, so
+  that every core can reach every other (`spawn_on`, `handle_of`). A core
+  whose `main` has returned keeps running what the others spawn onto it
+  until every `main` has returned, and then drops its tasks while its
+  thread is still that core; a core that cannot start keeps every `main`
+  from running. `#[ruio::main(cores = "all")]`, or `cores = N`, runs `main`
+  so, and returns `()` or the first core's error. The channels of `sync`,
+  `oneshot` and a bounded `mpsc`, carry values between cores, and wake a
+  task wherever it runs.
 
 ### Keeping work stealing possible
 
@@ -395,9 +413,19 @@ baseline are used only when probed.
   thread, as in the standard library. A Unix datagram sent to a path that
   makes no address goes to the kernel as the unnamed address, which fails
   with `EINVAL`, so the buffer comes back with the error.
+- `TcpListener::bind_reuseport` and `UdpSocket::bind_reuseport` set
+  `SO_REUSEPORT` before binding, so that a socket on each core can bind one
+  address, and the kernel spreads the connections, or the datagrams, among
+  them by a hash of their addresses and ports. The standard library sets no
+  option before it binds, so these make the socket themselves.
+- `TcpStream::send_to(core)` moves a stream to another core, once a write
+  behind in flight has finished, so that what that core writes comes after
+  it: a plain descriptor as it is, and a direct one with `MSG_RING`. The
+  `SentTcpStream` it makes is `Send`, and a task on that core takes it back
+  with `receive`.
 - Still to come: a `copy` using `splice`, owned-buffer read and write traits
-  that files can share, `bind_reuseport` (M6), and socket options for direct
-  descriptors through `URING_CMD`.
+  that files can share, and socket options for direct descriptors through
+  `URING_CMD`.
 
 ## Files
 
@@ -457,7 +485,8 @@ async fn main() -> std::io::Result<()> {
 Owned-buffer read and write traits carry the usual helpers (`read_exact`,
 `write_all`, and `copy` using `splice` between descriptors). The sockets
 have `read_exact` and `write_all` of their own so far, and the sketch's
-`send_all(chunk).timeout(d)` is `write_all(chunk).timeout(d)`.
+`send_all(chunk).timeout(d)` is `write_all(chunk).timeout(d)`;
+`#[ruio::main(cores = "all")]` and `bind_reuseport` work as sketched.
 
 ## Verification
 
@@ -600,8 +629,9 @@ starvation into the common case, and the pool wakes every waiting stream for
 each buffer that returns: 10,000 connections fell to 0.12×. Huge pages for the
 pool (`MADV_HUGEPAGE`, which the kernel granted) changed nothing measurable.
 Across two machines the server no longer does the client's receive
-processing, which leaves the runtime a larger share of its time; runtimes
-across cores are M6.
+processing, which leaves the runtime a larger share of its time. How
+runtimes on several cores fare is under
+[Scaling across cores](#scaling-across-cores).
 
 ### Random reads with direct I/O
 
@@ -648,6 +678,45 @@ At depth 64 and above ruio falls 3% to 5% behind, for a reason still to
 find; the kernel runs at most 20 items of deferred work per entry, which
 both sides live with.
 
+### Scaling across cores
+
+`ruio-bench scale` runs a load on more and more cores, every core loading
+itself: the echo benchmark's server on a port of its own, and 32
+connections of its own to it, each sending a 64 B message and waiting for
+its echo, again and again, for 3 seconds after 1 second of warm-up.
+Nothing crosses from core to core, so what the cores together lose comes
+from what they share. ruio runs on `Cores`, and tokio, as a reference, on a
+current-thread runtime per core, on a thread pinned to it; each run is a
+process of its own, and the runtimes take turns. Round trips per second,
+medians of three runs, on the Xeon Platinum 8488C with Linux 7.0, over
+loopback, on CPUs 0 up: CPUs n and n + 48 are the two hardware threads of
+one of its 48 cores. Scaling is the rate per core against one core's:
+
+| Cores | tokio | Scaling | ruio | Scaling | Busy loop |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 214k | 100% | 242k (1.13×) | 100% | 100% |
+| 2 | 426k | 99% | 479k (1.12×) | 99% | |
+| 4 | 855k | 100% | 963k (1.13×) | 99% | |
+| 8 | 1.71M | 100% | 1.92M (1.12×) | 99% | |
+| 16 | 3.40M | 99% | 3.82M (1.12×) | 99% | 97% |
+| 24 | 4.83M | 94% | 5.38M (1.11×) | 93% | 94% |
+| 32 | 6.08M | 89% | 6.67M (1.10×) | 86% | 90% |
+| 48 | 8.16M | 79% | 8.56M (1.05×) | 74% | 80% |
+| 64 | 8.39M | 61% | 8.62M (1.03×) | 56% | 58% |
+| 96 | 8.60M | 42% | 9.05M (1.05×) | 39% | 39% |
+
+The last column is what the host itself gives a busy loop on each core,
+a Python loop in a process pinned to each CPU, sharing nothing: with 48
+cores busy, 80% as much per core as with one, although the hypervisor
+reports no time stolen and the clock it reports falls by only 4%; and
+past 48, as the cores' second hardware threads join in, hardly more for
+all of them together. ruio scales linearly up to 16 cores, and from there
+keeps within 8% of what the busy loop gets, level with it from 64 cores
+on: the host is what stops it. Past 48 cores the second hardware threads
+add 5% to 6% for both runtimes. tokio keeps a few points closer to the busy
+loop at 32 and 48 cores, for a reason still to find, and ruio's lead over
+it narrows from 12% to 13% up to 16 cores to 3% to 5% from 48 on.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -661,18 +730,26 @@ both sides live with.
 | M6 | Multi-core: builder, CPU pinning, `spawn_on`, cross-core channels, descriptor passing | Close to linear scaling up to 96 cores |
 | M7 | Compat adapters, hyper and rustls examples, documentation | A hyper server runs through the adapters |
 
-M0 to M5 are done. M4 built linked timeouts and the `.timeout(d)`
+M0 to M6 are done. M4 built linked timeouts and the `.timeout(d)`
 combinator, bundles on the 6.10 baseline and writing behind, and the echo
 benchmark finds ruio ahead of tokio from 256 connections on, bar 10,000 with
 large messages, and level with fewer, bar one connection with 64 KiB messages,
 where tokio's echo is cut-through (see [TCP echo](#tcp-echo)). M5 built
 `ruio::fs` and buffers aligned for direct I/O, and ruio's direct reads keep
 within 5% of fio at every queue depth (see
-[Random reads with direct I/O](#random-reads-with-direct-io)). Still to come
-besides the later milestones: multishot read (6.7) and incremental
-consumption (6.12); general linked operations (`.link(next)`); reading
-directories; and channels and other synchronization primitives, with the
-cooperative budget they need.
+[Random reads with direct I/O](#random-reads-with-direct-io)). M6 built
+thread per core: `Cores`, which runs a runtime on a thread pinned to each
+CPU and lets the cores reach each other (`spawn_on`, `handle_of`,
+`Handle::spawn_with`), `#[ruio::main(cores = ...)]`, channels between
+cores, a listener on each core with `bind_reuseport`, and streams that
+move between cores, direct descriptors with `MSG_RING`. With every core
+loading itself, ruio scales linearly up to 16 cores, and up to 96 keeps
+within 8% of what the host gives a busy loop (see
+[Scaling across cores](#scaling-across-cores)). Still to come besides the
+later milestones: multishot read (6.7) and incremental consumption (6.12);
+general linked operations (`.link(next)`); reading directories; waking
+rings with `MSG_RING`; and synchronization primitives beyond channels,
+with the cooperative budget that those often ready at once need.
 
 ## Open questions
 
