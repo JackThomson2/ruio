@@ -65,7 +65,9 @@
 //! A server on several cores has a listener on each, all bound to one
 //! address with [`TcpListener::bind_reuseport`], and the kernel spreads the
 //! connections among them; [`UdpSocket::bind_reuseport`] does the same for
-//! datagrams.
+//! datagrams. A connection can also move from one core to another, with
+//! [`TcpStream::send_to`], for a task spawned there with
+//! [`Handle::spawn_with`](crate::Handle::spawn_with) to receive.
 //!
 //! Like the ring their I/O runs on, sockets belong to their thread: they are
 //! neither `Send` nor `Sync`.
@@ -84,6 +86,6 @@ mod unix;
 pub use behind::{Flush, WriteBehind};
 pub use socket::{ReadExact, RecvStream, SendZc, SocketOp, WriteAll, WriteAllVectored};
 pub(crate) use socket::{Sock, ThreadBound};
-pub use tcp::{Incoming, TcpListener, TcpStream};
+pub use tcp::{Incoming, SentTcpStream, TcpListener, TcpStream};
 pub use udp::UdpSocket;
 pub use unix::{UnixDatagram, UnixListener, UnixStream};

@@ -16,7 +16,7 @@ use ruio_driver::{Descriptor, Driver, Fd};
 
 use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
-    ReadExact, RecvStream, SendZc, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
+    ReadExact, RecvStream, SendZc, Sent, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
     bind_reuseport,
 };
 
@@ -425,6 +425,75 @@ impl TcpStream {
     /// once a [`write_behind`](Self::write_behind) in flight has finished.
     pub fn shutdown(&self, how: Shutdown) -> SocketOp<'_, ops::Shutdown> {
         self.sock.shutdown(how).behind(&self.behind)
+    }
+
+    /// Sends the stream to core `core` of the thread's run, for a task there
+    /// to [`receive`](SentTcpStream::receive), once a
+    /// [`write_behind`](Self::write_behind) in flight has finished. A plain
+    /// descriptor goes as it is, and a direct one moves to that core's ring,
+    /// with `IORING_OP_MSG_RING`; see [`DirectFd::send_to`].
+    ///
+    /// # Errors
+    ///
+    /// Hands the stream back with what the write behind failed with, or what
+    /// moving a direct descriptor reports: `ENFILE` if the other ring's file
+    /// table is full, say.
+    ///
+    /// # Panics
+    ///
+    /// Outside [`Cores::run`](crate::Cores::run), or if the run has no core
+    /// `core`.
+    ///
+    /// [`DirectFd::send_to`]: crate::uring::DirectFd::send_to
+    pub async fn send_to(self, core: usize) -> Result<SentTcpStream, (io::Error, TcpStream)> {
+        if let Err(err) = self.flush().await {
+            return Err((err, self));
+        }
+        let TcpStream {
+            sock,
+            peer,
+            behind,
+            _thread,
+        } = self;
+        match sock.send_to(core).await {
+            Ok(sock) => Ok(SentTcpStream { sock, peer }),
+            Err((err, sock)) => Err((
+                err,
+                TcpStream {
+                    sock,
+                    peer,
+                    behind,
+                    _thread,
+                },
+            )),
+        }
+    }
+}
+
+/// A TCP stream on its way to another core: `Send`, unlike a [`TcpStream`].
+/// Made by [`TcpStream::send_to`]; on the core it was sent to, a task makes
+/// it a stream again with [`receive`](SentTcpStream::receive). Dropping it
+/// closes the connection.
+#[derive(Debug)]
+pub struct SentTcpStream {
+    sock: Sent<net::TcpStream>,
+    peer: Option<SocketAddr>,
+}
+
+impl SentTcpStream {
+    /// The stream, on the core it was sent to.
+    ///
+    /// # Panics
+    ///
+    /// On any other core, if the stream is a direct descriptor, which only
+    /// that core's ring holds.
+    pub fn receive(self) -> TcpStream {
+        TcpStream {
+            sock: self.sock.receive(),
+            peer: self.peer,
+            behind: Rc::default(),
+            _thread: PhantomData,
+        }
     }
 }
 

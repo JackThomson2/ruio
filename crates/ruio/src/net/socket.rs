@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use ruio_driver::buf::{BufBundle, BufPool, BufResult, IoBuf, IoBufMut, IoBufs, Slice};
 use ruio_driver::ops::{self, Recv, Send, SendVectored, Shutdown};
-use ruio_driver::{Completion, Descriptor, DirectFd, Driver, Fd, Op, Operation, SockAddr};
+use ruio_driver::{Completion, Descriptor, DirectFd, Driver, Fd, Op, Operation, SentFd, SockAddr};
 
 use std::rc::Rc;
 
@@ -119,6 +119,54 @@ impl<S: From<OwnedFd>> Sock<S> {
         match descriptor {
             Descriptor::Plain(fd) => Sock::Plain(S::from(fd)),
             Descriptor::Direct(fd) => Sock::Direct(fd),
+        }
+    }
+}
+
+impl<S> Sock<S> {
+    /// Sends the socket to core `core` of the thread's run: a plain
+    /// descriptor as it is, and a direct one to that core's ring.
+    ///
+    /// # Errors
+    ///
+    /// Hands the socket back with what moving a direct descriptor reports.
+    ///
+    /// # Panics
+    ///
+    /// Outside a run of several cores, or if it has no core `core`.
+    pub(crate) async fn send_to(self, core: usize) -> Result<Sent<S>, (io::Error, Self)> {
+        let handle = crate::handle_of(core);
+        match self {
+            Sock::Plain(socket) => Ok(Sent::Plain(socket)),
+            Sock::Direct(fd) => match fd.send_to(handle.ring()).await {
+                Ok(sent) => Ok(Sent::Direct(sent)),
+                Err((err, fd)) => Err((err, Sock::Direct(fd))),
+            },
+        }
+    }
+}
+
+/// A socket on its way to another core. A direct descriptor is in that
+/// core's ring's file table, so only that core can take it.
+#[derive(Debug)]
+pub(crate) enum Sent<S> {
+    Plain(S),
+    Direct(SentFd),
+}
+
+impl<S> Sent<S> {
+    /// The socket, on the core it was sent to.
+    ///
+    /// # Panics
+    ///
+    /// For a direct descriptor, on any other core.
+    pub(crate) fn receive(self) -> Sock<S> {
+        match self {
+            Sent::Plain(socket) => Sock::Plain(socket),
+            Sent::Direct(sent) => match sent.claim() {
+                Ok(fd) => Sock::Direct(fd),
+                Err(_) => panic!("a direct descriptor is received on the core it was sent to"),
+            },
         }
     }
 }

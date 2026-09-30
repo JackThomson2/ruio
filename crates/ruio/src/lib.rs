@@ -56,7 +56,7 @@
 
 pub use ruio_executor::{
     Builder, Core, Cores, Handle, JoinError, JoinHandle, RemoteJoinHandle, Runtime, core,
-    core_count, driver, handle, spawn, spawn_on, yield_now,
+    core_count, driver, handle, handle_of, spawn, spawn_on, yield_now,
 };
 pub use ruio_executor::{sync, time};
 pub use ruio_macros::{main, test};

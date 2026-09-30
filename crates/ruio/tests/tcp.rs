@@ -328,6 +328,63 @@ fn a_server_on_several_cores_shares_out_the_connections() {
     assert!(serving.iter().all(|&index| index < count));
 }
 
+/// A connection accepted on one core moves to another, which serves it: as
+/// a plain descriptor, and as a direct one, from ring to ring.
+#[test]
+fn a_stream_moves_to_another_core() {
+    let all = ruio::Cores::all().unwrap();
+    // Two cores, sharing a CPU on a machine with one.
+    let cores = ruio::Cores::cpus(all.cpu_list().iter().copied().cycle().take(2));
+    let outputs = cores
+        .run(|core| async move {
+            // Core 1 serves what core 0 sends it, until the run ends.
+            if core.index() != 0 {
+                return Ok(());
+            }
+            for direct in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0")?;
+                listener.set_direct(direct);
+                let addr = listener.local_addr()?;
+                let head = pattern(8 << 20, usize::from(direct));
+                let expected = [&head[..], b"tail"].concat();
+                let client = ruio::spawn(async move {
+                    let client = within(TcpStream::connect(addr)).await?;
+                    let received = Vec::with_capacity(expected.len());
+                    let (read, received) = within(client.read_exact(received)).await;
+                    read?;
+                    assert!(received == expected, "out of order");
+                    within(client.write_all("ping")).await.0?;
+                    let (read, echo) = within(client.read_exact(Vec::with_capacity(4))).await;
+                    read?;
+                    assert_eq!(echo, b"ping");
+                    io::Result::Ok(())
+                });
+                let (server, _) = within(listener.accept()).await?;
+                // Larger than the socket holds, so still in flight as the
+                // stream is sent: it goes out before what the other core
+                // writes.
+                within(server.write_behind(vec![head])).await?;
+                let sent = within(server.send_to(1)).await.map_err(|(err, _)| err)?;
+                let served = ruio::handle_of(1).spawn_with(move || async move {
+                    let stream = sent.receive();
+                    assert_eq!(stream.is_direct(), direct);
+                    within(stream.write_all("tail")).await.0?;
+                    let (read, buf) = within(stream.read_exact(Vec::with_capacity(4))).await;
+                    read?;
+                    within(stream.write_all(buf)).await.0?;
+                    io::Result::Ok(ruio::core().unwrap().index())
+                });
+                client.await.unwrap()?;
+                assert_eq!(within(served).await.unwrap()?, 1);
+            }
+            io::Result::Ok(())
+        })
+        .unwrap();
+    for output in outputs {
+        output.unwrap();
+    }
+}
+
 #[ruio::test]
 async fn accept_reports_the_peer() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
