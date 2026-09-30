@@ -67,14 +67,17 @@ pub(crate) fn is_current(shared: &Arc<Shared>) -> bool {
         .unwrap_or(false)
 }
 
-/// Queues `task` on the thread's scheduler if it is the one `owner` belongs
-/// to, or hands it back.
-pub(crate) fn schedule_local(owner: &Arc<Shared>, task: TaskRef) -> Result<(), TaskRef> {
+/// Queues `task` on the thread's scheduler, unless it is queued there
+/// already, if that is the scheduler whose shared part is at `owner`: its
+/// own. Otherwise hands the task back. Compared by address, so that the
+/// caller needs no reference to the shared part.
+pub(crate) fn schedule_local(owner: *const Shared, task: TaskRef) -> Result<(), TaskRef> {
     let mut task = Some(task);
     let _ = CURRENT.try_with(|current| {
         if let Some(scheduler) = current.borrow().as_ref()
-            && Arc::ptr_eq(scheduler.shared(), owner)
+            && std::ptr::eq(Arc::as_ptr(scheduler.shared()), owner)
             && let Some(task) = task.take()
+            && task.claim()
         {
             scheduler.schedule(task);
         }

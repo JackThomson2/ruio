@@ -242,6 +242,69 @@ fn another_thread_can_wake_a_task() {
     assert_eq!(value, 11);
 }
 
+/// Another thread waking a task over and over, while the task waits, runs
+/// and yields in turn, loses no wake: each signal the task waits for, it
+/// sees, whether the wake lands while it waits, while it runs, or while it
+/// is queued by a wake of its own thread.
+#[test]
+fn wakes_from_another_thread_are_never_lost() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const ROUNDS: usize = 20_000;
+    let signalled = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let slot: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+    // Set when the waiter gives up, so that the signaller does too.
+    let stop = Arc::new(AtomicBool::new(false));
+    let signaller = {
+        let (signalled, seen, slot, stop) =
+            (signalled.clone(), seen.clone(), slot.clone(), stop.clone());
+        thread::spawn(move || {
+            for round in 1..=ROUNDS {
+                while seen.load(Ordering::Acquire) < round - 1 {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
+                signalled.store(round, Ordering::Release);
+                if let Some(waker) = slot.lock().unwrap().take() {
+                    waker.wake();
+                }
+            }
+        })
+    };
+    let runtime = Runtime::new().unwrap();
+    let waiter = runtime.block_on(async move {
+        let task = spawn(async move {
+            for round in 1..=ROUNDS {
+                poll_fn(|cx| {
+                    if signalled.load(Ordering::Acquire) >= round {
+                        return Poll::Ready(());
+                    }
+                    *slot.lock().unwrap() = Some(cx.waker().clone());
+                    // Checked again after the waker is in place, as a
+                    // channel does.
+                    if signalled.load(Ordering::Acquire) >= round {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                seen.store(round, Ordering::Release);
+                if round % 7 == 0 {
+                    yield_now().await;
+                }
+            }
+        });
+        ruio_executor::time::timeout(Duration::from_secs(10), task).await
+    });
+    stop.store(true, Ordering::Relaxed);
+    signaller.join().unwrap();
+    waiter.expect("a wake was lost").unwrap();
+}
+
 #[test]
 fn yielding_lets_other_tasks_run() {
     let runtime = Runtime::new().unwrap();

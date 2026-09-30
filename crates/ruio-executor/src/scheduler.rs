@@ -36,6 +36,14 @@ pub(crate) trait Runnable: Send + Sync {
     /// Drops the future of an unfinished task, which then reports that it
     /// was cancelled.
     fn cancel(&self);
+
+    /// Marks the task queued to run, unless it is queued already: whether
+    /// the caller is to queue it.
+    fn claim(&self) -> bool;
+
+    /// Queues the task on its scheduler's remote queue, from another thread,
+    /// unless it is there already.
+    fn wake_remote(self: Arc<Self>);
 }
 
 /// The part of a scheduler that other threads reach: the tasks woken there,
@@ -274,7 +282,9 @@ impl Scheduler {
         self.shared.pending.store(false, Ordering::Relaxed);
         let mut remote = self.shared.lock();
         if !remote.tasks.is_empty() {
-            self.queue.borrow_mut().extend(remote.tasks.drain(..));
+            // A task woken here meanwhile is in the queue already.
+            let claimed = remote.tasks.drain(..).filter(|task| task.claim());
+            self.queue.borrow_mut().extend(claimed);
         }
     }
 

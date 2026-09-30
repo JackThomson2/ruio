@@ -5,12 +5,12 @@ use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::mem;
+use std::mem::{self, ManuallyDrop};
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::context;
 use crate::scheduler::{Runnable, Scheduler, Shared, TaskRef};
@@ -19,10 +19,15 @@ use crate::scheduler::{Runnable, Scheduler, Shared, TaskRef};
 /// by the scheduler, the task's wakers and its [`JoinHandle`].
 pub(crate) struct Task<F: Future> {
     shared: Arc<Shared>,
-    /// Whether the task is queued to run, so that waking it again does not
-    /// queue it twice.
-    scheduled: AtomicBool,
+    /// Whether another thread has queued the task on its scheduler's remote
+    /// queue since it last ran, so that waking it again from elsewhere does
+    /// not queue it twice.
+    woken: AtomicBool,
     // The fields below are only used on the thread that spawned the task.
+    /// Whether the task is in its scheduler's run queue, so that waking it
+    /// again does not queue it twice. A plain cell: most wakes come from the
+    /// task's own thread, and need no atomic operation.
+    queued: Cell<bool>,
     stage: RefCell<Stage<F>>,
     /// The task's place in its scheduler's list of tasks.
     index: Cell<usize>,
@@ -40,8 +45,8 @@ enum Stage<F: Future> {
     Consumed,
 }
 
-// SAFETY: other threads only reach `shared` and `scheduled`, which are Send
-// and Sync, through the task's wakers. The future, the output and the `Cell`s
+// SAFETY: other threads only reach `shared` and `woken`, which are Send and
+// Sync, through the task's wakers. The future, the output and the `Cell`s
 // are only used on the thread that spawned the task: by its scheduler, which
 // runs there, and by its `JoinHandle`, which cannot leave it. The scheduler
 // keeps a reference until the future is dropped, and the `JoinHandle` drops
@@ -60,7 +65,8 @@ where
     pub(crate) fn spawn(future: F, scheduler: &Scheduler) -> JoinHandle<F::Output> {
         let task = Arc::new(Self {
             shared: Arc::clone(scheduler.shared()),
-            scheduled: AtomicBool::new(true),
+            woken: AtomicBool::new(false),
+            queued: Cell::new(true),
             stage: RefCell::new(Stage::Running(future)),
             index: Cell::new(0),
             join_waker: Cell::new(None),
@@ -89,14 +95,47 @@ where
         }
     }
 
+    /// Queues the task to run: on its scheduler's run queue from its own
+    /// thread, which claims it there, or on its remote queue from another.
     fn schedule(self: Arc<Self>) {
-        if self.scheduled.swap(true, Ordering::SeqCst) {
-            return;
+        let owner = Arc::as_ptr(&self.shared);
+        if let Err(task) = context::schedule_local(owner, self) {
+            task.wake_remote();
         }
-        let shared = Arc::clone(&self.shared);
-        if let Err(task) = context::schedule_local(&shared, self) {
-            shared.schedule_remote(task);
-        }
+    }
+
+    /// The task's wakers, made by hand rather than from `Wake` so that a
+    /// poll can lend one without taking a reference; see `run`. Each
+    /// function gets a pointer from an `Arc<Self>`, whose reference the
+    /// waker holds, except that the one `run` lends is never dropped.
+    const WAKER: RawWakerVTable = RawWakerVTable::new(
+        Self::clone_waker,
+        Self::wake_waker,
+        Self::wake_waker_by_ref,
+        Self::drop_waker,
+    );
+
+    unsafe fn clone_waker(task: *const ()) -> RawWaker {
+        // SAFETY: the waker holds a reference, so the task is alive.
+        unsafe { Arc::increment_strong_count(task.cast::<Self>()) };
+        RawWaker::new(task, &Self::WAKER)
+    }
+
+    unsafe fn wake_waker(task: *const ()) {
+        // SAFETY: waking consumes the waker, and so its reference.
+        let task = unsafe { Arc::from_raw(task.cast::<Self>()) };
+        task.schedule();
+    }
+
+    unsafe fn wake_waker_by_ref(task: *const ()) {
+        // SAFETY: the waker holds a reference, which stays with it.
+        let task = ManuallyDrop::new(unsafe { Arc::from_raw(task.cast::<Self>()) });
+        Arc::clone(&task).schedule();
+    }
+
+    unsafe fn drop_waker(task: *const ()) {
+        // SAFETY: dropping the waker releases its reference.
+        drop(unsafe { Arc::from_raw(task.cast::<Self>()) });
     }
 }
 
@@ -107,7 +146,12 @@ where
 {
     fn run(self: Arc<Self>, scheduler: &Scheduler) {
         // Cleared before polling, so a wake during the poll queues it again.
-        self.scheduled.store(false, Ordering::SeqCst);
+        // A remote wake's flag is cleared only if set, with the same order
+        // as the wake's own swap, so that the poll sees what it woke for.
+        self.queued.set(false);
+        if self.woken.load(Ordering::SeqCst) {
+            self.woken.store(false, Ordering::SeqCst);
+        }
         if self.aborted.get() {
             if matches!(*self.stage.borrow(), Stage::Running(_)) {
                 self.complete(Err(JoinError::cancelled()));
@@ -115,7 +159,14 @@ where
             }
             return;
         }
-        let waker = Waker::from(Arc::clone(&self));
+        // A waker borrowing the scheduler's reference, which outlives the
+        // poll: it takes a reference of its own only if cloned.
+        let raw = RawWaker::new(Arc::as_ptr(&self).cast(), &Self::WAKER);
+        // SAFETY: the vtable's functions treat the pointer as a reference, as
+        // `RawWakerVTable` asks, and this one lives until the end of the
+        // poll; never dropped, the waker releases no reference it does not
+        // hold.
+        let waker = ManuallyDrop::new(unsafe { Waker::from_raw(raw) });
         let mut cx = Context::from_waker(&waker);
         let poll = {
             let mut stage = self.stage.borrow_mut();
@@ -141,21 +192,16 @@ where
             self.complete(Err(JoinError::cancelled()));
         }
     }
-}
 
-impl<F> Wake for Task<F>
-where
-    F: Future + 'static,
-    F::Output: 'static,
-{
-    fn wake(self: Arc<Self>) {
-        self.schedule();
+    fn claim(&self) -> bool {
+        !self.queued.replace(true)
     }
 
-    fn wake_by_ref(self: &Arc<Self>) {
-        if !self.scheduled.load(Ordering::SeqCst) {
-            Arc::clone(self).schedule();
+    fn wake_remote(self: Arc<Self>) {
+        if self.woken.swap(true, Ordering::SeqCst) {
+            return;
         }
+        Arc::clone(&self.shared).schedule_remote(self);
     }
 }
 
