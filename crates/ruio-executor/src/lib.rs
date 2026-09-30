@@ -31,6 +31,7 @@
 mod context;
 mod runtime;
 mod scheduler;
+pub mod sync;
 mod task;
 pub mod time;
 mod wheel;
