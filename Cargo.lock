@@ -448,8 +448,12 @@ dependencies = [
 name = "ruio-bench"
 version = "0.0.0"
 dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "ruio",
+ "ruio-compat",
  "tokio",
 ]
 

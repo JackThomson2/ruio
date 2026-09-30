@@ -12,6 +12,12 @@
 //! The servers each run on one thread: ruio, with plain and with direct
 //! descriptors, and tokio's current-thread runtime.
 //!
+//! `ruio-bench http` runs the HTTP/1.1 benchmark the same way: hyper
+//! serving a short plaintext response on one thread, on ruio through its
+//! adapters, each connection receiving into a buffer of its own or into a
+//! shared pool, and on tokio's current-thread runtime; and connections that
+//! each send a request and wait for the response, again and again.
+//!
 //! `ruio-bench scale` measures how a runtime scales across cores: for each
 //! number of cores, every core loads itself, with an echo server and
 //! connections of its own, and the report gives the round trips per second
@@ -34,11 +40,14 @@
 //! ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
 //! ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] [--warmup S]
 //!                             [--cpus LIST]
+//! ruio-bench http-server ruio|ruio-pool|tokio ADDR [--cpu N] [--buffers N]
+//! ruio-bench http-client ADDR [--connections N] [--seconds S] [--warmup S] [--cpus LIST]
 //! ruio-bench scale-run ruio|tokio [--cores N] [--connections N] [--size BYTES] [--seconds S]
 //!                                 [--warmup S]
 //! ```
 
 mod client;
+mod http;
 mod randread;
 mod scale;
 mod server;
@@ -53,7 +62,8 @@ use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use client::Load;
+use client::{Exchange, Load};
+use http::HttpServer;
 use server::Server;
 
 const USAGE: &str = "usage: ruio-bench echo [--quick] [--runs N] [--seconds S] [--warmup S] \
@@ -61,6 +71,10 @@ const USAGE: &str = "usage: ruio-bench echo [--quick] [--runs N] [--seconds S] [
        ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
        ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] \
                      [--warmup S] [--cpus LIST]
+       ruio-bench http [--quick] [--runs N] [--seconds S] [--warmup S] [--server-cpu N] \
+                     [--client-cpus LIST]
+       ruio-bench http-server ruio|ruio-pool|tokio ADDR [--cpu N] [--buffers N]
+       ruio-bench http-client ADDR [--connections N] [--seconds S] [--warmup S] [--cpus LIST]
        ruio-bench randread PATH [--depths LIST] [--block BYTES] [--runs N] [--seconds S] \
                      [--warmup S] [--cpu N] [--fio FIO]
        ruio-bench scale [--cores LIST] [--connections N] [--size BYTES] [--runs N] \
@@ -75,6 +89,9 @@ fn main() {
         Some("echo") => echo(&options),
         Some("echo-server") => echo_server(&options),
         Some("echo-client") => echo_client(&options),
+        Some("http") => http(&options),
+        Some("http-server") => http_server(&options),
+        Some("http-client") => http_client(&options),
         Some("randread") => randread(&options),
         Some("randread-ruio") => randread_ruio(&options),
         Some("scale") => scale(&options),
@@ -358,19 +375,40 @@ fn echo_server(options: &Options) -> Result<(), String> {
 }
 
 fn echo_client(options: &Options) -> Result<(), String> {
+    let size = options.get("size", 64)?;
+    run_client(options, Exchange::Echo(size))
+}
+
+fn http_server(options: &Options) -> Result<(), String> {
+    let server: HttpServer = options.positional(0, "server")?;
+    let addr: SocketAddr = options.positional(1, "address")?;
+    let cpu = options.get("cpu", 0)?;
+    let buffers = options.get("buffers", 1024)?;
+    sys::pin(&[cpu]).map_err(|err| format!("pinning to CPU {cpu}: {err}"))?;
+    sys::raise_file_limit().map_err(|err| format!("raising the file limit: {err}"))?;
+    http::run(server, addr, buffers).map_err(|err| format!("{server} HTTP server: {err}"))
+}
+
+fn http_client(options: &Options) -> Result<(), String> {
+    run_client(options, Exchange::Http)
+}
+
+/// Runs the load generator, as the options say, making `exchange` on each
+/// connection, and reports what it measured.
+fn run_client(options: &Options, exchange: Exchange) -> Result<(), String> {
     let addr: SocketAddr = options.positional(0, "address")?;
     let connections: usize = options.get("connections", 1)?;
     let cpus = sys::parse_cpus(&options.get("cpus", "2-25".to_owned())?)?;
     let load = Load {
         connections,
-        size: options.get("size", 64)?,
+        exchange,
         warmup: options.duration("warmup", 1.0)?,
         measure: options.duration("seconds", 3.0)?,
         threads: cpus.len().min(connections).max(1),
     };
     sys::pin(&cpus).map_err(|err| format!("pinning to CPUs {cpus:?}: {err}"))?;
     sys::raise_file_limit().map_err(|err| format!("raising the file limit: {err}"))?;
-    let measured = client::run(addr, load).map_err(|err| format!("echo client: {err}"))?;
+    let measured = client::run(addr, load).map_err(|err| format!("client: {err}"))?;
     println!(
         "rate={:.0} p50={:.1} p99={:.1}",
         measured.rate(),
@@ -444,7 +482,8 @@ fn echo(options: &Options) -> Result<(), String> {
                 eprintln!("{server}: {connections} connections, {size} B messages, run {round}");
                 let run = Run {
                     exe: &exe,
-                    server,
+                    benchmark: "echo",
+                    server: server.to_string(),
                     server_cpu,
                     client_cpus: &client_cpus,
                     connections,
@@ -477,11 +516,86 @@ fn echo(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
+/// The connection counts of the HTTP benchmark.
+const HTTP_CONNECTIONS: &[usize] = &[1, 16, 256, 1024, 10_000];
+
+const HTTP_QUICK: &[usize] = &[1, 256];
+
+fn http(options: &Options) -> Result<(), String> {
+    let exe = env::current_exe().map_err(|err| err.to_string())?;
+    let counts = if options.flag("quick") {
+        HTTP_QUICK
+    } else {
+        HTTP_CONNECTIONS
+    };
+    let server_cpu: usize = options.get("server-cpu", 0)?;
+    let client_cpus: String = options.get("client-cpus", "2-25".to_owned())?;
+    let seconds = options.duration("seconds", 3.0)?;
+    let warmup = options.duration("warmup", 1.0)?;
+    let runs: usize = options.get("runs", 3)?;
+    if runs == 0 {
+        return Err("--runs must be at least 1".to_owned());
+    }
+
+    println!(
+        "Requests per second, and 99th percentile response time, medians of {runs} runs; \
+         hyper servers on CPU {server_cpu}, the client on {client_cpus}."
+    );
+    println!();
+    print!("| connections |");
+    for server in HttpServer::ALL {
+        print!(" {server} |");
+    }
+    println!();
+    println!("|---:|{}", "---:|".repeat(HttpServer::ALL.len()));
+    for &connections in counts {
+        let mut samples: Vec<Vec<Row>> = HttpServer::ALL.iter().map(|_| Vec::new()).collect();
+        for round in 1..=runs {
+            for (server, samples) in HttpServer::ALL.into_iter().zip(&mut samples) {
+                eprintln!("{server}: {connections} connections, run {round}");
+                let run = Run {
+                    exe: &exe,
+                    benchmark: "http",
+                    server: server.to_string(),
+                    server_cpu,
+                    client_cpus: &client_cpus,
+                    connections,
+                    size: 0,
+                    seconds,
+                    warmup,
+                };
+                samples.push(run.measure()?);
+            }
+        }
+        let rows: Vec<Row> = samples
+            .iter()
+            .map(|samples| Row {
+                rate: median(samples.iter().map(|row| row.rate)),
+                p99: median(samples.iter().map(|row| row.p99)),
+            })
+            .collect();
+        let tokio = rows[0].rate;
+        print!("| {connections} |");
+        for (server, row) in HttpServer::ALL.iter().zip(&rows) {
+            let versus = if *server == HttpServer::Tokio {
+                String::new()
+            } else {
+                format!(", {:.2}x", row.rate / tokio)
+            };
+            print!(" {}{versus}, {:.0} µs |", thousands(row.rate), row.p99);
+        }
+        println!();
+    }
+    Ok(())
+}
+
 /// One measurement: a server in a process of its own, and the client in
 /// another.
 struct Run<'a> {
     exe: &'a Path,
-    server: Server,
+    /// `echo` or `http`: what the server and client subcommands start with.
+    benchmark: &'static str,
+    server: String,
     server_cpu: usize,
     client_cpus: &'a str,
     connections: usize,
@@ -494,8 +608,8 @@ impl Run<'_> {
     fn measure(&self) -> Result<Row, String> {
         let addr = free_addr().map_err(|err| format!("finding a free port: {err}"))?;
         let mut server = Command::new(self.exe)
-            .arg("echo-server")
-            .arg(self.server.to_string())
+            .arg(format!("{}-server", self.benchmark))
+            .arg(&self.server)
             .arg(addr.to_string())
             .args(["--cpu", &self.server_cpu.to_string()])
             .args(["--buffers", &self.pool_buffers().to_string()])
@@ -511,7 +625,7 @@ impl Run<'_> {
     fn client(&self, addr: SocketAddr, server: &mut Child) -> Result<Row, String> {
         wait_until_listening(addr, server)?;
         let output = Command::new(self.exe)
-            .arg("echo-client")
+            .arg(format!("{}-client", self.benchmark))
             .arg(addr.to_string())
             .args(["--connections", &self.connections.to_string()])
             .args(["--size", &self.size.to_string()])

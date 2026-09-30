@@ -9,8 +9,12 @@ publish.workspace = true
 # The only crate that depends on another runtime: it is what ruio is
 # measured against.
 [dependencies]
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 libc.workspace = true
 ruio.workspace = true
+ruio-compat = { workspace = true, features = ["tokio"] }
 tokio = { version = "1.53.1", features = ["io-util", "net", "rt", "rt-multi-thread", "sync"] }
 
 [lints]
