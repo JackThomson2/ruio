@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ruio_executor::sync::{mpsc, oneshot};
 use ruio_executor::time::sleep;
-use ruio_executor::{Core, Cores, Runtime, core, core_count, spawn, spawn_on};
+use ruio_executor::{Core, Cores, Runtime, core, core_count, handle_of, spawn, spawn_on};
 
 /// A few cores, however many CPUs the machine has: on one with fewer, some
 /// share a CPU.
@@ -78,6 +78,9 @@ fn cores_spawn_onto_each_other() {
     let count = cores.count();
     let answers = cores
         .run(|me: Core| async move {
+            // A core's handle names its ring.
+            let ring = handle_of(me.index()).ring().id();
+            assert_eq!(ring, ruio_executor::driver().id());
             let next = (me.index() + 1) % count;
             let there = spawn_on(next, async { (core().unwrap(), current_cpu()) })
                 .await

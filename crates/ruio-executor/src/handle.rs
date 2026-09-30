@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker, ready};
 
+use ruio_driver::RemoteRing;
+
 use crate::scheduler::Shared;
 use crate::sync::oneshot;
 use crate::{JoinError, JoinHandle, spawn};
@@ -35,11 +37,25 @@ impl Handle {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        self.spawn_with(move || future)
+    }
+
+    /// Spawns the future that `make` makes, on the runtime's own thread at
+    /// its next turn, as [`spawn`](Handle::spawn) spawns one: made there,
+    /// the future need not be `Send`, only `make` and the output. So it can
+    /// hold what cannot leave its thread, such as a socket of the runtime's
+    /// ring.
+    pub fn spawn_with<M, F>(&self, make: M) -> RemoteJoinHandle<F::Output>
+    where
+        M: FnOnce() -> F + Send + 'static,
+        F: Future + 'static,
+        F::Output: Send + 'static,
+    {
         let (output, rx) = oneshot::channel();
         let abort = Arc::new(Abort::default());
         let relay_abort = Arc::clone(&abort);
         self.shared.spawn_remote(Box::new(move || {
-            let task = spawn(future);
+            let task = spawn(make());
             let _relay = spawn(Relay {
                 task,
                 abort: relay_abort,
@@ -48,6 +64,13 @@ impl Handle {
             });
         }));
         RemoteJoinHandle { rx, abort }
+    }
+
+    /// The runtime's ring, as other threads see it: where to send direct
+    /// descriptors for the runtime's tasks to use; see
+    /// [`DirectFd::send_to`](ruio_driver::DirectFd::send_to).
+    pub fn ring(&self) -> &RemoteRing {
+        self.shared.ring()
     }
 }
 

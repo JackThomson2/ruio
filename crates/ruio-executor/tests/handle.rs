@@ -1,6 +1,7 @@
 //! Spawning onto a runtime from other threads.
 
 use std::future::pending;
+use std::rc::Rc;
 use std::thread;
 
 use ruio_executor::sync::oneshot;
@@ -16,6 +17,31 @@ fn another_thread_spawns_onto_a_runtime() {
     let (result, received) = oneshot::channel();
     let other = thread::spawn(move || {
         let task = handle.spawn(async { (thread::current().id(), 21 * 2) });
+        let output = Runtime::new().unwrap().block_on(task);
+        result.send(output.unwrap()).unwrap();
+    });
+    assert_eq!(runtime.block_on(received).unwrap(), (home, 42));
+    other.join().unwrap();
+}
+
+/// A future made on the runtime's thread, by a closure sent there, need not
+/// be `Send`.
+#[test]
+fn a_future_made_on_the_runtime_need_not_be_send() {
+    let runtime = Runtime::new().unwrap();
+    let handle = runtime.handle();
+    let home = thread::current().id();
+    let (result, received) = oneshot::channel();
+    let other = thread::spawn(move || {
+        let task = handle.spawn_with(|| {
+            // Not `Send`, and held across an await: made on the runtime's
+            // thread, it never leaves it.
+            let local = Rc::new(21);
+            async move {
+                yield_now().await;
+                (thread::current().id(), *local * 2)
+            }
+        });
         let output = Runtime::new().unwrap().block_on(task);
         result.send(output.unwrap()).unwrap();
     });

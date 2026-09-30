@@ -46,7 +46,7 @@ use std::future::{self, Future};
 use std::sync::Arc;
 use std::task::Poll;
 
-pub use cores::{Core, Cores, core, core_count, spawn_on};
+pub use cores::{Core, Cores, core, core_count, handle_of, spawn_on};
 pub use handle::{Handle, RemoteJoinHandle};
 pub use ruio_driver::Driver;
 pub use runtime::{Builder, Runtime};

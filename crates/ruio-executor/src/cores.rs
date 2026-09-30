@@ -70,18 +70,28 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let handle = CURRENT.with(|current| {
+    handle_of(index).spawn(future)
+}
+
+/// The handle of core `index` of the thread's run: to spawn onto it, with a
+/// future made there if need be ([`Handle::spawn_with`]), and to send it
+/// direct descriptors ([`Handle::ring`]).
+///
+/// # Panics
+///
+/// Outside [`Cores::run`], or if the run has no core `index`.
+pub fn handle_of(index: usize) -> Handle {
+    CURRENT.with(|current| {
         let current = current.borrow();
         let (_, registry) = current
             .as_ref()
-            .expect("`spawn_on` must be called on a core of a `Cores` run");
+            .expect("only a core of a `Cores` run can reach the others");
         let (_, handle) = registry
             .cores
             .get(index)
             .unwrap_or_else(|| panic!("the run has no core {index}"));
         handle.clone()
-    });
-    handle.spawn(future)
+    })
 }
 
 /// A set of CPUs to run on, a runtime on each: thread per core.

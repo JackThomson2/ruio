@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use ruio_driver::{Driver, Unparker};
+use ruio_driver::{Driver, RemoteRing, Unparker};
 
 use crate::task::{JoinHandle, Task};
 use crate::time::Timers;
@@ -54,6 +54,8 @@ pub(crate) struct Shared {
     /// the lock only when there may be tasks to take.
     pending: AtomicBool,
     unparker: Unparker,
+    /// The ring, for other rings to send descriptors to.
+    ring: RemoteRing,
 }
 
 /// A spawn from another thread, which makes a task on the runtime's own.
@@ -115,6 +117,11 @@ impl Shared {
     /// Wakes the scheduler's ring.
     pub(crate) fn unpark(&self) {
         self.unparker.unpark();
+    }
+
+    /// The scheduler's ring, as other threads see it.
+    pub(crate) fn ring(&self) -> &RemoteRing {
+        &self.ring
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Remote> {
@@ -184,6 +191,7 @@ impl Scheduler {
             }),
             pending: AtomicBool::new(false),
             unparker: driver.unparker(),
+            ring: driver.remote(),
         });
         Self {
             driver,
