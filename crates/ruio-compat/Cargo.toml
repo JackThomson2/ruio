@@ -21,7 +21,15 @@ tokio = { version = "1.53.1", default-features = false, optional = true }
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["io"] }
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["client", "http1", "server"] }
+# For `TokioIo`, which gives hyper's traits to types with tokio's.
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 tokio = { version = "1.53.1", features = ["io-util"] }
+
+[[example]]
+name = "hyper"
+required-features = ["tokio"]
 
 [lints]
 workspace = true
