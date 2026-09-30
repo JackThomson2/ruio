@@ -15,7 +15,11 @@
 //!   the caller's takes; the rest waits for the next read, and
 //!   `AsyncBufRead` lends it out as it is. A receive stays in flight from
 //!   one poll to the next, however long the caller takes to poll again, so
-//!   nothing it receives is lost; dropping the adapter cancels it.
+//!   nothing it receives is lost; dropping the adapter cancels it. An
+//!   adapter made [`with_pool`](Compat::with_pool) receives into the
+//!   buffers of a pool instead, with one multishot receive that stays
+//!   armed, as [`TcpStream::recv_stream`] does, so that its reads cost the
+//!   ring no request each.
 //! - A write copies the caller's bytes and writes them behind the stream,
 //!   as [`TcpStream::write_behind`] does: it is done, as far as the caller
 //!   can tell, once the send is on its way, and the next write waits for it
@@ -54,6 +58,7 @@
 //! family's, or call through the trait, as in
 //! `futures_util::AsyncWriteExt::write_all(&mut stream, data)`.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::io::{self, IoSlice};
@@ -62,6 +67,7 @@ use std::net::Shutdown;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker, ready};
 
+use ruio::buf::{BufLease, BufPool};
 use ruio::net::{Flush, TcpStream, UnixStream, WriteBehind};
 use ruio::uring::ops::{self, Recv};
 use ruio::uring::{Driver, Fd, Op};
@@ -133,20 +139,15 @@ mod sealed {
 ///
 /// Reads go through a buffer of the adapter's, 16 KiB unless made
 /// [`with_capacity`](Compat::with_capacity), which a receive fills with
-/// whatever has arrived; writes copy up to 256 KiB at a time, and are
-/// written behind the stream.
+/// whatever has arrived, or through the buffers of a pool, made
+/// [`with_pool`](Compat::with_pool). Writes copy up to 256 KiB at a time,
+/// and are written behind the stream.
 pub struct Compat<S> {
     // Fields drop in order: the operations, which cancel, then the stream,
     // which closes after them.
-    /// The receive in flight, which holds the read buffer meanwhile.
-    read: Option<Op<Recv<Vec<u8>>>>,
+    reader: Reader,
     /// The shutdown in flight.
     shutdown: Option<Op<ops::Shutdown>>,
-    /// What was read and not yet taken: `buf[pos..]`.
-    buf: Vec<u8>,
-    pos: usize,
-    /// How many bytes a receive asks for.
-    capacity: usize,
     /// Whether the writing half of the connection has been shut down.
     closed: bool,
     /// The ring the adapter's own operations run on: the thread's, taken at
@@ -154,6 +155,153 @@ pub struct Compat<S> {
     /// descriptor's slot with it.
     driver: Option<Driver>,
     stream: S,
+}
+
+/// Where an adapter's reads come from.
+enum Reader {
+    /// A buffer of the adapter's, which one receive at a time fills.
+    Buffer {
+        /// The receive in flight, which holds the buffer meanwhile.
+        read: Option<Op<Recv<Vec<u8>>>>,
+        /// What was received and not yet taken: `buf[pos..]`.
+        buf: Vec<u8>,
+        pos: usize,
+        /// How many bytes a receive asks for.
+        capacity: usize,
+    },
+    /// The buffers of a pool, which a multishot receive fills as data
+    /// arrives.
+    Pool {
+        /// The receive, from the first read on.
+        recv: Option<ops::RecvStream>,
+        pool: BufPool,
+        /// What was received and not yet taken: the first lease's data from
+        /// `pos`, then the others'.
+        leases: VecDeque<BufLease>,
+        pos: usize,
+        /// What the receive failed with, when a read found it after taking
+        /// data, which it reported first.
+        error: Option<io::Error>,
+    },
+}
+
+impl Reader {
+    /// Ready once data has been received and not yet taken, or the stream
+    /// has ended. `target` gives the ring and descriptor to receive with.
+    fn poll_fill(
+        &mut self,
+        cx: &mut Context<'_>,
+        target: impl FnOnce() -> (Driver, Fd),
+    ) -> Poll<io::Result<()>> {
+        match self {
+            Reader::Buffer {
+                read,
+                buf,
+                pos,
+                capacity,
+            } => {
+                if *pos < buf.len() {
+                    return Poll::Ready(Ok(()));
+                }
+                if read.is_none() {
+                    let mut buf = mem::take(buf);
+                    buf.clear();
+                    buf.reserve(*capacity);
+                    *pos = 0;
+                    let (driver, fd) = target();
+                    *read = Some(driver.op(Recv::new(fd, buf)));
+                }
+                let op = read.as_mut().expect("a receive is in flight");
+                let (received, filled) = ready!(Pin::new(op).poll(cx));
+                *read = None;
+                *buf = filled;
+                Poll::Ready(received.map(drop))
+            }
+            Reader::Pool {
+                recv,
+                pool,
+                leases,
+                pos,
+                error,
+            } => {
+                if !leases.is_empty() {
+                    return Poll::Ready(Ok(()));
+                }
+                if let Some(err) = error.take() {
+                    return Poll::Ready(Err(err));
+                }
+                if recv.is_none() {
+                    let (driver, fd) = target();
+                    *recv = Some(ops::RecvStream::new(&driver, fd, pool));
+                }
+                let stream = recv.as_mut().expect("the receive is armed");
+                // Ended by the peer, or by an error it yielded, the stream
+                // yields nothing more: the end of the stream, from then on.
+                match ready!(stream.poll_next(cx)) {
+                    Some(Ok(bundle)) => {
+                        leases.extend(bundle);
+                        *pos = 0;
+                        Poll::Ready(Ok(()))
+                    }
+                    Some(Err(err)) => Poll::Ready(Err(err)),
+                    None => Poll::Ready(Ok(())),
+                }
+            }
+        }
+    }
+
+    /// Takes in what a pool's receive has brought in since, if what was
+    /// taken in before has all been read, without waiting for more.
+    fn fill_ready(&mut self) {
+        let Reader::Pool {
+            recv: Some(recv),
+            leases,
+            pos,
+            error,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if !leases.is_empty() || error.is_some() {
+            return;
+        }
+        match recv.next_ready() {
+            Some(Ok(bundle)) => {
+                leases.extend(bundle);
+                *pos = 0;
+            }
+            Some(Err(err)) => *error = Some(err),
+            None => {}
+        }
+    }
+
+    /// Data received and not yet taken, as it lies in one buffer: empty if
+    /// there is none.
+    fn buffered(&self) -> &[u8] {
+        match self {
+            Reader::Buffer { buf, pos, .. } => &buf[*pos..],
+            Reader::Pool { leases, pos, .. } => leases.front().map_or(&[], |lease| &lease[*pos..]),
+        }
+    }
+
+    /// Takes `amount` bytes of [`buffered`](Reader::buffered).
+    fn consume(&mut self, amount: usize) {
+        match self {
+            Reader::Buffer { buf, pos, .. } => *pos = (*pos + amount).min(buf.len()),
+            Reader::Pool { leases, pos, .. } => {
+                let Some(lease) = leases.front() else {
+                    return;
+                };
+                *pos = (*pos + amount).min(lease.len());
+                if *pos == lease.len() {
+                    // Back to the pool at once, for the kernel to fill again.
+                    leases.pop_front();
+                    *pos = 0;
+                }
+            }
+        }
+    }
 }
 
 impl<S: StreamSocket> Compat<S> {
@@ -170,12 +318,45 @@ impl<S: StreamSocket> Compat<S> {
     /// If `capacity` is 0.
     pub fn with_capacity(capacity: usize, stream: S) -> Self {
         assert!(capacity > 0, "a read buffer holds at least one byte");
+        Self::with_reader(
+            Reader::Buffer {
+                read: None,
+                buf: Vec::new(),
+                pos: 0,
+                capacity,
+            },
+            stream,
+        )
+    }
+
+    /// Adapts `stream`, receiving into `pool`, which must belong to the
+    /// thread's ring, with one multishot receive, which stays armed from the
+    /// first read on, as a stream's [`recv_stream`](TcpStream::recv_stream)
+    /// does. A read then costs the ring no request of its own, and the
+    /// connection holds a buffer only while it has data waiting to be read.
+    ///
+    /// The data waits in as many of the pool's buffers as it fills until it
+    /// is read, however many that is. A pool so suits connections whose
+    /// reader reads what arrives promptly, as hyper does: one that is not
+    /// read while data keeps arriving can take every buffer, and leave the
+    /// others' receives waiting for one.
+    pub fn with_pool(pool: &BufPool, stream: S) -> Self {
+        Self::with_reader(
+            Reader::Pool {
+                recv: None,
+                pool: pool.clone(),
+                leases: VecDeque::new(),
+                pos: 0,
+                error: None,
+            },
+            stream,
+        )
+    }
+
+    fn with_reader(reader: Reader, stream: S) -> Self {
         Self {
-            read: None,
+            reader,
             shutdown: None,
-            buf: Vec::new(),
-            pos: 0,
-            capacity,
             closed: false,
             driver: None,
             stream,
@@ -187,67 +368,82 @@ impl<S: StreamSocket> Compat<S> {
         &self.stream
     }
 
-    /// The data read from the stream and not yet taken.
+    /// The data received and not yet read, as far as it lies in one buffer:
+    /// all of it, unless the adapter receives into a pool, whose later
+    /// buffers may hold more.
     pub fn buffer(&self) -> &[u8] {
-        &self.buf[self.pos..]
+        self.reader.buffered()
     }
 
-    /// The stream back. A receive in flight is cancelled, and what it and
-    /// earlier receives brought in and nobody took is lost, as the
-    /// [`buffer`](Compat::buffer) says; a write in flight carries on.
+    /// The stream back. A receive in flight is cancelled, and what was
+    /// received and not yet read is lost, as the
+    /// [`buffer`](Compat::buffer) is; a write in flight carries on.
     pub fn into_inner(self) -> S {
         self.stream
     }
 
     /// The ring to run an operation on, and the stream's descriptor for it.
     fn target(&mut self) -> (Driver, Fd) {
-        let driver = self.driver.get_or_insert_with(ruio::driver).clone();
-        (driver, self.stream.fd())
+        target(&mut self.driver, &self.stream)
     }
 
-    /// Ready once the buffer holds data, or the stream has ended, which
-    /// leaves it empty.
-    fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.pos < self.buf.len() {
-            return Poll::Ready(Ok(()));
-        }
-        if self.read.is_none() {
-            let mut buf = mem::take(&mut self.buf);
-            buf.clear();
-            buf.reserve(self.capacity);
-            self.pos = 0;
-            let (driver, fd) = self.target();
-            self.read = Some(driver.op(Recv::new(fd, buf)));
-        }
-        let read = self.read.as_mut().expect("a receive is in flight");
-        let (received, buf) = ready!(Pin::new(read).poll(cx));
-        self.read = None;
-        self.buf = buf;
-        Poll::Ready(received.map(drop))
-    }
-
-    /// The data read and not yet taken, reading more first if there is
-    /// none; empty once the stream has ended.
+    /// The data received and not yet taken, as it lies in one buffer,
+    /// receiving some first if there is none; empty once the stream has
+    /// ended.
     fn poll_fill_buf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        ready!(self.poll_fill(cx))?;
-        Poll::Ready(Ok(self.buffer()))
+        let Compat {
+            reader,
+            driver,
+            stream,
+            ..
+        } = self;
+        ready!(reader.poll_fill(cx, || target(driver, stream)))?;
+        Poll::Ready(Ok(self.reader.buffered()))
     }
 
-    /// Takes `amount` bytes of the buffer.
+    /// Takes `amount` bytes of what [`poll_fill_buf`](Self::poll_fill_buf)
+    /// gave.
     fn consume(&mut self, amount: usize) {
-        self.pos = (self.pos + amount).min(self.buf.len());
+        self.reader.consume(amount);
     }
 
-    /// Reads into `dst`, as much as the buffer holds and `dst` takes.
-    fn poll_read(&mut self, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<io::Result<usize>> {
-        if dst.is_empty() {
+    /// Copies out as much of the data received as `room` bytes take, waiting
+    /// for some if there is none, and hands it to `put`, a buffer's worth
+    /// at a time. From a pool, that takes in all that its receive has
+    /// brought in.
+    fn poll_copy(
+        &mut self,
+        cx: &mut Context<'_>,
+        room: usize,
+        mut put: impl FnMut(&[u8]),
+    ) -> Poll<io::Result<usize>> {
+        if room == 0 {
             return Poll::Ready(Ok(0));
         }
-        let data = ready!(self.poll_fill_buf(cx))?;
-        let len = data.len().min(dst.len());
-        dst[..len].copy_from_slice(&data[..len]);
-        self.consume(len);
-        Poll::Ready(Ok(len))
+        ready!(self.poll_fill_buf(cx))?;
+        let mut copied = 0;
+        loop {
+            if copied < room && self.reader.buffered().is_empty() {
+                self.reader.fill_ready();
+            }
+            let data = self.reader.buffered();
+            let len = data.len().min(room - copied);
+            if len == 0 {
+                return Poll::Ready(Ok(copied));
+            }
+            put(&data[..len]);
+            self.reader.consume(len);
+            copied += len;
+        }
+    }
+
+    /// Reads into `dst`, as much of the data received as it takes.
+    fn poll_read(&mut self, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<io::Result<usize>> {
+        let mut filled = 0;
+        self.poll_copy(cx, dst.len(), |data| {
+            dst[filled..filled + data.len()].copy_from_slice(data);
+            filled += data.len();
+        })
     }
 
     /// Writes as many of the bytes of `bufs`, one after another, as one
@@ -312,6 +508,13 @@ impl<S: StreamSocket> Compat<S> {
     }
 }
 
+/// The ring the adapter runs its operations on, which the first of them
+/// takes, and the stream's descriptor for it.
+fn target<S: StreamSocket>(driver: &mut Option<Driver>, stream: &S) -> (Driver, Fd) {
+    let driver = driver.get_or_insert_with(ruio::driver).clone();
+    (driver, stream.fd())
+}
+
 // Nothing is pinned: the operations are `Unpin`, and the stream is only
 // ever borrowed.
 impl<S> Unpin for Compat<S> {}
@@ -320,8 +523,7 @@ impl<S: fmt::Debug> fmt::Debug for Compat<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Compat")
             .field("stream", &self.stream)
-            .field("buffered", &(self.buf.len() - self.pos))
-            .field("reading", &self.read.is_some())
+            .field("pooled", &matches!(self.reader, Reader::Pool { .. }))
             .field("closed", &self.closed)
             .finish_non_exhaustive()
     }

@@ -8,12 +8,14 @@ use std::future::poll_fn;
 use std::io::{self, ErrorKind};
 use std::pin::Pin;
 use std::task::Poll;
+use std::time::Duration;
 
 use futures_util::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use ruio::buf::BufPool;
 use ruio::net::UnixStream;
 use ruio_compat::Compat;
 
-use support::{pair, pattern, within};
+use support::{Reads, pair, pattern, within};
 
 /// Polls a read of `buf` from `stream` once.
 async fn poll_read_once<S: AsyncRead + Unpin>(
@@ -25,10 +27,9 @@ async fn poll_read_once<S: AsyncRead + Unpin>(
 
 /// More than a read buffer holds and a write takes goes one way, and a reply
 /// the other, each side closing after it.
-#[ruio::test]
-async fn data_crosses_the_adapters_both_ways() -> io::Result<()> {
+async fn cross_both_ways(reads: Reads) -> io::Result<()> {
     let (client, server) = pair(false).await?;
-    let (mut client, mut server) = (Compat::new(client), Compat::with_capacity(1000, server));
+    let (mut client, mut server) = (Compat::new(client), reads.adapt(server));
     let message = pattern(1 << 20, 3);
     let expected = message.clone();
     let reader = ruio::spawn(async move {
@@ -56,6 +57,18 @@ async fn data_crosses_the_adapters_both_ways() -> io::Result<()> {
     Ok(())
 }
 
+#[ruio::test]
+async fn data_crosses_the_adapters_both_ways() -> io::Result<()> {
+    cross_both_ways(Reads::Buffer(1000)).await
+}
+
+/// The pool is too small for what arrives, so its receive waits for the
+/// reader to give buffers back, again and again.
+#[ruio::test]
+async fn data_crosses_the_adapters_through_a_pool() -> io::Result<()> {
+    cross_both_ways(Reads::Pool(4, 1000)).await
+}
+
 /// A direct descriptor's operations reach it through its ring's table.
 #[ruio::test]
 async fn direct_streams_are_adapted() -> io::Result<()> {
@@ -69,12 +82,19 @@ async fn direct_streams_are_adapted() -> io::Result<()> {
     Ok(())
 }
 
-/// Lines come out of the adapter's buffer, however they fall across
-/// receives.
+/// Lines come out of the adapter's buffers, however they fall across
+/// receives and buffers.
 #[ruio::test]
-async fn lines_are_read_from_the_buffer() -> io::Result<()> {
+async fn lines_are_read_from_the_buffers() -> io::Result<()> {
+    for reads in [Reads::Buffer(5), Reads::Pool(2, 5)] {
+        read_lines(reads).await?;
+    }
+    Ok(())
+}
+
+async fn read_lines(reads: Reads) -> io::Result<()> {
     let (writer, reader) = UnixStream::pair()?;
-    let (mut writer, mut reader) = (Compat::new(writer), Compat::with_capacity(5, reader));
+    let (mut writer, mut reader) = (Compat::new(writer), reads.adapt(reader));
     within(writer.write_all(b"one\ntwo\nthree, the last\n")).await?;
     within(writer.close()).await?;
     let mut lines = Vec::new();
@@ -85,7 +105,52 @@ async fn lines_are_read_from_the_buffer() -> io::Result<()> {
         }
         lines.push(line);
     }
-    assert_eq!(lines, ["one\n", "two\n", "three, the last\n"]);
+    assert_eq!(lines, ["one\n", "two\n", "three, the last\n"], "{reads:?}");
+    Ok(())
+}
+
+/// A read takes all that the pool's receive has brought in, however many
+/// buffers it fills, as far as the read's buffer takes it.
+#[ruio::test]
+async fn a_read_takes_what_several_buffers_hold() -> io::Result<()> {
+    let (client, server) = pair(false).await?;
+    let pool = BufPool::new(&ruio::driver(), 8, 100)?;
+    let (mut client, mut server) = (Compat::new(client), Compat::with_pool(&pool, server));
+    let message = pattern(500, 4);
+    within(client.write_all(&message[..100])).await?;
+    let mut buf = vec![0; 1000];
+    within(server.read_exact(&mut buf[..1])).await?;
+    // Sent one after another, the rest arrives in receives of its own, which
+    // the loopback interface completes long before the read.
+    for part in message[100..].chunks(100) {
+        within(client.write_all(part)).await?;
+        ruio::yield_now().await;
+    }
+    ruio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(within(server.read(&mut buf[1..])).await?, 499);
+    assert!(buf[..500] == message);
+    Ok(())
+}
+
+/// A dropped adapter gives back the buffers it held, and those its receive
+/// took after.
+#[ruio::test]
+async fn a_dropped_adapter_gives_its_buffers_back() -> io::Result<()> {
+    let (client, server) = pair(false).await?;
+    let pool = BufPool::new(&ruio::driver(), 8, 64)?;
+    let (mut client, mut server) = (Compat::new(client), Compat::with_pool(&pool, server));
+    within(client.write_all(&pattern(4096, 5))).await?;
+    let mut first = [0; 1];
+    within(server.read_exact(&mut first)).await?;
+    assert!(pool.available() < pool.count(), "the adapter holds buffers");
+    drop(server);
+    let driver = ruio::driver();
+    within(async {
+        while driver.in_flight() > 0 || pool.available() < pool.count() {
+            ruio::yield_now().await;
+        }
+    })
+    .await;
     Ok(())
 }
 

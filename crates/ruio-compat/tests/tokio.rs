@@ -10,14 +10,13 @@ use ruio::net::{TcpListener, TcpStream, UnixStream};
 use ruio_compat::Compat;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use support::{pair, pattern, within};
+use support::{Reads, pair, pattern, within};
 
 /// More than a read buffer holds and a write takes goes one way, and a reply
 /// the other, each side shutting down after it.
-#[ruio::test]
-async fn data_crosses_the_adapters_both_ways() -> io::Result<()> {
+async fn cross_both_ways(reads: Reads) -> io::Result<()> {
     let (client, server) = pair(false).await?;
-    let (mut client, mut server) = (Compat::new(client), Compat::with_capacity(1000, server));
+    let (mut client, mut server) = (Compat::new(client), reads.adapt(server));
     let message = pattern(1 << 20, 7);
     let expected = message.clone();
     let reader = ruio::spawn(async move {
@@ -34,6 +33,16 @@ async fn data_crosses_the_adapters_both_ways() -> io::Result<()> {
     assert!(reader.await.unwrap()? == expected);
     assert_eq!(reply, b"received");
     Ok(())
+}
+
+#[ruio::test]
+async fn data_crosses_the_adapters_both_ways() -> io::Result<()> {
+    cross_both_ways(Reads::Buffer(1000)).await
+}
+
+#[ruio::test]
+async fn data_crosses_the_adapters_through_a_pool() -> io::Result<()> {
+    cross_both_ways(Reads::Pool(4, 1000)).await
 }
 
 /// A vectored write sends its buffers together, in order, as many bytes of
@@ -66,20 +75,22 @@ async fn vectored_writes_gather_their_buffers() -> io::Result<()> {
     Ok(())
 }
 
-/// Lines come out of the adapter's buffer, however they fall across
-/// receives.
+/// Lines come out of the adapter's buffers, however they fall across
+/// receives and buffers.
 #[ruio::test]
-async fn lines_are_read_from_the_buffer() -> io::Result<()> {
-    let (writer, reader) = UnixStream::pair()?;
-    let mut writer = Compat::new(writer);
-    within(writer.write_all(b"one\ntwo\nthree, the last\n")).await?;
-    within(writer.shutdown()).await?;
-    let mut lines = Compat::with_capacity(5, reader).lines();
-    let mut read = Vec::new();
-    while let Some(line) = within(lines.next_line()).await? {
-        read.push(line);
+async fn lines_are_read_from_the_buffers() -> io::Result<()> {
+    for reads in [Reads::Buffer(5), Reads::Pool(2, 5)] {
+        let (writer, reader) = UnixStream::pair()?;
+        let mut writer = Compat::new(writer);
+        within(writer.write_all(b"one\ntwo\nthree, the last\n")).await?;
+        within(writer.shutdown()).await?;
+        let mut lines = reads.adapt(reader).lines();
+        let mut read = Vec::new();
+        while let Some(line) = within(lines.next_line()).await? {
+            read.push(line);
+        }
+        assert_eq!(read, ["one", "two", "three, the last"], "{reads:?}");
     }
-    assert_eq!(read, ["one", "two", "three, the last"]);
     Ok(())
 }
 

@@ -14,14 +14,11 @@ impl<S: StreamSocket> AsyncRead for Compat<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        let data = ready!(this.poll_fill_buf(cx))?;
-        let len = data.len().min(buf.remaining());
-        buf.put_slice(&data[..len]);
-        this.consume(len);
+        let room = buf.remaining();
+        ready!(
+            self.get_mut()
+                .poll_copy(cx, room, |data| buf.put_slice(data))
+        )?;
         Poll::Ready(Ok(()))
     }
 }
