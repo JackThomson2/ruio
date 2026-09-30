@@ -6,6 +6,10 @@
 //! and need not be `Send`. A task is a single allocation holding its future
 //! and, once it finishes, its output, which its [`JoinHandle`] awaits.
 //!
+//! [`Cores`] runs a runtime on each of several CPUs, each on a thread pinned
+//! to its CPU: thread per core. [`spawn_on`] sends a `Send` future from one
+//! core to another, and the channels of [`sync`] carry values between them.
+//!
 //! Wakers are `Send + Sync`: a task woken on another thread goes to its
 //! runtime's queue of remote wakes, and the runtime's ring is unparked.
 //!
@@ -29,6 +33,7 @@
 //! ```
 
 mod context;
+mod cores;
 mod handle;
 mod runtime;
 mod scheduler;
@@ -41,6 +46,7 @@ use std::future::{self, Future};
 use std::sync::Arc;
 use std::task::Poll;
 
+pub use cores::{Core, Cores, core, core_count, spawn_on};
 pub use handle::{Handle, RemoteJoinHandle};
 pub use ruio_driver::Driver;
 pub use runtime::{Builder, Runtime};
