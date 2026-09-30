@@ -257,19 +257,32 @@ impl Scheduler {
             self.running.set(ptr::null());
         }
         self.take_remote();
-        let now = Instant::now();
-        self.timers.fire(now);
-        let idle = !self.has_ready_tasks() && !main_woken.load(Ordering::SeqCst);
-        let turned = if idle {
-            self.driver.park(self.timers.next_timeout(now))
-        } else {
-            self.driver.submit()
-        };
+        self.fire_timers();
+        // The ring's own timer wakes it for the earliest timer, so a park
+        // needs no timeout, and no turn needs the time until a timer is due.
+        let turned = self
+            .timers
+            .next_deadline()
+            .map_or(Ok(()), |deadline| self.driver.wake_at(deadline))
+            .and_then(|()| {
+                if !self.has_ready_tasks() && !main_woken.load(Ordering::SeqCst) {
+                    self.driver.park(None)
+                } else {
+                    self.driver.submit()
+                }
+            });
         if let Err(err) = turned {
             panic!("the io_uring driver failed: {err}");
         }
         self.take_remote();
-        self.timers.fire(Instant::now());
+        self.fire_timers();
+    }
+
+    /// Fires the timers due, once the ring's timer has said some may be.
+    fn fire_timers(&self) {
+        if self.driver.timer_fired() {
+            self.timers.fire(Instant::now());
+        }
     }
 
     /// Moves the tasks woken on other threads into the run queue.

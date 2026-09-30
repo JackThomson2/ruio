@@ -4,7 +4,7 @@
 //! resolution of a millisecond. The kernel sees a single timeout: how long the
 //! runtime may park before the wheel's next deadline.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 use std::future::{Future, IntoFuture, poll_fn};
@@ -26,15 +26,40 @@ pub(crate) struct Timers {
     /// Wakers of the timers that fired together, kept to reuse the
     /// allocation.
     fired: RefCell<Vec<Waker>>,
+    /// When the wheel next has work, as its last change left it, or `None`
+    /// if it has none: firing the timers before then has nothing to do.
+    next: Cell<Option<Instant>>,
+    /// `start`, as near as can be, on `CLOCK_MONOTONIC`, which the ring's
+    /// timer takes deadlines on: read after `start`, so that a deadline it
+    /// gives the ring is not early.
+    start_monotonic: Duration,
 }
 
 impl Timers {
     pub(crate) fn new() -> Self {
+        let start = Instant::now();
         Self {
-            start: Instant::now(),
+            start,
             wheel: RefCell::new(Wheel::new()),
             fired: RefCell::new(Vec::new()),
+            next: Cell::new(None),
+            start_monotonic: ruio_driver::monotonic_now(),
         }
+    }
+
+    /// When the wheel next has work, on `CLOCK_MONOTONIC`: the deadline to
+    /// wake the ring at.
+    pub(crate) fn next_deadline(&self) -> Option<Duration> {
+        let next = self.next.get()?;
+        Some(self.start_monotonic + next.saturating_duration_since(self.start))
+    }
+
+    /// Records when the wheel next has work, after a change to it.
+    fn refresh(&self, wheel: &Wheel) {
+        let next = wheel
+            .next_expiration()
+            .and_then(|tick| self.start.checked_add(Duration::from_millis(tick)));
+        self.next.set(next);
     }
 
     /// The last tick that has begun by `instant`.
@@ -53,27 +78,38 @@ impl Timers {
     fn insert(&self, deadline: Instant, waker: Waker) -> Key {
         let mut wheel = self.wheel.borrow_mut();
         let tick = self.tick_after(deadline).max(wheel.elapsed() + 1);
-        wheel.insert(tick, waker)
+        let key = wheel.insert(tick, waker);
+        self.refresh(&wheel);
+        key
+    }
+
+    fn remove(&self, key: Key) -> Option<Waker> {
+        let mut wheel = self.wheel.borrow_mut();
+        let waker = wheel.remove(key);
+        self.refresh(&wheel);
+        waker
     }
 
     /// Fires the timers due by `now`.
+    ///
+    /// Before the wheel next has work this does nothing, not even move the
+    /// wheel's time on: a timer queued meanwhile goes on a higher level, and
+    /// moves down as time comes to it.
     pub(crate) fn fire(&self, now: Instant) {
+        if self.next.get().is_none_or(|next| now < next) {
+            return;
+        }
         let mut fired = self.fired.take();
-        self.wheel
-            .borrow_mut()
-            .advance(self.tick_at(now), &mut fired);
+        {
+            let mut wheel = self.wheel.borrow_mut();
+            wheel.advance(self.tick_at(now), &mut fired);
+            self.refresh(&wheel);
+        }
         // Woken after the wheel is released: waking can run code that uses it.
         for waker in fired.drain(..) {
             waker.wake();
         }
         *self.fired.borrow_mut() = fired;
-    }
-
-    /// How long from `now` until the wheel next has work, if it has any.
-    pub(crate) fn next_timeout(&self, now: Instant) -> Option<Duration> {
-        let tick = self.wheel.borrow().next_expiration()?;
-        let at = self.start.checked_add(Duration::from_millis(tick));
-        Some(at.map_or(Duration::MAX, |at| at.saturating_duration_since(now)))
     }
 }
 
@@ -119,7 +155,7 @@ impl Sleep {
 
     fn disarm(&mut self) {
         if let Some((timers, key)) = self.timer.take() {
-            let waker = timers.wheel.borrow_mut().remove(key);
+            let waker = timers.remove(key);
             drop(waker);
         }
     }
