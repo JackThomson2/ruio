@@ -10,8 +10,14 @@
 //! in turns.
 //!
 //! The servers each run on one thread: ruio, with plain and with direct
-//! descriptors, and tokio's current-thread runtime. Runtimes across cores
-//! are milestone M6.
+//! descriptors, and tokio's current-thread runtime.
+//!
+//! `ruio-bench scale` measures how a runtime scales across cores: for each
+//! number of cores, every core loads itself, with an echo server and
+//! connections of its own, and the report gives the round trips per second
+//! of the cores together, and each core's share of them against the first
+//! row's, for ruio on its cores and for tokio with a current-thread runtime
+//! per core, each run in a process of its own, in turns.
 //!
 //! `ruio-bench randread` compares random reads with direct I/O against fio's,
 //! on a file or block device: for each queue depth, ruio's reader and fio's
@@ -28,10 +34,13 @@
 //! ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
 //! ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] [--warmup S]
 //!                             [--cpus LIST]
+//! ruio-bench scale-run ruio|tokio [--cores N] [--connections N] [--size BYTES] [--seconds S]
+//!                                 [--warmup S]
 //! ```
 
 mod client;
 mod randread;
+mod scale;
 mod server;
 mod sys;
 
@@ -53,7 +62,11 @@ const USAGE: &str = "usage: ruio-bench echo [--quick] [--runs N] [--seconds S] [
        ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] \
                      [--warmup S] [--cpus LIST]
        ruio-bench randread PATH [--depths LIST] [--block BYTES] [--runs N] [--seconds S] \
-                     [--warmup S] [--cpu N] [--fio FIO]";
+                     [--warmup S] [--cpu N] [--fio FIO]
+       ruio-bench scale [--cores LIST] [--connections N] [--size BYTES] [--runs N] \
+                     [--seconds S] [--warmup S]
+       ruio-bench scale-run ruio|tokio [--cores N] [--connections N] [--size BYTES] \
+                     [--seconds S] [--warmup S]";
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -64,6 +77,8 @@ fn main() {
         Some("echo-client") => echo_client(&options),
         Some("randread") => randread(&options),
         Some("randread-ruio") => randread_ruio(&options),
+        Some("scale") => scale(&options),
+        Some("scale-run") => scale_run(&options),
         _ => Err(USAGE.to_owned()),
     });
     if let Err(err) = result {
@@ -222,6 +237,112 @@ fn read_child(exe: &Path, load: &randread::Load) -> Result<f64, String> {
 fn randread_ruio(options: &Options) -> Result<(), String> {
     let load = read_load(options, options.get("depth", 32)?)?;
     let rate = randread::ruio(&load).map_err(|err| err.to_string())?;
+    println!("rate={rate:.0}");
+    Ok(())
+}
+
+/// The load of a scaling run on `cores` cores, from the options.
+fn scale_load(options: &Options, cores: usize) -> Result<scale::Load, String> {
+    Ok(scale::Load {
+        cores,
+        connections: options.get("connections", 32)?,
+        size: options.get("size", 64)?,
+        warmup: options.duration("warmup", 1.0)?,
+        measure: options.duration("seconds", 3.0)?,
+    })
+}
+
+/// Measures ruio and tokio on more and more cores, each run in a process of
+/// its own, in turns.
+fn scale(options: &Options) -> Result<(), String> {
+    let exe = env::current_exe().map_err(|err| err.to_string())?;
+    let counts: String = options.get("cores", "1,2,4,8,16,24,32,48,64,96".to_owned())?;
+    let counts = sys::parse_cpus(&counts)?;
+    let runs: usize = options.get("runs", 3)?;
+    if runs == 0 {
+        return Err("--runs must be at least 1".to_owned());
+    }
+    let available = ruio::Cores::all()
+        .map_err(|err| format!("finding the CPUs: {err}"))?
+        .count();
+    let load = scale_load(options, 1)?;
+    println!(
+        "Round trips per second over loopback, every core with an echo server and {} \
+         connections of its own, {} B messages; medians of {runs} runs. Scaling is each \
+         row's rate per core, against the first row's.",
+        load.connections, load.size
+    );
+    println!();
+    println!("| cores | tokio | scaling | ruio | scaling |");
+    println!("|---:|---:|---:|---:|---:|");
+    let mut first: Option<(f64, f64)> = None;
+    for cores in counts {
+        if cores == 0 || cores > available {
+            eprintln!("skipping {cores} cores: the process may run on {available} CPUs");
+            continue;
+        }
+        let load = scale_load(options, cores)?;
+        let (mut tokio_runs, mut ruio_runs) = (Vec::new(), Vec::new());
+        for round in 1..=runs {
+            eprintln!("{cores} cores, run {round}");
+            tokio_runs.push(scale_child(&exe, "tokio", &load)?);
+            ruio_runs.push(scale_child(&exe, "ruio", &load)?);
+        }
+        let (tokio, ruio) = (
+            median(tokio_runs.into_iter()),
+            median(ruio_runs.into_iter()),
+        );
+        let per_core = |rate: f64| rate / cores as f64;
+        let (tokio_one, ruio_one) = *first.get_or_insert((per_core(tokio), per_core(ruio)));
+        println!(
+            "| {cores} | {} | {:.0}% | {} ({:.2}x) | {:.0}% |",
+            thousands(tokio),
+            100.0 * per_core(tokio) / tokio_one,
+            thousands(ruio),
+            ruio / tokio,
+            100.0 * per_core(ruio) / ruio_one,
+        );
+    }
+    Ok(())
+}
+
+/// Runs one scaling run in a process of its own, and returns its rate.
+fn scale_child(exe: &Path, runtime: &str, load: &scale::Load) -> Result<f64, String> {
+    let output = Command::new(exe)
+        .args(["scale-run", runtime])
+        .args(["--cores", &load.cores.to_string()])
+        .args(["--connections", &load.connections.to_string()])
+        .args(["--size", &load.size.to_string()])
+        .args(["--warmup", &load.warmup.as_secs_f64().to_string()])
+        .args(["--seconds", &load.measure.as_secs_f64().to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("could not run {runtime} on {} cores: {err}", load.cores))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .trim()
+        .strip_prefix("rate=")
+        .and_then(|rate| rate.parse().ok())
+        .ok_or_else(|| {
+            format!(
+                "{runtime} on {} cores failed: {}{}",
+                load.cores,
+                stdout,
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+}
+
+fn scale_run(options: &Options) -> Result<(), String> {
+    let runtime: String = options.positional(0, "runtime")?;
+    let load = scale_load(options, options.get("cores", 1)?)?;
+    sys::raise_file_limit().map_err(|err| format!("raising the file limit: {err}"))?;
+    let rate = match runtime.as_str() {
+        "ruio" => scale::ruio(load),
+        "tokio" => scale::tokio(load),
+        _ => return Err(format!("unknown runtime {runtime:?}; try ruio or tokio")),
+    };
+    let rate = rate.map_err(|err| format!("{runtime} on {} cores: {err}", load.cores))?;
     println!("rate={rate:.0}");
     Ok(())
 }

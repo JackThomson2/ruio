@@ -79,30 +79,35 @@ fn ruio(addr: SocketAddr, buffers: u16, direct: bool) -> io::Result<()> {
         sys::set_nodelay(listener.as_raw_fd())?;
         listener.set_direct(direct);
         let pool = BufPool::new(&ruio::driver(), buffers, BUFFER_SIZE)?;
-        let mut incoming = listener.incoming();
-        while let Some(stream) = incoming.next().await {
-            let stream = match stream {
-                Ok(stream) => stream,
-                Err(err) => {
-                    eprintln!("ruio echo server: accept failed: {err}");
-                    continue;
-                }
-            };
-            let pool = pool.clone();
-            let _detached = ruio::spawn(async move {
-                let mut received = stream.recv_stream(&pool);
-                while let Some(Ok(mut data)) = received.next().await {
-                    while let Some(Ok(more)) = received.next_ready() {
-                        data.append(more);
-                    }
-                    if stream.write_behind(data).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        serve_ruio(listener, pool).await;
         Ok(())
     })
+}
+
+/// ruio's server, on `listener`, with `pool` to receive into.
+pub(crate) async fn serve_ruio(listener: ruio::net::TcpListener, pool: BufPool) {
+    let mut incoming = listener.incoming();
+    while let Some(stream) = incoming.next().await {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(err) => {
+                eprintln!("ruio echo server: accept failed: {err}");
+                continue;
+            }
+        };
+        let pool = pool.clone();
+        let _detached = ruio::spawn(async move {
+            let mut received = stream.recv_stream(&pool);
+            while let Some(Ok(mut data)) = received.next().await {
+                while let Some(Ok(more)) = received.next_ready() {
+                    data.append(more);
+                }
+                if stream.write_behind(data).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 }
 
 fn tokio(addr: SocketAddr) -> io::Result<()> {
@@ -112,27 +117,33 @@ fn tokio(addr: SocketAddr) -> io::Result<()> {
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         sys::set_nodelay(listener.as_raw_fd())?;
-        loop {
-            let mut stream = match listener.accept().await {
-                Ok((stream, _)) => stream,
-                Err(err) => {
-                    eprintln!("tokio echo server: accept failed: {err}");
-                    continue;
-                }
-            };
-            tokio::spawn(async move {
-                let mut buf = vec![0; BUFFER_SIZE as usize];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => {
-                            if stream.write_all(&buf[..read]).await.is_err() {
-                                break;
-                            }
+        serve_tokio(listener).await;
+        Ok(())
+    })
+}
+
+/// tokio's server, on `listener`: it never returns.
+pub(crate) async fn serve_tokio(listener: tokio::net::TcpListener) {
+    loop {
+        let mut stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                eprintln!("tokio echo server: accept failed: {err}");
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            let mut buf = vec![0; BUFFER_SIZE as usize];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        if stream.write_all(&buf[..read]).await.is_err() {
+                            break;
                         }
                     }
                 }
-            });
-        }
-    })
+            }
+        });
+    }
 }
