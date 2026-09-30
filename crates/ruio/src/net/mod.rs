@@ -62,6 +62,11 @@
 //! ones ([`TcpListener::set_direct`]), which save the kernel looking up the
 //! socket for every operation but cannot be used outside the ring.
 //!
+//! A server on several cores has a listener on each, all bound to one
+//! address with [`TcpListener::bind_reuseport`], and the kernel spreads the
+//! connections among them; [`UdpSocket::bind_reuseport`] does the same for
+//! datagrams.
+//!
 //! Like the ring their I/O runs on, sockets belong to their thread: they are
 //! neither `Send` nor `Sync`.
 //!

@@ -222,6 +222,36 @@ async fn write_all_vectored_sends_more_buffers_than_one_send_takes() -> io::Resu
     Ok(())
 }
 
+/// Listeners bound with `SO_REUSEPORT` share an address, which a listener
+/// without it cannot bind, and the kernel spreads the connections among
+/// them.
+#[ruio::test]
+async fn listeners_bound_with_reuseport_share_an_address() -> io::Result<()> {
+    let first = TcpListener::bind_reuseport("127.0.0.1:0")?;
+    let addr = first.local_addr()?;
+    let second = TcpListener::bind_reuseport(addr)?;
+    assert_eq!(second.local_addr()?, addr);
+    let err = TcpListener::bind(addr).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AddrInUse, "{err}");
+
+    // The kernel completes the handshakes before any accept.
+    let clients = (0..32)
+        .map(|_| std::net::TcpStream::connect(addr))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut accepted = [0; 2];
+    for (count, listener) in accepted.iter_mut().zip([&first, &second]) {
+        // Past the last connection waiting, an accept waits.
+        let wait = Duration::from_millis(100);
+        while let Ok((stream, _)) = listener.accept().timeout(wait).await {
+            assert_eq!(stream.local_addr()?, addr);
+            *count += 1;
+        }
+    }
+    assert_eq!(accepted.iter().sum::<usize>(), clients.len());
+    assert!(accepted.iter().all(|&count| count > 0), "{accepted:?}");
+    Ok(())
+}
+
 #[ruio::test]
 async fn accept_reports_the_peer() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;

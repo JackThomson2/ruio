@@ -161,8 +161,9 @@ impl SockAddr {
         }
     }
 
-    /// A pointer to the address, for an entry.
-    pub(crate) fn as_ptr(&self) -> *const libc::sockaddr {
+    /// A pointer to the address, for the kernel to read [`len`](Self::len)
+    /// bytes of: in an entry, or a system call such as `bind(2)`.
+    pub fn as_ptr(&self) -> *const libc::sockaddr {
         ptr::from_ref(&self.storage).cast()
     }
 

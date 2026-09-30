@@ -40,6 +40,38 @@ async fn datagrams_go_to_and_come_from_addresses() -> io::Result<()> {
     Ok(())
 }
 
+/// Sockets bound with `SO_REUSEPORT` share an address, which a socket
+/// without it cannot bind, and the kernel spreads the datagrams among them
+/// by sender.
+#[ruio::test]
+async fn sockets_bound_with_reuseport_share_an_address() -> io::Result<()> {
+    let first = UdpSocket::bind_reuseport("127.0.0.1:0")?;
+    let addr = first.local_addr()?;
+    let second = UdpSocket::bind_reuseport(addr)?;
+    assert_eq!(second.local_addr()?, addr);
+    let err = UdpSocket::bind(addr).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AddrInUse, "{err}");
+
+    let senders = (0..32)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0"))
+        .collect::<io::Result<Vec<_>>>()?;
+    for sender in &senders {
+        sender.send_to(b"hi", addr)?;
+    }
+    let mut received = [0; 2];
+    for (count, socket) in received.iter_mut().zip([&first, &second]) {
+        // Past the last datagram waiting, a receive waits.
+        let wait = Duration::from_millis(100);
+        while let (Ok((len, _)), _) = socket.recv_from(Vec::with_capacity(8)).timeout(wait).await {
+            assert_eq!(len, 2);
+            *count += 1;
+        }
+    }
+    assert_eq!(received.iter().sum::<usize>(), senders.len());
+    assert!(received.iter().all(|&count| count > 0), "{received:?}");
+    Ok(())
+}
+
 #[ruio::test]
 async fn a_recv_stream_takes_datagram_after_datagram() -> io::Result<()> {
     let receiver = UdpSocket::bind("127.0.0.1:0")?;

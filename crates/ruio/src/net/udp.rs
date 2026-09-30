@@ -9,7 +9,7 @@ use ruio_driver::buf::{BufPool, BufResult, IoBuf, IoBufMut};
 use ruio_driver::ops::{self, Recv, RecvFrom, Send, SendTo};
 use ruio_driver::{Fd, SockAddr};
 
-use super::socket::{RecvStream, SendZc, Sock, SocketOp, ThreadBound};
+use super::socket::{RecvStream, SendZc, Sock, SocketOp, ThreadBound, bind_reuseport};
 
 /// A UDP socket.
 ///
@@ -30,6 +30,20 @@ impl UdpSocket {
     /// As for [`std::net::UdpSocket::bind`].
     pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
         net::UdpSocket::bind(addr).map(Self::from_std)
+    }
+
+    /// A socket bound to `addr` as [`bind`](UdpSocket::bind) binds one, but
+    /// with `SO_REUSEPORT` too: sockets that all have it can bind one address,
+    /// and the kernel spreads the datagrams among them by a hash of each one's
+    /// addresses and ports, so that a sender's datagrams all reach one socket.
+    ///
+    /// # Errors
+    ///
+    /// As for [`bind`](UdpSocket::bind): `AddrInUse` if a socket without
+    /// `SO_REUSEPORT`, or another user's, has the address.
+    pub fn bind_reuseport(addr: impl ToSocketAddrs) -> io::Result<Self> {
+        let socket = bind_reuseport(addr, libc::SOCK_DGRAM)?;
+        Ok(Self::from_std(net::UdpSocket::from(socket)))
     }
 
     /// Wraps a socket from the standard library.

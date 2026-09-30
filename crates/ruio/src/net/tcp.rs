@@ -17,6 +17,7 @@ use ruio_driver::{Descriptor, Driver, Fd};
 use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
     ReadExact, RecvStream, SendZc, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
+    bind_reuseport,
 };
 
 /// How many connections a listener's backlog holds, as in tokio. The
@@ -61,6 +62,23 @@ impl TcpListener {
     /// resolves to no address.
     pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
         let socket = net::TcpListener::bind(addr)?;
+        listen(socket.as_raw_fd())?;
+        Ok(Self::from_std(socket))
+    }
+
+    /// A listener bound to `addr` as [`bind`](TcpListener::bind) binds one,
+    /// but with `SO_REUSEPORT` too: listeners that all have it can bind one
+    /// address, and the kernel spreads the connections among them by a hash
+    /// of each one's addresses and ports. A listener on each core, all bound
+    /// to one address, so share the connections out, and no core has to hand
+    /// any on.
+    ///
+    /// # Errors
+    ///
+    /// As for [`bind`](TcpListener::bind): `AddrInUse` if a socket without
+    /// `SO_REUSEPORT`, or another user's, has the address.
+    pub fn bind_reuseport(addr: impl ToSocketAddrs) -> io::Result<Self> {
+        let socket = net::TcpListener::from(bind_reuseport(addr, libc::SOCK_STREAM)?);
         listen(socket.as_raw_fd())?;
         Ok(Self::from_std(socket))
     }

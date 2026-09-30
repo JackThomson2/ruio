@@ -7,14 +7,15 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem;
 use std::net;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
+use std::ptr;
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
 use ruio_driver::buf::{BufBundle, BufPool, BufResult, IoBuf, IoBufMut, IoBufs, Slice};
 use ruio_driver::ops::{self, Recv, Send, SendVectored, Shutdown};
-use ruio_driver::{Completion, Descriptor, DirectFd, Driver, Fd, Op, Operation};
+use ruio_driver::{Completion, Descriptor, DirectFd, Driver, Fd, Op, Operation, SockAddr};
 
 use std::rc::Rc;
 
@@ -36,6 +37,75 @@ fn poll_gate(gate: &mut Option<&Behind>, cx: &mut Context<'_>) -> Poll<io::Resul
 /// whose ring their I/O runs on. See DESIGN.md on keeping work stealing
 /// possible.
 pub(crate) type ThreadBound = PhantomData<*const ()>;
+
+/// A socket of `kind`, such as `SOCK_STREAM`, bound to `addr`, or to the
+/// first address it resolves to that works, with `SO_REUSEPORT`: sockets
+/// that all have it can bind one address, and the kernel spreads what
+/// arrives among them. A stream socket has `SO_REUSEADDR` too, as the
+/// standard library's listeners do.
+///
+/// # Errors
+///
+/// The error of the last address tried, or `InvalidInput` if `addr`
+/// resolves to no address.
+pub(crate) fn bind_reuseport(
+    addr: impl net::ToSocketAddrs,
+    kind: libc::c_int,
+) -> io::Result<OwnedFd> {
+    let mut last = None;
+    for addr in addr.to_socket_addrs()? {
+        match bind_reuseport_to(addr, kind) {
+            Ok(socket) => return Ok(socket),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "could not resolve to any addresses",
+        )
+    }))
+}
+
+fn bind_reuseport_to(addr: net::SocketAddr, kind: libc::c_int) -> io::Result<OwnedFd> {
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    // SAFETY: `socket` touches no memory.
+    let fd = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is new, and nothing else owns it.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    if kind == libc::SOCK_STREAM {
+        enable(&socket, libc::SO_REUSEADDR)?;
+    }
+    enable(&socket, libc::SO_REUSEPORT)?;
+    let addr = SockAddr::from(addr);
+    let len = addr.len() as libc::socklen_t;
+    // SAFETY: `bind` reads the address's `len` bytes, which it has.
+    if unsafe { libc::bind(socket.as_raw_fd(), addr.as_ptr(), len) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(socket)
+}
+
+/// Turns on `option`, a socket option at `SOL_SOCKET`.
+fn enable(socket: &OwnedFd, option: libc::c_int) -> io::Result<()> {
+    let on: libc::c_int = 1;
+    let len = size_of::<libc::c_int>() as libc::socklen_t;
+    let value = ptr::from_ref(&on).cast();
+    // SAFETY: `setsockopt` reads the `c_int` it is given, and nothing else.
+    let set = unsafe { libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, option, value, len) };
+    if set == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
 
 /// A socket's or a file's descriptor: a plain one, as the standard library's
 /// type, which does what the ring cannot, or a direct descriptor.
