@@ -21,7 +21,7 @@ an API that still reads like ordinary async Rust.
 - Platforms other than Linux, and fallbacks to epoll or thread pools.
 - Kernels older than 6.10.
 - Being a drop-in replacement for tokio. Interoperability comes from adapters
-  (milestone M7).
+  (`ruio-compat`; see [Compatibility](#compatibility)).
 
 ## Decisions
 
@@ -31,7 +31,7 @@ an API that still reads like ordinary async Rust.
 | Work stealing | Not in the first release, but kept possible (see [Keeping work stealing possible](#keeping-work-stealing-possible)). | It fights per-ring state, but some workloads want it. |
 | Minimum kernel | Linux 6.10. Detected by capability, not by version string. | 6.1, the oldest LTS with `DEFER_TASKRUN`, had everything the core needs, but 6.10 adds bundles, which send and receive several provided buffers per request: the network path needs them to beat epoll on large messages (see [Benchmarks](#benchmarks)). It also brings `NO_SQARRAY` (6.6), multishot read (6.7) and socket options through `URING_CMD` (6.7). Distribution kernels backport features, so version numbers mislead. |
 | Bindings | Our own, in `ruio-sys`: written by hand from the kernel's uapi header and tested against it. | Full control of the ABI surface and the hot path, no bindgen at build time, and new kernel features arrive when we need them. |
-| Interop | `futures-io` and `tokio::io` adapters in `ruio-compat`, in the last milestone. | Ecosystem access matters, but must not shape the core API. |
+| Interop | `futures-io` and `tokio::io` adapters in `ruio-compat`, which hyper and rustls run over. | Ecosystem access matters, but must not shape the core API. |
 | Toolchain | Newest stable Rust (1.97.1), edition 2024, pinned in `rust-toolchain.toml`. Nightly only for sanitizers. | No minimum supported Rust version is required. |
 | Dependencies | `libc` only, in the core crates. | Small audit surface. |
 | Direct descriptors | Supported throughout the driver; `ruio::net` accepts them on request (`set_direct`), plain descriptors by default. | A direct socket cannot report its addresses (`getsockname` through `URING_CMD` is 6.19) and can change options only with `URING_CMD` requests, and a full file table makes the kernel close the connection it accepted. The echo benchmark measures the file lookups they save at about 1%. |
@@ -397,6 +397,15 @@ baseline are used only when probed.
   fails report it as the kernel would have.
 - Every operation borrows its socket, so the descriptor stays open until the
   kernel has the operation: dropping the socket first does not compile.
+  An operation that outlives its future, as a write behind or a cancelled
+  receive does, still sits in the submission queue until the end of the
+  loop pass, so a plain descriptor closes as a direct one does: with an
+  `IORING_OP_CLOSE` queued on the ring of the thread's runtime
+  (`Driver::close_in_order`), which the kernel takes after everything
+  queued before it, and at once only outside a runtime. Closed with
+  `close(2)` as it is dropped, a socket would lose what it wrote behind
+  just before, the send failing with `EBADF`, or reaching whichever file
+  took the number. Listeners and files close so too.
 - `SocketOp::timeout` sets an operation's linked timeout. `WriteAll` and
   `ReadExact` take one for the whole transfer, each request getting the time
   left. A send cut short part of the way reports the bytes it sent rather
@@ -459,6 +468,50 @@ running on the ring of the thread's runtime.
 - Still to come: reading directories, which io_uring has no operation for,
   `copy` with `splice`, links and permissions.
 
+## Compatibility
+
+Most of the ecosystem takes its I/O through poll-based traits, tokio's
+`AsyncRead` and `AsyncWrite` or those of futures-io, which lend the
+caller's buffer for one call; the kernel cannot use it once the call
+returns. `ruio_compat::Compat` adapts a `TcpStream` or a `UnixStream` to
+both families, and `AsyncBufRead` besides, with buffers of its own. tokio's
+traits need none of tokio's runtime.
+
+- A read receives into the adapter's buffer, 16 KiB unless made
+  `with_capacity`, and copies out what the caller's takes; the rest waits
+  for the next read. The receive stays in flight between polls, so nothing
+  that arrives while the caller does something else is lost; dropping the
+  adapter cancels it. Made `with_pool`, an adapter receives into a pool
+  instead, with one multishot receive kept armed from the first read, so
+  that a read costs the ring no request, and a buffer goes back to the pool
+  as soon as it has been read out. A connection then holds buffers only
+  while data waits, but as many as that data fills: a pool shared by
+  connections suits readers that read what arrives promptly, as hyper does.
+- A write copies up to 256 KiB of the caller's bytes and writes them behind
+  the stream: done, as far as the caller can tell, once the send is on its
+  way. The next write waits for it, and a failure fails the writes, flushes
+  and closes after it, as for the stream's own writes behind. A dropped
+  adapter leaves its send to finish, and the stream closes after it.
+- A flush has nothing to wait for, since the adapter holds nothing back: it
+  reports a failure if one is known, as a socket's flush would. hyper
+  flushes every response, and a flush that waited for the kernel would
+  cost each another wake of its task (see [HTTP/1.1](#http11)). Closing
+  (tokio's `shutdown`) waits for the send in flight, then shuts the
+  writing half down.
+- The adapter runs its receives and its shutdown on the thread's ring,
+  which it keeps from its first operation, so that a direct descriptor's
+  slot always names the stream's file.
+
+hyper-util's `TokioIo` gives hyper's own traits to anything with tokio's,
+so `TokioIo::new(Compat::with_pool(&pool, stream))` is a connection hyper
+serves, or a client's; HTTP/1.1 connections need no executor, and ruio's
+tasks need not be `Send`. tokio-rustls runs TLS over an adapter as it is,
+and its streams have tokio's traits too. The examples of `ruio-compat`
+serve HTTP/1.1 and HTTPS so on every core. hyper's timeouts, such as the
+one for reading a request's head, need a timer whose sleeps are `Send` and
+`Sync`, which ruio's per-thread timers are not, so they stay off. hyper's
+upgrades need `Send` streams, which ruio's are not either.
+
 ## API sketch
 
 Illustrative only; names will change as the API is built.
@@ -513,6 +566,11 @@ have `read_exact` and `write_all` of their own so far, and the sketch's
   sockets. Blocking std sockets in them have read timeouts, and waits inside
   the runtime a deadline, so a missing reply fails a test rather than
   hanging it.
+- **Adapters.** The tests of `ruio-compat` run both trait families over TCP
+  and Unix sockets, reading into a buffer and into pools too small for
+  what arrives. hyper serves hyper's client through the adapters, over TLS
+  too, and blocking clients of the standard library's and of rustls's,
+  which read to the end of the stream.
 - **Feature matrix.** Disable probed features to force the fallbacks, and run
   the 6.10 baseline in a VM (for example virtme-ng), since development hosts
   run newer kernels.
@@ -717,6 +775,52 @@ add 5% to 6% for both runtimes. tokio keeps a few points closer to the busy
 loop at 32 and 48 cores, for a reason still to find, and ruio's lead over
 it narrows from 12% to 13% up to 16 cores to 3% to 5% from 48 on.
 
+### HTTP/1.1
+
+`ruio-bench http` runs hyper 1.11 serving HTTP/1.1 on one CPU as the echo
+benchmark runs its servers, with the same load generator: each connection
+sends a GET and waits for the response, a 13-byte plaintext body with its
+head, again and again, for 3 seconds after 1 second of warm-up, and the
+client checks every response. The server's code is the same on both
+runtimes: on ruio through `Compat` and hyper-util's `TokioIo`, each
+connection receiving into a buffer of its own, or into a pool of a buffer
+per connection; and on tokio's current-thread runtime, through `TokioIo`.
+Requests per second, medians of three runs taken in turns, on the Xeon
+Platinum 8488C with Linux 7.0, over loopback:
+
+| Connections | tokio | ruio | ruio, pool | p99 tokio (µs) | p99 ruio (µs) | p99 ruio, pool (µs) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 45k | 44k (0.98×) | 45k (1.00×) | 28 | 28 | 28 |
+| 16 | 191k | 172k (0.90×) | 181k (0.95×) | 104 | 125 | 119 |
+| 256 | 177k | 169k (0.95×) | 180k (1.01×) | 1534 | 1628 | 1540 |
+| 1,024 | 186k | 183k (0.98×) | 192k (1.03×) | 5656 | 5746 | 5512 |
+| 10,000 | 171k | 170k (0.99×) | 176k (1.03×) | 60765 | 60278 | 58366 |
+
+Receiving into a pool, hyper on ruio is level with hyper on tokio with one
+connection, and from 256 connections on 1% to 3% ahead, with a 99th
+percentile as short or shorter; at 16 connections it is 5% behind. Loaded,
+both spend about 83% of their CPU in the kernel, 13% in hyper and the
+runtime, and 4% in the C library; the adapters' copies, of a request out
+of the pool's buffers and of a response into a buffer for the kernel, add
+little to that.
+
+Two things got the adapters there:
+
+- **A flush that does not wait.** hyper flushes every response. Waiting for
+  the kernel to finish the send woke the task again for each, as a write
+  that waited did in the echo benchmark: 0.76× at 10,000 connections,
+  with a 99th percentile four times as long, 259 ms.
+- **A multishot receive into a pool.** Reading into a buffer of its own, a
+  connection submits a receive for each read, which the kernel, finding
+  nothing waiting so soon after the last response, parks on a poll; a
+  multishot receive stays armed. That is worth 4% to 6% from 16
+  connections on.
+
+What is left: at 16 connections, for a reason still to find, ruio's CPU
+goes where tokio's does, bar the kernel's receive path, where
+`tcp_recvmsg_locked` and `__tcp_cleanup_rbuf` take twice their share under
+tokio, besides io_uring's own task work and poll checks.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -730,7 +834,7 @@ it narrows from 12% to 13% up to 16 cores to 3% to 5% from 48 on.
 | M6 | Multi-core: builder, CPU pinning, `spawn_on`, cross-core channels, descriptor passing | Close to linear scaling up to 96 cores |
 | M7 | Compat adapters, hyper and rustls examples, documentation | A hyper server runs through the adapters |
 
-M0 to M6 are done. M4 built linked timeouts and the `.timeout(d)`
+M0 to M7 are done. M4 built linked timeouts and the `.timeout(d)`
 combinator, bundles on the 6.10 baseline and writing behind, and the echo
 benchmark finds ruio ahead of tokio from 256 connections on, bar 10,000 with
 large messages, and level with fewer, bar one connection with 64 KiB messages,
@@ -745,11 +849,22 @@ cores, a listener on each core with `bind_reuseport`, and streams that
 move between cores, direct descriptors with `MSG_RING`. With every core
 loading itself, ruio scales linearly up to 16 cores, and up to 96 keeps
 within 8% of what the host gives a busy loop (see
-[Scaling across cores](#scaling-across-cores)). Still to come besides the
-later milestones: multishot read (6.7) and incremental consumption (6.12);
+[Scaling across cores](#scaling-across-cores)). M7 built `ruio-compat`:
+`Compat`, which gives ruio's TCP and Unix streams the `AsyncRead`,
+`AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, reading
+into a buffer of its own or into a pool with one multishot receive, and
+writing behind, with a flush that need not wait for the kernel; examples
+that serve HTTP/1.1 with hyper and HTTPS with rustls on every core; and an
+HTTP/1.1 benchmark, in which hyper on ruio, receiving into a pool, is
+level with hyper on tokio with one connection and 1% to 3% ahead from 256
+on (see [HTTP/1.1](#http11)). On the way, plain descriptors came to close
+through the ring, after the operations queued on them, as direct ones do:
+a stream dropped just after a write behind lost what it wrote. Still to
+come: multishot read (6.7) and incremental consumption (6.12);
 general linked operations (`.link(next)`); reading directories; waking
-rings with `MSG_RING`; and synchronization primitives beyond channels,
-with the cooperative budget that those often ready at once need.
+rings with `MSG_RING`; synchronization primitives beyond channels, with
+the cooperative budget that those often ready at once need; and a timer
+hyper can take, for its timeouts.
 
 ## Open questions
 
