@@ -15,6 +15,15 @@
 //! fn main() -> io::Result<()> { ::ruio::__private::block_on(async move { body }) }
 //! ```
 //!
+//! With `cores = "all"` or `cores = N`, the body runs on a runtime on each of
+//! several cores instead, each core making a future of its own:
+//!
+//! ```text
+//! fn main() -> io::Result<()> {
+//!     ::ruio::__private::block_on_cores(None, |_: ::ruio::Core| async move { body })
+//! }
+//! ```
+//!
 //! The tokens of the body are passed through untouched, so errors in it point
 //! at the right place.
 
@@ -26,7 +35,15 @@ use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenSt
 /// `async`, and blocks on its body with a new [`ruio::Runtime`], panicking if
 /// the runtime cannot start.
 ///
+/// `#[ruio::main(cores = "all")]` runs the body on every CPU the process may
+/// run on instead, each on a runtime of its own, and `cores = N` on the
+/// first `N`; see [`ruio::Cores::run`]. The function returns once every core
+/// has finished: `()`, or a `Result<(), E>` with the first core's error, in
+/// core order. As every core runs the body, it can use the function's
+/// arguments only by reference or by copy.
+///
 /// [`ruio::Runtime`]: https://docs.rs/ruio/latest/ruio/struct.Runtime.html
+/// [`ruio::Cores::run`]: https://docs.rs/ruio/latest/ruio/struct.Cores.html#method.run
 #[proc_macro_attribute]
 pub fn main(args: TokenStream, item: TokenStream) -> TokenStream {
     expand("main", args, item, TokenStream::new())
@@ -45,11 +62,11 @@ pub fn test(args: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 fn expand(name: &str, args: TokenStream, item: TokenStream, prefix: TokenStream) -> TokenStream {
-    // Arguments are reported, and the function still expanded, so the
-    // error stands alone.
-    let mut output = match args.into_iter().next() {
-        Some(arg) => error(arg.span(), &format!("`#[ruio::{name}]` takes no arguments")),
-        None => TokenStream::new(),
+    // Bad arguments are reported, and the function still expanded, onto one
+    // runtime, so the error stands alone.
+    let (cores, mut output) = match cores(name, args) {
+        Ok(cores) => (cores, TokenStream::new()),
+        Err(error) => (None, error),
     };
     let mut tokens: Vec<TokenTree> = item.clone().into_iter().collect();
     // What cannot be expanded is reported and passed through as it is, so
@@ -77,20 +94,78 @@ fn expand(name: &str, args: TokenStream, item: TokenStream, prefix: TokenStream)
     };
     tokens.remove(async_position);
 
-    let mut block_on: TokenStream = "::ruio::__private::block_on".parse().expect("valid tokens");
     let future = TokenStream::from_iter([
         TokenTree::Ident(Ident::new("async", body.span())),
         TokenTree::Ident(Ident::new("move", body.span())),
         TokenTree::Group(body.clone()),
     ]);
-    block_on.extend([TokenTree::Group(Group::new(Delimiter::Parenthesis, future))]);
-    let mut new_body = Group::new(Delimiter::Brace, block_on);
+    let (run, arguments) = match cores {
+        None => ("::ruio::__private::block_on", future),
+        Some(mut arguments) => {
+            arguments.extend([TokenTree::Punct(Punct::new(',', Spacing::Alone))]);
+            // Every core runs the body, in a future of its own.
+            arguments.extend(
+                "|_: ::ruio::Core|"
+                    .parse::<TokenStream>()
+                    .expect("valid tokens"),
+            );
+            arguments.extend(future);
+            ("::ruio::__private::block_on_cores", arguments)
+        }
+    };
+    let mut call: TokenStream = run.parse().expect("valid tokens");
+    call.extend([TokenTree::Group(Group::new(
+        Delimiter::Parenthesis,
+        arguments,
+    ))]);
+    let mut new_body = Group::new(Delimiter::Brace, call);
     new_body.set_span(body.span());
 
     output.extend(prefix);
     output.extend(tokens);
     output.extend([TokenTree::Group(new_body)]);
     output
+}
+
+/// The cores to run on, from the attribute's arguments: `None` for one
+/// runtime on the thread, or the count that `block_on_cores` takes, which is
+/// `None` for every CPU.
+fn cores(name: &str, args: TokenStream) -> Result<Option<TokenStream>, TokenStream> {
+    let args: Vec<TokenTree> = args.into_iter().collect();
+    let usage =
+        format!("`#[ruio::{name}]` takes no arguments, or `cores = \"all\"` or `cores = N`");
+    let [
+        TokenTree::Ident(key),
+        TokenTree::Punct(eq),
+        TokenTree::Literal(value),
+    ] = args.as_slice()
+    else {
+        return match args.first() {
+            None => Ok(None),
+            Some(arg) => Err(error(arg.span(), &usage)),
+        };
+    };
+    if key.to_string() != "cores" || eq.as_char() != '=' {
+        return Err(error(key.span(), &usage));
+    }
+    let count = match value.to_string().as_str() {
+        "\"all\"" => "::core::option::Option::None"
+            .parse()
+            .expect("valid tokens"),
+        count => match count.parse::<usize>() {
+            Ok(0) => return Err(error(value.span(), "`cores` must be at least 1")),
+            Ok(_) => {
+                let mut some: TokenStream = "::core::option::Option::Some"
+                    .parse()
+                    .expect("valid tokens");
+                let count = TokenStream::from(TokenTree::Literal(value.clone()));
+                some.extend([TokenTree::Group(Group::new(Delimiter::Parenthesis, count))]);
+                some
+            }
+            Err(_) => return Err(error(value.span(), &usage)),
+        },
+    };
+    Ok(Some(count))
 }
 
 fn is_ident(token: &TokenTree, name: &str) -> bool {

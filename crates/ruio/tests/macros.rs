@@ -45,6 +45,39 @@ fn main_keeps_qualifiers_arguments_and_the_output() {
     assert_eq!(unsafe { doubled(21) }, 42);
 }
 
+/// With `cores`, every core runs the body.
+#[ruio::test(cores = "all")]
+async fn a_test_runs_on_every_core() {
+    let core = ruio::core().expect("the test runs on a core");
+    assert_eq!(ruio::core_count(), ruio::Cores::all().unwrap().count());
+    let next = (core.index() + 1) % ruio::core_count();
+    let there = ruio::spawn_on(next, async { ruio::core().unwrap().index() });
+    assert_eq!(there.await.unwrap(), next);
+}
+
+#[ruio::test(cores = 1)]
+async fn a_test_on_cores_can_return_a_result() -> io::Result<()> {
+    assert_eq!(ruio::core_count(), 1);
+    ruio::driver().op(Nop).await?;
+    Ok(())
+}
+
+/// Every core runs the body, which copies the argument, and the output is
+/// the first core's error, in core order.
+#[ruio::main(cores = "all")]
+async fn fails_from(first: usize) -> Result<(), usize> {
+    let index = ruio::core().unwrap().index();
+    if index >= first { Err(index) } else { Ok(()) }
+}
+
+#[test]
+fn main_on_cores_returns_the_first_error() {
+    let count = ruio::Cores::all().unwrap().count();
+    assert_eq!(fails_from(0), Err(0));
+    assert_eq!(fails_from(count - 1), Err(count - 1));
+    assert_eq!(fails_from(count), Ok(()));
+}
+
 #[ruio::test]
 async fn early_returns_leave_the_body() {
     if ruio::driver().op(Nop).await.is_ok() {

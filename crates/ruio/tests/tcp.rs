@@ -4,10 +4,12 @@ mod support;
 
 use std::io::{self, ErrorKind};
 use std::net::Shutdown;
+use std::sync::{Barrier, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ruio::buf::BufPool;
 use ruio::net::{TcpListener, TcpStream};
+use ruio::sync::oneshot;
 
 use support::within;
 
@@ -250,6 +252,80 @@ async fn listeners_bound_with_reuseport_share_an_address() -> io::Result<()> {
     assert_eq!(accepted.iter().sum::<usize>(), clients.len());
     assert!(accepted.iter().all(|&count| count > 0), "{accepted:?}");
     Ok(())
+}
+
+/// A server on several cores, with a listener on each bound to one address,
+/// shares the connections out among its cores.
+#[test]
+fn a_server_on_several_cores_shares_out_the_connections() {
+    const CLIENTS: usize = 32;
+    let all = ruio::Cores::all().unwrap();
+    // Four cores, some sharing a CPU on a machine with fewer.
+    let cores = ruio::Cores::cpus(all.cpu_list().iter().copied().cycle().take(4));
+    let count = cores.count();
+    let addr = OnceLock::new();
+    let (published, bound) = (Barrier::new(count), Barrier::new(count));
+    // Core 0 runs the clients, and then lets the others go.
+    let (dones, waits): (Vec<_>, Vec<_>) = (1..count).map(|_| oneshot::channel::<()>()).unzip();
+    let dones = Mutex::new(Some(dones));
+    let waits: Vec<_> = waits
+        .into_iter()
+        .map(|wait| Mutex::new(Some(wait)))
+        .collect();
+    let served = cores
+        .run(|core| {
+            let (addr, published, bound) = (&addr, &published, &bound);
+            let (dones, waits) = (&dones, &waits);
+            async move {
+                let index = core.index();
+                let listener = if index == 0 {
+                    let listener = TcpListener::bind_reuseport("127.0.0.1:0").unwrap();
+                    addr.set(listener.local_addr().unwrap()).unwrap();
+                    published.wait();
+                    listener
+                } else {
+                    published.wait();
+                    TcpListener::bind_reuseport(addr.get().unwrap()).unwrap()
+                };
+                bound.wait();
+                // Each connection is told which core accepted it.
+                let _server = ruio::spawn(async move {
+                    let mut incoming = listener.incoming();
+                    while let Some(stream) = incoming.next().await {
+                        let stream = stream.unwrap();
+                        let _reply = ruio::spawn(async move {
+                            stream.write_all(vec![index as u8]).await.0.unwrap();
+                        });
+                    }
+                });
+                if index != 0 {
+                    let wait = waits[index - 1].lock().unwrap().take().unwrap();
+                    wait.await.unwrap();
+                    return Vec::new();
+                }
+                let mut served = Vec::new();
+                for _ in 0..CLIENTS {
+                    let stream = within(TcpStream::connect(addr.get().unwrap()))
+                        .await
+                        .unwrap();
+                    let (read, reply) = within(stream.read_exact(Vec::with_capacity(1))).await;
+                    read.unwrap();
+                    served.push(usize::from(reply[0]));
+                }
+                for done in dones.lock().unwrap().take().unwrap() {
+                    done.send(()).unwrap();
+                }
+                served
+            }
+        })
+        .unwrap();
+    let served = &served[0];
+    assert_eq!(served.len(), CLIENTS);
+    let mut serving = served.clone();
+    serving.sort_unstable();
+    serving.dedup();
+    assert!(serving.len() > 1, "{served:?}");
+    assert!(serving.iter().all(|&index| index < count));
 }
 
 #[ruio::test]
