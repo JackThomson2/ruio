@@ -108,6 +108,12 @@ impl DirectFd {
         Driver::find(self.ring)
     }
 
+    /// Whether the descriptor belongs to `driver`'s ring: a comparison,
+    /// where [`driver`](DirectFd::driver) searches the thread's drivers.
+    pub fn belongs_to(&self, driver: &Driver) -> bool {
+        driver.id() == self.ring
+    }
+
     /// Closes the file, on its ring, reporting what closing it found, such
     /// as an error writing back data, where dropping the descriptor closes
     /// it without saying.

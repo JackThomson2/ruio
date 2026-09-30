@@ -71,12 +71,21 @@ impl<S: AsRawFd> Sock<S> {
     pub(crate) fn target(&self) -> (Driver, Fd) {
         match self {
             Sock::Plain(socket) => (crate::driver(), Fd::Plain(socket.as_raw_fd())),
-            Sock::Direct(fd) => match fd.driver() {
-                Some(driver) => (driver, fd.fd()),
-                // The ring is gone, and the file with it. No table has this
-                // slot, so the kernel fails the operation with `EBADF`.
-                None => (crate::driver(), Fd::Direct(u32::MAX)),
-            },
+            Sock::Direct(fd) => {
+                // A direct descriptor almost always belongs to the thread's
+                // own ring, which takes no search to find.
+                let current = crate::driver();
+                if fd.belongs_to(&current) {
+                    return (current, fd.fd());
+                }
+                match fd.driver() {
+                    Some(driver) => (driver, fd.fd()),
+                    // The ring is gone, and the file with it. No table has
+                    // this slot, so the kernel fails the operation with
+                    // `EBADF`.
+                    None => (current, Fd::Direct(u32::MAX)),
+                }
+            }
         }
     }
 
