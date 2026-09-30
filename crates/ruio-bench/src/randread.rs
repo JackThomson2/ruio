@@ -127,10 +127,11 @@ pub(crate) fn check_direct_io(path: &Path, block: usize) -> io::Result<()> {
     })
 }
 
-/// Reads with fio's io_uring engine, at its leanest: registered buffers and
-/// files, as ruio's reader has, and no latency statistics
-/// (`gtod_reduce`), which ruio's does not gather either. Returns reads per
-/// second.
+/// Reads with fio's io_uring engine, at its best: registered buffers and
+/// files, as ruio's reader has; no latency statistics (`gtod_reduce`),
+/// which ruio's does not gather either; and reads submitted in batches of up
+/// to 32, where by default fio enters the kernel for every one. Returns
+/// reads per second.
 pub(crate) fn fio(fio: &str, load: &Load) -> Result<f64, String> {
     let secs = |duration: Duration| format!("{}ms", duration.as_millis());
     let output = Command::new(fio)
@@ -139,8 +140,13 @@ pub(crate) fn fio(fio: &str, load: &Load) -> Result<f64, String> {
         .args(["--ioengine=io_uring", "--direct=1", "--rw=randread"])
         .args(["--fixedbufs=1", "--registerfiles=1", "--gtod_reduce=1"])
         .args(["--norandommap", "--randrepeat=0", "--numjobs=1"])
+        // Nothing to drop from a cache for direct reads.
+        .arg("--invalidate=0")
         .arg(format!("--bs={}", load.block))
         .arg(format!("--iodepth={}", load.depth))
+        .arg(format!("--iodepth_batch_submit={}", load.depth.min(32)))
+        .arg("--iodepth_batch_complete_min=1")
+        .arg(format!("--iodepth_batch_complete_max={}", load.depth))
         .args(["--time_based=1", "--output-format=json"])
         .arg(format!("--ramp_time={}", secs(load.warmup)))
         .arg(format!("--runtime={}", secs(load.measure)))

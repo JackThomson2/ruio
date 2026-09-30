@@ -16,7 +16,8 @@
 //! `ruio-bench randread` compares random reads with direct I/O against fio's,
 //! on a file or block device: for each queue depth, ruio's reader and fio's
 //! io_uring engine each run in a process of their own on the same CPU, with
-//! registered buffers and files, in turns. The report gives reads per second
+//! registered buffers and files, in turns; fio submits in batches, at its
+//! best. The report gives reads per second
 //! and how ruio's compare.
 //!
 //! The server and the load generator also run on their own:
