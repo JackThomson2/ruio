@@ -25,7 +25,9 @@
 //! receive into a pool of buffers that the kernel picks from.
 //! Their operations, like all others, run on the thread's ring, which
 //! [`driver`] returns; [`uring`] has the operations and the types for
-//! writing new ones.
+//! writing new ones. Libraries that take their I/O through the poll-based
+//! traits of `tokio::io` or futures-io, such as hyper and rustls, run over
+//! ruio's streams through the adapters of the `ruio-compat` crate.
 //!
 //! Thread per core: [`Cores`] runs a runtime on each of several CPUs, on a
 //! thread pinned to it, as `#[ruio::main(cores = "all")]` runs `main`.
