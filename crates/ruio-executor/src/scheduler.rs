@@ -42,6 +42,9 @@ pub(crate) trait Runnable: Send + Sync {
 /// and the unparker of the scheduler's ring.
 pub(crate) struct Shared {
     remote: Mutex<Remote>,
+    /// Set once a task is queued in `remote`, so that the scheduler takes
+    /// the lock only when there may be tasks to take.
+    pending: AtomicBool,
     unparker: Unparker,
 }
 
@@ -67,7 +70,10 @@ impl Shared {
             // The runtime is gone, and dropped its tasks' futures on its own
             // thread, so this reference holds nothing that is not Send.
             Some(task) => drop(task),
-            None => self.unparker.unpark(),
+            None => {
+                self.pending.store(true, Ordering::Release);
+                self.unparker.unpark();
+            }
         }
     }
 
@@ -140,6 +146,7 @@ impl Scheduler {
                 tasks: Vec::new(),
                 closed: false,
             }),
+            pending: AtomicBool::new(false),
             unparker: driver.unparker(),
         });
         Self {
@@ -259,6 +266,12 @@ impl Scheduler {
 
     /// Moves the tasks woken on other threads into the run queue.
     fn take_remote(&self) {
+        // A task queued after the check sets the flag again, and unparks the
+        // ring: the next turn takes it.
+        if !self.shared.pending.load(Ordering::Acquire) {
+            return;
+        }
+        self.shared.pending.store(false, Ordering::Relaxed);
         let mut remote = self.shared.lock();
         if !remote.tasks.is_empty() {
             self.queue.borrow_mut().extend(remote.tasks.drain(..));
