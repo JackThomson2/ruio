@@ -56,9 +56,14 @@ pub(crate) struct Shared {
     unparker: Unparker,
 }
 
+/// A spawn from another thread, which makes a task on the runtime's own.
+pub(crate) type RemoteSpawn = Box<dyn FnOnce() + Send>;
+
 struct Remote {
     tasks: Vec<TaskRef>,
-    /// Set when the runtime shuts down, after which wakes are dropped.
+    spawns: Vec<RemoteSpawn>,
+    /// Set when the runtime shuts down, after which wakes and spawns are
+    /// dropped.
     closed: bool,
 }
 
@@ -78,6 +83,28 @@ impl Shared {
             // The runtime is gone, and dropped its tasks' futures on its own
             // thread, so this reference holds nothing that is not Send.
             Some(task) => drop(task),
+            None => {
+                self.pending.store(true, Ordering::Release);
+                self.unparker.unpark();
+            }
+        }
+    }
+
+    /// Queues a spawn from another thread, which the scheduler runs on its
+    /// own at its next turn, and wakes the scheduler. A runtime that has shut
+    /// down drops it.
+    pub(crate) fn spawn_remote(&self, spawn: RemoteSpawn) {
+        let refused = {
+            let mut remote = self.lock();
+            if remote.closed {
+                Some(spawn)
+            } else {
+                remote.spawns.push(spawn);
+                None
+            }
+        };
+        match refused {
+            Some(spawn) => drop(spawn),
             None => {
                 self.pending.store(true, Ordering::Release);
                 self.unparker.unpark();
@@ -152,6 +179,7 @@ impl Scheduler {
         let shared = Arc::new(Shared {
             remote: Mutex::new(Remote {
                 tasks: Vec::new(),
+                spawns: Vec::new(),
                 closed: false,
             }),
             pending: AtomicBool::new(false),
@@ -285,7 +313,8 @@ impl Scheduler {
         }
     }
 
-    /// Moves the tasks woken on other threads into the run queue.
+    /// Moves the tasks woken on other threads into the run queue, and makes
+    /// the tasks spawned from other threads.
     fn take_remote(&self) {
         // A task queued after the check sets the flag again, and unparks the
         // ring: the next turn takes it.
@@ -293,22 +322,29 @@ impl Scheduler {
             return;
         }
         self.shared.pending.store(false, Ordering::Relaxed);
-        let mut remote = self.shared.lock();
-        if !remote.tasks.is_empty() {
-            // A task woken here meanwhile is in the queue already.
-            let claimed = remote.tasks.drain(..).filter(|task| task.claim());
-            self.queue.borrow_mut().extend(claimed);
+        let spawns = {
+            let mut remote = self.shared.lock();
+            if !remote.tasks.is_empty() {
+                // A task woken here meanwhile is in the queue already.
+                let claimed = remote.tasks.drain(..).filter(|task| task.claim());
+                self.queue.borrow_mut().extend(claimed);
+            }
+            mem::take(&mut remote.spawns)
+        };
+        // Outside the lock: a spawn runs code, which can spawn elsewhere.
+        for spawn in spawns {
+            spawn();
         }
     }
 
     /// Drops the future of every unfinished task, on this thread.
     pub(crate) fn shutdown(&self) {
-        let woken = {
+        let (woken, spawns) = {
             let mut remote = self.shared.lock();
             remote.closed = true;
-            mem::take(&mut remote.tasks)
+            (mem::take(&mut remote.tasks), mem::take(&mut remote.spawns))
         };
-        drop(woken);
+        drop((woken, spawns));
         // Dropping a future can spawn more tasks, so repeat until none is left.
         loop {
             let tasks = self.tasks.borrow_mut().take_all();

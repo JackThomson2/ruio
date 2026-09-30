@@ -357,7 +357,7 @@ impl Payload {
 }
 
 impl JoinError {
-    fn cancelled() -> Self {
+    pub(crate) fn cancelled() -> Self {
         Self {
             repr: Repr::Cancelled,
         }

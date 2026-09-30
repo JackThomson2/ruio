@@ -12,6 +12,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use ruio_driver::Driver;
 
 use crate::context;
+use crate::handle::Handle;
 use crate::scheduler::{Scheduler, Shared};
 use crate::task::JoinHandle;
 
@@ -123,6 +124,12 @@ impl Runtime {
     /// The runtime's io_uring driver.
     pub fn driver(&self) -> &Driver {
         self.scheduler.driver()
+    }
+
+    /// A handle that spawns tasks onto this runtime from any thread; see
+    /// [`Handle`].
+    pub fn handle(&self) -> Handle {
+        Handle::new(Arc::clone(self.scheduler.shared()))
     }
 }
 

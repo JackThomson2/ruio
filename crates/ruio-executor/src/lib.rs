@@ -29,6 +29,7 @@
 //! ```
 
 mod context;
+mod handle;
 mod runtime;
 mod scheduler;
 pub mod sync;
@@ -37,11 +38,24 @@ pub mod time;
 mod wheel;
 
 use std::future::{self, Future};
+use std::sync::Arc;
 use std::task::Poll;
 
+pub use handle::{Handle, RemoteJoinHandle};
 pub use ruio_driver::Driver;
 pub use runtime::{Builder, Runtime};
 pub use task::{JoinError, JoinHandle};
+
+/// A handle that spawns tasks onto the thread's runtime from any thread;
+/// see [`Handle`].
+///
+/// # Panics
+///
+/// If the thread is not inside [`Runtime::block_on`].
+pub fn handle() -> Handle {
+    let scheduler = context::current().expect(OUTSIDE);
+    Handle::new(Arc::clone(scheduler.shared()))
+}
 
 const OUTSIDE: &str = "must be called from inside a ruio runtime";
 
