@@ -44,6 +44,7 @@ pub mod buf;
 mod driver;
 mod fd;
 mod fixed;
+mod link;
 mod mem;
 mod op;
 pub mod ops;
@@ -58,6 +59,7 @@ mod unpark;
 
 pub use driver::{Builder, Driver, Stats, monotonic_now};
 pub use fd::{Descriptor, DirectFd, Fd};
+pub use link::{Chain, Link};
 pub use op::{Completion, Op, Operation};
 pub use probe::{BaselineError, Probe};
 pub use remote::{RemoteRing, SentFd};

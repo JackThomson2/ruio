@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use ruio_sys as sys;
 
 use crate::Probe;
+use crate::link::private::Member;
 use crate::op::{Completion, Op, Operation, Orphan};
 use crate::remote::{Remote, RemoteRing};
 use crate::ring::Ring;
@@ -601,6 +602,18 @@ impl Driver {
             .queue_entry(|sqe| operation.prepare(sqe), false, timeout, waker)
     }
 
+    /// Queues the operations of a chain, each linked to the next, and
+    /// records in each its `user_data`, or, if the chain cannot be queued,
+    /// the error; see [`Link`](crate::Link).
+    pub(crate) fn queue_chain(&self, members: &mut [&mut dyn Member], waker: &Waker) {
+        self.inner.borrow_mut().queue_chain(members, waker);
+    }
+
+    /// Whether `other` drives the same ring.
+    pub(crate) fn same_ring(&self, other: &Driver) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Queues a multishot request's entry, returning its `user_data`.
     pub(crate) fn queue_stream<T: Multishot>(
         &self,
@@ -765,6 +778,66 @@ impl Inner {
         }
         self.stats.operations += 1;
         Ok(user_data)
+    }
+
+    /// Queues a chain's operations, each followed by its linked timeout if
+    /// it has one, and each but the last linked to what follows; see
+    /// [`Driver::queue_chain`].
+    ///
+    /// The kernel links only entries submitted together, so the chain gets
+    /// room for all of its entries before any is queued. Every entry is
+    /// prepared, and every waker cloned, before any reaches the queue, so
+    /// that a panic in an operation's `prepare`, or a waker's `clone`,
+    /// leaves nothing queued that points to memory the panic frees.
+    fn queue_chain(&mut self, members: &mut [&mut dyn Member], waker: &Waker) {
+        let needed = members
+            .iter()
+            .map(|member| if member.timeout().is_some() { 2 } else { 1 })
+            .sum();
+        if self.ring.sq_space() < needed
+            && let Err(err) = self.submit_queued(needed)
+        {
+            for member in members {
+                member.refused(&err);
+            }
+            return;
+        }
+        let entries: Vec<(sys::io_uring_sqe, Waker)> = members
+            .iter_mut()
+            .map(|member| {
+                let mut sqe = sys::io_uring_sqe::default();
+                member.prepare(&mut sqe);
+                debug_assert_eq!(sqe.flags & FORBIDDEN_SQE_FLAGS, 0);
+                sqe.flags &= !FORBIDDEN_SQE_FLAGS;
+                (sqe, waker.clone())
+            })
+            .collect();
+        let last = members.len() - 1;
+        for (index, (member, (entry, waker))) in members.iter_mut().zip(entries).enumerate() {
+            let timeout = member.timeout();
+            // The room was made above, and nothing has taken it since.
+            let sqe = self.ring.next_sqe().expect("no room for a linked entry");
+            *sqe = entry;
+            if timeout.is_some() || index < last {
+                sqe.flags |= sys::IOSQE_IO_LINK;
+            }
+            let user_data = self.table.insert(Some(waker));
+            sqe.user_data = user_data;
+            if let Some(timeout) = timeout {
+                let link = self
+                    .ring
+                    .next_link_timeout(timespec(timeout))
+                    .expect("no room for a linked timeout");
+                // A timeout in the middle of a chain carries the link on.
+                link.flags = sys::IOSQE_CQE_SKIP_SUCCESS;
+                if index < last {
+                    link.flags |= sys::IOSQE_IO_LINK;
+                }
+                link.user_data = IGNORED;
+            }
+            member.queued(user_data, index == 0);
+            self.stats.operations += 1;
+        }
     }
 
     /// Queues cancellations for dropped operations, then enters the kernel,

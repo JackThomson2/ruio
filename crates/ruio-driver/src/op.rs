@@ -11,6 +11,8 @@ use std::time::Duration;
 use ruio_sys as sys;
 
 use crate::Driver;
+use crate::link::private::{Linkable, Member};
+use crate::link::{Chain, Link};
 
 /// The result the kernel posted for an operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +123,11 @@ pub struct Op<T: Operation> {
 
 enum State<T> {
     Unsubmitted(T),
+    /// The operation's chain could not be queued; it completes with this.
+    Refused {
+        operation: T,
+        completion: Completion,
+    },
     Submitted {
         operation: T,
         user_data: u64,
@@ -156,6 +163,18 @@ impl<T: Operation> Op<T> {
         self
     }
 
+    /// Links `next` after this operation into a chain, which the kernel
+    /// runs in order, each operation once the one before has succeeded;
+    /// see [`Link`].
+    ///
+    /// # Panics
+    ///
+    /// If this operation, or one of `next`, has been submitted, or `next`
+    /// is on another ring.
+    pub fn link<C: Chain>(self, next: C) -> Link<Self, C> {
+        Link::new(self, next)
+    }
+
     /// Leaves the operation to finish with nobody waiting for it: submits it
     /// if it has not been, and hands it to the driver, which drops its output
     /// once the kernel is done. Unlike dropping the `Op`, this does not cancel
@@ -172,6 +191,10 @@ impl<T: Operation> Op<T> {
                     Err(err) => return drop(operation.complete(Completion::from_error(&err))),
                 }
             }
+            State::Refused {
+                operation,
+                completion,
+            } => return drop(operation.complete(completion)),
             State::Submitted {
                 operation,
                 user_data,
@@ -189,7 +212,7 @@ impl<T: Operation> Op<T> {
     /// operation.
     pub fn into_inner(mut self) -> Option<T> {
         match mem::replace(&mut self.state, State::Done) {
-            State::Unsubmitted(operation) => Some(operation),
+            State::Unsubmitted(operation) | State::Refused { operation, .. } => Some(operation),
             submitted => {
                 self.state = submitted;
                 None
@@ -248,6 +271,10 @@ impl<T: Operation> Future for Op<T> {
                     Err(err) => Poll::Ready(operation.complete(Completion::from_error(&err))),
                 }
             }
+            State::Refused {
+                operation,
+                completion,
+            } => Poll::Ready(operation.complete(completion)),
             State::Submitted {
                 operation,
                 user_data,
@@ -285,10 +312,67 @@ impl<T: Operation> Drop for Op<T> {
 // it, by the contract of `Operation`.
 impl<T: Operation> Unpin for Op<T> {}
 
+impl<T: Operation> Linkable for Op<T> {
+    type Output = T::Output;
+
+    fn driver(&self) -> &Driver {
+        &self.driver
+    }
+
+    fn unsubmitted(&self) -> bool {
+        matches!(self.state, State::Unsubmitted(_))
+    }
+
+    fn members<'a>(&'a mut self, members: &mut Vec<&'a mut dyn Member>) {
+        members.push(self);
+    }
+
+    fn poll_chain(&mut self, cx: &mut Context<'_>) -> Poll<T::Output> {
+        Pin::new(self).poll(cx)
+    }
+}
+
+impl<T: Operation> Member for Op<T> {
+    fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        match &mut self.state {
+            State::Unsubmitted(operation) => operation.prepare(sqe),
+            _ => unreachable!("a chain holds only unsubmitted operations"),
+        }
+    }
+
+    fn queued(&mut self, user_data: u64, first: bool) {
+        self.state = match mem::replace(&mut self.state, State::Done) {
+            State::Unsubmitted(operation) => State::Submitted {
+                operation,
+                user_data,
+                // Only the first operation of a chain is cancelled by its
+                // timeout alone: a later one also by a failure before it.
+                timed: first && self.timeout.is_some(),
+            },
+            _ => unreachable!("a chain holds only unsubmitted operations"),
+        };
+    }
+
+    fn refused(&mut self, error: &io::Error) {
+        self.state = match mem::replace(&mut self.state, State::Done) {
+            State::Unsubmitted(operation) => State::Refused {
+                operation,
+                completion: Completion::from_error(error),
+            },
+            _ => unreachable!("a chain holds only unsubmitted operations"),
+        };
+    }
+}
+
 impl<T: Operation> fmt::Debug for Op<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = match self.state {
             State::Unsubmitted(_) => "unsubmitted",
+            State::Refused { .. } => "refused",
             State::Submitted { .. } => "submitted",
             State::Done => "done",
         };
