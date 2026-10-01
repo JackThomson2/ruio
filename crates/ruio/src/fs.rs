@@ -28,6 +28,9 @@
 //! [`AlignedBuf`](crate::buf::AlignedBuf), or a registered buffer for
 //! [`File::read_fixed_at`], which also skips mapping the memory on each read.
 //!
+//! [`read_dir`] reads a directory's entries, which io_uring has no
+//! operation for: with `getdents64(2)`, a batch at a time, on the thread.
+//!
 //! The kernel does most of what is not a read or a write in an io-wq worker,
 //! as the calls it stands for can block: opening a file whose name is not
 //! cached, statx, fsync, truncating, and changing names. Buffered reads and
@@ -53,6 +56,10 @@ use ruio_driver::ops::{
 use ruio_driver::{Driver, Fd, Op, Operation};
 
 use crate::net::{Sock, ThreadBound};
+
+mod dir;
+
+pub use dir::{DirEntry, ReadDir, read_dir};
 
 /// The status fields [`Metadata`] asks for.
 const METADATA: u32 = libc::STATX_BASIC_STATS | libc::STATX_BTIME | libc::STATX_DIOALIGN;

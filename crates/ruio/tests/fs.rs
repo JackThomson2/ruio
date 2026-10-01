@@ -358,3 +358,100 @@ async fn a_read_stream_takes_what_arrives_on_a_fifo() -> io::Result<()> {
     assert_eq!(err.raw_os_error(), Some(libc::EBADFD));
     Ok(())
 }
+
+/// Every entry, of every type, but `.` and `..`, with its name, path,
+/// inode number and type; the status of a symbolic link is the link's.
+#[ruio::test]
+async fn read_dir_lists_the_entries_of_a_directory() -> io::Result<()> {
+    let scratch = Scratch::new("read-dir");
+    std::fs::write(scratch.path("file"), b"data")?;
+    std::fs::create_dir(scratch.path("dir"))?;
+    symlink("file", scratch.path("link"))?;
+    let fifo =
+        std::ffi::CString::new(scratch.path("fifo").into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: `fifo` is a nul-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let mut entries = within(fs::read_dir(&scratch.0)).await?;
+    let mut found = Vec::new();
+    while let Some(entry) = within(entries.next_entry()).await? {
+        let name = entry.file_name().into_string().unwrap();
+        assert_eq!(entry.path(), scratch.path(&name));
+        let std_status = std::fs::symlink_metadata(entry.path())?;
+        assert_eq!(entry.ino(), std_status.ino());
+        let kind = entry.file_type().await?;
+        let status = entry.metadata().await?;
+        assert_eq!(status.file_type(), kind);
+        assert_eq!(status.ino(), std_status.ino());
+        found.push((name, kind));
+    }
+    assert!(
+        within(entries.next_entry()).await?.is_none(),
+        "it stays ended"
+    );
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let names: Vec<_> = found.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["dir", "fifo", "file", "link"]);
+    assert!(found[0].1.is_dir());
+    assert!(found[1].1.is_fifo());
+    assert!(found[2].1.is_file());
+    assert!(found[3].1.is_symlink());
+    Ok(())
+}
+
+/// A directory of more entries than one read takes is read in batches, all
+/// of it, once, and the other tasks run between batches.
+#[ruio::test]
+async fn read_dir_reads_a_large_directory_in_batches() -> io::Result<()> {
+    const COUNT: usize = 3000;
+    let scratch = Scratch::new("read-dir-large");
+    for index in 0..COUNT {
+        std::fs::File::create(scratch.path(&format!("entry-{index:05}")))?;
+    }
+    let mut entries = within(fs::read_dir(&scratch.0)).await?;
+    let listed = std::rc::Rc::new(std::cell::Cell::new(0));
+    let bystander = ruio::spawn({
+        let listed = listed.clone();
+        async move { listed.get() }
+    });
+    let mut names = Vec::new();
+    while let Some(entry) = within(entries.next_entry()).await? {
+        names.push(entry.file_name());
+        listed.set(names.len());
+    }
+    let seen = bystander.await.unwrap();
+    assert!(0 < seen && seen < COUNT, "the bystander saw {seen} entries");
+    names.sort();
+    let expected: Vec<_> = (0..COUNT)
+        .map(|index| std::ffi::OsString::from(format!("entry-{index:05}")))
+        .collect();
+    assert_eq!(names, expected);
+    Ok(())
+}
+
+#[ruio::test]
+async fn read_dir_refuses_what_is_not_a_directory() -> io::Result<()> {
+    let scratch = Scratch::new("read-dir-errors");
+    let missing = within(fs::read_dir(scratch.path("missing"))).await;
+    assert_eq!(missing.unwrap_err().kind(), ErrorKind::NotFound);
+    std::fs::write(scratch.path("file"), b"")?;
+    let file = within(fs::read_dir(scratch.path("file"))).await;
+    assert_eq!(file.unwrap_err().kind(), ErrorKind::NotADirectory);
+    Ok(())
+}
+
+/// An entry keeps its directory open: its status is the entry's in the
+/// directory read, after the reader is gone and the directory renamed.
+#[ruio::test]
+async fn an_entry_outlives_its_reader() -> io::Result<()> {
+    let scratch = Scratch::new("read-dir-entry");
+    std::fs::create_dir(scratch.path("before"))?;
+    std::fs::write(scratch.path("before/inside"), b"12345")?;
+    let mut entries = within(fs::read_dir(scratch.path("before"))).await?;
+    let entry = within(entries.next_entry()).await?.unwrap();
+    drop(entries);
+    std::fs::rename(scratch.path("before"), scratch.path("after"))?;
+    assert_eq!(entry.metadata().await?.len(), 5);
+    assert_eq!(entry.path(), scratch.path("before/inside"));
+    Ok(())
+}
