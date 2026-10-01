@@ -48,7 +48,7 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 | Crate | What it has |
 |---|---|
 | [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `time`, `sync`, and `net` and `fs`, whose I/O runs on the thread's ring |
-| [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, for hyper, rustls and the rest of the ecosystem |
+| [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, for hyper, rustls and the rest of the ecosystem; and `Timer`, which gives hyper ruio's timers for its timeouts |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
 | [`ruio-sys`](crates/ruio-sys) | The kernel's io_uring ABI and system calls |
@@ -60,11 +60,14 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 `ruio-compat` adapts a `TcpStream` or a `UnixStream` to the poll-based
 traits that most of the ecosystem takes its I/O through; tokio's traits
 need none of tokio's runtime. hyper-util's `TokioIo` then makes it a
-connection hyper serves, and tokio-rustls runs TLS over it:
+connection hyper serves, and tokio-rustls runs TLS over it. `Timer` gives
+hyper ruio's timers, with which it times out a client that is slow to send
+a request's head:
 
 ```rust
 let io = TokioIo::new(Compat::with_pool(&pool, stream));
 hyper::server::conn::http1::Builder::new()
+    .timer(Timer::new())
     .serve_connection(io, service_fn(serve))
     .await?;
 ```

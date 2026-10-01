@@ -332,6 +332,14 @@ baseline are used only when probed.
   timer has fired; before the wheel's next deadline, firing does nothing,
   not even move the wheel's time on, and a timer queued meanwhile goes on a
   higher level and moves down as time comes to it.
+- A sleep is `Send` and `Sync`, so that a future given to `spawn_on`, or a
+  sleep hyper asks of a timer, can hold one. Its timer is in the wheel of
+  the runtime that polls it, which it names by the runtime's shared part.
+  On that runtime's thread, inside it, it reaches the wheel through the
+  thread's current runtime, with no lock. Polled by another
+  runtime, it arms its timer there; dropped, or moved away, where its wheel
+  cannot be reached, it queues the timer's key beside the wakes from other
+  threads, and the runtime's next turn removes it.
 - A wake from another thread goes to the runtime's mutex-protected queue,
   sets a flag so that a pass takes the lock only when the queue may hold
   tasks, and unparks its ring. Unparking writes to an eventfd that a parked
@@ -507,10 +515,17 @@ so `TokioIo::new(Compat::with_pool(&pool, stream))` is a connection hyper
 serves, or a client's; HTTP/1.1 connections need no executor, and ruio's
 tasks need not be `Send`. tokio-rustls runs TLS over an adapter as it is,
 and its streams have tokio's traits too. The examples of `ruio-compat`
-serve HTTP/1.1 and HTTPS so on every core. hyper's timeouts, such as the
-one for reading a request's head, need a timer whose sleeps are `Send` and
-`Sync`, which ruio's per-thread timers are not, so they stay off. hyper's
-upgrades need `Send` streams, which ruio's are not either.
+serve HTTP/1.1 and HTTPS so on every core.
+
+hyper's timeouts, such as the one for reading a request's head, need a
+timer, whose sleeps hyper boxes as `Send` and `Sync`. `ruio_compat::Timer`,
+behind the `hyper` feature, on by default, is one whose sleeps are ruio's:
+hyper polls them in the task serving the connection, so their timers go in
+the wheel of that task's runtime, and a reset moves a sleep's deadline in
+place. Given it, hyper's server cuts off a client that takes longer than
+30 seconds, unless set otherwise, to send a request's head, as the
+examples' servers do. hyper's upgrades need `Send` streams, which ruio's
+are not.
 
 ## API sketch
 
@@ -570,7 +585,9 @@ have `read_exact` and `write_all` of their own so far, and the sketch's
   and Unix sockets, reading into a buffer and into pools too small for
   what arrives. hyper serves hyper's client through the adapters, over TLS
   too, and blocking clients of the standard library's and of rustls's,
-  which read to the end of the stream.
+  which read to the end of the stream. Given ruio's timer, hyper serves
+  requests whose heads come in time over a connection that outlasts the
+  timeout, then times out a head that never ends.
 - **Feature matrix.** Disable probed features to force the fallbacks, and run
   the 6.10 baseline in a VM (for example virtme-ng), since development hosts
   run newer kernels.
@@ -785,8 +802,9 @@ client checks every response. The server's code is the same on both
 runtimes: on ruio through `Compat` and hyper-util's `TokioIo`, each
 connection receiving into a buffer of its own, or into a pool of a buffer
 per connection; and on tokio's current-thread runtime, through `TokioIo`.
-Requests per second, medians of three runs taken in turns, on the Xeon
-Platinum 8488C with Linux 7.0, over loopback:
+Neither gives hyper a timer, so neither has hyper's timeouts. Requests per
+second, medians of three runs taken in turns, on the Xeon Platinum 8488C
+with Linux 7.0, over loopback:
 
 | Connections | tokio | ruio | ruio, pool | p99 tokio (µs) | p99 ruio (µs) | p99 ruio, pool (µs) |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -859,12 +877,13 @@ HTTP/1.1 benchmark, in which hyper on ruio, receiving into a pool, is
 level with hyper on tokio with one connection and 1% to 3% ahead from 256
 on (see [HTTP/1.1](#http11)). On the way, plain descriptors came to close
 through the ring, after the operations queued on them, as direct ones do:
-a stream dropped just after a write behind lost what it wrote. Still to
+a stream dropped just after a write behind lost what it wrote. Since M7,
+sleeps are `Send` and `Sync`, and `ruio_compat::Timer` gives hyper ruio's
+timers, for its timeouts (see [Compatibility](#compatibility)). Still to
 come: multishot read (6.7) and incremental consumption (6.12);
 general linked operations (`.link(next)`); reading directories; waking
-rings with `MSG_RING`; synchronization primitives beyond channels, with
-the cooperative budget that those often ready at once need; and a timer
-hyper can take, for its timeouts.
+rings with `MSG_RING`; and synchronization primitives beyond channels,
+with the cooperative budget that those often ready at once need.
 
 ## Open questions
 
