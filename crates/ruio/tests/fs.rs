@@ -503,3 +503,34 @@ async fn a_failed_write_cancels_its_flush() -> io::Result<()> {
     assert_eq!(synced.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
     Ok(())
 }
+
+/// A pipe's data arrives whole through a stream whose own pool the kernel
+/// consumes incrementally.
+#[ruio::test]
+async fn an_incremental_read_stream_takes_what_arrives() -> io::Result<()> {
+    if !ruio::uring::Probe::current()?.supports_incremental_buffers() {
+        eprintln!("skipped: the kernel does not consume buffers incrementally");
+        return Ok(());
+    }
+    let (reader, writer) = io::pipe()?;
+    let reader = File::from_std(std::os::fd::OwnedFd::from(reader).into());
+    let sent = pattern(30_000);
+    let writer = std::thread::spawn({
+        let sent = sent.clone();
+        move || {
+            let mut writer = writer;
+            for chunk in sent.chunks(250) {
+                io::Write::write_all(&mut writer, chunk)?;
+            }
+            io::Result::Ok(())
+        }
+    });
+    let mut stream = reader.read_stream_incremental(2, 8192)?;
+    let mut received = Vec::new();
+    while let Some(chunk) = within(stream.next()).await {
+        received.extend_from_slice(&chunk?);
+    }
+    writer.join().unwrap()?;
+    assert_eq!(received, sent);
+    Ok(())
+}

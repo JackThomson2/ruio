@@ -616,3 +616,32 @@ fn incoming_carries_on_with_plain_streams_once_the_table_is_full() {
         })
         .unwrap();
 }
+
+/// A connection's data arrives whole through a stream whose own pool the
+/// kernel consumes incrementally, many small writes to a buffer.
+#[ruio::test]
+async fn an_incremental_stream_receives_everything() -> io::Result<()> {
+    if !ruio::uring::Probe::current()?.supports_incremental_buffers() {
+        eprintln!("skipped: the kernel does not consume buffers incrementally");
+        return Ok(());
+    }
+    let (client, server) = within(pair()).await?;
+    let sent: Vec<u8> = (0..50_000).map(|index| (index % 251) as u8).collect();
+    let writer = ruio::spawn({
+        let sent = sent.clone();
+        async move {
+            for chunk in sent.chunks(333) {
+                client.write_all(chunk.to_vec()).await.0?;
+            }
+            client.shutdown(Shutdown::Write).await
+        }
+    });
+    let mut received = Vec::new();
+    let mut stream = server.recv_stream_incremental(4, 16 << 10)?;
+    while let Some(data) = within(stream.next()).await {
+        received.extend(data?.to_vec());
+    }
+    within(writer).await.unwrap()?;
+    assert_eq!(received, sent);
+    Ok(())
+}

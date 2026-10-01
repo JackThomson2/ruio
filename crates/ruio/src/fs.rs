@@ -238,6 +238,23 @@ impl File {
         }
     }
 
+    /// The data arriving on the file, read into a pool of the stream's own,
+    /// of `count` buffers of `size` bytes, which the kernel consumes
+    /// incrementally (Linux 6.12), so that large buffers hold many small
+    /// reads; see [`read_stream`](File::read_stream) and
+    /// [`ops::ReadStream::incremental`].
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` before Linux 6.12, and as for [`BufPool::new`].
+    pub fn read_stream_incremental(&self, count: u16, size: u32) -> io::Result<ReadStream<'_>> {
+        let (driver, fd) = self.sock.target();
+        Ok(ReadStream {
+            stream: ops::ReadStream::incremental(&driver, fd, count, size)?,
+            _file: PhantomData,
+        })
+    }
+
     /// Flushes the file's data and metadata to its device, as `fsync(2)`
     /// does.
     pub fn sync_all(&self) -> FileOp<'_, Fsync> {

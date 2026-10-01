@@ -352,6 +352,18 @@ impl<S: AsRawFd + Into<OwnedFd>> Sock<S> {
         }
     }
 
+    pub(crate) fn recv_stream_incremental(
+        &self,
+        count: u16,
+        size: u32,
+    ) -> io::Result<RecvStream<'_>> {
+        let (driver, fd) = self.target();
+        Ok(RecvStream {
+            stream: ops::RecvStream::incremental(&driver, fd, count, size)?,
+            _socket: PhantomData,
+        })
+    }
+
     pub(crate) fn shutdown(&self, how: net::Shutdown) -> SocketOp<'_, Shutdown> {
         self.op(|fd| Shutdown::new(fd, how))
     }

@@ -421,6 +421,21 @@ impl TcpStream {
         self.sock.recv_stream(pool)
     }
 
+    /// The data arriving on the connection, received into a pool of the
+    /// stream's own, of `count` buffers of `size` bytes, which the kernel
+    /// consumes incrementally (Linux 6.12): each receive takes only what its
+    /// data fills of a buffer, and the next carries on in it, so that large
+    /// buffers hold many small receives; see
+    /// [`RecvStream::incremental`](crate::uring::ops::RecvStream::incremental).
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` before Linux 6.12, and as for
+    /// [`BufPool::new`](crate::buf::BufPool::new).
+    pub fn recv_stream_incremental(&self, count: u16, size: u32) -> io::Result<RecvStream<'_>> {
+        self.sock.recv_stream_incremental(count, size)
+    }
+
     /// Shuts down the reading or writing half of the connection, or both,
     /// once a [`write_behind`](Self::write_behind) in flight has finished.
     pub fn shutdown(&self, how: Shutdown) -> SocketOp<'_, ops::Shutdown> {

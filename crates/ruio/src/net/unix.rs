@@ -236,6 +236,18 @@ impl UnixStream {
         self.sock.recv_stream(pool)
     }
 
+    /// The data arriving on the connection, received into a pool of the
+    /// stream's own whose buffers the kernel consumes incrementally; see
+    /// [`TcpStream::recv_stream_incremental`](super::TcpStream::recv_stream_incremental).
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` before Linux 6.12, and as for
+    /// [`BufPool::new`](crate::buf::BufPool::new).
+    pub fn recv_stream_incremental(&self, count: u16, size: u32) -> io::Result<RecvStream<'_>> {
+        self.sock.recv_stream_incremental(count, size)
+    }
+
     /// Shuts down the reading or writing half of the connection, or both.
     pub fn shutdown(&self, how: Shutdown) -> SocketOp<'_, ops::Shutdown> {
         self.sock.shutdown(how).behind(&self.behind)
