@@ -17,10 +17,14 @@
 //! configuration is made once and shared by the cores; each serves its
 //! connections on a thread of its own, receiving into a pool of its own, as
 //! the hyper example does.
+//!
+//! A client has 30 seconds for its handshake, and as long again for each
+//! request's head, which hyper times through `ruio_compat::Timer`.
 
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use http_body_util::{Either, Full};
 use hyper::body::{Bytes, Incoming};
@@ -31,13 +35,16 @@ use hyper_util::rt::TokioIo;
 use ruio::Cores;
 use ruio::buf::BufPool;
 use ruio::net::TcpListener;
-use ruio_compat::Compat;
+use ruio_compat::{Compat, Timer};
 use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::TlsAcceptor;
 
 type Body = Either<Full<Bytes>, Incoming>;
+
+/// How long a client has for its handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn serve(request: Request<Incoming>) -> Result<Response<Body>, hyper::Error> {
     let response = match (request.method(), request.uri().path()) {
@@ -101,6 +108,8 @@ fn main() -> io::Result<()> {
         async move {
             let listener = TcpListener::bind_reuseport(address)?;
             let pool = BufPool::new(&ruio::driver(), 256, 4096)?;
+            let mut http = http1::Builder::new();
+            http.timer(Timer::new());
             let mut incoming = listener.incoming();
             while let Some(stream) = incoming.next().await {
                 let stream = match stream {
@@ -112,14 +121,16 @@ fn main() -> io::Result<()> {
                 };
                 stream.set_nodelay(true)?;
                 let acceptor = acceptor.clone();
+                let http = http.clone();
                 let stream = Compat::with_pool(&pool, stream);
                 let _detached = ruio::spawn(async move {
-                    let tls = match acceptor.accept(stream).await {
-                        Ok(tls) => tls,
-                        Err(err) => return eprintln!("handshake failed: {err}"),
+                    let handshake = acceptor.accept(stream);
+                    let tls = match ruio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+                        Ok(Ok(tls)) => tls,
+                        Ok(Err(err)) => return eprintln!("handshake failed: {err}"),
+                        Err(_) => return eprintln!("handshake timed out"),
                     };
-                    let connection = http1::Builder::new()
-                        .serve_connection(TokioIo::new(tls), service_fn(serve));
+                    let connection = http.serve_connection(TokioIo::new(tls), service_fn(serve));
                     if let Err(err) = connection.await {
                         eprintln!("connection failed: {err}");
                     }

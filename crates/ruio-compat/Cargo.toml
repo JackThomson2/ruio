@@ -37,11 +37,11 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 
 [[example]]
 name = "hyper"
-required-features = ["tokio"]
+required-features = ["hyper", "tokio"]
 
 [[example]]
 name = "rustls"
-required-features = ["tokio"]
+required-features = ["hyper", "tokio"]
 
 [lints]
 workspace = true

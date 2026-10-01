@@ -17,6 +17,10 @@
 //! buffer of the pool only while a request waits for hyper, except while
 //! hyper has stopped reading a request's body to send an echo that the
 //! client is slow to read.
+//!
+//! hyper's timeouts take ruio's timers through `ruio_compat::Timer`: a
+//! client that takes longer than 30 seconds to send a request's head, the
+//! first or one on a connection kept alive, is cut off.
 
 use std::io;
 
@@ -28,7 +32,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use ruio::buf::BufPool;
 use ruio::net::TcpListener;
-use ruio_compat::Compat;
+use ruio_compat::{Compat, Timer};
 
 /// A response's body: all of it at once, or the request's, streamed back as
 /// it arrives.
@@ -60,6 +64,8 @@ async fn main() -> io::Result<()> {
         );
     }
     let pool = BufPool::new(&ruio::driver(), 256, 4096)?;
+    let mut http = http1::Builder::new();
+    http.timer(Timer::new());
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await {
         let stream = match stream {
@@ -72,8 +78,8 @@ async fn main() -> io::Result<()> {
         // Responses go out as soon as they are written.
         stream.set_nodelay(true)?;
         let io = TokioIo::new(Compat::with_pool(&pool, stream));
+        let connection = http.serve_connection(io, service_fn(serve));
         let _detached = ruio::spawn(async move {
-            let connection = http1::Builder::new().serve_connection(io, service_fn(serve));
             if let Err(err) = connection.await {
                 eprintln!("connection failed: {err}");
             }
