@@ -120,6 +120,7 @@ pub struct Probe {
     setup_flags: u32,
     opcodes: [u64; 4],
     last_opcode: u8,
+    incremental_buffers: bool,
 }
 
 impl Probe {
@@ -144,6 +145,7 @@ impl Probe {
             setup_flags,
             opcodes,
             last_opcode,
+            incremental_buffers: probe_incremental_buffers(&ring),
         })
     }
 
@@ -201,6 +203,13 @@ impl Probe {
     /// The highest opcode the kernel knows, supported or not.
     pub fn last_opcode(&self) -> u8 {
         self.last_opcode
+    }
+
+    /// Whether the kernel consumes provided buffers incrementally
+    /// (`IOU_PBUF_RING_INC`, Linux 6.12): a buffer ring registered for it
+    /// lends each buffer to as many completions as fit in it.
+    pub fn supports_incremental_buffers(&self) -> bool {
+        self.incremental_buffers
     }
 
     /// Checks the kernel against ruio's baseline, the capabilities of Linux
@@ -294,7 +303,12 @@ impl fmt::Display for Probe {
                 self.last_opcode - last_known
             )?;
         }
-        Ok(())
+        let incremental = if self.incremental_buffers {
+            "supported"
+        } else {
+            "unsupported"
+        };
+        writeln!(f, "buffers   incremental consumption {incremental}")
     }
 }
 
@@ -419,6 +433,23 @@ fn probe_opcodes(ring: &OwnedFd) -> io::Result<([u64; 4], u8)> {
     Ok((opcodes, probe.header.last_op))
 }
 
+/// Whether the kernel accepts a buffer ring registered for incremental
+/// consumption. The ring is the kernel's own memory, so the probe maps none,
+/// and goes with the probe ring.
+fn probe_incremental_buffers(ring: &OwnedFd) -> bool {
+    let mut reg = sys::io_uring_buf_reg {
+        ring_entries: 1,
+        flags: sys::IOU_PBUF_RING_MMAP | sys::IOU_PBUF_RING_INC,
+        ..Default::default()
+    };
+    let arg = ptr::from_mut(&mut reg).cast();
+    // SAFETY: `reg` is one valid registration, of a ring the kernel
+    // allocates: the kernel reads `reg` and no other memory of the process.
+    let registered =
+        unsafe { sys::io_uring_register(ring.as_raw_fd(), sys::IORING_REGISTER_PBUF_RING, arg, 1) };
+    registered.is_ok()
+}
+
 fn kernel_release() -> String {
     fs::read_to_string("/proc/sys/kernel/osrelease").map_or_else(
         |_| "unknown".to_owned(),
@@ -441,6 +472,7 @@ mod tests {
             setup_flags,
             opcodes: bits,
             last_opcode: opcodes.iter().copied().max().unwrap_or(0),
+            incremental_buffers: false,
         }
     }
 
