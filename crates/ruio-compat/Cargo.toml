@@ -7,15 +7,19 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-default = ["futures-io", "tokio"]
+default = ["futures-io", "hyper", "tokio"]
 # `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of futures-io.
 futures-io = ["dep:futures-io"]
+# `Timer`, which gives hyper ruio's timers for its timeouts. It needs none of
+# hyper's own features.
+hyper = ["dep:hyper"]
 # `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io`, which need
 # none of tokio's runtime.
 tokio = ["dep:tokio"]
 
 [dependencies]
 futures-io = { version = "0.3.34", optional = true }
+hyper = { version = "1.11.1", default-features = false, optional = true }
 ruio.workspace = true
 tokio = { version = "1.53.1", default-features = false, optional = true }
 

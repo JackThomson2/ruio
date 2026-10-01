@@ -1,5 +1,6 @@
 //! hyper serves HTTP/1.1 through the adapters, to hyper's own client through
-//! them too, and to a blocking client of the standard library's.
+//! them too, and to a blocking client of the standard library's; and with
+//! ruio's timer, times out a request's head that is slow to come.
 
 #![cfg(feature = "tokio")]
 
@@ -45,6 +46,15 @@ fn serve(
     connections: usize,
     pool: Option<BufPool>,
 ) -> io::Result<(SocketAddr, ruio::JoinHandle<Result<(), hyper::Error>>)> {
+    serve_with(server::Builder::new(), connections, pool)
+}
+
+/// Like [`serve`], with the server's configuration in `builder`.
+fn serve_with(
+    builder: server::Builder,
+    connections: usize,
+    pool: Option<BufPool>,
+) -> io::Result<(SocketAddr, ruio::JoinHandle<Result<(), hyper::Error>>)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     let server = ruio::spawn(async move {
@@ -57,7 +67,7 @@ fn serve(
                 None => Compat::new(stream),
             });
             served.push(ruio::spawn(
-                server::Builder::new().serve_connection(io, service_fn(service)),
+                builder.serve_connection(io, service_fn(service)),
             ));
         }
         for connection in served {
@@ -185,4 +195,131 @@ async fn a_closed_connection_ends_after_the_response() -> io::Result<()> {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response.ends_with("\r\n\r\nhello"), "{response}");
     Ok(())
+}
+
+/// hyper's timeouts, on ruio's timer.
+#[cfg(feature = "hyper")]
+mod timeouts {
+    use std::future::{Future, poll_fn};
+    use std::pin::Pin;
+    use std::ptr;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    use hyper::rt::{Sleep, Timer as _};
+    use ruio_compat::Timer;
+
+    use super::*;
+
+    /// How long hyper gives a request's head.
+    const HEAD_TIMEOUT: Duration = Duration::from_millis(400);
+
+    /// Reads a response to `GET /`, which ends with its body.
+    fn read_hello(stream: &mut std::net::TcpStream) -> io::Result<String> {
+        let mut response = Vec::new();
+        let mut buf = [0; 1024];
+        while !response.ends_with(b"\r\n\r\nhello") {
+            let read = stream.read(&mut buf)?;
+            if read == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            response.extend_from_slice(&buf[..read]);
+        }
+        String::from_utf8(response).map_err(io::Error::other)
+    }
+
+    /// Each head has its time: requests that come in time are served, for
+    /// however long the connection lasts, until a head that does not ends
+    /// the connection.
+    #[ruio::test]
+    async fn a_head_that_comes_too_late_times_out() -> io::Result<()> {
+        let mut builder = server::Builder::new();
+        builder
+            .timer(Timer::new())
+            .header_read_timeout(HEAD_TIMEOUT);
+        let (addr, server) = serve_with(builder, 1, None)?;
+        let client = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(addr)?;
+            stream.set_read_timeout(Some(PATIENCE))?;
+            let request = b"GET / HTTP/1.1\r\nHost: ruio\r\n\r\n";
+            for _ in 0..5 {
+                thread::sleep(HEAD_TIMEOUT / 4);
+                stream.write_all(request)?;
+                read_hello(&mut stream)?;
+            }
+            // A request, then the start of a head, which never ends. Its time
+            // starts once the request is in.
+            let start = Instant::now();
+            stream.write_all(request)?;
+            stream.write_all(b"GET / HTTP/1.1\r\n")?;
+            let mut rest = String::new();
+            stream.read_to_string(&mut rest)?;
+            io::Result::Ok((rest, start.elapsed()))
+        });
+        let err = within(server).await.unwrap().unwrap_err();
+        assert!(err.is_timeout(), "{err}");
+        let (rest, elapsed) = client.join().unwrap()?;
+        assert!(rest.starts_with("HTTP/1.1 200 OK\r\n"), "{rest}");
+        assert!(rest.ends_with("\r\n\r\nhello"), "{rest}");
+        assert!(elapsed >= HEAD_TIMEOUT, "{elapsed:?}");
+        Ok(())
+    }
+
+    /// The address of a sleep, to tell whether it was replaced.
+    fn address(sleep: &Pin<Box<dyn Sleep>>) -> *const dyn Sleep {
+        &**sleep
+    }
+
+    /// Never ends.
+    struct Endless;
+
+    impl Future for Endless {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+
+    impl Sleep for Endless {}
+
+    /// A reset moves a sleep's deadline, armed or not, without making a new
+    /// sleep; a sleep of another timer's it replaces.
+    #[ruio::test]
+    async fn the_timer_resets_its_sleeps_in_place() {
+        let timer = Timer::new();
+        for armed in [false, true] {
+            let start = Instant::now();
+            let mut sleep = timer.sleep(Duration::from_secs(60));
+            if armed {
+                poll_fn(|cx| {
+                    assert!(sleep.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+            }
+            let before = address(&sleep);
+            timer.reset(&mut sleep, Instant::now() + Duration::from_millis(10));
+            assert!(ptr::addr_eq(address(&sleep), before));
+            within(sleep).await;
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
+
+        let mut sleep: Pin<Box<dyn Sleep>> = Box::pin(Endless);
+        timer.reset(&mut sleep, Instant::now());
+        assert!(!sleep.is::<Endless>());
+        within(sleep).await;
+    }
+
+    /// The timer's sleeps end at their deadlines.
+    #[ruio::test]
+    async fn the_timers_sleeps_wait_for_their_time() {
+        let timer = Timer::new();
+        let start = Instant::now();
+        timer.sleep(Duration::from_millis(20)).await;
+        assert!(start.elapsed() >= Duration::from_millis(20));
+        let deadline = Instant::now() + Duration::from_millis(20);
+        timer.sleep_until(deadline).await;
+        assert!(Instant::now() >= deadline);
+    }
 }
