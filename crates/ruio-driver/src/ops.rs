@@ -490,6 +490,33 @@ impl RecvStream {
         }
     }
 
+    /// A stream of the data arriving on `fd`, received into a pool of its
+    /// own, of `count` buffers of `size` bytes, which the kernel consumes
+    /// incrementally (`IOU_PBUF_RING_INC`, Linux 6.12): each receive takes
+    /// what its data fills of a buffer, and the next carries on where it
+    /// left off, so that a large buffer holds many small receives. A buffer
+    /// returns to the pool once the kernel has filled it and every lease of
+    /// a part of it is dropped; a lease's room is only its data.
+    ///
+    /// The pool is the stream's alone: a completion does not say where in
+    /// its buffer its data starts, which the pool works out from the
+    /// completions before it, so it must see every one, in order.
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` before Linux 6.12, and as for [`BufPool::new`].
+    pub fn incremental(
+        driver: &Driver,
+        fd: impl Into<Fd>,
+        count: u16,
+        size: u32,
+    ) -> io::Result<Self> {
+        let pool = BufPool::incremental(driver, count, size)?;
+        Ok(Self {
+            inner: Rearming::new(driver, RecvMulti::new(fd, &pool), &pool),
+        })
+    }
+
     /// The next data, or `None` once the peer has shut down or an error has
     /// been yielded.
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufBundle>>> {
@@ -586,6 +613,25 @@ impl ReadStream {
         Self {
             inner: Rearming::new(driver, ReadMulti::new(fd, pool), pool),
         }
+    }
+
+    /// A stream of the data arriving on `fd`, read into a pool of its own
+    /// whose buffers the kernel consumes incrementally, so that a large
+    /// buffer holds many small reads; see [`RecvStream::incremental`].
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` before Linux 6.12, and as for [`BufPool::new`].
+    pub fn incremental(
+        driver: &Driver,
+        fd: impl Into<Fd>,
+        count: u16,
+        size: u32,
+    ) -> io::Result<Self> {
+        let pool = BufPool::incremental(driver, count, size)?;
+        Ok(Self {
+            inner: Rearming::new(driver, ReadMulti::new(fd, &pool), &pool),
+        })
     }
 
     /// The next data, or `None` at the end of the file or once an error has

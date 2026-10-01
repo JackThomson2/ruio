@@ -16,10 +16,10 @@ use std::vec;
 
 use ruio_sys as sys;
 
-use crate::Driver;
 use crate::buf::{IoBuf, IoBufMut};
 use crate::driver::WeakDriver;
 use crate::mem::Mapping;
+use crate::{Driver, Probe};
 
 /// A pool of equal-sized buffers that the kernel picks from as data arrives:
 /// a provided-buffer ring (`IORING_REGISTER_PBUF_RING`).
@@ -78,6 +78,17 @@ struct Pool {
     available: Cell<usize>,
     /// Tasks waiting for a buffer to return to the ring.
     waiters: RefCell<Vec<Waker>>,
+    /// Whether the kernel consumes the buffers incrementally
+    /// (`IOU_PBUF_RING_INC`): each completion takes as much of a buffer as
+    /// its data fills, from where the last left off, and the kernel keeps
+    /// the buffer in the ring until it is full.
+    incremental: bool,
+    /// For each buffer in the ring, how much of it the kernel has filled;
+    /// only ever above zero in incremental mode.
+    filled: Box<[Cell<u32>]>,
+    /// For each buffer, how many leases of parts of it there are, in
+    /// incremental mode.
+    shares: Box<[Cell<u32>]>,
 }
 
 impl BufPool {
@@ -89,6 +100,30 @@ impl BufPool {
     /// `InvalidInput` unless `count` is a power of two up to 32768 and
     /// `size` is above zero, and what `mmap` and the kernel report.
     pub fn new(driver: &Driver, count: u16, size: u32) -> io::Result<Self> {
+        Self::with(driver, count, size, 0)
+    }
+
+    /// A pool whose buffers the kernel consumes incrementally (Linux 6.12),
+    /// for one reader at a time: a completion does not say where in its
+    /// buffer its data starts, which the pool works out from the
+    /// completions before it, so it must see them in the order the kernel
+    /// posted them.
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` if the kernel cannot, and as for [`BufPool::new`].
+    pub(crate) fn incremental(driver: &Driver, count: u16, size: u32) -> io::Result<Self> {
+        if !Probe::current()?.supports_incremental_buffers() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "incremental buffer consumption needs Linux 6.12",
+            ));
+        }
+        Self::with(driver, count, size, sys::IOU_PBUF_RING_INC)
+    }
+
+    /// A pool registered with the `IOU_PBUF_RING_*` flags `flags`.
+    fn with(driver: &Driver, count: u16, size: u32, flags: u16) -> io::Result<Self> {
         if !count.is_power_of_two() || count > 1 << 15 || size == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -114,6 +149,9 @@ impl BufPool {
             spare: RefCell::new(Vec::with_capacity(usize::from(count))),
             available: Cell::new(0),
             waiters: RefCell::new(Vec::new()),
+            incremental: flags & sys::IOU_PBUF_RING_INC != 0,
+            filled: (0..count).map(|_| Cell::new(0)).collect(),
+            shares: (0..count).map(|_| Cell::new(0)).collect(),
         };
         for bid in 0..count {
             pool.put(bid);
@@ -122,6 +160,7 @@ impl BufPool {
             ring_addr: pool.ring.ptr().expose_provenance() as u64,
             ring_entries: u32::from(count),
             bgid: pool.group,
+            flags,
             ..Default::default()
         };
         // SAFETY: `reg` is one valid registration. The ring and the buffers
@@ -182,6 +221,11 @@ impl BufPool {
         if flags & sys::IORING_CQE_F_BUFFER == 0 {
             return None;
         }
+        if self.pool.incremental {
+            let mut leases = self.pool.take_incremental(flags, len);
+            assert!(leases.len() <= 1, "the kernel read into several buffers");
+            return leases.pop();
+        }
         let bid = (flags >> sys::IORING_CQE_BUFFER_SHIFT) as u16;
         self.pool.take(bid);
         Some(self.pool.lease_taken(bid, len))
@@ -199,6 +243,14 @@ impl BufPool {
     pub(crate) fn bundle(&self, flags: u32, res: i32) -> Option<BufBundle> {
         if flags & sys::IORING_CQE_F_BUFFER == 0 {
             return None;
+        }
+        if self.pool.incremental {
+            let total = usize::try_from(res).unwrap_or(0);
+            let mut leases = self.pool.take_incremental(flags, total).into_iter();
+            return leases.next().map(|first| BufBundle {
+                first,
+                rest: leases.collect(),
+            });
         }
         let pool = &self.pool;
         let first = (flags >> sys::IORING_CQE_BUFFER_SHIFT) as u16;
@@ -287,7 +339,104 @@ impl Pool {
         BufLease {
             pool: Rc::clone(self),
             bid,
+            start: 0,
             len: len.min(self.size as usize),
+            room: self.size as usize,
+        }
+    }
+
+    /// The leases of the data a completion reports in incremental mode:
+    /// `total` bytes from where the kernel left off in the buffer the
+    /// completion names, on through the buffers after it in the ring, each
+    /// from its start. The kernel keeps the last buffer to fill on if the
+    /// completion says so (`IORING_CQE_F_BUF_MORE`), and is done with every
+    /// other, even one it filled only in part, as it does when it takes all
+    /// of a buffer before it reads; a buffer it is done with returns to the
+    /// ring once its leases are gone. A completion without data that leaves
+    /// the kernel the buffer takes nothing.
+    ///
+    /// # Panics
+    ///
+    /// If the data does not fit the buffers in the ring from the first one
+    /// on, or the kernel keeps a buffer it filled.
+    fn take_incremental(self: &Rc<Self>, flags: u32, total: usize) -> Vec<BufLease> {
+        let first = (flags >> sys::IORING_CQE_BUFFER_SHIFT) as u16;
+        assert!(
+            first < self.count && self.in_ring[usize::from(first)].get(),
+            "the kernel reported buffer {first}, which is not in the ring"
+        );
+        let kept = flags & sys::IORING_CQE_F_BUF_MORE != 0;
+        let size = self.size as usize;
+        // The first walk works out what of each buffer the data fills, and
+        // checks that each slot still holds what the kernel took from it, a
+        // buffer in the ring put there at that position, and that only the
+        // first, which the kernel's head is at, was begun.
+        let start = self.positions[usize::from(first)].get();
+        let mut parts: Vec<(u16, usize, usize)> = Vec::new();
+        let mut left = total;
+        loop {
+            let position = start.wrapping_add(parts.len() as u16);
+            let bid = self.slots[self.slot(position)].get();
+            let in_ring = self.in_ring[usize::from(bid)].get()
+                && self.positions[usize::from(bid)].get() == position;
+            assert!(
+                in_ring,
+                "the kernel reported {total} bytes from buffer {first}, more than its buffers \
+                 after it in the ring hold"
+            );
+            let filled = self.filled[usize::from(bid)].get() as usize;
+            assert!(
+                parts.is_empty() || filled == 0,
+                "the kernel filled on into buffer {bid}, which it had begun"
+            );
+            let len = left.min(size - filled);
+            left -= len;
+            parts.push((bid, filled, len));
+            if left == 0 {
+                break;
+            }
+        }
+        let &(last, filled, len) = parts.last().expect("the walk takes a buffer");
+        assert!(
+            !kept || filled + len < size,
+            "the kernel kept buffer {last}, which it filled"
+        );
+        // The second walk takes them. Taking puts spare buffers only in the
+        // slot of the tail, as for a bundle, which is none of these.
+        let count = parts.len();
+        let mut leases = Vec::with_capacity(count);
+        for (index, (bid, filled, len)) in parts.into_iter().enumerate() {
+            let buffer = usize::from(bid);
+            self.filled[buffer].set((filled + len) as u32);
+            if len > 0 {
+                self.shares[buffer].set(self.shares[buffer].get() + 1);
+                leases.push(BufLease {
+                    pool: Rc::clone(self),
+                    bid,
+                    start: filled,
+                    len,
+                    // The kernel may fill on past the data.
+                    room: len,
+                });
+            }
+            if index + 1 < count || !kept {
+                self.take(bid);
+                if self.shares[buffer].get() == 0 {
+                    self.put(bid);
+                }
+            }
+        }
+        leases
+    }
+
+    /// Lets go of a lease of part of buffer `bid`, in incremental mode: the
+    /// buffer returns to the ring once its last lease is gone, if the
+    /// kernel is done with it.
+    fn release(&self, bid: u16) {
+        let shares = &self.shares[usize::from(bid)];
+        shares.set(shares.get() - 1);
+        if shares.get() == 0 && !self.in_ring[usize::from(bid)].get() {
+            self.put(bid);
         }
     }
 
@@ -355,6 +504,7 @@ impl Pool {
         self.slots[slot].set(bid);
         self.positions[usize::from(bid)].set(tail);
         self.in_ring[usize::from(bid)].set(true);
+        self.filled[usize::from(bid)].set(0);
         let entry = self
             .ring
             .ptr()
@@ -430,14 +580,21 @@ impl fmt::Debug for BufPool {
 }
 
 /// Data the kernel put in a pooled buffer. The buffer returns to its
-/// [`BufPool`] when the lease is dropped.
+/// [`BufPool`] when the lease is dropped, or, if the kernel consumes the
+/// pool's buffers incrementally, once the kernel is done with it and every
+/// lease of a part of it is dropped.
 ///
 /// A lease is also a buffer of its own, to write its data out, or read more
-/// into.
+/// into, up to its [`capacity`](BufLease::capacity).
 pub struct BufLease {
     pool: Rc<Pool>,
     bid: u16,
+    /// Where the data starts in the buffer: past what earlier completions
+    /// filled, in incremental mode.
+    start: usize,
     len: usize,
+    /// How much the lease may hold, from `start` on.
+    room: usize,
 }
 
 impl BufLease {
@@ -451,9 +608,16 @@ impl BufLease {
         self.len == 0
     }
 
-    /// The size of the buffer.
+    /// How much the lease can hold: the size of the buffer, or, for a part
+    /// of a buffer that the kernel consumes incrementally, and may fill on
+    /// past the part, only its data.
     pub fn capacity(&self) -> usize {
-        self.pool.size as usize
+        self.room
+    }
+
+    /// Where the lease's room starts.
+    fn ptr(&self) -> *mut u8 {
+        self.pool.buffer(self.bid).wrapping_add(self.start)
     }
 }
 
@@ -462,25 +626,27 @@ impl Deref for BufLease {
 
     fn deref(&self) -> &[u8] {
         // SAFETY: the buffer is mapped for as long as the pool lives, which
-        // the lease keeps alive, and all of it is initialized. While leased it
-        // is out of the ring, so the kernel does not touch it.
-        unsafe { slice::from_raw_parts(self.pool.buffer(self.bid), self.len) }
+        // the lease keeps alive, and all of it is initialized. While leased,
+        // the lease's room is out of the kernel's reach: the buffer is out of
+        // the ring, or, consumed incrementally, the kernel fills on only past
+        // what it reported filled.
+        unsafe { slice::from_raw_parts(self.ptr(), self.len) }
     }
 }
 
 impl DerefMut for BufLease {
     fn deref_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as in `deref`; the lease is the buffer's only user.
-        unsafe { slice::from_raw_parts_mut(self.pool.buffer(self.bid), self.len) }
+        // SAFETY: as in `deref`; the lease is its room's only user.
+        unsafe { slice::from_raw_parts_mut(self.ptr(), self.len) }
     }
 }
 
-// SAFETY: the buffer is part of the pool's mapping, which the lease keeps
-// alive and which does not move; out of the ring, only the lease and the
-// operation holding it use it. All of it is initialized.
+// SAFETY: the room is part of the pool's mapping, which the lease keeps
+// alive and which does not move; only the lease and the operation holding
+// it use it, as for `Deref`. All of it is initialized.
 unsafe impl IoBuf for BufLease {
     fn stable_ptr(&self) -> *const u8 {
-        self.pool.buffer(self.bid)
+        self.ptr()
     }
 
     fn bytes_init(&self) -> usize {
@@ -493,10 +659,10 @@ unsafe impl IoBuf for BufLease {
 }
 
 // SAFETY: as for `IoBuf`; `set_init` only moves the length within the
-// buffer, all of which is initialized.
+// room, all of which is initialized.
 unsafe impl IoBufMut for BufLease {
     fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.pool.buffer(self.bid)
+        self.ptr()
     }
 
     unsafe fn set_init(&mut self, pos: usize) {
@@ -506,7 +672,11 @@ unsafe impl IoBufMut for BufLease {
 
 impl Drop for BufLease {
     fn drop(&mut self) {
-        self.pool.put(self.bid);
+        if self.pool.incremental {
+            self.pool.release(self.bid);
+        } else {
+            self.pool.put(self.bid);
+        }
     }
 }
 
@@ -514,6 +684,7 @@ impl fmt::Debug for BufLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BufLease")
             .field("buffer", &self.bid)
+            .field("start", &self.start)
             .field("len", &self.len)
             .finish()
     }
@@ -715,5 +886,111 @@ mod tests {
         let driver = Driver::new().unwrap();
         let pool = BufPool::new(&driver, 4, 8).unwrap();
         let _bundle = pool.bundle(buffer(2), 17);
+    }
+
+    /// The flags of a completion that names buffer `bid`, which the kernel
+    /// keeps to fill on.
+    fn kept(bid: u16) -> u32 {
+        buffer(bid) | sys::IORING_CQE_F_BUF_MORE
+    }
+
+    /// A pool whose buffers the kernel consumes incrementally, if it can.
+    fn incremental(count: u16, size: u32) -> Option<(Driver, BufPool)> {
+        if !Probe::current().unwrap().supports_incremental_buffers() {
+            eprintln!("skipped: the kernel does not consume buffers incrementally");
+            return None;
+        }
+        let driver = Driver::new().unwrap();
+        let pool = BufPool::incremental(&driver, count, size).unwrap();
+        Some((driver, pool))
+    }
+
+    /// Completions that fill a buffer bit by bit share it, each lease its
+    /// own part; the buffer leaves the ring once full, and returns to it,
+    /// from its start, once the last lease is gone.
+    #[test]
+    fn parts_of_a_buffer_share_it_until_it_is_full() {
+        let Some((_driver, pool)) = incremental(2, 16) else {
+            return;
+        };
+        let base = pool.pool.buffer(0);
+        let first = pool.lease(kept(0), 5).unwrap();
+        let second = pool.lease(kept(0), 5).unwrap();
+        assert_eq!((first.ptr(), first.len()), (base, 5));
+        assert_eq!((second.ptr(), second.len()), (base.wrapping_add(5), 5));
+        assert_eq!(pool.available(), 2, "the kernel fills on into the buffer");
+        let last = pool.lease(buffer(0), 6).unwrap();
+        assert_eq!(last.ptr(), base.wrapping_add(10));
+        assert_eq!(pool.available(), 1);
+        drop((first, last));
+        assert_eq!(pool.available(), 1, "a part of it is still leased");
+        drop(second);
+        assert_eq!(pool.available(), 2);
+        assert_eq!(pool.pool.positions[0].get(), 2);
+        assert_eq!(pool.pool.filled[0].get(), 0);
+    }
+
+    /// A bundle carries on from where the kernel left off in its first
+    /// buffer, through whole buffers after it.
+    #[test]
+    fn a_bundle_carries_on_where_the_last_completion_left_off() {
+        let Some((_driver, pool)) = incremental(4, 8) else {
+            return;
+        };
+        let first = pool.bundle(kept(0), 3).unwrap();
+        let bundle = pool.bundle(kept(0), 15).unwrap();
+        assert_eq!(bids(&bundle), [0, 1, 2]);
+        let parts: Vec<(usize, usize)> = bundle
+            .iter()
+            .map(|lease| (lease.start, lease.len()))
+            .collect();
+        assert_eq!(parts, [(3, 5), (0, 8), (0, 2)]);
+        assert_eq!(pool.available(), 2, "the kernel is done with 0 and 1");
+        drop(bundle);
+        assert_eq!(pool.available(), 3);
+        drop(first);
+        assert_eq!(pool.available(), 4);
+    }
+
+    /// Without data, a completion that leaves the kernel its buffer takes
+    /// nothing. One that does not is done with the buffer, however little
+    /// it filled, as when the kernel took all of it before it read.
+    #[test]
+    fn the_kernel_says_whether_it_keeps_the_buffer() {
+        let Some((_driver, pool)) = incremental(2, 16) else {
+            return;
+        };
+        assert!(pool.lease(kept(0), 0).is_none());
+        assert_eq!(pool.available(), 2);
+        let short = pool.lease(buffer(0), 3).unwrap();
+        assert_eq!(pool.available(), 1);
+        drop(short);
+        assert_eq!(pool.available(), 2);
+        assert!(pool.lease(buffer(1), 0).is_none());
+        assert_eq!(pool.available(), 2, "returned at once");
+        assert_eq!(pool.pool.positions[1].get(), 3);
+    }
+
+    /// The kernel may fill on past a lease of a part of a buffer, so its
+    /// room is only its data.
+    #[test]
+    fn a_part_of_a_buffer_has_room_only_for_its_data() {
+        let Some((_driver, pool)) = incremental(2, 16) else {
+            return;
+        };
+        let mut part = pool.lease(kept(0), 4).unwrap();
+        assert_eq!((part.capacity(), part.bytes_total()), (4, 4));
+        // SAFETY: the whole buffer is initialized.
+        unsafe { part.set_init(12) };
+        assert_eq!(part.len(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "which it filled")]
+    fn the_kernel_cannot_keep_a_buffer_it_filled() {
+        let Some((_driver, pool)) = incremental(2, 8) else {
+            panic!("skipped: which it filled");
+        };
+        let _ = pool.lease(kept(0), 8);
     }
 }
