@@ -479,27 +479,159 @@ unsafe impl Multishot for RecvMulti {
 /// the peer shuts down, or after yielding an error.
 #[derive(Debug)]
 pub struct RecvStream {
-    stream: MultiOp<RecvMulti>,
-    pool: BufPool,
-    /// The pool ran dry; the request re-arms once a buffer returns.
-    starved: bool,
-    finished: bool,
+    inner: Rearming<RecvMulti>,
 }
 
 impl RecvStream {
     /// A stream of the data arriving on `fd`, received into `pool`.
     pub fn new(driver: &Driver, fd: impl Into<Fd>, pool: &BufPool) -> Self {
         Self {
-            stream: driver.stream(RecvMulti::new(fd, pool)),
-            pool: pool.clone(),
-            starved: false,
-            finished: false,
+            inner: Rearming::new(driver, RecvMulti::new(fd, pool), pool),
         }
     }
 
     /// The next data, or `None` once the peer has shut down or an error has
     /// been yielded.
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufBundle>>> {
+        self.inner.poll_next(cx)
+    }
+
+    /// The next data; see [`poll_next`](RecvStream::poll_next).
+    pub async fn next(&mut self) -> Option<io::Result<BufBundle>> {
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// The next data if it has arrived already, without waiting, or `None`:
+    /// nothing has, or the stream has ended, which the next
+    /// [`poll_next`](RecvStream::poll_next) tells. It leaves the stream as it
+    /// is otherwise, so a stream the kernel ended re-arms at the next poll.
+    ///
+    /// A message that arrives while the stream is armed can come in two
+    /// receives, since the kernel takes a single buffer when it does not
+    /// know yet how much is waiting; with this, a reader takes both at once.
+    pub fn next_ready(&mut self) -> Option<io::Result<BufBundle>> {
+        self.inner.next_ready()
+    }
+}
+
+/// Reads from a file that can be polled, such as a pipe, a FIFO or a
+/// character device, into a [`BufPool`] again and again as data arrives: a
+/// multishot `read(2)` (`IORING_OP_READ_MULTISHOT`) at the file's position.
+///
+/// Each item is one read's data, in one buffer of the pool, or `None` at
+/// the end of the file, which ends the request. The kernel refuses a file
+/// it cannot poll, such as a regular file, with `EBADFD`. A file that does
+/// not say it can be read without blocking, and is not `O_NONBLOCK`, as a
+/// FIFO or a character device may not be, it reads only while the file
+/// polls as readable: a FIFO whose writers have gone polls only as hung
+/// up, and its end never comes. When the pool runs dry the kernel ends the
+/// request with `ENOBUFS`; [`ReadStream`] waits for a buffer and re-arms
+/// it.
+#[derive(Debug)]
+pub struct ReadMulti {
+    fd: Fd,
+    pool: BufPool,
+}
+
+impl ReadMulti {
+    /// Reads from `fd` into `pool`.
+    pub fn new(fd: impl Into<Fd>, pool: &BufPool) -> Self {
+        Self {
+            fd: fd.into(),
+            pool: pool.clone(),
+        }
+    }
+}
+
+// SAFETY: the entry points to no memory of its own: the kernel writes into
+// buffers of the pool, which the request keeps alive. A multishot read's
+// completions carry IORING_CQE_F_MORE until the last.
+unsafe impl Multishot for ReadMulti {
+    type Item = io::Result<Option<BufLease>>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_READ_MULTISHOT;
+        self.fd.apply(sqe);
+        sqe.flags |= sys::IOSQE_BUFFER_SELECT;
+        sqe.buf_index = self.pool.group();
+        sqe.off = CURRENT_POSITION;
+        // `addr` and `len` stay zero, as the kernel asks: each read fills
+        // one buffer of the pool, as much of it as the data takes.
+    }
+
+    fn item(&mut self, completion: Completion) -> Self::Item {
+        let len = usize::try_from(completion.res()).unwrap_or(0);
+        // Taken before looking at the result, as for `ReadPooled`.
+        let lease = self.pool.lease(completion.flags(), len);
+        pooled_data(completion, lease)
+    }
+}
+
+/// The data arriving on a file that can be polled, such as a pipe, read
+/// into a [`BufPool`] by a multishot read that the stream keeps armed, as
+/// [`RecvStream`] keeps a receive armed: re-armed once a buffer returns to
+/// a pool that ran dry, and when the kernel ends it for reasons of its own.
+///
+/// Each item is one read's data, in one buffer. The stream ends at the end
+/// of the file, as when a pipe's writing end closes, or after yielding an
+/// error, such as `EBADFD` for a file that cannot be polled.
+#[derive(Debug)]
+pub struct ReadStream {
+    inner: Rearming<ReadMulti>,
+}
+
+impl ReadStream {
+    /// A stream of the data arriving on `fd`, read into `pool`.
+    pub fn new(driver: &Driver, fd: impl Into<Fd>, pool: &BufPool) -> Self {
+        Self {
+            inner: Rearming::new(driver, ReadMulti::new(fd, pool), pool),
+        }
+    }
+
+    /// The next data, or `None` at the end of the file or once an error has
+    /// been yielded.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufLease>>> {
+        self.inner.poll_next(cx)
+    }
+
+    /// The next data; see [`poll_next`](ReadStream::poll_next).
+    pub async fn next(&mut self) -> Option<io::Result<BufLease>> {
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// The next data if it has arrived already, without waiting, or `None`;
+    /// see [`RecvStream::next_ready`].
+    pub fn next_ready(&mut self) -> Option<io::Result<BufLease>> {
+        self.inner.next_ready()
+    }
+}
+
+/// A multishot request into a pool, kept armed: what [`RecvStream`] and
+/// [`ReadStream`] share. Its items are data, `None` at the end of the data,
+/// or an error.
+#[derive(Debug)]
+struct Rearming<T: Multishot> {
+    stream: MultiOp<T>,
+    pool: BufPool,
+    /// The pool ran dry; the request re-arms once a buffer returns.
+    starved: bool,
+    finished: bool,
+}
+
+impl<T, D> Rearming<T>
+where
+    T: Multishot<Item = io::Result<Option<D>>>,
+{
+    fn new(driver: &Driver, request: T, pool: &BufPool) -> Self {
+        Self {
+            stream: driver.stream(request),
+            pool: pool.clone(),
+            starved: false,
+            finished: false,
+        }
+    }
+
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<D>>> {
         loop {
             if self.finished {
                 return Poll::Ready(None);
@@ -510,7 +642,7 @@ impl RecvStream {
                 self.stream.rearm();
             }
             match ready!(self.stream.poll_next(cx)) {
-                Some(Ok(Some(bundle))) => return Poll::Ready(Some(Ok(bundle))),
+                Some(Ok(Some(data))) => return Poll::Ready(Some(Ok(data))),
                 Some(Ok(None)) => {
                     self.finished = true;
                     return Poll::Ready(None);
@@ -528,25 +660,12 @@ impl RecvStream {
         }
     }
 
-    /// The next data; see [`poll_next`](RecvStream::poll_next).
-    pub async fn next(&mut self) -> Option<io::Result<BufBundle>> {
-        poll_fn(|cx| self.poll_next(cx)).await
-    }
-
-    /// The next data if it has arrived already, without waiting, or `None`:
-    /// nothing has, or the stream has ended, which the next
-    /// [`poll_next`](RecvStream::poll_next) tells. It leaves the stream as it
-    /// is otherwise, so a stream the kernel ended re-arms at the next poll.
-    ///
-    /// A message that arrives while the stream is armed can come in two
-    /// receives, since the kernel takes a single buffer when it does not
-    /// know yet how much is waiting; with this, a reader takes both at once.
-    pub fn next_ready(&mut self) -> Option<io::Result<BufBundle>> {
+    fn next_ready(&mut self) -> Option<io::Result<D>> {
         if self.finished || self.starved {
             return None;
         }
         match self.stream.next_ready()? {
-            Ok(Some(bundle)) => Some(Ok(bundle)),
+            Ok(Some(data)) => Some(Ok(data)),
             Ok(None) => {
                 self.finished = true;
                 None
