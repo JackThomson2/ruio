@@ -11,10 +11,10 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use ruio_driver::Driver;
 
-use crate::context;
 use crate::handle::Handle;
 use crate::scheduler::{Scheduler, Shared};
 use crate::task::JoinHandle;
+use crate::{context, coop};
 
 /// Configures and creates a [`Runtime`].
 #[derive(Clone, Debug, Default)]
@@ -103,7 +103,7 @@ impl Runtime {
         let mut future = pin!(future);
         loop {
             if main.woken.swap(false, Ordering::SeqCst)
-                && let Poll::Ready(output) = future.as_mut().poll(&mut cx)
+                && let Poll::Ready(output) = coop::budgeted(|| future.as_mut().poll(&mut cx))
             {
                 return output;
             }

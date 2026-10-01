@@ -10,10 +10,10 @@ use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker, ready};
 
-use crate::context;
 use crate::scheduler::{Runnable, Scheduler, Shared, TaskRef};
+use crate::{context, coop};
 
 /// A spawned future and, once it finishes, its output: one allocation, shared
 /// by the scheduler, the task's wakers and its [`JoinHandle`].
@@ -176,7 +176,7 @@ where
             // SAFETY: the future stays where it is, in the task's allocation,
             // until it is dropped in place when the stage is replaced.
             let future = unsafe { Pin::new_unchecked(future) };
-            panic::catch_unwind(AssertUnwindSafe(|| future.poll(&mut cx)))
+            panic::catch_unwind(AssertUnwindSafe(|| coop::budgeted(|| future.poll(&mut cx))))
         };
         let result = match poll {
             Ok(Poll::Pending) => return,
@@ -226,6 +226,7 @@ where
     type Output = F::Output;
 
     fn poll_join(&self, cx: &mut Context<'_>) -> Poll<Result<F::Output, JoinError>> {
+        let proceed = ready!(coop::poll_proceed(cx));
         let mut stage = self.stage.borrow_mut();
         match &*stage {
             Stage::Running(_) => {
@@ -238,7 +239,10 @@ where
                 Poll::Pending
             }
             Stage::Finished(_) => match mem::replace(&mut *stage, Stage::Consumed) {
-                Stage::Finished(result) => Poll::Ready(result),
+                Stage::Finished(result) => {
+                    proceed.made_progress();
+                    Poll::Ready(result)
+                }
                 _ => unreachable!(),
             },
             Stage::Consumed => panic!("`JoinHandle` polled after it completed"),

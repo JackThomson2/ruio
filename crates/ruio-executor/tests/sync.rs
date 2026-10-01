@@ -1,7 +1,9 @@
 //! Channels, on one runtime and across threads.
 
+use std::cell::Cell;
 use std::future::poll_fn;
 use std::pin::pin;
+use std::rc::Rc;
 use std::task::Poll;
 use std::thread;
 use std::time::Duration;
@@ -167,6 +169,99 @@ fn a_sender_that_gives_up_does_not_hold_back_the_others() {
         stayer.await.unwrap().unwrap();
         assert_eq!(rx.recv().await, Some(2));
     });
+}
+
+/// How many steps that are ready at once a task takes before the task
+/// queued behind it runs: `steps` counts them as they are taken.
+async fn steps_before_the_next_task(steps: Rc<Cell<usize>>) -> usize {
+    spawn(async move { steps.get() }).await.unwrap()
+}
+
+/// A task that always finds its channel ready, or its tasks finished, still
+/// lets the others run: what is ready spends the task's budget, and once
+/// it is spent the task yields.
+#[test]
+fn what_is_always_ready_does_not_starve_the_other_tasks() {
+    const MANY: usize = 10_000;
+    Runtime::new().unwrap().block_on(async {
+        let (tx, mut rx) = mpsc::channel(MANY);
+        for value in 0..MANY {
+            tx.try_send(value).unwrap();
+        }
+        drop(tx);
+        let received = Rc::new(Cell::new(0));
+        let receiver = spawn({
+            let received = received.clone();
+            async move {
+                while rx.recv().await.is_some() {
+                    received.set(received.get() + 1);
+                }
+            }
+        });
+        let seen = steps_before_the_next_task(received.clone()).await;
+        assert!(0 < seen && seen < MANY / 10, "{seen} receives");
+        receiver.await.unwrap();
+        assert_eq!(received.get(), MANY);
+
+        let (tx, mut rx) = mpsc::channel(MANY);
+        let sent = Rc::new(Cell::new(0));
+        let sender = spawn({
+            let sent = sent.clone();
+            async move {
+                for value in 0..MANY {
+                    tx.send(value).await.unwrap();
+                    sent.set(sent.get() + 1);
+                }
+            }
+        });
+        let seen = steps_before_the_next_task(sent.clone()).await;
+        assert!(0 < seen && seen < MANY / 10, "{seen} sends");
+        sender.await.unwrap();
+        assert_eq!(rx.try_recv(), Ok(0));
+
+        let finished: Vec<_> = (0..MANY).map(|n| spawn(async move { n })).collect();
+        while !finished.iter().all(|task| task.is_finished()) {
+            yield_now().await;
+        }
+        let joined = Rc::new(Cell::new(0));
+        let joiner = spawn({
+            let joined = joined.clone();
+            async move {
+                for task in finished {
+                    task.await.unwrap();
+                    joined.set(joined.get() + 1);
+                }
+            }
+        });
+        let seen = steps_before_the_next_task(joined.clone()).await;
+        assert!(0 < seen && seen < MANY / 10, "{seen} joins");
+        joiner.await.unwrap();
+    });
+}
+
+/// The future given to `block_on` has a budget too.
+#[test]
+fn the_main_future_does_not_starve_the_tasks() {
+    const MANY: usize = 10_000;
+    let received = Rc::new(Cell::new(0));
+    let seen = Rc::new(Cell::new(None));
+    Runtime::new().unwrap().block_on(async {
+        let (tx, mut rx) = mpsc::channel(MANY);
+        for value in 0..MANY {
+            tx.try_send(value).unwrap();
+        }
+        drop(tx);
+        let task = spawn({
+            let (received, seen) = (received.clone(), seen.clone());
+            async move { seen.set(Some(received.get())) }
+        });
+        while rx.recv().await.is_some() {
+            received.set(received.get() + 1);
+        }
+        task.await.unwrap();
+    });
+    let seen = seen.get().expect("the task ran");
+    assert!(seen < MANY / 10, "{seen} receives");
 }
 
 /// Values from many threads all arrive, and the channel ends when the last

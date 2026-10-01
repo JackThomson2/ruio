@@ -16,6 +16,12 @@
 //! Timers ([`time`]) live in a timing wheel in user space; the kernel sees a
 //! single timeout, until the next deadline.
 //!
+//! Each poll of a task has a budget: the channels of [`sync`] and
+//! [`JoinHandle`]s, which can be ready every time they are polled, spend a
+//! step of it each time they are, and once it is spent make the task
+//! yield, so that a task that always finds them ready cannot hold up the
+//! others or the ring.
+//!
 //! ```
 //! use ruio_driver::ops::Nop;
 //! use ruio_executor::Runtime;
@@ -33,6 +39,7 @@
 //! ```
 
 mod context;
+mod coop;
 mod cores;
 mod handle;
 mod runtime;

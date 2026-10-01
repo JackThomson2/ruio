@@ -4,6 +4,12 @@
 //! task wherever it runs: a task on another core is woken through its
 //! runtime's queue of remote wakes. [`oneshot`] carries one value;
 //! [`mpsc`] carries many, from any number of senders, with a bound.
+//!
+//! A channel can be ready again and again, as the ring's operations never
+//! are, so each send or receive that completes at once spends a step of
+//! the task's budget for the poll. Once the budget is spent, the next one
+//! yields: it wakes the task and returns `Pending`, and the task carries
+//! on after the others have run.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Waker};
@@ -30,9 +36,10 @@ pub mod oneshot {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Poll, Waker, ready};
 
     use super::{lock, register};
+    use crate::coop;
 
     /// A channel for one value: the sender sends it, the receiver awaits it.
     pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
@@ -134,11 +141,14 @@ pub mod oneshot {
         type Output = Result<T, RecvError>;
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let proceed = ready!(coop::poll_proceed(cx));
             let mut state = lock(&self.shared);
             if let Some(value) = state.value.take() {
+                proceed.made_progress();
                 return Poll::Ready(Ok(value));
             }
             if !state.sender {
+                proceed.made_progress();
                 return Poll::Ready(Err(RecvError(())));
             }
             register(&mut state.waker, cx);
@@ -208,9 +218,10 @@ pub mod mpsc {
     use std::mem;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Poll, Waker, ready};
 
     use super::{lock, register};
+    use crate::coop;
 
     /// A channel that holds up to `capacity` values: sending waits while it
     /// is full.
@@ -341,13 +352,13 @@ pub mod mpsc {
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
-            let value = this
-                .value
-                .take()
-                .expect("`Sending` polled after it completed");
+            assert!(this.value.is_some(), "`Sending` polled after it completed");
+            let proceed = ready!(coop::poll_proceed(cx));
+            let value = this.value.take().expect("checked above");
             let waker = {
                 let mut state = lock(&this.sender.shared);
                 if !state.receiver {
+                    proceed.made_progress();
                     return Poll::Ready(Err(SendError(value)));
                 }
                 if state.queue.len() >= state.capacity {
@@ -364,6 +375,7 @@ pub mod mpsc {
                 state.queue.push_back(value);
                 state.receiver_waker.take()
             };
+            proceed.made_progress();
             if let Some(waker) = waker {
                 waker.wake();
             }
@@ -393,13 +405,17 @@ pub mod mpsc {
         }
 
         /// The next value, or `None` once every sender is gone and the
-        /// channel is empty; arranges for the task to be woken otherwise.
+        /// channel is empty; arranges for the task to be woken otherwise,
+        /// or, once its budget is spent, wakes it at once.
         pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-            match self.take(Some(cx)) {
-                Ok(value) => Poll::Ready(Some(value)),
-                Err(TryRecvError::Closed) => Poll::Ready(None),
-                Err(TryRecvError::Empty) => Poll::Pending,
-            }
+            let proceed = ready!(coop::poll_proceed(cx));
+            let value = match self.take(Some(cx)) {
+                Ok(value) => Some(value),
+                Err(TryRecvError::Closed) => None,
+                Err(TryRecvError::Empty) => return Poll::Pending,
+            };
+            proceed.made_progress();
+            Poll::Ready(value)
         }
 
         /// The next value if there is one, without waiting.
