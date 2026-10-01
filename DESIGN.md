@@ -291,8 +291,18 @@ its own flag set.
   decision above for why sockets have plain ones by default.
 - Provided-buffer rings, which receives fill in bundles (6.10). Vectored
   sends take bundles back out rather than send bundles, which would need a
-  second ring holding the data to send. Incremental consumption (6.12) is
-  still to come.
+  second ring holding the data to send.
+- Incremental consumption (`IOU_PBUF_RING_INC`, 6.12, probed):
+  `RecvStream::incremental` and `ReadStream::incremental` read into a pool
+  of their own whose buffers the kernel lends to as many completions as
+  fit, each taking only what its data fills, so large buffers hold many
+  small receives. Leases are parts of buffers, whose room is only their
+  data, as the kernel may fill on past it; a buffer returns once the
+  kernel is done with it, which `IORING_CQE_F_BUF_MORE` says rather than
+  the length, and its last lease is gone. A completion does not say where
+  in its buffer its data starts, which the pool works out from the
+  completions before it, so it must see all of them in order: the pool
+  is one stream's alone, and never handed out.
 - Zero-copy send, with the notification CQE keeping the buffer alive, on
   request (`send_zc`). Over loopback the kernel copies the data when it
   reaches the peer's socket, so only a network card can show where
@@ -309,7 +319,9 @@ its own flag set.
 
 `ruio_driver::Probe` uses throwaway rings to learn the kernel's feature bits,
 which setup flags it accepts and which opcodes it supports
-(`IORING_REGISTER_PROBE`). `Probe::check_baseline` names every missing
+(`IORING_REGISTER_PROBE`), and whether it consumes provided buffers
+incrementally, by registering such a buffer ring in memory the kernel
+allocates. `Probe::check_baseline` names every missing
 capability when the kernel is below the 6.10 baseline. Features past the
 baseline are used only when probed.
 
@@ -946,9 +958,10 @@ Since M7:
   devices (`File::read_stream`), and `read_dir` reads directories (see
   [Files](#files)).
 - Operations link into chains (`Op::link`, `FileOp::link`).
+- Streams read into buffers the kernel consumes incrementally (6.12,
+  probed), on request.
 
-Still to come: incremental consumption (6.12); and waking rings with
-`MSG_RING`.
+Still to come: waking rings with `MSG_RING`.
 
 ## Open questions
 
