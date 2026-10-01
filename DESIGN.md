@@ -252,6 +252,15 @@ its own flag set.
   it re-arms at once. The data waits in the socket meanwhile, so none is
   lost. The kernel does not bundle a request's first receive, not knowing
   yet how much is waiting.
+  `ReadStream` keeps a multishot read into a pool armed the same way, one
+  buffer to a read, for files the kernel can poll: pipes, FIFOs and
+  character devices; it refuses others with `EBADFD`. A file that does
+  not say it can be read without blocking, and is not `O_NONBLOCK`, as a
+  FIFO is not, it reads only while the file polls as readable, so a FIFO
+  whose writers have gone, which polls only as hung up, would never end:
+  such a file is opened `O_NONBLOCK` for streaming, which ruio leaves to
+  the caller, as the flag belongs to the file description and so to
+  everyone sharing it.
   `AcceptStream` does the same for a multishot accept, which the kernel ends
   when the completion queue is full; the connections wait in the backlog.
   It yields an error that ends the request and re-arms when polled again, as
@@ -259,10 +268,9 @@ its own flag set.
 
 ### Kernel features
 
-- Multishot accept, recv and poll, exposed as streams and re-armed
-  automatically when the kernel ends them (no `IORING_CQE_F_MORE`) or the
-  buffer pool runs dry (`ENOBUFS`); multishot read (6.7), in the baseline,
-  is still to come.
+- Multishot accept, recv, read (6.7) and poll, exposed as streams and
+  re-armed automatically when the kernel ends them (no
+  `IORING_CQE_F_MORE`) or the buffer pool runs dry (`ENOBUFS`).
 - Direct descriptors: socket and accept install straight into the registered
   file table (`IORING_FILE_INDEX_ALLOC`), so later operations skip the file
   lookup, and so does open. The driver makes them on request; see the
@@ -472,6 +480,8 @@ running on the ring of the thread's runtime.
   `write_all_at` take as many as a buffer needs; `read_fixed_at` and
   `write_fixed_at` read and write registered buffers. `read` and `write` use
   the file's position, which nothing orders when they overlap.
+  `read_stream` reads what arrives on a pipe, a FIFO or a character device
+  into a pool, with one multishot read that stays armed.
 - Every operation borrows its file, so the file cannot close before the
   kernel has the operation. `close` closes it with a result, which dropping
   it cannot report.
@@ -902,10 +912,11 @@ Since M7:
 - A cooperative budget keeps a task that always finds its channel or lock
   ready from holding up the others, and `sync` has semaphores, mutexes,
   reader-writer locks and `Notify` (see [Executor](#executor)).
+- Multishot reads stream what arrives on pipes, FIFOs and character
+  devices (`File::read_stream`).
 
-Still to come: multishot read (6.7) and incremental consumption (6.12);
-general linked operations (`.link(next)`); reading directories; and
-waking rings with `MSG_RING`.
+Still to come: incremental consumption (6.12); general linked operations
+(`.link(next)`); reading directories; and waking rings with `MSG_RING`.
 
 ## Open questions
 
