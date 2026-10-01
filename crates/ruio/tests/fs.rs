@@ -455,3 +455,51 @@ async fn an_entry_outlives_its_reader() -> io::Result<()> {
     assert_eq!(entry.path(), scratch.path("before/inside"));
     Ok(())
 }
+
+/// A write and a flush linked into a chain run in order, and the flush
+/// waits for the write.
+#[ruio::test]
+async fn a_write_linked_to_a_flush_reaches_the_file() -> io::Result<()> {
+    let scratch = Scratch::new("chain");
+    let path = scratch.path("journal");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .await?;
+    let (((first, _), (second, _)), synced) = within(
+        file.write_at("first ", 0)
+            .link(file.write_at("second", 6))
+            .link(file.sync_data()),
+    )
+    .await;
+    assert_eq!(first?, 6);
+    assert_eq!(second?, 6);
+    synced?;
+    let (((written, _), synced), (read, data)) = within(
+        file.write_at("!", 12)
+            .link(file.sync_all())
+            .link(file.read_at(Vec::with_capacity(13), 0)),
+    )
+    .await;
+    assert_eq!(written?, 1);
+    synced?;
+    assert_eq!(read?, 13);
+    assert_eq!(data, b"first second!");
+    assert_eq!(std::fs::read(&path)?, b"first second!");
+    Ok(())
+}
+
+/// A failing operation cancels the rest of its chain.
+#[ruio::test]
+async fn a_failed_write_cancels_its_flush() -> io::Result<()> {
+    let scratch = Scratch::new("chain-failure");
+    let path = scratch.path("read-only");
+    std::fs::write(&path, b"")?;
+    let file = File::open(&path).await?;
+    let ((written, _), synced) = within(file.write_at("never", 0).link(file.sync_all())).await;
+    assert_eq!(written.unwrap_err().raw_os_error(), Some(libc::EBADF));
+    assert_eq!(synced.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+    Ok(())
+}

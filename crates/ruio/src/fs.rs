@@ -53,7 +53,7 @@ use ruio_driver::ops::{
     self, Fsync, Ftruncate, MkdirAt, OpenAt, Read, ReadFixed, RenameAt, Statx, UnlinkAt, Write,
     WriteFixed,
 };
-use ruio_driver::{Driver, Fd, Op, Operation};
+use ruio_driver::{Chain, Driver, Fd, Link, Op, Operation};
 
 use crate::net::{Sock, ThreadBound};
 
@@ -351,7 +351,7 @@ pub struct FileOp<'a, T: Operation> {
     _file: PhantomData<&'a File>,
 }
 
-impl<T: Operation> FileOp<'_, T> {
+impl<'a, T: Operation> FileOp<'a, T> {
     /// Cancels the operation if the kernel has not completed it `duration`
     /// after it is submitted, with a linked timeout; see [`Op::timeout`].
     /// The kernel cannot stop every operation part of the way, such as a
@@ -361,6 +361,83 @@ impl<T: Operation> FileOp<'_, T> {
             op: self.op.timeout(duration),
             ..self
         }
+    }
+
+    /// Links `next` after this operation into a chain, which the kernel
+    /// runs in order, each operation once the one before has succeeded;
+    /// see [`FileChain`].
+    ///
+    /// # Panics
+    ///
+    /// If `next` was made on another ring, under another runtime.
+    pub fn link<U: Operation>(self, next: FileOp<'a, U>) -> FileChain<'a, Link<Op<T>, Op<U>>> {
+        FileChain {
+            chain: self.op.link(next.op),
+            _files: PhantomData,
+        }
+    }
+}
+
+/// Operations on files linked into a chain (`IOSQE_IO_LINK`), which the
+/// kernel runs one after another, each once the one before has succeeded;
+/// made by [`FileOp::link`] and [`FileChain::link`]. The output is every
+/// operation's, in pairs, as for the driver's [`Link`], which says how a
+/// failure, a timeout or a drop goes. It borrows every file, which so
+/// stays open until the kernel has the chain.
+///
+/// The kernel counts a read or a write that moves fewer bytes than asked
+/// for as failing, and cancels the rest of the chain with `ECANCELED`.
+///
+/// ```no_run
+/// # ruio::Runtime::new().unwrap().block_on(async {
+/// use ruio::fs::File;
+///
+/// let file = File::create("journal").await?;
+/// // The flush runs once the write has succeeded, with no turn of the
+/// // loop in between, and not at all if it fails.
+/// let ((written, _), synced) = file
+///     .write_at("entry\n", 0)
+///     .link(file.sync_data())
+///     .await;
+/// written?;
+/// synced?;
+/// # Ok::<(), std::io::Error>(())
+/// # }).unwrap();
+/// ```
+#[must_use = "a chain does nothing until polled"]
+pub struct FileChain<'a, C: Chain> {
+    chain: C,
+    _files: PhantomData<&'a File>,
+}
+
+impl<'a, C: Chain> FileChain<'a, C> {
+    /// Links `next` after the chain's last operation, which it runs once
+    /// every one before has succeeded.
+    ///
+    /// # Panics
+    ///
+    /// If `next` was made on another ring, under another runtime.
+    pub fn link<U: Operation>(self, next: FileOp<'a, U>) -> FileChain<'a, Link<C, Op<U>>> {
+        FileChain {
+            chain: Link::new(self.chain, next.op),
+            _files: PhantomData,
+        }
+    }
+}
+
+impl<A: Chain, B: Chain> Future for FileChain<'_, Link<A, B>> {
+    type Output = <Link<A, B> as Future>::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().chain).poll(cx)
+    }
+}
+
+impl<C: Chain + fmt::Debug> fmt::Debug for FileChain<'_, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileChain")
+            .field("chain", &self.chain)
+            .finish_non_exhaustive()
     }
 }
 
