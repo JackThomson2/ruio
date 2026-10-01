@@ -289,3 +289,72 @@ async fn names_are_made_changed_and_removed() -> io::Result<()> {
     assert_eq!(err.kind(), ErrorKind::InvalidData);
     Ok(())
 }
+
+/// A pipe's data arrives through one multishot read until its writing end
+/// closes.
+#[ruio::test]
+async fn a_read_stream_takes_what_arrives_on_a_pipe() -> io::Result<()> {
+    let (reader, writer) = io::pipe()?;
+    let reader = File::from_std(std::os::fd::OwnedFd::from(reader).into());
+    let pool = ruio::buf::BufPool::new(&ruio::driver(), 4, 1024)?;
+    let sent = pattern(100_000);
+    let writer = std::thread::spawn({
+        let sent = sent.clone();
+        move || {
+            let mut writer = writer;
+            for chunk in sent.chunks(3000) {
+                io::Write::write_all(&mut writer, chunk)?;
+            }
+            io::Result::Ok(())
+        }
+    });
+    let mut stream = reader.read_stream(&pool);
+    let mut received = Vec::new();
+    while let Some(chunk) = within(stream.next()).await {
+        received.extend_from_slice(&chunk?);
+    }
+    writer.join().unwrap()?;
+    assert_eq!(received, sent);
+    Ok(())
+}
+
+/// A FIFO opened by its name, without blocking as the kernel needs to see
+/// its end, streams what a writer sends until the writer closes; a regular
+/// file, which cannot be polled, is refused.
+#[ruio::test]
+async fn a_read_stream_takes_what_arrives_on_a_fifo() -> io::Result<()> {
+    let scratch = Scratch::new("fifo");
+    let path = scratch.path("fifo");
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `name` is a nul-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let fifo = within(
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path),
+    )
+    .await?;
+    // With the reader there, the writer opens at once.
+    let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
+    let pool = ruio::buf::BufPool::new(&ruio::driver(), 2, 64)?;
+    let mut stream = fifo.read_stream(&pool);
+    io::Write::write_all(&mut writer, b"through ")?;
+    let first = within(stream.next()).await.unwrap()?;
+    assert_eq!(&*first, b"through ");
+    io::Write::write_all(&mut writer, b"the fifo")?;
+    drop(writer);
+    let mut received = first.to_vec();
+    while let Some(chunk) = within(stream.next()).await {
+        received.extend_from_slice(&chunk?);
+    }
+    assert_eq!(received, b"through the fifo");
+
+    let regular = scratch.path("regular");
+    fs::write(&regular, "data").await?;
+    let file = File::open(&regular).await?;
+    let mut stream = file.read_stream(&pool);
+    let err = within(stream.next()).await.unwrap().unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EBADFD));
+    Ok(())
+}

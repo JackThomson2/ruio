@@ -4,7 +4,9 @@
 //! Reads and writes take owned buffers and hand them back with the result,
 //! as the sockets' do. They go at an offset, which lets any number run at
 //! once; [`File::read`] and [`File::write`] use the file's position instead,
-//! as `read(2)` and `write(2)` do.
+//! as `read(2)` and `write(2)` do. [`File::read_stream`] reads what arrives
+//! on a pipe, a FIFO or a character device into a pool of buffers, with
+//! one multishot read.
 //!
 //! ```no_run
 //! # ruio::Runtime::new().unwrap().block_on(async {
@@ -33,7 +35,7 @@
 //! device from the ring.
 
 use std::fmt;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
@@ -43,7 +45,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
-use ruio_driver::buf::{BufResult, FixedIoBuf, IoBuf, IoBufMut, Slice};
+use ruio_driver::buf::{BufLease, BufPool, BufResult, FixedIoBuf, IoBuf, IoBufMut, Slice};
 use ruio_driver::ops::{
     self, Fsync, Ftruncate, MkdirAt, OpenAt, Read, ReadFixed, RenameAt, Statx, UnlinkAt, Write,
     WriteFixed,
@@ -206,6 +208,29 @@ impl File {
         self.op(|fd| Write::new(fd, buf))
     }
 
+    /// The data arriving on the file, read into `pool`, which must belong
+    /// to the thread's ring, as it arrives; see [`ReadStream`].
+    ///
+    /// It suits files that the kernel can poll, which data arrives on:
+    /// pipes, FIFOs and character devices. A regular file is always
+    /// readable, and the stream yields `EBADFD` for one.
+    ///
+    /// A FIFO, and most character devices, do not tell the kernel that they
+    /// can be read without blocking, so it reads them only while they poll
+    /// as readable; a FIFO whose writers have gone polls only as hung up,
+    /// and the stream would wait for ever for its end. Open such a file with
+    /// `O_NONBLOCK`, through [`OpenOptions::custom_flags`], which makes it
+    /// one that can be. A FIFO reads as ended while it has no writer, as
+    /// `read(2)` finds it, so open it once one is there, or open it to read
+    /// and write, so that it always has one.
+    pub fn read_stream(&self, pool: &BufPool) -> ReadStream<'_> {
+        let (driver, fd) = self.sock.target();
+        ReadStream {
+            stream: ops::ReadStream::new(&driver, fd, pool),
+            _file: PhantomData,
+        }
+    }
+
     /// Flushes the file's data and metadata to its device, as `fsync(2)`
     /// does.
     pub fn sync_all(&self) -> FileOp<'_, Fsync> {
@@ -260,6 +285,54 @@ impl fmt::Debug for File {
         f.debug_struct("File")
             .field("fd", &self.fd())
             .finish_non_exhaustive()
+    }
+}
+
+/// The data arriving on a file that can be polled, such as a pipe, read
+/// into a [`BufPool`] by a multishot read that the stream keeps armed.
+/// Made by [`File::read_stream`]; see [`ops::ReadStream`].
+///
+/// Each item is one read's data, in one buffer of the pool, so a request
+/// costs nothing per read. The stream ends at the end of the file, as when
+/// a pipe's writing end closes, or after yielding an error.
+///
+/// ```no_run
+/// # ruio::Runtime::new().unwrap().block_on(async {
+/// use ruio::buf::BufPool;
+/// use ruio::fs::File;
+///
+/// let (reader, _writer) = std::io::pipe()?;
+/// let reader = File::from_std(std::os::fd::OwnedFd::from(reader).into());
+/// let pool = BufPool::new(&ruio::driver(), 16, 4096)?;
+/// let mut data = reader.read_stream(&pool);
+/// while let Some(chunk) = data.next().await {
+///     println!("{} bytes", chunk?.len());
+/// }
+/// # Ok::<(), std::io::Error>(())
+/// # }).unwrap();
+/// ```
+#[derive(Debug)]
+pub struct ReadStream<'a> {
+    stream: ops::ReadStream,
+    _file: PhantomData<&'a File>,
+}
+
+impl ReadStream<'_> {
+    /// The next data, or `None` at the end of the file or once an error has
+    /// been yielded.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufLease>>> {
+        self.stream.poll_next(cx)
+    }
+
+    /// The next data; see [`poll_next`](ReadStream::poll_next).
+    pub async fn next(&mut self) -> Option<io::Result<BufLease>> {
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// The next data if it has been read already, or `None`, without
+    /// waiting; see [`ops::ReadStream::next_ready`].
+    pub fn next_ready(&mut self) -> Option<io::Result<BufLease>> {
+        self.stream.next_ready()
     }
 }
 
