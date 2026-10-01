@@ -318,9 +318,15 @@ baseline are used only when probed.
   ring: it submits without waiting if anything is runnable, and otherwise
   parks until a completion, a wake or the next timer. A task woken by the
   running task takes a LIFO slot and runs next, at most three in a row;
-  everything else queues in FIFO order. Every io_uring operation yields at
-  least once, so a cooperative per-task budget can wait for primitives that
-  are often ready at once, such as channels.
+  everything else queues in FIFO order.
+- Every io_uring operation yields at least once, as its completion comes
+  through the ring, but a channel or a lock can be ready every time it is
+  polled. So each poll of a task, and of the future given to `block_on`,
+  has a cooperative budget of 128 steps, in a thread-local cell. The
+  primitives of `sync` and `JoinHandle` check it before they take
+  anything, and spend a step when they are ready; once none are left they
+  wake the task and return `Pending`, and it runs again after the others.
+  Outside a runtime there is no budget.
 - Panics in tasks are caught and reported through `JoinError`; the payload
   only leaves by value, so `JoinError` is `Send + Sync`. Dropping the runtime
   drops every unfinished future on its thread before the driver drains their
@@ -360,6 +366,16 @@ baseline are used only when probed.
   so, and returns `()` or the first core's error. The channels of `sync`,
   `oneshot` and a bounded `mpsc`, carry values between cores, and wake a
   task wherever it runs.
+- `sync` also has a `Semaphore`, and on it a `Mutex` and an `RwLock` whose
+  guards may be held across awaits, and `Notify`. Like the channels they
+  keep their state behind a standard mutex, wake outside it, and work
+  across cores. The semaphore serves its waiters in the order they came,
+  each with all the permits it asked for at once, so one that needs many
+  is not passed by later ones that need fewer, and a writer, which takes
+  every permit a reader takes one of, cannot be starved by readers. A
+  waiter dropped after its permits were set aside gives them back, and a
+  `Notified` dropped after `notify_one` chose it passes the notification
+  on, so cancelling a wait loses nothing.
 
 ### Keeping work stealing possible
 
@@ -877,13 +893,19 @@ HTTP/1.1 benchmark, in which hyper on ruio, receiving into a pool, is
 level with hyper on tokio with one connection and 1% to 3% ahead from 256
 on (see [HTTP/1.1](#http11)). On the way, plain descriptors came to close
 through the ring, after the operations queued on them, as direct ones do:
-a stream dropped just after a write behind lost what it wrote. Since M7,
-sleeps are `Send` and `Sync`, and `ruio_compat::Timer` gives hyper ruio's
-timers, for its timeouts (see [Compatibility](#compatibility)). Still to
-come: multishot read (6.7) and incremental consumption (6.12);
-general linked operations (`.link(next)`); reading directories; waking
-rings with `MSG_RING`; and synchronization primitives beyond channels,
-with the cooperative budget that those often ready at once need.
+a stream dropped just after a write behind lost what it wrote.
+
+Since M7:
+
+- Sleeps are `Send` and `Sync`, and `ruio_compat::Timer` gives hyper
+  ruio's timers, for its timeouts (see [Compatibility](#compatibility)).
+- A cooperative budget keeps a task that always finds its channel or lock
+  ready from holding up the others, and `sync` has semaphores, mutexes,
+  reader-writer locks and `Notify` (see [Executor](#executor)).
+
+Still to come: multishot read (6.7) and incremental consumption (6.12);
+general linked operations (`.link(next)`); reading directories; and
+waking rings with `MSG_RING`.
 
 ## Open questions
 
