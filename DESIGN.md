@@ -312,8 +312,18 @@ its own flag set.
 - `MSG_RING` to move direct descriptors from one ring's file table to
   another's (`DirectFd::send_to`). The other ring posts no completion
   (`IORING_MSG_RING_CQE_SKIP`): the sender's says which slot the file went
-  to, and comes only once it is there. Waking other rings with `MSG_RING`
-  is still to come.
+  to, and comes only once it is there.
+- Waking other rings with `MSG_RING` was measured, and not adopted. In a
+  ping-pong between two drivers parked on separate physical cores, a wake
+  sent as an `IORING_MSG_DATA` message, queued with
+  `IOSQE_CQE_SKIP_SUCCESS` and so submitted with the sender's own next
+  `io_uring_enter`, took 5.1 to 5.3 µs a round trip against 4.7 to 4.8 µs
+  for the eventfd, though it saves the eventfd write's system call; only
+  between hyperthread siblings was it ahead, at 4.8 against 5.2 µs
+  (Linux 7.0, Xeon Platinum 8488C). The kernel's posting into another
+  ring, one with `DEFER_TASKRUN`, costs more than the write, a busy sender
+  would hold the wake back until its next enter, and threads without a
+  ring need the eventfd in any case.
 
 ### Capability probe
 
@@ -960,8 +970,9 @@ Since M7:
 - Operations link into chains (`Op::link`, `FileOp::link`).
 - Streams read into buffers the kernel consumes incrementally (6.12,
   probed), on request.
-
-Still to come: waking rings with `MSG_RING`.
+- Waking rings with `MSG_RING` was measured against the eventfd, and lost
+  across physical cores, so it was not adopted (see
+  [Kernel features](#kernel-features)).
 
 ## Open questions
 
