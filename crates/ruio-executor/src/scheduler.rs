@@ -5,7 +5,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::mem;
 use std::ptr;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -14,6 +13,7 @@ use ruio_driver::{Driver, RemoteRing, Unparker};
 
 use crate::task::{JoinHandle, Task};
 use crate::time::Timers;
+use crate::wheel::Key;
 
 /// How many tasks run between turns of the ring, so that a flood of ready
 /// tasks cannot hold up completions.
@@ -47,11 +47,11 @@ pub(crate) trait Runnable: Send + Sync {
 }
 
 /// The part of a scheduler that other threads reach: the tasks woken there,
-/// and the unparker of the scheduler's ring.
+/// the timers dropped there, and the unparker of the scheduler's ring.
 pub(crate) struct Shared {
     remote: Mutex<Remote>,
-    /// Set once a task is queued in `remote`, so that the scheduler takes
-    /// the lock only when there may be tasks to take.
+    /// Set once anything is queued in `remote`, so that the scheduler takes
+    /// the lock only when there may be something to take.
     pending: AtomicBool,
     unparker: Unparker,
     /// The ring, for other rings to send descriptors to.
@@ -64,8 +64,11 @@ pub(crate) type RemoteSpawn = Box<dyn FnOnce() + Send>;
 struct Remote {
     tasks: Vec<TaskRef>,
     spawns: Vec<RemoteSpawn>,
-    /// Set when the runtime shuts down, after which wakes and spawns are
-    /// dropped.
+    /// Timers of the scheduler's wheel to remove, whose sleeps were dropped
+    /// or moved where the wheel cannot be reached.
+    timers: Vec<Key>,
+    /// Set when the runtime shuts down, after which wakes, spawns and
+    /// removals are dropped.
     closed: bool,
 }
 
@@ -111,6 +114,26 @@ impl Shared {
                 self.pending.store(true, Ordering::Release);
                 self.unparker.unpark();
             }
+        }
+    }
+
+    /// Has the scheduler remove a timer from its wheel at its next turn,
+    /// for a sleep that lets go of it where the wheel cannot be reached:
+    /// on another thread, or outside the runtime. Until then the timer may
+    /// still fire, waking for nothing whoever last polled the sleep. A
+    /// runtime that has shut down has no wheel left to remove it from.
+    pub(crate) fn remove_timer(&self, key: Key) {
+        let queued = {
+            let mut remote = self.lock();
+            let open = !remote.closed;
+            if open {
+                remote.timers.push(key);
+            }
+            open
+        };
+        if queued {
+            self.pending.store(true, Ordering::Release);
+            self.unparker.unpark();
         }
     }
 
@@ -178,7 +201,7 @@ pub(crate) struct Scheduler {
     /// Every task whose future has not been dropped; this is what keeps a
     /// task alive while nothing else refers to it.
     tasks: RefCell<Tasks>,
-    timers: Rc<Timers>,
+    timers: Timers,
 }
 
 impl Scheduler {
@@ -187,6 +210,7 @@ impl Scheduler {
             remote: Mutex::new(Remote {
                 tasks: Vec::new(),
                 spawns: Vec::new(),
+                timers: Vec::new(),
                 closed: false,
             }),
             pending: AtomicBool::new(false),
@@ -201,11 +225,11 @@ impl Scheduler {
             lifo_streak: Cell::new(0),
             running: Cell::new(ptr::null()),
             tasks: RefCell::new(Tasks::default()),
-            timers: Rc::new(Timers::new()),
+            timers: Timers::new(),
         }
     }
 
-    pub(crate) fn timers(&self) -> &Rc<Timers> {
+    pub(crate) fn timers(&self) -> &Timers {
         &self.timers
     }
 
@@ -321,25 +345,30 @@ impl Scheduler {
         }
     }
 
-    /// Moves the tasks woken on other threads into the run queue, and makes
-    /// the tasks spawned from other threads.
+    /// Moves the tasks woken on other threads into the run queue, removes
+    /// the timers let go of there, and makes the tasks spawned from other
+    /// threads.
     fn take_remote(&self) {
-        // A task queued after the check sets the flag again, and unparks the
-        // ring: the next turn takes it.
+        // Anything queued after the check sets the flag again, and unparks
+        // the ring: the next turn takes it.
         if !self.shared.pending.load(Ordering::Acquire) {
             return;
         }
         self.shared.pending.store(false, Ordering::Relaxed);
-        let spawns = {
+        let (timers, spawns) = {
             let mut remote = self.shared.lock();
             if !remote.tasks.is_empty() {
                 // A task woken here meanwhile is in the queue already.
                 let claimed = remote.tasks.drain(..).filter(|task| task.claim());
                 self.queue.borrow_mut().extend(claimed);
             }
-            mem::take(&mut remote.spawns)
+            (mem::take(&mut remote.timers), mem::take(&mut remote.spawns))
         };
-        // Outside the lock: a spawn runs code, which can spawn elsewhere.
+        // Outside the lock: dropping a waker can drop a task, and a spawn
+        // runs code, either of which can reach this runtime or another.
+        for key in timers {
+            drop(self.timers.remove(key));
+        }
         for spawn in spawns {
             spawn();
         }
@@ -350,6 +379,8 @@ impl Scheduler {
         let (woken, spawns) = {
             let mut remote = self.shared.lock();
             remote.closed = true;
+            // The wheel goes with the scheduler, timers and all.
+            remote.timers.clear();
             (mem::take(&mut remote.tasks), mem::take(&mut remote.spawns))
         };
         drop((woken, spawns));

@@ -1,12 +1,17 @@
 //! Timers: sleep, sleep_until and timeout.
 
 use std::cell::{Cell, RefCell};
-use std::future::pending;
+use std::future::{Future, pending};
 use std::io;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Wake, Waker};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use ruio_executor::time::{Elapsed, sleep, sleep_until, timeout};
+use ruio_executor::time::{Elapsed, Sleep, sleep, sleep_until, timeout};
 use ruio_executor::{Runtime, spawn, yield_now};
 
 /// How late a timer may fire on a loaded machine before a test fails.
@@ -160,12 +165,124 @@ fn timers_fire_while_tasks_keep_yielding() {
     assert!(start.elapsed() < Duration::from_millis(20) + SLACK);
 }
 
+/// A waker that counts its wakes.
+#[derive(Default)]
+struct Count(AtomicUsize);
+
+impl Wake for Count {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Polls `nap` once inside `runtime`, with a waker that counts: its timer
+/// goes into that runtime's wheel.
+fn arm(runtime: &Runtime, nap: &mut Sleep) -> Arc<Count> {
+    let count = Arc::new(Count::default());
+    let waker = Waker::from(count.clone());
+    runtime.block_on(async {
+        let polled = Pin::new(nap).poll(&mut Context::from_waker(&waker));
+        assert!(polled.is_pending());
+    });
+    count
+}
+
+#[test]
+fn sleeps_and_timeouts_can_be_sent() {
+    fn send_sync<T: Send + Sync>(_: &T) {}
+    fn send<T: Send>(_: &T) {}
+    send_sync(&sleep(Duration::from_secs(1)));
+    send(&timeout(
+        Duration::from_secs(1),
+        sleep(Duration::from_secs(1)),
+    ));
+}
+
+/// A future spawned from another thread, which must be `Send`, can sleep
+/// and time out.
+#[test]
+fn a_future_sent_to_a_runtime_can_sleep() {
+    let runtime = Runtime::new().unwrap();
+    let handle = runtime.handle();
+    let start = Instant::now();
+    let task = thread::spawn(move || {
+        handle.spawn(async {
+            sleep(Duration::from_millis(20)).await;
+            timeout(Duration::from_millis(10), pending::<()>()).await
+        })
+    })
+    .join()
+    .unwrap();
+    assert!(runtime.block_on(task).unwrap().is_err());
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(30), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(30) + SLACK, "{elapsed:?}");
+}
+
+/// Polled by a runtime on another thread, a sleep armed in one ends at its
+/// deadline there, and its timer leaves the first runtime's wheel, which
+/// would otherwise wake whoever polled it there.
+#[test]
+fn a_sleep_polled_by_another_runtime_moves_its_timer_there() {
+    let first = Runtime::new().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(30);
+    let mut nap = sleep_until(deadline);
+    let woken = arm(&first, &mut nap);
+    let nap = thread::spawn(move || {
+        let second = Runtime::new().unwrap();
+        // A timer in the same place of this wheel as the nap's in the
+        // first, which the nap must not take for its own.
+        let mut long = sleep(Duration::from_secs(60));
+        arm(&second, &mut long);
+        let ended = second.block_on(timeout(Duration::from_secs(10), &mut nap));
+        assert_eq!(ended, Ok(()));
+        let now = Instant::now();
+        assert!(now >= deadline);
+        assert!(now < deadline + SLACK, "{:?} late", now - deadline);
+        nap
+    })
+    .join()
+    .unwrap();
+    assert!(nap.is_elapsed());
+    // Past the deadline, the first runtime has no timer of the sleep's left
+    // to fire.
+    first.block_on(sleep(Duration::from_millis(10)));
+    assert_eq!(woken.0.load(Ordering::SeqCst), 0);
+}
+
+/// A sleep dropped on another thread takes its timer out of its runtime's
+/// wheel.
+#[test]
+fn a_sleep_dropped_on_another_thread_removes_its_timer() {
+    let runtime = Runtime::new().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let mut nap = sleep_until(deadline);
+    let woken = arm(&runtime, &mut nap);
+    thread::spawn(move || drop(nap)).join().unwrap();
+    runtime.block_on(sleep_until(deadline + Duration::from_millis(10)));
+    assert_eq!(woken.0.load(Ordering::SeqCst), 0);
+}
+
+/// A sleep can outlive the runtime its timer was in, and be polled by
+/// another.
+#[test]
+fn a_sleep_outlives_its_runtime() {
+    let mut nap = sleep(Duration::from_millis(10));
+    let first = Runtime::new().unwrap();
+    arm(&first, &mut nap);
+    drop(first);
+    Runtime::new().unwrap().block_on(&mut nap);
+
+    let mut nap = sleep(Duration::from_secs(60));
+    let first = Runtime::new().unwrap();
+    arm(&first, &mut nap);
+    drop(first);
+    drop(nap);
+}
+
 #[test]
 #[should_panic(expected = "inside a ruio runtime")]
 fn polling_a_sleep_outside_a_runtime_panics() {
-    use std::future::Future;
-    use std::pin::pin;
-    use std::task::{Context, Waker};
-    let mut nap = pin!(sleep(Duration::from_secs(1)));
-    let _ = nap.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+    let mut nap = sleep(Duration::from_secs(1));
+    let _ = Pin::new(&mut nap).poll(&mut Context::from_waker(Waker::noop()));
 }
