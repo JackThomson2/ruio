@@ -184,9 +184,23 @@ its own flag set.
   `ECANCELED`, which the `Op` reports as `ETIMEDOUT`, since nothing else
   cancels an operation whose `Op` exists; and it hands back its buffer, which
   a timer in user space cannot, as it can only drop the `Op`. The driver
-  builds the chain itself: an `Operation`'s entry may not link. A general
-  `.link(next)` is not built. What `.fixed()` would have chosen is the
-  operation's `Fd`.
+  builds the chain itself: an `Operation`'s entry may not link. What
+  `.fixed()` would have chosen is the operation's `Fd`.
+- `Op::link(next)` links operations into a chain (`IOSQE_IO_LINK`), which
+  the kernel runs in order, each once the one before has succeeded: a
+  `Link`, a future of both outputs, which nests through a sealed `Chain`
+  trait into chains of any length. It is queued as a whole at its first
+  poll, and each `Op` is then left submitted, as if it had queued itself,
+  so polling, cancelling on drop and timeouts are the `Op`'s own. The
+  kernel links only entries submitted together, so the chain gets room
+  for all of its entries first, or every operation fails with the error;
+  each entry is prepared into a copy before any is queued, so a panic in
+  a later `prepare` leaves nothing queued that points at memory the panic
+  frees. A failure, including a read or a write the kernel counts as
+  short, cancels the rest with `ECANCELED`. A member's linked timeout
+  sits between it and the next, and carries the link on. Only the first
+  member reports its timeout as `ETIMEDOUT`: a later one cannot tell its
+  own timeout from a failure before it.
 - `Op::detach` hands an operation to the driver to finish with nobody
   waiting: it becomes an orphan, as a dropped `Op`'s does, but is not
   cancelled, and a timed one still completes with `ETIMEDOUT`. An operation
@@ -481,7 +495,13 @@ baseline are used only when probed.
   `write_fixed_at` read and write registered buffers. `read` and `write` use
   the file's position, which nothing orders when they overlap.
   `read_stream` reads what arrives on a pipe, a FIFO or a character device
-  into a pool, with one multishot read that stays armed.
+  into a pool, with one multishot read that stays armed. `FileOp::link`
+  links file operations into a `FileChain`, which borrows every file as
+  the operations do: a write and the flush behind it reach the kernel in
+  one submission, and the flush runs only if the write succeeded. Socket
+  operations are not linked in `ruio::net`, since a write waits for the
+  writes behind its stream before it is submitted, which a chain would
+  have to wait for as a whole; `ruio::uring` links the driver's own.
 - Every operation borrows its file, so the file cannot close before the
   kernel has the operation. `close` closes it with a result, which dropping
   it cannot report.
@@ -925,9 +945,10 @@ Since M7:
 - Multishot reads stream what arrives on pipes, FIFOs and character
   devices (`File::read_stream`), and `read_dir` reads directories (see
   [Files](#files)).
+- Operations link into chains (`Op::link`, `FileOp::link`).
 
-Still to come: incremental consumption (6.12); general linked operations
-(`.link(next)`); and waking rings with `MSG_RING`.
+Still to come: incremental consumption (6.12); and waking rings with
+`MSG_RING`.
 
 ## Open questions
 
