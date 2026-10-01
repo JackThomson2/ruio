@@ -472,8 +472,8 @@ baseline are used only when probed.
 
 `ruio::fs` has `File`, `OpenOptions` and `Metadata`, and the functions
 `metadata`, `symlink_metadata`, `read`, `read_to_string`, `write`,
-`create_dir`, `create_dir_all`, `remove_file`, `remove_dir` and `rename`,
-running on the ring of the thread's runtime.
+`create_dir`, `create_dir_all`, `remove_file`, `remove_dir`, `rename` and
+`read_dir`, running on the ring of the thread's runtime.
 
 - Reads and writes take owned buffers and hand them back with the result, at
   an offset, so any number can run at once. `read_exact_at` and
@@ -499,8 +499,18 @@ running on the ring of the thread's runtime.
   operations on names in an io-wq worker, and an open whose lookup is not
   cached; so buffered reads and writes that miss the page cache. A direct
   read goes to the device from the ring.
-- Still to come: reading directories, which io_uring has no operation for,
-  `copy` with `splice`, links and permissions.
+- io_uring has no operation that reads a directory, so `read_dir` opens
+  one through the ring and `ReadDir` reads its entries with
+  `getdents64(2)` on the thread, 32 KiB at a time, as resolving a host
+  name runs on it: it blocks the thread while the kernel reads the
+  directory, which is quick once it is cached. Before each batch after
+  the first, the reader yields once, so that a large directory does not
+  hold up the other tasks. Entries share the directory's descriptor, and
+  their status comes from statx relative to it, so it is the status of
+  the entry in the directory read, wherever the directory has moved; the
+  type comes from the directory, or from statx where the file system
+  gives none.
+- Still to come: `copy` with `splice`, links and permissions.
 
 ## Compatibility
 
@@ -913,10 +923,11 @@ Since M7:
   ready from holding up the others, and `sync` has semaphores, mutexes,
   reader-writer locks and `Notify` (see [Executor](#executor)).
 - Multishot reads stream what arrives on pipes, FIFOs and character
-  devices (`File::read_stream`).
+  devices (`File::read_stream`), and `read_dir` reads directories (see
+  [Files](#files)).
 
 Still to come: incremental consumption (6.12); general linked operations
-(`.link(next)`); reading directories; and waking rings with `MSG_RING`.
+(`.link(next)`); and waking rings with `MSG_RING`.
 
 ## Open questions
 
