@@ -104,6 +104,37 @@ impl Drop for TrackedRead {
     }
 }
 
+/// An operation padded past what a table slot holds in place, so that the
+/// driver boxes it when it is orphaned, as it does not a [`TrackedRead`].
+struct Large<T> {
+    operation: T,
+    bulk: [u8; 512],
+}
+
+impl<T> Large<T> {
+    fn new(operation: T) -> Self {
+        Self {
+            operation,
+            bulk: [FILL; 512],
+        }
+    }
+}
+
+// SAFETY: as for the operation it wraps, whose entry it prepares and whose
+// completion it reports; the padding is never pointed to.
+unsafe impl<T: Operation> Operation for Large<T> {
+    type Output = T::Output;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        self.operation.prepare(sqe);
+    }
+
+    fn complete(self, completion: Completion) -> T::Output {
+        assert!(self.bulk.iter().all(|&byte| byte == FILL));
+        self.operation.complete(completion)
+    }
+}
+
 /// When the test writes to the pipe, relative to the polls.
 #[derive(Clone, Copy, Debug)]
 enum WriteAt {
@@ -154,6 +185,99 @@ fn tracked_reads_dropped_after_every_number_of_polls() {
             drop_tracked_read(polls, write_at);
         }
     }
+}
+
+/// A tracked read, as it is or padded to be boxed, detached after `polls`
+/// polls, with the pipe written to at `write_at`: it completes, and is
+/// freed, whether the kernel is given data or cancels it at shutdown.
+fn detach_tracked_read(polls: usize, write_at: WriteAt, large: bool) {
+    let driver = Driver::new().unwrap();
+    let (reader, mut writer) = io::pipe().unwrap();
+    let (read, track) = TrackedRead::new(reader.as_raw_fd());
+    let context = format!("{polls} polls, write {write_at:?}, large {large}");
+    if matches!(write_at, WriteAt::Before) {
+        writer.write_all(&[FILL; 5]).unwrap();
+    }
+    let mut write = |poll| {
+        if matches!(write_at, WriteAt::AfterPoll(after) if after == poll) {
+            writer.write_all(&[FILL; 5]).unwrap();
+        }
+    };
+    if large {
+        detach_after(&driver, driver.op(Large::new(read)), polls, &mut write);
+    } else {
+        detach_after(&driver, driver.op(read), polls, &mut write);
+    }
+    assert!(track.prepared.get(), "{context}: detaching submits");
+    if matches!(write_at, WriteAt::Never) {
+        assert_eq!(driver.in_flight(), 1, "{context}: detached in flight");
+        driver.submit().unwrap();
+        assert!(
+            !track.dropped.get(),
+            "{context}: nothing to read, yet freed"
+        );
+        drop(driver);
+    } else {
+        settle(&driver);
+    }
+    assert!(track.dropped.get(), "{context}: never freed");
+    assert!(track.result.get().is_some(), "{context}: never completed");
+}
+
+/// Polls `op` up to `polls` times, calling `between` and making a driver
+/// pass after each, then detaches it, unless it completed first, which
+/// leaves nothing to detach.
+fn detach_after<T: Operation>(
+    driver: &Driver,
+    mut op: Op<T>,
+    polls: usize,
+    mut between: impl FnMut(usize),
+) {
+    for poll in 0..polls {
+        if poll_once(&mut op).is_ready() {
+            return;
+        }
+        between(poll);
+        driver.submit().unwrap();
+    }
+    op.detach();
+}
+
+/// Detached operations complete with nobody waiting, whether they lie in
+/// their slot or in a box, and are freed once, whenever they are detached.
+#[test]
+fn tracked_reads_detached_after_every_number_of_polls() {
+    for polls in 0..3 {
+        for write_at in [
+            WriteAt::Never,
+            WriteAt::Before,
+            WriteAt::AfterPoll(0),
+            WriteAt::AfterPoll(1),
+        ] {
+            if matches!(write_at, WriteAt::AfterPoll(after) if after >= polls) {
+                continue;
+            }
+            detach_tracked_read(polls, write_at, false);
+            detach_tracked_read(polls, write_at, true);
+        }
+    }
+}
+
+/// A detached operation with a linked timeout that fires reports a
+/// timeout, as its `Op` would have, and one that is never submitted
+/// completes with the error at once.
+#[test]
+fn detached_operations_see_their_timeouts() {
+    let driver = Driver::new().unwrap();
+    let (reader, _writer) = io::pipe().unwrap();
+    let (read, track) = TrackedRead::new(reader.as_raw_fd());
+    driver.op(read).timeout(Duration::ZERO).detach();
+    let (read, large) = TrackedRead::new(reader.as_raw_fd());
+    driver.op(Large::new(read)).timeout(Duration::ZERO).detach();
+    settle(&driver);
+    assert_eq!(track.result.get(), Some(-libc::ETIMEDOUT));
+    assert_eq!(large.result.get(), Some(-libc::ETIMEDOUT));
+    assert!(track.dropped.get() && large.dropped.get());
 }
 
 /// Polls `op` up to `polls` times, with a driver pass after each, then drops

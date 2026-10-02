@@ -48,6 +48,7 @@ mod link;
 mod mem;
 mod op;
 pub mod ops;
+mod orphan;
 mod pool;
 mod probe;
 mod remote;

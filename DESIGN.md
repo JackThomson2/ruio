@@ -172,10 +172,16 @@ its own flag set.
   operation. The payload (buffer, address, ...) lives in the future, not the
   slot.
 - Slot states: free, waiting (with a `Waker`), completed (result and flags,
-  until the future collects them), orphaned (the boxed payload of a dropped
-  operation), streaming (the queued completions of a multishot request) and
-  orphaned stream (the payload of a dropped stream, handed each completion
-  until the last).
+  until the future collects them), orphaned (the payload of a dropped or
+  detached operation), streaming (the queued completions of a multishot
+  request) and orphaned stream (the payload of a dropped stream, handed each
+  completion until the last). An orphaned operation lies in the slot itself
+  when it fits (160 bytes, room for a write behind's send with its bundle
+  of leased buffers), and in a box otherwise, so detaching an operation, as
+  every write behind does, allocates nothing: a detached operation goes
+  straight into an orphaned slot as it is queued. The slot is larger for it,
+  184 bytes rather than 72, which the table pays once per slot, at the
+  maximum in flight.
 - Operations are lazy: nothing is queued before the first poll, which leaves
   room for combinators to shape the SQE at no cost. `Op::timeout(d)` queues
   the operation with `IOSQE_IO_LINK` and an `IORING_OP_LINK_TIMEOUT` behind

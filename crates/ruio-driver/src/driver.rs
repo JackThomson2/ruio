@@ -21,6 +21,7 @@ use ruio_sys as sys;
 use crate::Probe;
 use crate::link::private::{Linkable, Member};
 use crate::op::{Completion, Op, Operation, Orphan};
+use crate::orphan::Payload;
 use crate::remote::{Remote, RemoteRing};
 use crate::ring::Ring;
 use crate::stream::{MultiOp, Multishot, Stranded};
@@ -299,7 +300,7 @@ struct Inner {
     /// The number of slots in the registered file table.
     files: u32,
     /// Every operation the kernel may still own.
-    table: Table<Box<dyn Orphan>>,
+    table: Table<Payload>,
     /// What the driver shares with the threads that send it descriptors.
     remote: Arc<Remote>,
     /// Whether the multishot poll on the unparkers' eventfd is in flight.
@@ -320,7 +321,7 @@ struct Inner {
     /// Wakers of a batch of completions, kept to reuse the allocation.
     wakers: Vec<Waker>,
     /// Orphaned payloads released by a batch of completions, likewise.
-    released: Vec<(Box<dyn Orphan>, Completion)>,
+    released: Vec<(Payload, Completion)>,
     /// Orphaned streams with completions to hand over, likewise.
     deliveries: Vec<u64>,
     /// How many completions the last turn delivered; see
@@ -385,7 +386,10 @@ impl Driver {
             .iter_mut()
             .map(|op| op as &mut dyn Member)
             .collect();
-        self.queue_chain(&mut members, Waker::noop());
+        self.queue_chain(&mut members, Waiter::Nobody);
+        // Each operation went into its slot as it was queued, leaving
+        // nothing to detach; unless the chain was refused, when this
+        // completes each with the error.
         for op in operations {
             op.detach();
         }
@@ -689,19 +693,44 @@ impl Driver {
         timeout: Option<Duration>,
         waker: &Waker,
     ) -> io::Result<u64> {
-        self.inner.state.borrow_mut().queue_entry(
-            |sqe| operation.prepare(sqe),
-            false,
-            timeout,
-            waker,
-        )
+        self.inner
+            .state
+            .borrow_mut()
+            .queue_entry(
+                operation,
+                |operation, sqe| operation.prepare(sqe),
+                timeout,
+                |table, _| table.insert(Some(waker)),
+            )
+            .map_err(|(err, _)| err)
     }
 
-    /// Queues the operations of a chain, each linked to the next, and
-    /// records in each its `user_data`, or, if the chain cannot be queued,
-    /// the error; see [`Link`](crate::Link).
-    pub(crate) fn queue_chain(&self, members: &mut [&mut dyn Member], waker: &Waker) {
-        self.inner.state.borrow_mut().queue_chain(members, waker);
+    /// Queues an operation's entry, followed by a linked timeout if it has
+    /// one, with nobody waiting for it: the operation goes into its slot in
+    /// the table, which drops its output once the kernel is done. If the
+    /// entry cannot be queued, the operation comes back with the error.
+    pub(crate) fn detach<T: Operation>(
+        &self,
+        operation: T,
+        timeout: Option<Duration>,
+    ) -> Result<(), (io::Error, T)> {
+        self.inner
+            .state
+            .borrow_mut()
+            .queue_entry(
+                operation,
+                |operation, sqe| operation.prepare(sqe),
+                timeout,
+                |table, operation| table.insert_orphan(Payload::operation(operation)),
+            )
+            .map(|_| ())
+    }
+
+    /// Queues the operations of a chain, each linked to the next, for
+    /// `waiter`, and records in each its `user_data`, or, if the chain
+    /// cannot be queued, the error; see [`Link`](crate::Link).
+    pub(crate) fn queue_chain(&self, members: &mut [&mut dyn Member], waiter: Waiter<'_>) {
+        self.inner.state.borrow_mut().queue_chain(members, waiter);
     }
 
     /// Whether `other` drives the same ring.
@@ -718,7 +747,13 @@ impl Driver {
         self.inner
             .state
             .borrow_mut()
-            .queue_entry(|sqe| request.prepare(sqe), true, None, waker)
+            .queue_entry(
+                request,
+                |request, sqe| request.prepare(sqe),
+                None,
+                |table, _| table.insert_stream(Some(waker)),
+            )
+            .map_err(|(err, _)| err)
     }
 
     /// Takes a stream's next completion, or arranges for `waker` to be woken
@@ -760,7 +795,7 @@ impl Driver {
         }
         drop(inner);
         drop(abandoned.waker);
-        let mut payload: Box<dyn Orphan> = Box::new(Stranded(request));
+        let mut payload = Payload::boxed(Stranded(request));
         if !hand_over(&mut payload, abandoned.completions) {
             mem::forget(payload);
             return;
@@ -803,7 +838,7 @@ impl Driver {
                 drop(operation.complete(completion));
             }
             None => {
-                let waker = inner.table.orphan(user_data, Box::new(Some(operation)));
+                let waker = inner.table.orphan(user_data, Payload::operation(operation));
                 if cancel {
                     inner.cancels.push(user_data);
                 }
@@ -814,10 +849,19 @@ impl Driver {
     }
 }
 
+/// Who waits for the operations of a chain as they are queued.
+pub(crate) enum Waiter<'a> {
+    /// The task with this waker, which each operation's completion wakes.
+    Task(&'a Waker),
+    /// Nobody: each operation goes into its slot as it is queued, and
+    /// finishes there, as a detached one does.
+    Nobody,
+}
+
 /// Hands a payload its completions, in order. Returns `false` if it panicked,
 /// in which case the payload must not be freed: the kernel may still use
 /// memory it owns.
-fn hand_over(payload: &mut Box<dyn Orphan>, completions: VecDeque<Completion>) -> bool {
+fn hand_over(payload: &mut Payload, completions: VecDeque<Completion>) -> bool {
     panic::catch_unwind(AssertUnwindSafe(|| {
         for completion in completions {
             payload.deliver(completion);
@@ -827,44 +871,43 @@ fn hand_over(payload: &mut Box<dyn Orphan>, completions: VecDeque<Completion>) -
 }
 
 impl Inner {
-    /// Queues an entry that `prepare` fills in, followed by a linked timeout
-    /// if `timeout` is set, and returns the entry's `user_data`.
+    /// Queues an entry that `prepare` fills in for `carried`, followed by a
+    /// linked timeout if `timeout` is set, in the table slot `occupy` takes,
+    /// given `carried` to keep there, and returns the entry's `user_data`.
+    /// If the entry cannot be queued, `carried` comes back with the error.
     ///
     /// The linked timeout posts no completion when it is cancelled because
     /// the entry completed first (`IOSQE_CQE_SKIP_SUCCESS`), and any it does
     /// post is ignored: the entry's own completion tells whether it timed
     /// out.
-    fn queue_entry(
+    fn queue_entry<C>(
         &mut self,
-        prepare: impl FnOnce(&mut sys::io_uring_sqe),
-        stream: bool,
+        mut carried: C,
+        prepare: impl FnOnce(&mut C, &mut sys::io_uring_sqe),
         timeout: Option<Duration>,
-        waker: &Waker,
-    ) -> io::Result<u64> {
+        occupy: impl FnOnce(&mut Table<Payload>, C) -> u64,
+    ) -> Result<u64, (io::Error, C)> {
         // An entry and its linked timeout reach the kernel together.
         let needed = if timeout.is_some() { 2 } else { 1 };
-        if self.ring.sq_space() < needed {
-            self.submit_queued(needed)?;
+        if self.ring.sq_space() < needed
+            && let Err(err) = self.submit_queued(needed)
+        {
+            return Err((err, carried));
         }
-        let sqe = self
-            .ring
-            .next_sqe()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))?;
+        let Some(sqe) = self.ring.next_sqe() else {
+            return Err((io::Error::from_raw_os_error(libc::EBUSY), carried));
+        };
         let mut entry = Entry {
             sqe,
             prepared: false,
         };
-        prepare(entry.sqe);
+        prepare(&mut carried, entry.sqe);
         debug_assert_eq!(entry.sqe.flags & FORBIDDEN_SQE_FLAGS, 0);
         entry.sqe.flags &= !FORBIDDEN_SQE_FLAGS;
         if timeout.is_some() {
             entry.sqe.flags |= sys::IOSQE_IO_LINK;
         }
-        let user_data = if stream {
-            self.table.insert_stream(Some(waker))
-        } else {
-            self.table.insert(Some(waker))
-        };
+        let user_data = occupy(&mut self.table, carried);
         entry.sqe.user_data = user_data;
         entry.prepared = true;
         drop(entry);
@@ -890,7 +933,7 @@ impl Inner {
     /// prepared, and every wake taken, before any reaches the queue, so
     /// that a panic in an operation's `prepare`, or a waker's `clone`,
     /// leaves nothing queued that points to memory the panic frees.
-    fn queue_chain(&mut self, members: &mut [&mut dyn Member], waker: &Waker) {
+    fn queue_chain(&mut self, members: &mut [&mut dyn Member], waiter: Waiter<'_>) {
         let needed = members
             .iter()
             .map(|member| if member.timeout().is_some() { 2 } else { 1 })
@@ -903,14 +946,18 @@ impl Inner {
             }
             return;
         }
-        let entries: Vec<(sys::io_uring_sqe, Wake)> = members
+        let entries: Vec<(sys::io_uring_sqe, Option<Wake>)> = members
             .iter_mut()
             .map(|member| {
                 let mut sqe = sys::io_uring_sqe::default();
                 member.prepare(&mut sqe);
                 debug_assert_eq!(sqe.flags & FORBIDDEN_SQE_FLAGS, 0);
                 sqe.flags &= !FORBIDDEN_SQE_FLAGS;
-                (sqe, self.table.wake_of(waker))
+                let wake = match waiter {
+                    Waiter::Task(waker) => Some(self.table.wake_of(waker)),
+                    Waiter::Nobody => None,
+                };
+                (sqe, wake)
             })
             .collect();
         let last = members.len() - 1;
@@ -922,7 +969,10 @@ impl Inner {
             if timeout.is_some() || index < last {
                 sqe.flags |= sys::IOSQE_IO_LINK;
             }
-            let user_data = self.table.insert_wake(wake);
+            let user_data = match wake {
+                Some(wake) => self.table.insert_wake(wake),
+                None => self.table.insert_orphan(member.detached(index == 0)),
+            };
             sqe.user_data = user_data;
             if let Some(timeout) = timeout {
                 let link = self
@@ -936,7 +986,9 @@ impl Inner {
                 }
                 link.user_data = IGNORED;
             }
-            member.queued(user_data, index == 0);
+            if matches!(waiter, Waiter::Task(_)) {
+                member.queued(user_data, index == 0);
+            }
             self.stats.operations += 1;
         }
     }
@@ -1194,7 +1246,7 @@ impl Inner {
     fn reap(
         &mut self,
         wakers: &mut Vec<Waker>,
-        released: &mut Vec<(Box<dyn Orphan>, Completion)>,
+        released: &mut Vec<(Payload, Completion)>,
         deliveries: &mut Vec<u64>,
     ) {
         while let Some(cqe) = self.ring.pop_cqe() {
@@ -1308,14 +1360,24 @@ mod tests {
         fn deliver(&mut self, _: Completion) {}
     }
 
+    // SAFETY: the entry is never filled in.
+    unsafe impl Operation for Stuck {
+        type Output = ();
+
+        fn prepare(&mut self, _: &mut sys::io_uring_sqe) {}
+
+        fn complete(self, _: Completion) {}
+    }
+
     #[test]
     fn operations_the_kernel_never_finishes_are_leaked_at_shutdown() {
         let timeout = Duration::from_millis(50);
         let driver = Driver::builder().shutdown_timeout(timeout).build().unwrap();
         {
+            // One payload in its slot, one in a box.
             let mut inner = driver.inner.state.borrow_mut();
-            let user_data = inner.table.insert(None);
-            let _ = inner.table.orphan(user_data, Box::new(Stuck));
+            inner.table.insert_orphan(Payload::operation(Stuck));
+            inner.table.insert_orphan(Payload::boxed(Stuck));
         }
 
         let start = Instant::now();

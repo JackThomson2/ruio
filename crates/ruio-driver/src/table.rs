@@ -57,8 +57,9 @@ enum State<P> {
     /// them.
     Streaming(Stream),
     /// A multishot request whose stream was dropped: its payload handles the
-    /// completions still to come.
-    OrphanedStream(OrphanStream<P>),
+    /// completions still to come. Boxed, so that the slot is no larger than
+    /// an orphaned operation's payload: a dropped stream is rare.
+    OrphanedStream(Box<OrphanStream<P>>),
 }
 
 /// How a slot wakes the task waiting on it.
@@ -221,6 +222,15 @@ impl<P> Table<P> {
         user_data(index, slot.generation)
     }
 
+    /// Adds a submitted operation that nobody waits for, which `payload`
+    /// finishes when it completes, and returns its `user_data`.
+    pub(crate) fn insert_orphan(&mut self, payload: P) -> u64 {
+        let index = self.occupy();
+        let slot = &mut self.slots[index as usize];
+        forget_trivial(mem::replace(&mut slot.state, State::Orphaned(payload)));
+        user_data(index, slot.generation)
+    }
+
     /// Adds a submitted multishot request and returns its `user_data`.
     pub(crate) fn insert_stream(&mut self, waker: Option<&Waker>) -> u64 {
         let waker = waker.map_or(Wake::None, |waker| self.wake_of(waker));
@@ -372,11 +382,11 @@ impl<P> Table<P> {
         if ended {
             drop(self.free_stream(index));
         } else {
-            self.slots[index as usize].state = State::OrphanedStream(OrphanStream {
+            self.slots[index as usize].state = State::OrphanedStream(Box::new(OrphanStream {
                 payload: None,
                 completions: VecDeque::new(),
                 ended: false,
-            });
+            }));
         }
         Some(Abandoned {
             waker,
@@ -713,6 +723,20 @@ mod tests {
         assert!(table.orphan(op, "payload").is_none());
         assert_eq!(table.in_flight(), 1);
 
+        assert!(matches!(
+            table.complete(op, DONE),
+            Outcome::Release("payload")
+        ));
+        assert_eq!(table.in_flight(), 0);
+        assert!(matches!(table.complete(op, DONE), Outcome::Ignore));
+    }
+
+    #[test]
+    fn detached_operations_are_orphans_from_the_start() {
+        let mut table = Table::<&str>::with_capacity(4);
+        let op = table.insert_orphan("payload");
+        assert_eq!(table.in_flight(), 1);
+        assert_eq!(table.take_completed(op), None);
         assert!(matches!(
             table.complete(op, DONE),
             Outcome::Release("payload")

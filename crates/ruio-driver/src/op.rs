@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::mem;
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use ruio_sys as sys;
@@ -13,6 +13,7 @@ use ruio_sys as sys;
 use crate::Driver;
 use crate::link::private::{Linkable, Member};
 use crate::link::{Chain, Link};
+use crate::orphan::Payload;
 
 /// The result the kernel posted for an operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,10 +65,10 @@ impl Completion {
 /// Every address `prepare` writes into the entry must stay valid for what the
 /// kernel does with it until `complete` is called, or for as long as the
 /// operation exists if it never is. The driver moves the operation around
-/// (into a heap allocation, if its `Op` is dropped early), so the entry must
-/// not point into the operation itself: point it at heap memory the
-/// operation owns, such as the contents of a `Box` or `Vec`, or at `'static`
-/// memory.
+/// (into its slot of the operation table, or a heap allocation, if its `Op`
+/// is dropped early or detached), so the entry must not point into the
+/// operation itself: point it at heap memory the operation owns, such as
+/// the contents of a `Box` or `Vec`, or at `'static` memory.
 ///
 /// The entry must produce exactly one completion: no multishot flags,
 /// `IOSQE_CQE_SKIP_SUCCESS` or links. `prepare` must not use the driver.
@@ -101,6 +102,12 @@ impl<T: Operation> Orphan for Option<T> {
         if let Some(operation) = self.take() {
             drop(operation.complete(completion));
         }
+    }
+}
+
+impl Orphan for Box<dyn Orphan> {
+    fn deliver(&mut self, completion: Completion) {
+        (**self).deliver(completion);
     }
 }
 
@@ -181,30 +188,28 @@ impl<T: Operation> Op<T> {
     /// the operation. An operation that should say how it went can record
     /// that in its `complete`.
     pub fn detach(mut self) {
-        let (operation, user_data, timed) = match mem::replace(&mut self.state, State::Done) {
-            State::Unsubmitted(mut operation) => {
-                match self
-                    .driver
-                    .queue(&mut operation, self.timeout, Waker::noop())
-                {
-                    Ok(user_data) => (operation, user_data, self.timeout.is_some()),
-                    Err(err) => return drop(operation.complete(Completion::from_error(&err))),
+        // Cancelled means timed out for a timed operation detached too.
+        match mem::replace(&mut self.state, State::Done) {
+            State::Unsubmitted(operation) => {
+                let timed = self.timeout.is_some();
+                let detached = Seen { operation, timed };
+                if let Err((err, detached)) = self.driver.detach(detached, self.timeout) {
+                    drop(detached.complete(Completion::from_error(&err)));
                 }
             }
             State::Refused {
                 operation,
                 completion,
-            } => return drop(operation.complete(completion)),
+            } => drop(operation.complete(completion)),
             State::Submitted {
                 operation,
                 user_data,
                 timed,
-            } => (operation, user_data, timed),
-            State::Done => return,
-        };
-        // Cancelled means timed out for a timed operation detached too.
-        self.driver
-            .orphan(user_data, Seen { operation, timed }, false);
+            } => self
+                .driver
+                .orphan(user_data, Seen { operation, timed }, false),
+            State::Done => {}
+        }
     }
 
     /// The operation back, if it has not been submitted, so nothing reached
@@ -359,6 +364,17 @@ impl<T: Operation> Member for Op<T> {
             },
             _ => unreachable!("a chain holds only unsubmitted operations"),
         };
+    }
+
+    fn detached(&mut self, first: bool) -> Payload {
+        match mem::replace(&mut self.state, State::Done) {
+            State::Unsubmitted(operation) => Payload::operation(Seen {
+                operation,
+                // As for `queued`.
+                timed: first && self.timeout.is_some(),
+            }),
+            _ => unreachable!("a chain holds only unsubmitted operations"),
+        }
     }
 
     fn refused(&mut self, error: &io::Error) {

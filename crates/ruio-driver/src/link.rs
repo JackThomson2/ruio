@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::driver::Waiter;
 use crate::{Driver, Op, Operation};
 
 pub(crate) mod private {
@@ -17,6 +18,7 @@ pub(crate) mod private {
     use ruio_sys as sys;
 
     use crate::Driver;
+    use crate::orphan::Payload;
 
     /// What [`Chain`](super::Chain) asks of a part of a chain: an `Op`, or
     /// a `Link` of parts.
@@ -51,6 +53,10 @@ pub(crate) mod private {
         /// Records that the operation was queued as `user_data`, the first
         /// of its chain or not.
         fn queued(&mut self, user_data: u64, first: bool);
+
+        /// Takes the operation, queued with nobody waiting for it, as the
+        /// payload of its slot, the first of its chain or not.
+        fn detached(&mut self, first: bool) -> Payload;
 
         /// Records that the chain could not be queued, for `error`.
         fn refused(&mut self, error: &io::Error);
@@ -193,7 +199,7 @@ impl<A: Chain, B: Chain> Future for Link<A, B> {
             let driver = this.driver().clone();
             let mut members = Vec::new();
             this.members(&mut members);
-            driver.queue_chain(&mut members, cx.waker());
+            driver.queue_chain(&mut members, Waiter::Task(cx.waker()));
         }
         this.poll_chain(cx)
     }

@@ -259,6 +259,51 @@ fn a_detached_chain_runs_in_order() {
     assert_eq!(driver.stats().operations, 3);
 }
 
+/// A write padded past what a table slot holds in place, so that the
+/// driver boxes it when it is detached.
+struct LargeWrite {
+    write: Write<Vec<u8>>,
+    bulk: [u8; 512],
+}
+
+// SAFETY: as for the write, whose entry it prepares and whose completion it
+// reports; the padding is never pointed to.
+unsafe impl Operation for LargeWrite {
+    type Output = ();
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        self.write.prepare(sqe);
+    }
+
+    fn complete(self, completion: Completion) {
+        assert!(self.bulk.iter().all(|&byte| byte == 7));
+        drop(self.write.complete(completion));
+    }
+}
+
+/// A detached chain runs in order whether its operations lie in their
+/// slots or in boxes.
+#[test]
+fn a_detached_chain_of_large_operations_runs_in_order() {
+    let driver = Driver::new().unwrap();
+    let (mut output, sink) = io::pipe().unwrap();
+    let large = |data: &[u8]| LargeWrite {
+        write: Write::new(sink.as_raw_fd(), data.to_vec()),
+        bulk: [7; 512],
+    };
+    driver.detach_chain(vec![
+        driver.op(large(b"first")),
+        driver.op(large(b" then")),
+        driver.op(large(b" last")),
+    ]);
+    assert_eq!(driver.in_flight(), 3);
+    settle(&driver);
+    let mut out = [0; 15];
+    output.read_exact(&mut out).unwrap();
+    assert_eq!(&out, b"first then last");
+    assert_eq!(driver.stats().operations, 3);
+}
+
 /// A failure in a detached chain cancels the rest of it.
 #[test]
 fn a_failure_cancels_the_rest_of_a_detached_chain() {
