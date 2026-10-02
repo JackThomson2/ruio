@@ -203,7 +203,10 @@ its own flag set.
   every write behind does, allocates nothing: a detached operation goes
   straight into an orphaned slot as it is queued. The slot is larger for it,
   184 bytes rather than 72, which the table pays once per slot, at the
-  maximum in flight.
+  maximum in flight, and which costs nothing measurable: with slots of
+  twice the size, the echo benchmark at 1,024 and 10,000 connections read
+  within 1% of what it read with these (see
+  [The runtime itself](#the-runtime-itself)).
 - Operations are lazy: nothing is queued before the first poll, which leaves
   room for combinators to shape the SQE at no cost. `Op::timeout(d)` queues
   the operation with `IOSQE_IO_LINK` and an `IORING_OP_LINK_TIMEOUT` behind
@@ -402,8 +405,12 @@ baseline are used only when probed.
   that awaits another's `JoinHandle` is held by a local reference too,
   when it is a task of the runtime on the thread, and the share goes with
   a plain load when it is the last reference, as it nearly always is once
-  a task has finished: a spawn and its join take two locked instructions,
-  the count of the scheduler's shared part, which the task holds.
+  a task has finished. A task holds the shared part of its scheduler,
+  which its wakes from other threads reach, by a count of the runtime's
+  thread, as its local references are counted, and by an atomic reference
+  of its own only from when it may be freed on another thread: once its
+  last local reference goes while a waker of it is held elsewhere. So a
+  spawn and its join take no locked instruction on the task's thread.
 - Every task's wakers share one vtable, whatever the task's future: the
   header of a task comes first in it, so a pointer to the task is a pointer
   to its header, through which the vtable reaches the rest. So the driver
@@ -497,11 +504,21 @@ baseline are used only when probed.
   from running. `#[ruio::main(cores = "all")]`, or `cores = N`, runs `main`
   so, and returns `()` or the first core's error. The channels of `sync`,
   `oneshot` and a bounded `mpsc`, carry values between cores, and wake a
-  task wherever it runs.
+  task wherever it runs, with no lock on the path of a value. An `mpsc`
+  keeps its values in a ring of slots, each stamped with the turn round
+  the ring at which it is free to fill, or was filled, as in Vyukov's
+  bounded queue: a sender claims a slot with one compare-and-exchange on
+  the tail, fills it and stamps it, and the one receiver takes the value
+  and stamps the slot free. Only senders that find the channel full wait,
+  in a locked list. The receiver's waker stays registered across waits
+  and is woken by reference, so a task that waits again clones nothing. A
+  `oneshot` is one atomic state, in which the sender finishes, by sending
+  or going, and the receiver registers its waker and goes, each with one
+  read-modify-write.
 - `sync` also has a `Semaphore`, and on it a `Mutex` and an `RwLock` whose
-  guards may be held across awaits, and `Notify`. Like the channels they
-  keep their waiters behind a standard mutex, wake outside it, and work
-  across cores. The semaphore's free permits are an atomic count beside
+  guards may be held across awaits, and `Notify`. They keep their waiters
+  behind a standard mutex, wake outside it, and work across cores, as the
+  channels do. The semaphore's free permits are an atomic count beside
   its queue, with a flag that is set while waiters are queued and changes
   only with the queue locked: an acquire that finds enough permits and
   nobody waiting takes them with one compare-and-exchange, and a release
@@ -1313,6 +1330,71 @@ runtime without a clone of its `Rc` for `spawn` and the driver measured
 within the runs' noise, and the code does so anyway, as the sleeps and
 the wakes do.
 
+The fourth pass took up four costs the third left. Before and after it,
+medians of five runs taken in turns, on a host busier than for the
+third's, with tokio's current-thread runtime for reference:
+
+| Step | tokio | ruio before | ruio after |
+|---|---:|---:|---:|
+| nop 1 | | 4.54M | 4.38M (0.97×) |
+| nop 64 | | 20.6M | 20.3M (0.98×) |
+| spawn | 2.2M | 15.3M | 17.7M (1.16×) |
+| yield | 3.9M | 59.8M | 63.1M (1.06×) |
+| channel | 1.7M | 8.1M | 10.8M (1.33×) |
+| remote | 184k | 193k | 191k (0.99×) |
+| timer | 3.0M | 11.0M | 11.0M (1.00×) |
+| sleep | 464k | 500k | 500k (1.00×) |
+| mutex | 20.0M | 53.0M | 53.0M (1.00×) |
+
+- **A spawn without an atomic reference.** A task held an `Arc` of its
+  scheduler's shared part, which its wakes from other threads reach,
+  cloned as it was spawned and dropped as it was freed: the last two
+  locked instructions of a spawn and its join on the task's thread. It
+  holds the part by a count of the runtime's thread now, and by an atomic
+  reference of its own only from when it may be freed on another thread:
+  `spawn` 1.16×.
+- **Channels without a lock.** In a ping-pong between two tasks, each
+  value's way took the channel's standard mutex three times, for the send,
+  for the receive that found nothing and kept its waker, and for the one
+  that took the value, six locked instructions; and the receive cloned its
+  waker into the channel, which the send took out and woke by value, two
+  more. The values wait in a ring of stamped slots now, which a send
+  claims with one compare-and-exchange and the receiver frees with one
+  store, and the receiver's waker stays registered and is woken by
+  reference: `channel` 1.33×. A wake from another thread, which `remote`
+  measures, costs what it did.
+
+`nop 1` and `nop 64` read 2% to 3% fewer steps a second after the pass,
+with the same instructions per step, about 905 for `nop 1`, in more
+cycles: the channels' change adds no code to their path, and with the
+spawn's change alone they read as before, so it is where the code was
+placed. The network benchmarks were not run again: their servers spawn a
+task per connection rather than per message, and send nothing through a
+channel; `Handle::spawn`, from another thread, is what hands its output
+back through a `oneshot`.
+
+Measured and not adopted:
+
+- **Completions held back.** An entry into the kernel runs at most
+  `max(20, min_complete)` items of deferred completion work in each of
+  its two halves, and under load the echo server settled at 80
+  completions an entry, with 256 connections and with 1,024. The kernel
+  counts the completions an entry waits for from the head it was given,
+  so a ring that keeps the slots of the completions it read until its
+  next entry, and asks that entry for that many more, waits no longer but
+  has the kernel run more of the work. It did, 115 and 124 completions an
+  entry, but the benchmark made 5% and 13% fewer round trips, with a 99th
+  percentile 1.6 and 2.1 times as long, whether a quarter of the
+  completion queue was held back or 64 slots of it.
+- **Other table slots.** A slot of the operation table is 184 bytes,
+  most of it room for an orphaned operation, which every operation's poll
+  and completion reach past. Slots twice the size left the echo benchmark
+  at 1,024 and 10,000 connections within 1%, so their size costs nothing
+  that the table's footprint shows, and slots with room for 48 bytes of
+  an orphan rather than 160 did no better on the driver's own loops: the
+  larger and the smaller both read 3% fewer `nop 1` steps a second than
+  slots of this size.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -1408,6 +1490,14 @@ Since M7:
   which a waker sent to another thread could have it do from there. After
   it, reads and writes went to the kernel in batches of 32, a block plug's,
   which made random reads at depth 64 and above as fast as at 32.
+- A fourth performance pass (see
+  [The runtime itself](#the-runtime-itself)): a task holds its scheduler's
+  shared part by a count of the runtime's thread, so a spawn and its join
+  take no locked instruction; and the channels carry values without a
+  lock, the receiver's waker kept registered. Measured and not adopted:
+  completions held back so that an entry into the kernel runs more of
+  their work, and table slots smaller or larger than an orphaned write
+  behind needs.
 
 ## Open questions
 
