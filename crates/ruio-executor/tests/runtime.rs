@@ -275,6 +275,47 @@ fn another_thread_can_wake_a_task() {
     assert_eq!(value, 11);
 }
 
+/// A task's waker can reach the ring of another thread's runtime, sent there
+/// and used to poll an operation. That ring's driver holds it by a clone,
+/// since the task's count of references from its own thread is not another
+/// thread's to touch, and the operation's completion wakes the task from
+/// there.
+#[test]
+fn a_waker_polled_on_another_threads_ring_wakes_its_task() {
+    let runtime = Runtime::new().unwrap();
+    let joined = runtime.block_on(async {
+        let (to_other, from_task) = std::sync::mpsc::channel::<Waker>();
+        let other = thread::spawn(move || {
+            let waker = from_task.recv().unwrap();
+            Runtime::new().unwrap().block_on(async move {
+                let mut op = ruio_executor::driver().op(Nop);
+                let mut cx = Context::from_waker(&waker);
+                // The ring completes the no-op as its runtime turns it,
+                // which the yields make it do.
+                while Pin::new(&mut op).poll(&mut cx).is_pending() {
+                    yield_now().await;
+                }
+            });
+        });
+        let task = spawn(async move {
+            let mut sent = false;
+            poll_fn(|cx| {
+                if sent {
+                    return Poll::Ready(());
+                }
+                sent = true;
+                to_other.send(cx.waker().clone()).unwrap();
+                Poll::Pending
+            })
+            .await;
+        });
+        let joined = ruio_executor::time::timeout(Duration::from_secs(10), task).await;
+        other.join().unwrap();
+        joined
+    });
+    joined.expect("the task was not woken").unwrap();
+}
+
 /// Another thread waking a task over and over, while the task waits, runs
 /// and yields in turn, loses no wake: each signal the task waits for, it
 /// sees, whether the wake lands while it waits, while it runs, or while it

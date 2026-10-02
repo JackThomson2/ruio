@@ -477,9 +477,11 @@ impl Driver {
     /// # Safety
     ///
     /// Every waker with `local.vtable` that reaches this driver must name a
-    /// task of this thread, which `local.retain` keeps alive until the
-    /// matching `local.release`; `local.wake` must wake it as
-    /// `Waker::wake_by_ref` would, without using this driver.
+    /// live task. `local.retain` must return `true` only if `local.release`
+    /// and `local.wake` may then use the task from this thread, and must
+    /// then keep it alive until the matching `local.release`; `local.wake`
+    /// must wake it as `Waker::wake_by_ref` would, without using this
+    /// driver.
     pub unsafe fn set_local_waker(&self, local: LocalWaker) {
         self.inner.state.borrow_mut().table.set_local(local);
     }

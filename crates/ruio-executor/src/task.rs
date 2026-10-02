@@ -394,8 +394,7 @@ unsafe fn drop_waker(header: *const ()) {
 }
 
 /// How the driver of a task's thread holds the task's wakers: by a local
-/// reference. The driver sees only the wakers of tasks of its own thread,
-/// since tasks and the operations they poll stay on theirs.
+/// reference, for a task of the runtime running on the driver's thread.
 pub(crate) const LOCAL_WAKER: LocalWaker = LocalWaker {
     vtable: &WAKER,
     retain: retain_local,
@@ -403,10 +402,21 @@ pub(crate) const LOCAL_WAKER: LocalWaker = LocalWaker {
     wake: wake_waker_by_ref,
 };
 
-unsafe fn retain_local(header: *const ()) {
-    // SAFETY: the waker the driver was given holds a reference, so the task
-    // is alive, and the driver is on the task's thread.
-    mem::forget(unsafe { LocalRef::retain(header.cast()) });
+/// Counts a local reference to the task at `header` for the driver, if it is
+/// a task of the runtime running on this thread, the only thread that may
+/// touch its local count: every task's wakers share the vtable the driver
+/// knows them by, and a waker sent to another thread can be used to poll an
+/// operation there.
+unsafe fn retain_local(header: *const ()) -> bool {
+    let header = header.cast::<Header>();
+    // SAFETY: the waker the driver was given holds a reference, or borrows
+    // a run's, so the task is alive.
+    let owner = Arc::as_ptr(unsafe { &(*header).shared });
+    context::with_owner(owner, |_| {
+        // SAFETY: the task is alive, and this is its thread.
+        mem::forget(unsafe { LocalRef::retain(header) });
+    })
+    .is_some()
 }
 
 unsafe fn release_local(header: *const ()) {

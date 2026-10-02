@@ -197,11 +197,11 @@ impl Scheduler {
             unparker: driver.unparker(),
             ring: driver.remote(),
         });
-        // SAFETY: a task's wakers reach the driver of the task's thread only,
-        // as tasks and the operations they poll stay on theirs; the retain
-        // counts a local reference, which keeps the task alive until the
-        // release; and the wake queues the task on this scheduler, or on its
-        // remote queue, without using the driver.
+        // SAFETY: the retain counts a local reference only to a task of the
+        // runtime running on this thread, the driver's, which keeps the task
+        // alive until the release, on this thread; and the wake queues the
+        // task on its scheduler, or on its remote queue, without using the
+        // driver.
         unsafe { driver.set_local_waker(task::LOCAL_WAKER) };
         Self {
             driver,

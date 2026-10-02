@@ -140,19 +140,20 @@ impl<P> Table<P> {
     }
 
     /// How a slot is to wake `waker`: by a counted reference if it is one of
-    /// the executor's on this thread, and otherwise by a clone.
+    /// the executor's that it may count on this thread, and otherwise by a
+    /// clone.
     #[inline]
     pub(crate) fn wake_of(&self, waker: &Waker) -> Wake {
-        match self.local {
-            Some(local) if ptr::eq(waker.vtable(), local.vtable) => {
-                // SAFETY: the waker's vtable is the executor's, so its data
-                // names a task of this thread, which the executor keeps alive
-                // while the reference is counted; see `LocalWaker`.
-                unsafe { (local.retain)(waker.data()) };
-                Wake::Local(waker.data())
-            }
-            _ => Wake::Foreign(waker.clone()),
+        if let Some(local) = self.local
+            && ptr::eq(waker.vtable(), local.vtable)
+            // SAFETY: the waker's vtable is the executor's, so its data names
+            // a live task, which the executor keeps alive while the reference
+            // is counted, if it counts one; see `LocalWaker`.
+            && unsafe { (local.retain)(waker.data()) }
+        {
+            return Wake::Local(waker.data());
         }
+        Wake::Foreign(waker.clone())
     }
 
     /// Whether `wake` wakes the task `waker` does.
