@@ -337,6 +337,8 @@ struct Inner {
     /// How many completions the last turn delivered; see
     /// [`Driver::completions_last_turn`].
     last_turn: usize,
+    /// Counts of the driver's work, but for its entries into the kernel,
+    /// which the ring counts.
     stats: Stats,
     shutdown_timeout: Duration,
 }
@@ -522,7 +524,11 @@ impl Driver {
     /// Counts of the driver's work so far.
     #[inline]
     pub fn stats(&self) -> Stats {
-        self.inner.state.borrow().stats
+        let inner = self.inner.state.borrow();
+        Stats {
+            enters: inner.ring.enters(),
+            ..inner.stats
+        }
     }
 
     /// How many completions the last turn of the ring, a [`submit`] or a
@@ -972,6 +978,7 @@ impl Inner {
         if timeout.is_some() {
             entry.sqe.flags |= sys::IOSQE_IO_LINK;
         }
+        let opcode = entry.sqe.opcode;
         let user_data = occupy(&mut self.table, carried);
         entry.sqe.user_data = user_data;
         entry.prepared = true;
@@ -985,6 +992,7 @@ impl Inner {
             link.flags = sys::IOSQE_CQE_SKIP_SUCCESS;
             link.user_data = IGNORED;
         }
+        self.ring.note_queued(opcode);
         self.stats.operations += 1;
         Ok(user_data)
     }
@@ -1030,6 +1038,7 @@ impl Inner {
             let timeout = member.timeout();
             // The room was made above, and nothing has taken it since.
             let sqe = self.ring.next_sqe().expect("no room for a linked entry");
+            let opcode = entry.opcode;
             *sqe = entry;
             if timeout.is_some() || index < last {
                 sqe.flags |= sys::IOSQE_IO_LINK;
@@ -1054,6 +1063,7 @@ impl Inner {
             if matches!(waiter, Waiter::Task(_)) {
                 member.queued(user_data, index == 0);
             }
+            self.ring.note_queued(opcode);
             self.stats.operations += 1;
         }
     }
@@ -1075,7 +1085,6 @@ impl Inner {
         if min_complete == 0 && self.ring.queued() == 0 && self.ring.sq_flags() & pending == 0 {
             return Ok(());
         }
-        self.stats.enters += 1;
         // SAFETY: every queued entry was prepared by an `Operation`, whose
         // contract keeps the memory it points to valid while the operation
         // exists, and the table keeps the operation until its completion; or
@@ -1104,7 +1113,6 @@ impl Inner {
     /// Submits the queued entries, without waiting, to make room for
     /// `needed` more in the submission queue.
     fn submit_queued(&mut self, needed: u32) -> io::Result<()> {
-        self.stats.enters += 1;
         // SAFETY: as in `Inner::enter`.
         let entered = unsafe { self.ring.enter(0, None) };
         if let Err(err) = entered

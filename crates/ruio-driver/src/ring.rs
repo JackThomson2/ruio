@@ -22,6 +22,34 @@ const UNSUPPORTED_FLAGS: u32 = sys::IORING_SETUP_IOPOLL
     | sys::IORING_SETUP_SQE_MIXED
     | sys::IORING_SETUP_SQ_REWIND;
 
+/// The most entries that plug the block layer, its reads and writes, that
+/// [`Ring::enter`] submits in one entry into the kernel. The kernel plugs the
+/// block layer for each entry that submits them, sets the requests of the
+/// plug's first 32 up in one batch and those of the rest one by one, and
+/// flushes the plug as its 33rd request comes (`BLK_MAX_REQUEST_COUNT`): a
+/// read past the 32nd costs a reference and a tag of its own.
+const PLUG_BATCH: u32 = 32;
+
+/// Whether the kernel plugs the block layer for an entry with `opcode`: a
+/// read, a write, or a passthrough command (`.plug` in io_uring's
+/// `opdef.c`).
+#[inline]
+fn plugs(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        sys::IORING_OP_READV
+            | sys::IORING_OP_WRITEV
+            | sys::IORING_OP_READ_FIXED
+            | sys::IORING_OP_WRITE_FIXED
+            | sys::IORING_OP_READ
+            | sys::IORING_OP_WRITE
+            | sys::IORING_OP_URING_CMD
+            | sys::IORING_OP_READV_FIXED
+            | sys::IORING_OP_WRITEV_FIXED
+            | sys::IORING_OP_URING_CMD128
+    )
+}
+
 /// An io_uring instance with its submission and completion queues mapped.
 ///
 /// The ring knows nothing about operations. Callers fill entries from
@@ -40,6 +68,8 @@ pub(crate) struct Ring {
     /// waiting for its sockets, or its timer, is not counted as waiting for
     /// a disk.
     wait_flags: u32,
+    /// How many times the ring has entered the kernel.
+    enters: u64,
     // Declared after the queues, which point into them, and before the
     // descriptor, so they are unmapped before it is closed.
     _rings: Mapping,
@@ -62,6 +92,9 @@ struct SubmissionQueue {
     /// consumes entries only while it is entered, there being no polling
     /// thread, so between entries this is the head, read once per entry.
     local_head: u32,
+    /// How many of the queued entries plug the block layer, as
+    /// [`Ring::note_queued`] counted them; see [`PLUG_BATCH`].
+    plugged: u32,
     /// The duration of each slot's linked timeout, which the slot's entry
     /// points to; see [`Ring::next_link_timeout`].
     link_timeouts: Box<[sys::__kernel_timespec]>,
@@ -147,6 +180,7 @@ impl Ring {
             sqes: sqes.ptr().cast(),
             local_tail: 0,
             local_head: 0,
+            plugged: 0,
             link_timeouts: vec![sys::__kernel_timespec::default(); params.sq_entries as usize]
                 .into_boxed_slice(),
         };
@@ -173,6 +207,7 @@ impl Ring {
             enter_fd,
             enter_flags,
             wait_flags,
+            enters: 0,
             _rings: rings,
             _sqes: sqes,
             fd,
@@ -284,7 +319,12 @@ impl Ring {
 
     /// Publishes the queued entries and enters the kernel, submitting them
     /// and waiting until `min_complete` completions are ready or `timeout`
-    /// passes. Returns the number of entries submitted.
+    /// passes. Returns the number of entries the last entry into the kernel
+    /// submitted.
+    ///
+    /// Entries that plug the block layer go in batches of [`PLUG_BATCH`],
+    /// each but the last in an entry of its own that waits for nothing; the
+    /// last goes with the rest.
     ///
     /// Always passes `IORING_ENTER_GETEVENTS`: a ring set up with
     /// `IORING_SETUP_DEFER_TASKRUN` only posts completions when asked to.
@@ -302,6 +342,10 @@ impl Ring {
     ) -> io::Result<u32> {
         // SAFETY: `sq.tail` points to the tail field in the live mapping.
         unsafe { atomic(self.sq.tail) }.store(self.sq.local_tail, Ordering::Release);
+        if self.sq.plugged > PLUG_BATCH {
+            // SAFETY: the caller vouches for the queued entries.
+            unsafe { self.submit_plug_batches() }?;
+        }
         let to_submit = self.queued();
         let mut flags = sys::IORING_ENTER_GETEVENTS | self.enter_flags;
         if min_complete > 0 {
@@ -321,21 +365,123 @@ impl Ring {
         };
         // SAFETY: the caller vouches for the queued entries, and `arg` and the
         // timeout it points to outlive the call.
+        let entered =
+            unsafe { self.enter_kernel(to_submit, min_complete, flags, arg_ptr, arg_len) };
+        if self.queued() == 0 {
+            self.sq.plugged = 0;
+        }
+        entered
+    }
+
+    /// Submits the queued entries in batches of at most [`PLUG_BATCH`] that
+    /// plug the block layer, each but the last in an entry into the kernel
+    /// of its own, and leaves the last for the caller's entry; see
+    /// [`Ring::first_plug_batch`]. Each entry waits for nothing, but runs
+    /// the completion work of what it submitted, as `IORING_ENTER_GETEVENTS`
+    /// has it, which a device that finishes inline leaves ready: an entry
+    /// runs at most 40 items of it unless asked to wait for more, room for a
+    /// batch's.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Ring::enter`].
+    unsafe fn submit_plug_batches(&mut self) -> io::Result<()> {
+        let flags = sys::IORING_ENTER_GETEVENTS | self.enter_flags;
+        while self.sq.plugged > PLUG_BATCH {
+            let Some((len, plugged)) = self.first_plug_batch() else {
+                break;
+            };
+            let head = self.sq.local_head;
+            // SAFETY: the caller vouches for the queued entries, and the call
+            // reads no argument.
+            unsafe { self.enter_kernel(len, 0, flags, ptr::null(), 0) }?;
+            if self.sq.local_head.wrapping_sub(head) != len {
+                // The kernel took fewer: the rest go in the caller's entry.
+                break;
+            }
+            self.sq.plugged = self.sq.plugged.saturating_sub(plugged);
+        }
+        Ok(())
+    }
+
+    /// The first batch of the queued entries, if they take more than one:
+    /// how many entries it holds, and how many of them plug the block layer.
+    /// It ends after the chain that holds its [`PLUG_BATCH`]th entry that
+    /// plugs, as the kernel links only entries submitted together; and if
+    /// no entry that plugs comes after that, the queued entries are one
+    /// batch.
+    fn first_plug_batch(&self) -> Option<(u32, u32)> {
+        let head = self.sq.local_head;
+        let mut position = head;
+        let mut plugged = 0;
+        let mut end: Option<u32> = None;
+        while position != self.sq.local_tail {
+            let sqe = self
+                .sq
+                .sqes
+                .wrapping_add((position & self.sq.mask) as usize);
+            // SAFETY: the entry lies between the head and the tail: written,
+            // and not yet taken by the kernel, which only ever reads entries.
+            let sqe = unsafe { &*sqe };
+            position = position.wrapping_add(1);
+            let plug = plugs(sqe.opcode);
+            match end {
+                Some(end) if plug => return Some((end.wrapping_sub(head), plugged)),
+                Some(_) => {}
+                None => {
+                    plugged += u32::from(plug);
+                    let linked = sqe.flags & (sys::IOSQE_IO_LINK | sys::IOSQE_IO_HARDLINK) != 0;
+                    if plugged >= PLUG_BATCH && !linked {
+                        end = Some(position);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Enters the kernel, counting the entry, and reads where it left the
+    /// submission queue's head.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Ring::enter`], for the first `to_submit` queued entries; and
+    /// `arg` must point to `arg_len` bytes for the call to read, as `flags`
+    /// describe them.
+    unsafe fn enter_kernel(
+        &mut self,
+        to_submit: u32,
+        min_complete: u32,
+        flags: u32,
+        arg: *const c_void,
+        arg_len: usize,
+    ) -> io::Result<u32> {
+        self.enters += 1;
+        // SAFETY: the caller's contract.
         let entered = unsafe {
-            sys::io_uring_enter(
-                self.enter_fd,
-                to_submit,
-                min_complete,
-                flags,
-                arg_ptr,
-                arg_len,
-            )
+            sys::io_uring_enter(self.enter_fd, to_submit, min_complete, flags, arg, arg_len)
         };
         // Read whether or not the call failed: it may have consumed entries
         // before failing.
         // SAFETY: `sq.head` points to the head field in the live mapping.
         self.sq.local_head = unsafe { atomic(self.sq.head) }.load(Ordering::Acquire);
         entered
+    }
+
+    /// Counts the entry just queued, with `opcode`, toward those that plug
+    /// the block layer, which [`Ring::enter`] submits in batches; an entry
+    /// left uncounted only goes in a larger batch.
+    #[inline]
+    pub(crate) fn note_queued(&mut self, opcode: u8) {
+        if plugs(opcode) {
+            self.sq.plugged += 1;
+        }
+    }
+
+    /// How many times the ring has entered the kernel.
+    #[inline]
+    pub(crate) fn enters(&self) -> u64 {
+        self.enters
     }
 
     /// Whether the kernel has posted completions that have not been popped.
@@ -481,6 +627,21 @@ mod tests {
         sqe.user_data = user_data;
     }
 
+    /// Queues a read of one byte from `fd` to `addr`, linked to the next
+    /// entry if `linked`, and counts it as the driver counts an operation's.
+    fn queue_read(ring: &mut Ring, fd: c_int, addr: u64, user_data: u64, linked: bool) {
+        let sqe = ring.next_sqe().expect("a free entry");
+        sqe.opcode = sys::IORING_OP_READ;
+        sqe.fd = fd;
+        sqe.addr = addr;
+        sqe.len = 1;
+        sqe.user_data = user_data;
+        if linked {
+            sqe.flags = sys::IOSQE_IO_LINK;
+        }
+        ring.note_queued(sys::IORING_OP_READ);
+    }
+
     /// Submits the queued no-ops and returns the `user_data` of `n`
     /// completions, in order.
     fn complete(ring: &mut Ring, n: u32) -> Vec<u64> {
@@ -552,6 +713,57 @@ mod tests {
         let err = unsafe { ring.enter(1, Some(&timeout)) }.unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ETIME));
         assert!(start.elapsed() >= Duration::from_millis(10));
+    }
+
+    /// A batch of reads ends after its 32nd, or after the chain that holds
+    /// it, and only if another read comes after.
+    #[test]
+    fn plug_batches_end_where_chains_do() {
+        let mut ring = ring(64, FLAGS);
+        for user_data in 0..31 {
+            queue_read(&mut ring, -1, 0, user_data, false);
+        }
+        // A chain of three, whose first entry is the 32nd read.
+        for user_data in 31..34 {
+            queue_read(&mut ring, -1, 0, user_data, user_data < 33);
+        }
+        assert_eq!(ring.first_plug_batch(), None, "no read comes after");
+        for user_data in 34..40 {
+            queue_nop(&mut ring, user_data);
+        }
+        assert_eq!(ring.first_plug_batch(), None, "no-ops plug nothing");
+        queue_read(&mut ring, -1, 0, 40, false);
+        assert_eq!(ring.first_plug_batch(), Some((34, 34)));
+        // Dropped unsubmitted: none of these reaches the kernel.
+    }
+
+    /// Reads beyond a block plug's batch go in entries into the kernel of
+    /// their own, and every one completes.
+    #[test]
+    fn reads_beyond_a_plug_batch_go_in_entries_of_their_own() {
+        let zero = std::fs::File::open("/dev/zero").unwrap();
+        let mut ring = ring(128, FLAGS);
+        let mut bytes = [1_u8; 80];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let addr = ptr::from_mut(byte).expose_provenance() as u64;
+            queue_read(&mut ring, zero.as_raw_fd(), addr, index as u64, false);
+        }
+        // SAFETY: each read points to a byte of `bytes`, which outlives the
+        // reads, as the entry waits for all of them to complete.
+        unsafe { ring.enter(80, None) }.unwrap();
+        // 32, 32, and the 16 that go with the entry that waits.
+        assert_eq!(ring.enters(), 3);
+        assert_eq!(ring.queued(), 0);
+        let mut done: Vec<u64> = ring
+            .completions()
+            .map(|cqe| {
+                assert_eq!(cqe.res, 1);
+                cqe.user_data
+            })
+            .collect();
+        done.sort_unstable();
+        assert_eq!(done, (0..80).collect::<Vec<_>>());
+        assert!(bytes.iter().all(|&byte| byte == 0));
     }
 
     /// A thread can register only 16 rings, so if dropping a ring did not

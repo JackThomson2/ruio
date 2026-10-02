@@ -2,12 +2,14 @@
 
 mod support;
 
+use std::fs::File;
 use std::future::Future;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use ruio_driver::ops::Nop;
+use ruio_driver::ops::{Nop, Read};
 use ruio_driver::{Driver, Op};
 
 use support::{Counter, block_on, poll_once, settle};
@@ -61,6 +63,32 @@ fn a_full_submission_queue_is_submitted_early() {
         assert!(matches!(poll_once(op), Poll::Ready(Ok(()))));
     }
     assert_eq!(driver.stats().completions, 100);
+}
+
+/// Eighty reads queued at once reach the kernel in three entries, of 32,
+/// 32 and the rest, as a block plug takes 32 at a time; and all complete.
+#[test]
+fn reads_beyond_a_plug_batch_are_submitted_in_batches() {
+    let zero = File::open("/dev/zero").unwrap();
+    let driver = Driver::builder().entries(128).build().unwrap();
+    let mut ops: Vec<_> = (0..80)
+        .map(|_| driver.op(Read::at(zero.as_raw_fd(), Vec::with_capacity(1), 0)))
+        .collect();
+    for op in &mut ops {
+        assert!(poll_once(op).is_pending());
+    }
+    assert_eq!(driver.stats().enters, 0);
+    driver.submit().unwrap();
+    assert_eq!(driver.stats().enters, 3);
+
+    settle(&driver);
+    for op in &mut ops {
+        let Poll::Ready((read, buf)) = poll_once(op) else {
+            panic!("a read is still pending");
+        };
+        assert_eq!(read.unwrap(), 1);
+        assert_eq!(buf, [0]);
+    }
 }
 
 #[test]
