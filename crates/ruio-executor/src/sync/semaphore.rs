@@ -190,6 +190,7 @@ impl Semaphore {
     }
 
     /// Gives back `permits` permits, and wakes the waiters they go to.
+    #[inline]
     fn release(&self, permits: usize) {
         if permits == 0 {
             return;
@@ -242,6 +243,7 @@ impl Wait {
     /// # Panics
     ///
     /// If the acquire has its permits already.
+    #[inline]
     fn poll(&mut self, semaphore: &Semaphore, cx: &mut Context<'_>) -> Poll<()> {
         assert!(!self.done, "an acquire polled after it completed");
         let proceed = ready!(coop::poll_proceed(cx));
@@ -283,6 +285,7 @@ impl Wait {
 
     /// Leaves the queue, giving back the permits set aside for the waiter,
     /// if any, and letting the waiters behind it have what it held up.
+    #[inline]
     fn cancel(&mut self, semaphore: &Semaphore) {
         let Some(ticket) = self.ticket.take() else {
             return;
@@ -314,6 +317,7 @@ pub struct Acquire<'a> {
 impl<'a> Future for Acquire<'a> {
     type Output = SemaphorePermit<'a>;
 
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         ready!(this.wait.poll(this.semaphore, cx));
@@ -325,6 +329,7 @@ impl<'a> Future for Acquire<'a> {
 }
 
 impl Drop for Acquire<'_> {
+    #[inline]
     fn drop(&mut self) {
         self.wait.cancel(self.semaphore);
     }
@@ -401,6 +406,7 @@ impl SemaphorePermit<'_> {
 }
 
 impl Drop for SemaphorePermit<'_> {
+    #[inline]
     fn drop(&mut self) {
         self.semaphore.release(self.permits);
     }

@@ -55,12 +55,14 @@ impl Timers {
 
     /// When the wheel next has work, on `CLOCK_MONOTONIC`: the deadline to
     /// wake the ring at.
+    #[inline]
     pub(crate) fn next_deadline(&self) -> Option<Duration> {
         let next = self.next.get()?;
         Some(self.start_monotonic + next.saturating_duration_since(self.start))
     }
 
     /// Records when the wheel next has work, after a change to it.
+    #[inline]
     fn refresh(&self, wheel: &Wheel) {
         let next = wheel
             .next_expiration()
@@ -76,11 +78,13 @@ impl Timers {
 
     /// The first tick that begins at or after `deadline`, so a timer never
     /// fires early.
+    #[inline]
     fn tick_after(&self, deadline: Instant) -> u64 {
         let nanos = deadline.saturating_duration_since(self.start).as_nanos();
         u64::try_from(nanos.div_ceil(1_000_000)).unwrap_or(u64::MAX)
     }
 
+    #[inline]
     fn insert(&self, deadline: Instant, waker: Waker) -> Key {
         let mut wheel = self.wheel.borrow_mut();
         let tick = self.tick_after(deadline).max(wheel.elapsed() + 1);
@@ -91,6 +95,7 @@ impl Timers {
 
     /// Removes a timer, fired or not. Returns its waker, if it still had one,
     /// for the caller to drop after releasing the wheel.
+    #[inline]
     pub(crate) fn remove(&self, key: Key) -> Option<Waker> {
         let mut wheel = self.wheel.borrow_mut();
         let waker = wheel.remove(key);
@@ -161,6 +166,7 @@ impl Sleep {
     }
 
     /// Whether the deadline has passed.
+    #[inline]
     pub fn is_elapsed(&self) -> bool {
         Instant::now() >= self.deadline
     }
@@ -171,6 +177,7 @@ impl Sleep {
         self.disarm();
     }
 
+    #[inline]
     fn disarm(&mut self) {
         let Some(Armed { owner, key }) = self.timer.take() else {
             return;
@@ -191,6 +198,7 @@ impl Future for Sleep {
     /// # Panics
     ///
     /// If the sleep has not ended and the thread is not inside a runtime.
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         if this.is_elapsed() {
@@ -223,6 +231,7 @@ impl Future for Sleep {
 }
 
 impl Drop for Sleep {
+    #[inline]
     fn drop(&mut self) {
         self.disarm();
     }

@@ -92,6 +92,7 @@ where
 /// # Panics
 ///
 /// If the thread is not inside [`Runtime::block_on`].
+#[inline]
 pub fn driver() -> Driver {
     try_driver().expect(OUTSIDE)
 }
@@ -99,6 +100,7 @@ pub fn driver() -> Driver {
 /// The io_uring driver of the thread's runtime, or `None` if the thread is
 /// not inside one, as when code that may run anywhere, such as a
 /// destructor, has I/O for the ring if there is one.
+#[inline]
 pub fn try_driver() -> Option<Driver> {
     context::current().map(|scheduler| scheduler.driver().clone())
 }

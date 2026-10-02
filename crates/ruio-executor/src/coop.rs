@@ -24,11 +24,13 @@ thread_local! {
 
 /// Runs `poll`, a poll of a task or of the future given to `block_on`,
 /// with a full budget, and gives the thread back the budget it had before.
+#[inline]
 pub(crate) fn budgeted<R>(poll: impl FnOnce() -> R) -> R {
     /// Restores the budget before, even if the poll panics.
     struct Restore(Option<u32>);
 
     impl Drop for Restore {
+        #[inline]
         fn drop(&mut self) {
             let _ = LEFT.try_with(|left| left.set(self.0));
         }
@@ -42,6 +44,7 @@ pub(crate) fn budgeted<R>(poll: impl FnOnce() -> R) -> R {
 /// Ready if the poll may take a step, which the primitive then spends with
 /// [`Proceed::made_progress`] if it does make progress; otherwise wakes the
 /// task, so that it is polled again after the others, and is `Pending`.
+#[inline]
 pub(crate) fn poll_proceed(cx: &mut Context<'_>) -> Poll<Proceed> {
     if LEFT.try_with(Cell::get).ok().flatten() == Some(0) {
         cx.waker().wake_by_ref();
@@ -55,6 +58,7 @@ pub(crate) struct Proceed(());
 
 impl Proceed {
     /// Spends the step, for a primitive that was ready.
+    #[inline]
     pub(crate) fn made_progress(self) {
         let _ = LEFT.try_with(|left| {
             if let Some(steps) = left.get() {

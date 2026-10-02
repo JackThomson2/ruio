@@ -60,6 +60,7 @@ impl Drop for Enter {
 }
 
 /// The thread's current scheduler.
+#[inline]
 pub(crate) fn current() -> Option<Rc<Scheduler>> {
     CURRENT
         .try_with(|current| current.borrow().clone())
@@ -69,6 +70,7 @@ pub(crate) fn current() -> Option<Rc<Scheduler>> {
 
 /// Runs `f` with the thread's current scheduler, if the thread is inside a
 /// runtime.
+#[inline]
 pub(crate) fn with_current<R>(f: impl FnOnce(&Scheduler) -> R) -> Option<R> {
     let scheduler = ACTIVE.try_with(Cell::get).unwrap_or(ptr::null());
     if scheduler.is_null() {
@@ -84,6 +86,7 @@ pub(crate) fn with_current<R>(f: impl FnOnce(&Scheduler) -> R) -> Option<R> {
 /// shared part is at `owner`: the owner of what the address was taken from.
 /// Compared by address, so that the caller need not keep a reference to the
 /// shared part alive across `f`.
+#[inline]
 pub(crate) fn with_owner<R>(owner: *const Shared, f: impl FnOnce(&Scheduler) -> R) -> Option<R> {
     with_current(|scheduler| ptr::eq(Arc::as_ptr(scheduler.shared()), owner).then(|| f(scheduler)))
         .flatten()

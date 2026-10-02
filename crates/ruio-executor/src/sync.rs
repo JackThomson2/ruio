@@ -32,11 +32,13 @@ pub use semaphore::{Acquire, AcquireOwned, OwnedSemaphorePermit, Semaphore, Sema
 
 /// Locks `mutex`, whose data no panic can leave half-changed: every critical
 /// section here only moves values in and out.
+#[inline]
 fn lock<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Keeps `cx`'s waker in `slot`, cloning it only if it is another task's.
+#[inline]
 fn register(slot: &mut Option<Waker>, cx: &Context<'_>) {
     match slot {
         Some(waker) if waker.will_wake(cx.waker()) => {}

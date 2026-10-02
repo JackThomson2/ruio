@@ -37,13 +37,15 @@ use crate::{context, coop};
 #[repr(C)]
 pub(crate) struct Task<F: Future> {
     header: Header,
-    // The fields below are only used on the thread that spawned the task.
-    stage: RefCell<Stage<F>>,
-    join_waker: Cell<Option<Waker>>,
-    /// Set when the `JoinHandle` is dropped: the output has no one to go to.
-    detached: Cell<bool>,
+    // The fields below are only used on the thread that spawned the task;
+    // the small ones before the future, which can be large, so that a run
+    // finds them beside the header.
     /// Set by `JoinHandle::abort`.
     aborted: Cell<bool>,
+    /// Set when the `JoinHandle` is dropped: the output has no one to go to.
+    detached: Cell<bool>,
+    join_waker: Cell<JoinWaker>,
+    stage: RefCell<Stage<F>>,
 }
 
 enum Stage<F: Future> {
@@ -97,6 +99,7 @@ const MAIN: usize = usize::MAX;
 impl Header {
     /// Marks the task queued to run, unless it is already: whether the caller
     /// is to queue it. Only on the task's thread.
+    #[inline]
     fn claim(&self) -> bool {
         !self.queued.replace(true)
     }
@@ -104,6 +107,7 @@ impl Header {
     /// Whether this is the header of the future given to `block_on`, which
     /// its loop polls once it is marked queued, rather than a run of the
     /// scheduler's. Only on the task's thread.
+    #[inline]
     fn is_main(&self) -> bool {
         self.index.get() == MAIN
     }
@@ -125,6 +129,7 @@ impl LocalRef {
     ///
     /// `header` must be the header of a live task on this thread, counting a
     /// local reference that nothing else lets go of.
+    #[inline]
     unsafe fn from_raw(header: *const Header) -> Self {
         Self {
             // SAFETY: a live task's header is not null.
@@ -139,6 +144,7 @@ impl LocalRef {
     /// # Safety
     ///
     /// `header` must be the header of a live task on this thread.
+    #[inline]
     unsafe fn retain(header: *const Header) -> Self {
         // SAFETY: the task is alive, and this is its thread.
         let task = unsafe { &*header };
@@ -154,6 +160,7 @@ impl LocalRef {
     /// Makes a reference from anywhere a local one: the first local
     /// reference, when the task has none, takes it over as the share, and a
     /// later one lets it go.
+    #[inline]
     pub(crate) fn adopt(remote: RemoteRef) -> Self {
         let header = remote.header.as_ptr();
         // SAFETY: the remote reference keeps the task alive, and this is its
@@ -170,18 +177,40 @@ impl LocalRef {
         unsafe { Self::from_raw(header) }
     }
 
+    #[inline]
     fn header(&self) -> &Header {
         // SAFETY: the reference keeps the task alive.
         unsafe { self.header.as_ref() }
     }
 
     /// The task's header, as wakers and the scheduler name the task.
+    #[inline]
     pub(crate) fn as_ptr(&self) -> *const Header {
         self.header.as_ptr()
     }
 
+    /// Queues the task to run, consuming the reference, as a wake does: on
+    /// its scheduler's run queue, by this reference, if that is the runtime
+    /// running on this thread, and otherwise on its remote queue.
+    #[inline]
+    fn wake(self) {
+        let owner = Arc::as_ptr(&self.header().shared);
+        let mut task = Some(self);
+        context::with_owner(owner, |scheduler| {
+            let task = task.take().expect("the reference is still held");
+            if task.header().claim() && !task.header().is_main() {
+                scheduler.schedule(task);
+            }
+        });
+        if let Some(task) = task {
+            // SAFETY: the local reference keeps the task alive.
+            unsafe { RemoteRef::retain(task.as_ptr()) }.wake_remote();
+        }
+    }
+
     /// Polls the task, finishing it if its future completes or it was
     /// aborted.
+    #[inline]
     pub(crate) fn run(&self, scheduler: &Scheduler) {
         // SAFETY: the reference keeps the task alive, and the vtable is the
         // task's own.
@@ -197,6 +226,7 @@ impl LocalRef {
 }
 
 impl Clone for LocalRef {
+    #[inline]
     fn clone(&self) -> Self {
         // SAFETY: the reference keeps the task alive, on this thread.
         unsafe { Self::retain(self.as_ptr()) }
@@ -204,6 +234,7 @@ impl Clone for LocalRef {
 }
 
 impl Drop for LocalRef {
+    #[inline]
     fn drop(&mut self) {
         let task = self.header();
         let left = task.local.get() - 1;
@@ -211,7 +242,7 @@ impl Drop for LocalRef {
         if left == 0 {
             // The last local reference lets the share go.
             // SAFETY: the share is one of the atomic count.
-            unsafe { release(self.as_ptr()) };
+            unsafe { release_share(self.as_ptr()) };
         }
     }
 }
@@ -239,6 +270,7 @@ impl RemoteRef {
     ///
     /// `header` must be the header of a live task, counting an atomic
     /// reference that nothing else lets go of.
+    #[inline]
     unsafe fn from_raw(header: *const Header) -> Self {
         Self {
             // SAFETY: a live task's header is not null.
@@ -251,6 +283,7 @@ impl RemoteRef {
     /// # Safety
     ///
     /// `header` must be the header of a live task.
+    #[inline]
     unsafe fn retain(header: *const Header) -> Self {
         // SAFETY: the task is alive.
         unsafe { (*header).strong.fetch_add(1, Ordering::Relaxed) };
@@ -258,6 +291,7 @@ impl RemoteRef {
         unsafe { Self::from_raw(header) }
     }
 
+    #[inline]
     fn header(&self) -> &Header {
         // SAFETY: the reference keeps the task alive.
         unsafe { self.header.as_ref() }
@@ -266,12 +300,14 @@ impl RemoteRef {
     /// Marks the task queued to run, unless it is already: whether the caller
     /// is to queue it. Only on the task's thread, as the scheduler takes its
     /// remote queue.
+    #[inline]
     pub(crate) fn claim(&self) -> bool {
         self.header().claim()
     }
 
     /// Queues the task to run, consuming the reference: on its scheduler's
     /// run queue if this is its thread, and on the remote queue otherwise.
+    #[inline]
     fn wake(self) {
         let header = self.header.as_ptr();
         // The owner's address alone: the reference may be let go of below,
@@ -305,6 +341,7 @@ impl RemoteRef {
 }
 
 impl Clone for RemoteRef {
+    #[inline]
     fn clone(&self) -> Self {
         // SAFETY: the reference keeps the task alive.
         unsafe { Self::retain(self.header.as_ptr()) }
@@ -312,6 +349,7 @@ impl Clone for RemoteRef {
 }
 
 impl Drop for RemoteRef {
+    #[inline]
     fn drop(&mut self) {
         // SAFETY: the reference is one of the atomic count.
         unsafe { release(self.header.as_ptr()) };
@@ -325,16 +363,52 @@ impl Drop for RemoteRef {
 ///
 /// `header` must be the header of a live task, counting an atomic reference
 /// that nothing else lets go of.
+#[inline]
 unsafe fn release(header: *const Header) {
     // SAFETY: the task is alive.
     let task = unsafe { &*header };
     if task.strong.fetch_sub(1, Ordering::Release) == 1 {
         atomic::fence(Ordering::Acquire);
-        let dealloc = task.vtable.dealloc;
-        // SAFETY: the last reference is gone, so nothing reaches the task
-        // again; the vtable is the task's own.
-        unsafe { dealloc(header) };
+        // SAFETY: the last reference is gone.
+        unsafe { free(header) };
     }
+}
+
+/// Lets go of the share, as the last local reference goes, freeing the task
+/// if it was the last reference: as it usually is, the task having
+/// finished with no waker of it held elsewhere. Then it takes no
+/// read-modify-write: taking a reference takes one already held, so with
+/// no other held, nothing counts meanwhile, and the acquire load sees what
+/// the threads that let theirs go did.
+///
+/// # Safety
+///
+/// As for [`release`], for the share.
+#[cold]
+unsafe fn release_share(header: *const Header) {
+    // SAFETY: the task is alive.
+    let task = unsafe { &*header };
+    if task.strong.load(Ordering::Acquire) == 1 {
+        // SAFETY: the share was the last reference.
+        unsafe { free(header) };
+    } else {
+        // SAFETY: the share is one of the atomic count.
+        unsafe { release(header) };
+    }
+}
+
+/// Frees the task at `header`.
+///
+/// # Safety
+///
+/// `header` must be the header of a live task whose last reference is gone,
+/// so that nothing reaches the task again.
+#[inline]
+unsafe fn free(header: *const Header) {
+    // SAFETY: the task is alive.
+    let dealloc = unsafe { (*header).vtable.dealloc };
+    // SAFETY: nothing reaches the task again; the vtable is the task's own.
+    unsafe { dealloc(header) };
 }
 
 /// Queues the task at `header` to run, as a wake by reference does: on its
@@ -344,6 +418,7 @@ unsafe fn release(header: *const Header) {
 /// # Safety
 ///
 /// `header` must be the header of a live task.
+#[inline]
 unsafe fn wake_by_ref(header: *const Header) {
     // SAFETY: the task is alive.
     let task = unsafe { &*header };
@@ -368,6 +443,7 @@ unsafe fn wake_by_ref(header: *const Header) {
 static WAKER: RawWakerVTable =
     RawWakerVTable::new(clone_waker, wake_waker, wake_waker_by_ref, drop_waker);
 
+#[inline]
 unsafe fn clone_waker(header: *const ()) -> RawWaker {
     // SAFETY: the waker holds a reference, so the task is alive.
     unsafe {
@@ -378,16 +454,19 @@ unsafe fn clone_waker(header: *const ()) -> RawWaker {
     RawWaker::new(header, &WAKER)
 }
 
+#[inline]
 unsafe fn wake_waker(header: *const ()) {
     // SAFETY: waking consumes the waker, and so its reference.
     unsafe { RemoteRef::from_raw(header.cast()) }.wake();
 }
 
+#[inline]
 unsafe fn wake_waker_by_ref(header: *const ()) {
     // SAFETY: the waker holds a reference, so the task is alive.
     unsafe { wake_by_ref(header.cast()) };
 }
 
+#[inline]
 unsafe fn drop_waker(header: *const ()) {
     // SAFETY: dropping the waker releases its reference.
     unsafe { release(header.cast()) };
@@ -407,6 +486,7 @@ pub(crate) const LOCAL_WAKER: LocalWaker = LocalWaker {
 /// touch its local count: every task's wakers share the vtable the driver
 /// knows them by, and a waker sent to another thread can be used to poll an
 /// operation there.
+#[inline]
 unsafe fn retain_local(header: *const ()) -> bool {
     let header = header.cast::<Header>();
     // SAFETY: the waker the driver was given holds a reference, or borrows
@@ -419,9 +499,63 @@ unsafe fn retain_local(header: *const ()) -> bool {
     .is_some()
 }
 
+#[inline]
 unsafe fn release_local(header: *const ()) {
     // SAFETY: the reference `retain_local` counted, on the task's thread.
     drop(unsafe { LocalRef::from_raw(header.cast()) });
+}
+
+/// Who a task wakes as it finishes: the one awaiting its handle, held by a
+/// local reference if that is a task of the runtime running on this thread,
+/// as an awaiter almost always is, so that holding and waking it take no
+/// atomic operation; and otherwise by its waker.
+#[derive(Default)]
+enum JoinWaker {
+    #[default]
+    None,
+    Local(LocalRef),
+    Foreign(Waker),
+}
+
+impl JoinWaker {
+    /// How to wake the task `waker` wakes.
+    #[inline]
+    fn of(waker: &Waker) -> Self {
+        if ptr::eq(waker.vtable(), &WAKER) {
+            let header = waker.data().cast::<Header>();
+            // SAFETY: a waker with the tasks' vtable names a live task, which
+            // it holds a reference to, or borrows a run's.
+            let owner = Arc::as_ptr(unsafe { &(*header).shared });
+            // SAFETY: the task is alive, and, its runtime running on this
+            // thread, it is of this thread.
+            let local = context::with_owner(owner, |_| unsafe { LocalRef::retain(header) });
+            if let Some(task) = local {
+                return JoinWaker::Local(task);
+            }
+        }
+        JoinWaker::Foreign(waker.clone())
+    }
+
+    /// Whether this wakes the task `waker` does.
+    #[inline]
+    fn will_wake(&self, waker: &Waker) -> bool {
+        match self {
+            JoinWaker::None => false,
+            JoinWaker::Local(task) => {
+                ptr::eq(waker.data(), task.as_ptr().cast()) && ptr::eq(waker.vtable(), &WAKER)
+            }
+            JoinWaker::Foreign(current) => current.will_wake(waker),
+        }
+    }
+
+    #[inline]
+    fn wake(self) {
+        match self {
+            JoinWaker::None => {}
+            JoinWaker::Local(task) => task.wake(),
+            JoinWaker::Foreign(waker) => waker.wake(),
+        }
+    }
 }
 
 /// What the header of the future given to `block_on` does when asked what a
@@ -483,6 +617,7 @@ impl Main {
 
     /// Whether the future has been woken since this was last asked, and so
     /// is to be polled; a wake during the poll marks it again.
+    #[inline]
     pub(crate) fn take_wake(&self) -> bool {
         let header = self.task.header();
         if !header.queued.replace(false) {
@@ -497,6 +632,7 @@ impl Main {
     }
 
     /// Whether the future has been woken, and is to be polled.
+    #[inline]
     pub(crate) fn is_woken(&self) -> bool {
         self.task.header().queued.get()
     }
@@ -550,7 +686,7 @@ where
                 index: Cell::new(0),
             },
             stage: RefCell::new(Stage::Running(future)),
-            join_waker: Cell::new(None),
+            join_waker: Cell::new(JoinWaker::None),
             detached: Cell::new(false),
             aborted: Cell::new(false),
         });
@@ -578,9 +714,7 @@ where
                 *stage = Stage::Finished(result);
             }
         }));
-        if let Some(waker) = self.join_waker.take() {
-            waker.wake();
-        }
+        self.join_waker.take().wake();
     }
 
     unsafe fn run(header: *const Header, scheduler: &Scheduler) {
@@ -672,7 +806,15 @@ where
     unsafe fn dealloc(header: *const Header) {
         // SAFETY: the vtable's contract, and the header is the first field
         // of the `#[repr(C)]` task the box held.
-        drop(unsafe { Box::from_raw(header.cast_mut().cast::<Self>()) });
+        let task = unsafe { Box::from_raw(header.cast_mut().cast::<Self>()) };
+        // A task finishes, and wakes its awaiter, before its last reference
+        // can go. Were one still held, it is a reference of the awaiter's
+        // thread, which this may not be: leaking it is safe.
+        if let JoinWaker::Local(awaiter) = task.join_waker.take() {
+            debug_assert!(false, "a task is freed with its awaiter still held");
+            mem::forget(awaiter);
+        }
+        drop(task);
     }
 
     unsafe fn poll_join(
@@ -686,11 +828,12 @@ where
         match &*stage {
             Stage::Running(_) => {
                 let current = this.join_waker.take();
-                let waker = match current {
-                    Some(current) if current.will_wake(cx.waker()) => current,
-                    _ => cx.waker().clone(),
+                let waker = if current.will_wake(cx.waker()) {
+                    current
+                } else {
+                    JoinWaker::of(cx.waker())
                 };
-                this.join_waker.set(Some(waker));
+                this.join_waker.set(waker);
                 Poll::Pending
             }
             Stage::Finished(_) => match mem::replace(&mut *stage, Stage::Consumed) {

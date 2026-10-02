@@ -134,6 +134,7 @@ struct Tasks {
 }
 
 impl Tasks {
+    #[inline]
     fn insert(&mut self, task: LocalRef) -> usize {
         match self.free.pop() {
             Some(index) => {
@@ -147,6 +148,7 @@ impl Tasks {
         }
     }
 
+    #[inline]
     fn remove(&mut self, index: usize) -> Option<LocalRef> {
         let task = self.slots.get_mut(index)?.take()?;
         self.free.push(index);
@@ -217,14 +219,17 @@ impl Scheduler {
         }
     }
 
+    #[inline]
     pub(crate) fn timers(&self) -> &Timers {
         &self.timers
     }
 
+    #[inline]
     pub(crate) fn driver(&self) -> &Driver {
         &self.driver
     }
 
+    #[inline]
     pub(crate) fn shared(&self) -> &Arc<Shared> {
         &self.shared
     }
@@ -238,11 +243,13 @@ impl Scheduler {
     }
 
     /// Takes ownership of a new task and returns its index.
+    #[inline]
     pub(crate) fn adopt(&self, task: LocalRef) -> usize {
         self.tasks.borrow_mut().insert(task)
     }
 
     /// Lets go of a finished task.
+    #[inline]
     pub(crate) fn release(&self, index: usize) {
         let task = self.tasks.borrow_mut().remove(index);
         drop(task);
@@ -251,6 +258,7 @@ impl Scheduler {
     /// Queues a woken task. One woken by the running task, other than
     /// itself, takes the LIFO slot; the task it displaces, and any other,
     /// joins the back of the queue.
+    #[inline]
     pub(crate) fn schedule(&self, task: LocalRef) {
         let running = self.running.get();
         let task = if !running.is_null() && !ptr::eq(task.as_ptr().cast::<()>(), running) {
@@ -265,11 +273,13 @@ impl Scheduler {
     }
 
     /// Queues a new task, at the back of the queue.
+    #[inline]
     pub(crate) fn schedule_new(&self, task: LocalRef) {
         self.queue.borrow_mut().push_back(task);
     }
 
     /// The next task to run: the LIFO slot's, unless it has had its share.
+    #[inline]
     fn next_task(&self) -> Option<LocalRef> {
         let lifo = self.lifo.borrow_mut().take();
         if let Some(task) = lifo {
@@ -283,6 +293,7 @@ impl Scheduler {
         self.queue.borrow_mut().pop_front()
     }
 
+    #[inline]
     fn has_ready_tasks(&self) -> bool {
         !self.queue.borrow().is_empty() || self.lifo.borrow().is_some()
     }
@@ -374,6 +385,7 @@ impl Scheduler {
     }
 
     /// Fires the timers due, once the ring's timer has said some may be.
+    #[inline]
     fn fire_timers(&self) {
         if self.driver.timer_fired() {
             self.timers.fire(Instant::now());
@@ -383,12 +395,18 @@ impl Scheduler {
     /// Moves the tasks woken on other threads into the run queue, removes
     /// the timers let go of there, and makes the tasks spawned from other
     /// threads.
+    #[inline]
     fn take_remote(&self) {
         // Anything queued after the check sets the flag again, and unparks
         // the ring: the next turn takes it.
-        if !self.shared.pending.load(Ordering::Acquire) {
-            return;
+        if self.shared.pending.load(Ordering::Acquire) {
+            self.take_pending();
         }
+    }
+
+    /// What [`Scheduler::take_remote`] takes, once the flag says that
+    /// something may have been queued.
+    fn take_pending(&self) {
         self.shared.pending.store(false, Ordering::Relaxed);
         let (timers, spawns) = {
             let mut remote = self.shared.lock();
