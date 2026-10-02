@@ -204,9 +204,12 @@ its own flag set.
 - `Op::detach` hands an operation to the driver to finish with nobody
   waiting: it becomes an orphan, as a dropped `Op`'s does, but is not
   cancelled, and a timed one still completes with `ETIMEDOUT`. An operation
-  that should say how it went records that in its `complete`. `Op::into_inner`
-  gives back an operation that has not been submitted, which
-  `Completion::from_error` can then fail, handing back its buffers.
+  that should say how it went records that in its `complete`.
+  `Driver::detach_chain` does the same for several, queued linked as a
+  `Link` is, so the kernel runs them in order and a failure cancels the
+  rest. `Op::into_inner` gives back an operation that has not been
+  submitted, which `Completion::from_error` can then fail, handing back its
+  buffers.
 
 ### Operations
 
@@ -261,10 +264,12 @@ its own flag set.
 - `RecvStream` keeps a multishot receive into a pool armed, asking for
   bundles (`IORING_RECVSEND_BUNDLE`), so each item is all the data one
   receive found waiting, in as many buffers as it needed. When the kernel
-  ends the receive with `ENOBUFS` it waits for a lease to return a buffer
-  (the pool wakes waiters), and when the kernel ends it for its own reasons
-  it re-arms at once. The data waits in the socket meanwhile, so none is
-  lost. The kernel does not bundle a request's first receive, not knowing
+  ends the receive with `ENOBUFS` it waits for a lease to return a buffer,
+  and when the kernel ends it for its own reasons it re-arms at once. The
+  data waits in the socket meanwhile, so none is lost. Each buffer that
+  returns to a pool wakes one waiting stream, the first to have asked:
+  woken all at once, every one would ask the kernel again for the one
+  buffer, and all but one would starve again. The kernel does not bundle a request's first receive, not knowing
   yet how much is waiting.
   `ReadStream` keeps a multishot read into a pool armed the same way, one
   buffer to a read, for files the kernel can poll: pipes, FIFOs and
@@ -454,9 +459,19 @@ baseline are used only when probed.
 - A stream's `write_behind` writes with a detached vectored send, and
   resolves once the send is on its way; the driver drops the buffers when the
   kernel is done. A task echoing what it receives is so polled once per
-  message rather than twice. The stream's writes stay in order, one at a
-  time: a write behind, every other write and `shutdown` first wait for the
-  write behind in flight. Nobody waits for a write behind, so its failure
+  message rather than twice. While the thread waits on one peer at a time,
+  as a single connection's does, which the ring's last turn delivering one
+  completion tells (`Driver::completions_last_turn`), a write of more than
+  32 KiB goes as a chain of up to four linked sends, the first of 32 KiB
+  each and the last of the rest, so that the peer receives the first while
+  the kernel still copies the rest, as it would receive the writes of a
+  stream that sends what it has as it goes; a send that fails cancels those
+  after it. Under load a write goes as one send whatever its size: each send
+  costs the kernel a transmit and the peer a wake-up, which pay only while
+  the thread would otherwise wait for the peer (see [TCP echo](#tcp-echo)).
+  The stream's writes stay in order, one at a time: a write behind, every
+  other write and `shutdown` first wait for the write behind in flight, all
+  of its sends. Nobody waits for a write behind, so its failure
   comes out later: it fails every write after it, handing buffers back
   unsent, as the stream now has a gap, and `flush` waits for it and reports
   it. The kernel reports a `MSG_WAITALL` send it stopped short as the bytes
@@ -576,7 +591,10 @@ traits need none of tokio's runtime.
 - A write copies up to 256 KiB of the caller's bytes and writes them behind
   the stream: done, as far as the caller can tell, once the send is on its
   way. The next write waits for it, and a failure fails the writes, flushes
-  and closes after it, as for the stream's own writes behind. A dropped
+  and closes after it, as for the stream's own writes behind. The buffer
+  comes back to the adapter once the send is done with it, for the next
+  write to fill, unless it has grown past 16 KiB, so a connection's writes
+  allocate nothing once it is going, and an idle one holds little. A dropped
   adapter leaves its send to finish, and the stream closes after it.
 - A flush has nothing to wait for, since the adapter holds nothing back: it
   reports a failure if one is known, as a socket's flush would. hyper
@@ -688,44 +706,49 @@ request. A CI job fails on regressions.
 its SMT sibling idle, and the load generator, on tokio's multi-threaded
 runtime, on 24 other CPUs. Each connection sends a message and waits for its
 echo, again and again, for 3 seconds after 1 second of warm-up, and the
-client checks every echo. The servers are single-threaded, with a 16 KiB
-buffer per connection each: tokio's current-thread runtime reads into its
-connection's buffer and writes back what it read; ruio receives into a pool
-of as many buffers, gathers whatever has arrived and writes it back behind,
-with one vectored send. Both set `TCP_NODELAY` on the listener. Round trips
-per second, medians of three runs taken in turns, on a Xeon Platinum 8488C
-with Linux 7.0, over loopback:
+client checks every echo. The servers are single-threaded: tokio's
+current-thread runtime reads into a 16 KiB buffer of each connection's and
+writes back what it read; ruio receives into a pool of as many 16 KiB
+buffers, up to 4096 (see below), gathers whatever has arrived and writes it
+back behind, with one vectored send, or, with one connection, in segments.
+Both set `TCP_NODELAY` on the listener. Round trips per second, medians of
+three runs taken in turns, on a Xeon Platinum 8488C with Linux 7.0, over
+loopback:
 
 | Connections | Message | tokio | ruio | p99 tokio (µs) | p99 ruio (µs) |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 64 B | 48k | 47k (0.99×) | 28 | 28 |
-| 1 | 1 KiB | 45k | 45k (1.01×) | 29 | 28 |
-| 1 | 16 KiB | 32k | 32k (1.01×) | 40 | 39 |
-| 1 | 64 KiB | 18k | 14k (0.78×) | 72 | 76 |
-| 16 | 64 B | 211k | 207k (0.98×) | 94 | 100 |
-| 16 | 1 KiB | 200k | 195k (0.97×) | 101 | 106 |
-| 16 | 16 KiB | 117k | 122k (1.04×) | 187 | 176 |
-| 16 | 64 KiB | 42k | 46k (1.09×) | 558 | 476 |
-| 256 | 64 B | 204k | 206k (1.01×) | 1306 | 1339 |
-| 256 | 1 KiB | 193k | 198k (1.03×) | 1395 | 1399 |
-| 256 | 16 KiB | 155k | 163k (1.06×) | 1814 | 1739 |
-| 256 | 64 KiB | 49k | 50k (1.01×) | 5442 | 6106 |
-| 1,024 | 64 B | 222k | 227k (1.03×) | 4774 | 4710 |
-| 1,024 | 1 KiB | 219k | 233k (1.06×) | 4795 | 4614 |
-| 1,024 | 16 KiB | 140k | 155k (1.10×) | 7492 | 7477 |
-| 1,024 | 64 KiB | 37k | 40k (1.08×) | 30183 | 27317 |
-| 10,000 | 64 B | 217k | 222k (1.02×) | 47404 | 46561 |
-| 10,000 | 1 KiB | 187k | 192k (1.03×) | 55255 | 53736 |
-| 10,000 | 16 KiB | 92k | 89k (0.97×) | 111754 | 113884 |
-| 10,000 | 64 KiB | 33k | 31k (0.96×) | 310059 | 323082 |
+| 1 | 64 B | 46k | 47k (1.03×) | 28 | 29 |
+| 1 | 1 KiB | 45k | 46k (1.01×) | 29 | 29 |
+| 1 | 16 KiB | 31k | 31k (1.03×) | 42 | 42 |
+| 1 | 64 KiB | 17k | 16k (0.94×) | 75 | 68 |
+| 16 | 64 B | 210k | 203k (0.97×) | 96 | 101 |
+| 16 | 1 KiB | 197k | 192k (0.98×) | 103 | 108 |
+| 16 | 16 KiB | 114k | 118k (1.04×) | 193 | 182 |
+| 16 | 64 KiB | 42k | 44k (1.07×) | 570 | 486 |
+| 256 | 64 B | 202k | 204k (1.01×) | 1331 | 1355 |
+| 256 | 1 KiB | 192k | 197k (1.02×) | 1419 | 1423 |
+| 256 | 16 KiB | 153k | 161k (1.05×) | 1862 | 1768 |
+| 256 | 64 KiB | 48k | 47k (0.98×) | 5590 | 6260 |
+| 1,024 | 64 B | 220k | 228k (1.04×) | 4850 | 4822 |
+| 1,024 | 1 KiB | 215k | 232k (1.08×) | 5775 | 4805 |
+| 1,024 | 16 KiB | 134k | 149k (1.11×) | 8104 | 7828 |
+| 1,024 | 64 KiB | 36k | 39k (1.09×) | 29630 | 27816 |
+| 10,000 | 64 B | 214k | 201k (0.94×) | 48815 | 59353 |
+| 10,000 | 1 KiB | 179k | 182k (1.01×) | 57525 | 59740 |
+| 10,000 | 16 KiB | 90k | 89k (0.99×) | 115665 | 116545 |
+| 10,000 | 64 KiB | 32k | 33k (1.01×) | 316985 | 318078 |
 
-ruio is ahead of tokio from 256 connections on, by up to 10%, bar 10,000
-connections with large messages (0.96× to 0.97×), and level at 1 and 16
-connections, bar one connection with 64 KiB messages (0.78×). Its 99th
-percentile is within 3% of tokio's or better, bar 256 connections with 64 KiB
-messages (12% later) and those two large-message loads at 10,000 (2% to 4%).
-Direct descriptors change nothing measurable. Runs of the same load differ by
-up to a few percent on this host, which is shared.
+ruio is ahead of tokio from 256 connections on, by up to 11%, bar 256
+connections with 64 KiB messages (0.98×), and level at 1 and 16 connections
+and at 10,000, bar one connection with 64 KiB messages (0.94×). Its 99th
+percentile is within 6% of tokio's or better, bar 256 connections with 64 KiB
+messages (12% later) and 10,000 with 64 B messages. Direct descriptors change
+nothing measurable. Runs of the same load differ by up to a few percent on
+this host, which is shared, and more while it is busy: the 0.94× at 10,000
+connections with 64 B messages, with a 99th percentile a fifth later than
+tokio's, came in such a spell, in which the server with direct descriptors,
+run in the same turns, measured 1.01× and 47.6 ms, and two more runs of that
+row gave 1.14× and 1.12×, with tokio the one caught.
 
 Loaded, both servers spend 95% or more of their CPU in the kernel: over
 loopback a server's CPU runs the transmit path of every echo and the receive
@@ -747,29 +770,52 @@ What got ruio here, in order of effect:
   share rose from 5% to 15%. A detached send needs no poll, which took 10,000
   connections from 0.79× to 1.02× and the 99th percentile from half as long
   again as tokio's to about the same, each echo waking its task once.
-- **A small pool.** A pool's ring hands out buffers in the order they came
-  back, so every buffer of the pool is in use in turn, and a pool larger than
-  its load spreads the copies over more memory than the cache holds. With
-  echoes written behind, a buffer goes back once its data is sent, and data a
-  pool has no room for waits in the socket, so a buffer per connection is
-  enough: with 1024 connections and 64 KiB messages, 8192 buffers where 1024
-  do cost a fifth of the throughput.
+- **A pool no larger than the load.** A pool's ring hands out buffers in the
+  order they came back, so every buffer of the pool is in use in turn, and a
+  pool larger than its load spreads the copies over more memory than the
+  cache holds. With echoes written behind, a buffer goes back once its data
+  is sent, and data a pool has no room for waits in the socket, so a buffer
+  per connection is more than enough: with 1024 connections and 64 KiB
+  messages, 8192 buffers where 1024 do cost a fifth of the throughput, and
+  with 10,000 connections and 64 KiB messages, 4096 buffers (64 MiB, which
+  the last-level cache holds) beat a buffer per connection by a tenth, from
+  0.96× to 1.01×, where a send's copy reads what a receive wrote up to forty
+  receives earlier. Fewer starve: with 2048, the sends to 10,000 clients hold
+  more buffers than that while the clients' acknowledgements are on their
+  way, and the throughput fell by a third with some echoes taking seconds.
+- **Segmented writes while idle.** tokio's echo is cut-through: it writes
+  each 16 KiB as soon as it has read it, so the client receives while the
+  server still reads. The kernel receives a whole 64 KiB message for ruio in
+  one pass, and ruio sent it back in one send, which the kernel copies whole
+  before it transmits any of it; with one connection, which is bound by
+  latency, that cost a fifth (0.78×), and given 64 KiB buffers, so that it
+  too echoed whole messages, tokio did the same as ruio. A write behind of
+  more than 32 KiB now goes as a chain of linked sends while the thread is
+  waiting on one peer at a time, the first of 32 KiB each, so the client
+  receives the first while the server copies the rest: 0.94×. Only while the
+  ring's last turn delivered a single completion: a send costs a transmit and
+  the client a wake-up, and with 16 connections, where the server is busy
+  throughout, four 16 KiB sends per echo cost 40% (48k round trips a second
+  fell to 28k). 32 KiB segments do as well as 16 KiB ones with one
+  connection and cost a sixth less CPU, and 8 KiB ones lost all of the gain:
+  the kernel issues each link of a chain from its deferred work, so a chain
+  of four takes two or three entries into the kernel.
 
 What is left:
 
-- tokio's echo is cut-through: it writes each 16 KiB as soon as it has read
-  it, so the client receives while the server still reads. The kernel
-  receives a whole message for ruio in one pass. With one connection, which
-  is bound by latency, that costs ruio a fifth with 64 KiB messages; given
-  64 KiB buffers, so that it too echoes whole messages, tokio does the same
-  as ruio, 13.7k round trips per second. With 10,000 connections the same
-  holds for the cache: tokio's 16 KiB stays in the first-level cache between
-  read and write, where ruio's 64 KiB comes back from further out, and its
-  sends' copies cost seven times as much (16% of the CPU against 2%).
+- With one connection and 64 KiB messages the kernel still copies the whole
+  message into ruio's buffers before the server sees any of it, where tokio
+  has echoed the first 16 KiB by then; and the client's copy of the last
+  segment, 32 KiB, comes after the server's last send, where tokio's is
+  16 KiB.
+- With 10,000 connections and large messages, tokio's 16 KiB stays in the
+  first-level cache between read and write, where ruio's 64 KiB, received
+  up to forty receives earlier, comes back from the last-level cache, and
+  its sends' copies cost several times as much. Each entry into the kernel
+  runs up to 20 items of deferred work, such as receives, and a turn of the
+  ring two entries' worth, before the tasks run and the sends go.
 - Sends reach the kernel at the end of a loop pass, after up to 64 tasks have
   run, which costs a few microseconds of latency with few connections.
-- Each entry into the kernel runs at most 20 items of deferred work, such as
-  receives, besides what it waits for.
 
 Four experiments did not pay. Submitting after every task brings the 99th
 percentile at 16 connections to tokio's, but costs 4% to 6% of the
@@ -778,9 +824,14 @@ with small messages and 38% with 10,000 connections: every extra entry into
 the kernel runs everyone's pending work and breaks up the batching; writing
 behind removed the second poll instead. A shallow ring, holding only as many
 buffers as the load needs and refilled with the ones returned last, turns
-starvation into the common case, and the pool wakes every waiting stream for
-each buffer that returns: 10,000 connections fell to 0.12×. Huge pages for the
-pool (`MADV_HUGEPAGE`, which the kernel granted) changed nothing measurable.
+starvation into the common case: 10,000 connections fell to 0.12× while the
+pool woke every waiting stream for each buffer that returned, and each of
+them asked the kernel again for the one buffer. The pool now wakes one, the
+first to have asked, which makes starvation cheaper but not quick: the
+woken stream's receive is re-armed at the end of the pass, by when a receive
+that was armed, with data waiting, has taken the buffer, and with demand
+beyond the pool some streams wait seconds. Huge pages for the pool
+(`MADV_HUGEPAGE`, which the kernel granted) changed nothing measurable.
 Across two machines the server no longer does the client's receive
 processing, which leaves the runtime a larger share of its time. How
 runtimes on several cores fare is under
@@ -886,21 +937,23 @@ with Linux 7.0, over loopback:
 
 | Connections | tokio | ruio | ruio, pool | p99 tokio (µs) | p99 ruio (µs) | p99 ruio, pool (µs) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 45k | 44k (0.98×) | 45k (1.00×) | 28 | 28 | 28 |
-| 16 | 191k | 172k (0.90×) | 181k (0.95×) | 104 | 125 | 119 |
-| 256 | 177k | 169k (0.95×) | 180k (1.01×) | 1534 | 1628 | 1540 |
-| 1,024 | 186k | 183k (0.98×) | 192k (1.03×) | 5656 | 5746 | 5512 |
-| 10,000 | 171k | 170k (0.99×) | 176k (1.03×) | 60765 | 60278 | 58366 |
+| 1 | 44k | 44k (0.99×) | 45k (1.00×) | 28 | 28 | 28 |
+| 16 | 189k | 172k (0.91×) | 182k (0.96×) | 104 | 125 | 119 |
+| 256 | 175k | 169k (0.96×) | 178k (1.02×) | 1590 | 1655 | 1565 |
+| 1,024 | 185k | 182k (0.98×) | 191k (1.03×) | 5720 | 5780 | 5580 |
+| 10,000 | 164k | 163k (0.99×) | 173k (1.05×) | 64506 | 62789 | 59256 |
 
 Receiving into a pool, hyper on ruio is level with hyper on tokio with one
-connection, and from 256 connections on 1% to 3% ahead, with a 99th
-percentile as short or shorter; at 16 connections it is 5% behind. Loaded,
+connection, and from 256 connections on 2% to 5% ahead, with a 99th
+percentile as short or shorter; at 16 connections it is 4% behind. Loaded,
 both spend about 83% of their CPU in the kernel, 13% in hyper and the
 runtime, and 4% in the C library; the adapters' copies, of a request out
 of the pool's buffers and of a response into a buffer for the kernel, add
-little to that.
+little to that. The kernel does the same for each request under both: one
+receive, one send, one segment each way and one wake-up of the client,
+counted with probes.
 
-Two things got the adapters there:
+Three things got the adapters there:
 
 - **A flush that does not wait.** hyper flushes every response. Waiting for
   the kernel to finish the send woke the task again for each, as a write
@@ -911,11 +964,20 @@ Two things got the adapters there:
   nothing waiting so soon after the last response, parks on a poll; a
   multishot receive stays armed. That is worth 4% to 6% from 16
   connections on.
+- **A write buffer kept.** The adapter copies each response into a buffer
+  of its own for the kernel to send, and the buffer now comes back to it
+  once the send is done, so a response allocates nothing where it allocated
+  twice, and is copied into memory still in the cache: a percent or so,
+  with the C library's allocator a third of what it was in the profile.
 
-What is left: at 16 connections, for a reason still to find, ruio's CPU
-goes where tokio's does, bar the kernel's receive path, where
-`tcp_recvmsg_locked` and `__tcp_cleanup_rbuf` take twice their share under
-tokio, besides io_uring's own task work and poll checks.
+What is left: at 16 connections ruio's CPU goes where tokio's does, bar
+io_uring's own share, the deferred work that runs a receive when its socket
+wakes and the poll bookkeeping around it, which stands where epoll's
+readiness list and the system calls stand under tokio and comes to slightly
+more. The kernel's receive path takes twice its share under tokio, as it
+does in the echo benchmark, where the two are level: under tokio `epoll_wait`
+polls the socket first and takes the cache misses that `recvmsg` takes under
+ruio, which the profiles show in different places.
 
 ## Milestones
 
@@ -932,9 +994,9 @@ tokio, besides io_uring's own task work and poll checks.
 
 M0 to M7 are done. M4 built linked timeouts and the `.timeout(d)`
 combinator, bundles on the 6.10 baseline and writing behind, and the echo
-benchmark finds ruio ahead of tokio from 256 connections on, bar 10,000 with
-large messages, and level with fewer, bar one connection with 64 KiB messages,
-where tokio's echo is cut-through (see [TCP echo](#tcp-echo)). M5 built
+benchmark finds ruio ahead of tokio from 256 connections on, and level with
+fewer and at 10,000, bar one connection with 64 KiB messages, where tokio's
+echo is cut-through (see [TCP echo](#tcp-echo)). M5 built
 `ruio::fs` and buffers aligned for direct I/O, and ruio's direct reads keep
 within 5% of fio at every queue depth (see
 [Random reads with direct I/O](#random-reads-with-direct-io)). M6 built
@@ -973,6 +1035,15 @@ Since M7:
 - Waking rings with `MSG_RING` was measured against the eventfd, and lost
   across physical cores, so it was not adopted (see
   [Kernel features](#kernel-features)).
+- A performance pass: a large write behind goes as a chain of segments
+  while the thread waits on one peer, so that the peer receives the first
+  while the rest is copied (`Driver::detach_chain`, which leaves a chain to
+  finish with nobody waiting), which took one connection with 64 KiB
+  messages from 0.78× to 0.94× of tokio; a pool wakes one waiting stream
+  per buffer that returns rather than all; the echo benchmark's pool stops
+  at 4096 buffers, which took 10,000 connections with 64 KiB messages from
+  0.96× to 1.01×; and `Compat` keeps its write buffer for the next write
+  (see [TCP echo](#tcp-echo) and [HTTP/1.1](#http11)).
 
 ## Open questions
 

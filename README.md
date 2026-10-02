@@ -88,14 +88,14 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
 [Benchmarks](DESIGN.md#benchmarks) for the loads and the full tables):
 
 - **TCP echo**, one core: ahead of tokio from 256 connections on, by up to
-  10%, and level with fewer.
+  11%, and level with fewer and at 10,000.
 - **4 KiB `O_DIRECT` random reads**: within 5% of fio's io_uring engine at
   every queue depth, and level with it up to 32.
 - **Across cores**: linear up to 16 cores, and up to 96 within 8% of what
   the host gives a busy loop.
 - **hyper, HTTP/1.1**, one core, through the adapters, receiving into a
-  pool: level with hyper on tokio with one connection, 1% to 3% ahead from
-  256 connections on, and 5% behind at 16.
+  pool: level with hyper on tokio with one connection, 2% to 5% ahead from
+  256 connections on, and 4% behind at 16.
 
 ## Development
 
