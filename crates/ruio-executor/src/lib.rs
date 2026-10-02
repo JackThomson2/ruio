@@ -66,8 +66,7 @@ pub use task::{JoinError, JoinHandle};
 ///
 /// If the thread is not inside [`Runtime::block_on`].
 pub fn handle() -> Handle {
-    let scheduler = context::current().expect(OUTSIDE);
-    Handle::new(Arc::clone(scheduler.shared()))
+    context::with_current(|scheduler| Handle::new(Arc::clone(scheduler.shared()))).expect(OUTSIDE)
 }
 
 const OUTSIDE: &str = "must be called from inside a ruio runtime";
@@ -84,7 +83,9 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
-    context::current().expect(OUTSIDE).spawn(future)
+    // The scheduler by the thread's plain pointer to it, which the thread's
+    // `block_on` keeps alive, rather than a clone of its `Rc`.
+    context::with_current(|scheduler| scheduler.spawn(future)).expect(OUTSIDE)
 }
 
 /// The io_uring driver of the thread's runtime.
@@ -102,7 +103,7 @@ pub fn driver() -> Driver {
 /// destructor, has I/O for the ring if there is one.
 #[inline]
 pub fn try_driver() -> Option<Driver> {
-    context::current().map(|scheduler| scheduler.driver().clone())
+    context::with_current(|scheduler| scheduler.driver().clone())
 }
 
 /// Lets the other ready tasks run before the current one continues.

@@ -59,15 +59,6 @@ impl Drop for Enter {
     }
 }
 
-/// The thread's current scheduler.
-#[inline]
-pub(crate) fn current() -> Option<Rc<Scheduler>> {
-    CURRENT
-        .try_with(|current| current.borrow().clone())
-        .ok()
-        .flatten()
-}
-
 /// Runs `f` with the thread's current scheduler, if the thread is inside a
 /// runtime.
 #[inline]
