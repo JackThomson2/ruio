@@ -35,8 +35,8 @@
 //! The server and the load generator also run on their own:
 //!
 //! ```text
-//! ruio-bench echo [--quick] [--runs N] [--seconds S] [--warmup S] [--server-cpu N]
-//!                 [--client-cpus LIST]
+//! ruio-bench echo [--quick] [--connections LIST] [--runs N] [--seconds S] [--warmup S]
+//!                 [--server-cpu N] [--client-cpus LIST]
 //! ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
 //! ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] [--warmup S]
 //!                             [--cpus LIST]
@@ -66,13 +66,14 @@ use client::{Exchange, Load};
 use http::HttpServer;
 use server::Server;
 
-const USAGE: &str = "usage: ruio-bench echo [--quick] [--runs N] [--seconds S] [--warmup S] \
-                     [--server-cpu N] [--client-cpus LIST]
+const USAGE: &str =
+    "usage: ruio-bench echo [--quick] [--connections LIST] [--runs N] [--seconds S] \
+                     [--warmup S] [--server-cpu N] [--client-cpus LIST]
        ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
        ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] \
                      [--warmup S] [--cpus LIST]
-       ruio-bench http [--quick] [--runs N] [--seconds S] [--warmup S] [--server-cpu N] \
-                     [--client-cpus LIST]
+       ruio-bench http [--quick] [--connections LIST] [--runs N] [--seconds S] [--warmup S] \
+                     [--server-cpu N] [--client-cpus LIST]
        ruio-bench http-server ruio|ruio-pool|tokio ADDR [--cpu N] [--buffers N]
        ruio-bench http-client ADDR [--connections N] [--seconds S] [--warmup S] [--cpus LIST]
        ruio-bench randread PATH [--depths LIST] [--block BYTES] [--runs N] [--seconds S] \
@@ -450,9 +451,29 @@ struct Row {
     p99: f64,
 }
 
+/// The connection counts `--connections` picks out of a benchmark's matrix,
+/// for running part of it again; every one if it is not given.
+fn connections_wanted(options: &Options) -> Result<Option<Vec<usize>>, String> {
+    let list: String = options.get("connections", String::new())?;
+    if list.is_empty() {
+        Ok(None)
+    } else {
+        sys::parse_cpus(&list).map(Some)
+    }
+}
+
 fn echo(options: &Options) -> Result<(), String> {
     let exe = env::current_exe().map_err(|err| err.to_string())?;
-    let matrix = if options.flag("quick") { QUICK } else { MATRIX };
+    let wanted = connections_wanted(options)?;
+    let matrix: Vec<(usize, usize)> = if options.flag("quick") { QUICK } else { MATRIX }
+        .iter()
+        .copied()
+        .filter(|(connections, _)| {
+            wanted
+                .as_ref()
+                .is_none_or(|wanted| wanted.contains(connections))
+        })
+        .collect();
     let server_cpu: usize = options.get("server-cpu", 0)?;
     let client_cpus: String = options.get("client-cpus", "2-25".to_owned())?;
     let seconds = options.duration("seconds", 3.0)?;
@@ -473,7 +494,7 @@ fn echo(options: &Options) -> Result<(), String> {
     }
     println!();
     println!("|---:|---:|{}", "---:|".repeat(Server::ALL.len()));
-    for &(connections, size) in matrix {
+    for (connections, size) in matrix {
         // The servers take turns, run after run, so that whatever else the
         // host does falls on all of them alike.
         let mut samples: Vec<Vec<Row>> = Server::ALL.iter().map(|_| Vec::new()).collect();
@@ -523,11 +544,20 @@ const HTTP_QUICK: &[usize] = &[1, 256];
 
 fn http(options: &Options) -> Result<(), String> {
     let exe = env::current_exe().map_err(|err| err.to_string())?;
-    let counts = if options.flag("quick") {
+    let wanted = connections_wanted(options)?;
+    let counts: Vec<usize> = if options.flag("quick") {
         HTTP_QUICK
     } else {
         HTTP_CONNECTIONS
-    };
+    }
+    .iter()
+    .copied()
+    .filter(|connections| {
+        wanted
+            .as_ref()
+            .is_none_or(|wanted| wanted.contains(connections))
+    })
+    .collect();
     let server_cpu: usize = options.get("server-cpu", 0)?;
     let client_cpus: String = options.get("client-cpus", "2-25".to_owned())?;
     let seconds = options.duration("seconds", 3.0)?;
@@ -548,7 +578,7 @@ fn http(options: &Options) -> Result<(), String> {
     }
     println!();
     println!("|---:|{}", "---:|".repeat(HttpServer::ALL.len()));
-    for &connections in counts {
+    for connections in counts {
         let mut samples: Vec<Vec<Row>> = HttpServer::ALL.iter().map(|_| Vec::new()).collect();
         for round in 1..=runs {
             for (server, samples) in HttpServer::ALL.into_iter().zip(&mut samples) {
@@ -656,22 +686,22 @@ impl Run<'_> {
         })
     }
 
-    /// A buffer per connection, as tokio's server has, within what a pool
-    /// can have.
+    /// A buffer per connection, as tokio's server has, up to 4096.
     ///
-    /// That is enough whatever the size of the messages: the server writes
-    /// its echoes behind, so a buffer goes back once the kernel has sent its
-    /// data, and data a pool has no room for yet waits in the socket. More
-    /// costs throughput: the kernel takes buffers from a pool's ring in the
-    /// order they went back, so every buffer of the pool is in use in turn,
-    /// and a pool larger than its load spreads the copies over more memory
-    /// than the cache holds. With 1024 connections and 64 KiB messages, 8192
-    /// buffers where 1024 do cost a fifth of the throughput.
+    /// A pool holds only the data in flight: the server writes its echoes
+    /// behind, so a buffer goes back once the kernel has sent its data, and
+    /// data a pool has no room for yet waits in the socket. So a buffer per
+    /// connection is more than enough, and more than the load needs costs
+    /// throughput: the kernel takes buffers from a pool's ring in the order
+    /// they went back, so every buffer of the pool is in use in turn, and a
+    /// pool larger than its load spreads the copies over more memory than
+    /// the cache holds. With 1024 connections and 64 KiB messages, 8192
+    /// buffers where 1024 do cost a fifth of the throughput; with 10,000
+    /// connections, 4096 buffers (64 MiB) beat 16,384 by a tenth with 64 KiB
+    /// messages, where 2048 starve: the sends to that many clients hold
+    /// more than that while the clients' acknowledgements are on their way.
     fn pool_buffers(&self) -> u16 {
-        self.connections
-            .clamp(64, 1 << 15)
-            .next_power_of_two()
-            .min(1 << 15) as u16
+        self.connections.clamp(64, 4096).next_power_of_two() as u16
     }
 }
 
