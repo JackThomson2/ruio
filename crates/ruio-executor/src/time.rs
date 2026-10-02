@@ -22,7 +22,7 @@ use std::time::Duration;
 pub use std::time::Instant;
 
 use crate::context;
-use crate::scheduler::Shared;
+use crate::scheduler::{Scheduler, Shared};
 use crate::wheel::{Key, Wheel};
 
 /// A runtime's timers: its wheel, whose ticks are milliseconds since `start`.
@@ -182,13 +182,45 @@ impl Sleep {
         let Some(Armed { owner, key }) = self.timer.take() else {
             return;
         };
-        match context::current() {
-            Some(scheduler) if Arc::ptr_eq(scheduler.shared(), &owner) => {
-                let waker = scheduler.timers().remove(key);
-                drop(waker);
-            }
-            _ => owner.remove_timer(key),
+        // On the owner's thread, inside it, the wheel is at hand; anywhere
+        // else the owner removes the timer at its next turn.
+        let removed = context::with_owner(Arc::as_ptr(&owner), |scheduler| {
+            scheduler.timers().remove(key)
+        });
+        match removed {
+            // Dropped once the wheel is released, as dropping a waker can
+            // run code that uses it.
+            Some(waker) => drop(waker),
+            None => owner.remove_timer(key),
         }
+    }
+
+    /// Arms the timer in `scheduler`'s wheel, to wake `waker` at the
+    /// deadline; or, if it is armed there and has not fired, has it wake
+    /// `waker` instead.
+    #[inline]
+    fn arm(&mut self, scheduler: &Scheduler, waker: &Waker) {
+        let timers = scheduler.timers();
+        if let Some(armed) = &self.timer
+            && Arc::ptr_eq(&armed.owner, scheduler.shared())
+        {
+            let mut wheel = timers.wheel.borrow_mut();
+            if !wheel.fired(armed.key) {
+                let replaced = wheel.set_waker(armed.key, waker);
+                drop(wheel);
+                // As for a removed timer's waker.
+                drop(replaced);
+                return;
+            }
+        }
+        // Not armed yet, armed by another runtime, or fired at the edge of
+        // the wheel's reach, before the deadline: arm here.
+        self.disarm();
+        let key = timers.insert(self.deadline, waker.clone());
+        self.timer = Some(Armed {
+            owner: Arc::clone(scheduler.shared()),
+            key,
+        });
     }
 }
 
@@ -205,27 +237,10 @@ impl Future for Sleep {
             this.disarm();
             return Poll::Ready(());
         }
-        let scheduler = context::current().expect("a `Sleep` must be polled inside a ruio runtime");
-        let timers = scheduler.timers();
-        match &this.timer {
-            Some(armed)
-                if Arc::ptr_eq(&armed.owner, scheduler.shared())
-                    && !timers.wheel.borrow().fired(armed.key) =>
-            {
-                let replaced = timers.wheel.borrow_mut().set_waker(armed.key, cx.waker());
-                drop(replaced);
-            }
-            _ => {
-                // Not armed yet, armed by another runtime, or fired at the
-                // edge of the wheel's reach, before the deadline: arm here.
-                this.disarm();
-                let key = timers.insert(this.deadline, cx.waker().clone());
-                this.timer = Some(Armed {
-                    owner: Arc::clone(scheduler.shared()),
-                    key,
-                });
-            }
-        }
+        // The runtime by the thread's plain pointer to it, which the thread's
+        // `block_on` keeps alive, rather than a clone of its `Rc`.
+        context::with_current(|scheduler| this.arm(scheduler, cx.waker()))
+            .expect("a `Sleep` must be polled inside a ruio runtime");
         Poll::Pending
     }
 }
