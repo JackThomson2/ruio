@@ -153,7 +153,8 @@ its own flag set.
 - The executor calls the driver once per scheduler pass. One `io_uring_enter`
   submits everything queued and, if no task is runnable, waits for a
   completion. The cost is one system call per pass whether one or a thousand
-  operations were queued. Timers wake the ring through its own timer
+  operations were queued, unless more than 32 of them are reads and writes
+  (below). Timers wake the ring through its own timer
   (`Driver::wake_at`), a timeout of the kernel's at the earliest deadline,
   so the wait passes no timeout (`EXT_ARG`), which the kernel would copy in
   on every wait. A turn borrows the driver's state once, for the entry,
@@ -169,6 +170,15 @@ its own flag set.
 - A full submission queue is submitted early instead of failing the
   operation. An operation with a linked timeout needs two entries that reach
   the kernel together, so queueing makes room for both.
+- Reads and writes reach the kernel at most 32 to an entry. The kernel plugs
+  the block layer for each entry that submits them, sets the requests of the
+  plug's first 32 up in one batch and those of the rest one by one, and
+  flushes the plug as the 33rd comes (`BLK_MAX_REQUEST_COUNT`). So the driver
+  counts the queued entries whose opcodes plug, and when more than 32 are
+  queued the ring submits them in batches of 32, each but the last in an
+  entry of its own that waits for nothing but runs its completions' deferred
+  work, and cuts a batch only where a chain ends (see
+  [Random reads with direct I/O](#random-reads-with-direct-io)).
 - The completion queue is drained fully on every pass, its tail read once
   for the batch, and the submission queue's head is read once per entry
   into the kernel, which consumes entries only while it is entered: no
@@ -972,16 +982,20 @@ second, on a Xeon Platinum 8488C with Linux 7.0:
 
 | Depth | fio | ruio |
 |---:|---:|---:|
-| 1 | 1.32M | 1.33M (1.01×) |
-| 4 | 1.89M | 1.93M (1.02×) |
-| 16 | 2.33M | 2.34M (1.00×) |
-| 32 | 2.49M | 2.51M (1.01×) |
-| 64 | 2.51M | 2.42M (0.97×) |
-| 128 | 2.41M | 2.28M (0.95×) |
+| 1 | 1.27M | 1.44M (1.13×) |
+| 4 | 1.81M | 2.09M (1.15×) |
+| 16 | 2.23M | 2.55M (1.14×) |
+| 32 | 2.34M | 2.71M (1.16×) |
+| 64 | 2.40M | 2.73M (1.14×) |
+| 128 | 2.40M | 2.71M (1.13×) |
 
-ruio is within 5% of fio at every depth, and level with it up to 32. It
-started at 0.82× at depth 1 and 0.93× at 32, where its user space took 29%
-of the CPU; four things were in the way, all of them the runtime's:
+ruio is ahead of fio at every depth, by 13% to 16%, and reads as fast at
+depth 128 as at 32. When the comparison was first made, at the end of M5,
+it was within 5% of fio at every depth: level with it up to 32, and 3% to
+5% behind at 64 and above (2.42M to fio's 2.51M at depth 64, 2.28M to
+2.41M at 128). It had started at 0.82× at depth 1 and 0.93× at 32, where
+its user space took 29% of the CPU; four things were in the way, all of
+them the runtime's:
 
 - Waking and running a task took six locked instructions, which serialize
   the pipeline. On the task's own thread four of them went first (see
@@ -998,24 +1012,46 @@ of the CPU; four things were in the way, all of them the runtime's:
 - Each operation on a direct descriptor searched the thread's drivers for
   its ring.
 
-At depth 64 and above ruio fell 3% to 5% behind, for a reason still to
-find. Reading Linux 7.0 since gives two candidates, neither measured yet.
-An entry into the kernel runs at most 20 items of deferred work, such as
-these reads' completions, as it submits, and 20 more as it waits, so a
-pass that submits 64 reads gets at most 40 of their completions back from
-its entry, where fio submits 32 at a time. And the block layer sets
-requests up in a batch only for the first 32 of a plug
-(`BLK_MAX_REQUEST_COUNT`), and the rest one by one: a pass of up to 64
-tasks submits up to 64 reads in one plug, and fio 32.
+The second and third performance passes took more of the runtime's own
+costs away (see [The runtime itself](#the-runtime-itself)). fio was off the
+host for the second; ruio before and after it, run in turns on the same
+device, medians of three runs of four seconds: depth 1, 1.17M to 1.38M
+reads a second (1.18×), where every read is a turn of the loop and a park;
+depth 4, 1.90M to 2.00M (1.06×); depth 16, 2.31M to 2.42M (1.05×); depth
+32, 2.27M to 2.37M (1.04×); depth 64, 2.26M to 2.36M (1.04×); depth 128,
+2.25M to 2.35M (1.04×). After the third, ruio was 13% ahead of fio at depth
+16 and 32 but only 9% at 64 and 128, where it read 2.64M and 2.62M a second
+to its 2.72M at 32, while fio's rate stayed flat.
 
-The table is from before the second performance pass, and fio was no longer
-on the host to run it again. ruio before and after the pass, run in turns on
-the same device, medians of three runs of four seconds: depth 1, 1.17M to
-1.38M reads a second (1.18×), where every read is a turn of the loop and a
-park; depth 4, 1.90M to 2.00M (1.06×); depth 16, 2.31M to 2.42M (1.05×);
-depth 32, 2.27M to 2.37M (1.04×); depth 64, 2.26M to 2.36M (1.04×); depth
-128, 2.25M to 2.35M (1.04×). The host was busier than when the table was
-measured, which both sides of the comparison share.
+What held depth 64 and above back was how many reads an entry into the
+kernel submitted: 32 at depth 32, by the driver's counts, and 40 at 64 and
+128. An entry runs at most 40 items of deferred work, such as these reads'
+completions, unless it is asked to wait for more: 20 as it submits, and 20
+before it would wait (`IO_LOCAL_TW_DEFAULT_MAX`). With every read completing
+inline, a turn of the ring so settled at 40 reads in and 40 completions
+out, the rest of the depth waiting in the kernel's list of deferred work.
+And the kernel plugs the block layer for each entry that submits reads: the
+plug sets the requests of its first 32 up in one batch, is flushed as the
+33rd comes, and sets every request after that up one by one, each with a
+reference on the queue and a tag of its own (`BLK_MAX_REQUEST_COUNT`), 8
+reads in each of these entries. fio's engine, as the harness runs it,
+submits 32 to an entry. The ring now submits reads and writes in batches of
+32 (see [Submission and completion](#submission-and-completion)): a pass of
+64 reads takes two entries of 32, and each entry gets back the completions
+of what it submitted. Five runs of each in turns, before and after: depth
+64, 2.61M to 2.74M reads a second (1.05×); depth 128, 2.62M to 2.73M
+(1.04×); depth 1 and 32 unchanged within 1%.
+
+Measured and not adopted: capping each entry at 32 and leaving the rest
+queued for the next pass, which leaves reads unsubmitted while the ring
+waits, and a scheduler pass of 32 tasks, which changes every workload's
+pass, each gained 4%; batches of 20, whose completions all fit in the work
+an entry runs as it submits, lost 4% at depth 32 to the entries they cost.
+
+The table is from after the plug batches, with fio 3.43 built from source.
+The host was shared with other work, which both sides of the comparison
+share; its load was between 2 and 5 as the table was measured. Two runs
+while it was higher, up to 19, put ruio 9% to 29% ahead.
 
 ### Scaling across cores
 
@@ -1369,7 +1405,9 @@ Since M7:
   its permits with a compare-and-exchange; sleeps and spawns reach the
   runtime without cloning it; and parks leave iowait out. It also made the
   driver hold a task's waker by reference only on the task's own thread,
-  which a waker sent to another thread could have it do from there.
+  which a waker sent to another thread could have it do from there. After
+  it, reads and writes went to the kernel in batches of 32, a block plug's,
+  which made random reads at depth 64 and above as fast as at 32.
 
 ## Open questions
 

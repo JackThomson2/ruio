@@ -91,9 +91,10 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   13%, and level with fewer; with one connection, a runtime that spins
   before it parks (`Builder::spin`) makes twice tokio's round trips, with
   half the tail latency.
-- **4 KiB `O_DIRECT` random reads**: within 5% of fio's io_uring engine at
-  every queue depth, and level with it up to 32; 18% more reads at depth 1
-  and 4% to 6% more at the others since, from the runtime's own paths.
+- **4 KiB `O_DIRECT` random reads**: 13% to 16% ahead of fio's io_uring
+  engine at every queue depth. It was within 5% of fio when first compared;
+  the runtime's own paths, and submitting reads 32 to an entry into the
+  kernel as a block plug takes them, made up the rest.
 - **Across cores**: linear up to 16 cores, and up to 96 within 8% of what
   the host gives a busy loop.
 - **hyper, HTTP/1.1**, one core, through the adapters, receiving into a
