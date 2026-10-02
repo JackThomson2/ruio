@@ -66,11 +66,13 @@ impl Remote {
 
     /// The slots that other threads have asked the ring to close.
     pub(crate) fn take_closes(&self) -> Vec<u32> {
-        // A slot queued after the check sets the flag again, and unparks the
-        // ring: its next turn takes it.
-        if !self.pending.swap(false, Ordering::Acquire) {
+        // A plain load on every turn of the ring, which almost always finds
+        // nothing. A slot queued after the check sets the flag again, and
+        // unparks the ring: its next turn takes it.
+        if !self.pending.load(Ordering::Acquire) {
             return Vec::new();
         }
+        self.pending.store(false, Ordering::Relaxed);
         mem::take(&mut self.lock().closes)
     }
 

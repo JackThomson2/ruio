@@ -113,19 +113,31 @@ impl<P> Table<P> {
 
     /// Adds a submitted operation and returns its `user_data`.
     pub(crate) fn insert(&mut self, waker: Option<Waker>) -> u64 {
-        self.occupy(State::Waiting(waker))
+        let index = self.occupy();
+        let slot = &mut self.slots[index as usize];
+        // Written into the slot where it is, rather than built elsewhere
+        // and copied: this is the table's hottest path. The slot was free,
+        // and so owned nothing.
+        forget_trivial(mem::replace(&mut slot.state, State::Waiting(waker)));
+        user_data(index, slot.generation)
     }
 
     /// Adds a submitted multishot request and returns its `user_data`.
     pub(crate) fn insert_stream(&mut self, waker: Option<Waker>) -> u64 {
-        self.occupy(State::Streaming(Stream {
+        let index = self.occupy();
+        let slot = &mut self.slots[index as usize];
+        let stream = State::Streaming(Stream {
             completions: VecDeque::new(),
             waker,
             ended: false,
-        }))
+        });
+        forget_trivial(mem::replace(&mut slot.state, stream));
+        user_data(index, slot.generation)
     }
 
-    fn occupy(&mut self, state: State<P>) -> u64 {
+    /// Takes a free slot, which stays in its free state for the caller to
+    /// write, counting it in flight, and returns its index.
+    fn occupy(&mut self) -> u32 {
         let index = if self.free == NONE {
             let index = u32::try_from(self.slots.len())
                 .ok()
@@ -133,21 +145,19 @@ impl<P> Table<P> {
                 .expect("operation table is full");
             self.slots.push(Slot {
                 generation: 1,
-                state,
+                state: State::Free { next: NONE },
             });
             index
         } else {
             let index = self.free;
-            let slot = &mut self.slots[index as usize];
-            let State::Free { next } = slot.state else {
+            let State::Free { next } = self.slots[index as usize].state else {
                 unreachable!("free list points at a slot in use");
             };
             self.free = next;
-            slot.state = state;
             index
         };
         self.in_flight += 1;
-        user_data(index, self.slots[index as usize].generation)
+        index
     }
 
     /// Takes the operation's completion, freeing its slot, or, if it has not
@@ -168,7 +178,7 @@ impl<P> Table<P> {
         match &mut self.slots[index as usize].state {
             State::Completed(completion) => {
                 let completion = *completion;
-                self.free(index);
+                forget_trivial(self.free(index));
                 Ok(completion)
             }
             State::Waiting(current) => {
@@ -315,7 +325,7 @@ impl<P> Table<P> {
         let State::Completed(completion) = self.slots[index as usize].state else {
             return None;
         };
-        self.free(index);
+        forget_trivial(self.free(index));
         Some(completion)
     }
 
@@ -350,7 +360,8 @@ impl<P> Table<P> {
         match state {
             State::Waiting(waker) => {
                 let waker = waker.take();
-                *state = State::Completed(completion);
+                // Its waker taken, the state owns nothing.
+                forget_trivial(mem::replace(state, State::Completed(completion)));
                 self.in_flight -= 1;
                 Outcome::Wake(waker)
             }
@@ -436,6 +447,21 @@ impl<P> Table<P> {
 
 fn user_data(index: u32, generation: u32) -> u64 {
     u64::from(generation) << 32 | u64::from(index)
+}
+
+/// Lets go of a state that owns nothing: free, completed, or waiting with
+/// its waker taken. Dropping it would run the state's drop glue for nothing,
+/// on the hottest path of the table, so it is forgotten instead, which leaks
+/// nothing of such a state.
+fn forget_trivial<P>(state: State<P>) {
+    debug_assert!(
+        matches!(
+            state,
+            State::Free { .. } | State::Completed(_) | State::Waiting(None)
+        ),
+        "a state that owns something is dropped, not forgotten"
+    );
+    mem::forget(state);
 }
 
 #[cfg(test)]

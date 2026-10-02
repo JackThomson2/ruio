@@ -257,6 +257,17 @@ impl<T: Operation> Future for Op<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T::Output> {
         let this = self.get_mut();
+        // A submitted operation stays where it is unless it has completed,
+        // which is what most polls find: nothing is moved for a pending one.
+        let completed = match &this.state {
+            State::Submitted { user_data, .. } => {
+                match this.driver.poll_completion(*user_data, cx.waker()) {
+                    Some(completion) => Some(completion),
+                    None => return Poll::Pending,
+                }
+            }
+            _ => None,
+        };
         match mem::replace(&mut this.state, State::Done) {
             State::Unsubmitted(mut operation) => {
                 match this.driver.queue(&mut operation, this.timeout, cx.waker()) {
@@ -276,20 +287,11 @@ impl<T: Operation> Future for Op<T> {
                 completion,
             } => Poll::Ready(operation.complete(completion)),
             State::Submitted {
-                operation,
-                user_data,
-                timed,
-            } => match this.driver.poll_completion(user_data, cx.waker()) {
-                Some(completion) => Poll::Ready(operation.complete(seen(completion, timed))),
-                None => {
-                    this.state = State::Submitted {
-                        operation,
-                        user_data,
-                        timed,
-                    };
-                    Poll::Pending
-                }
-            },
+                operation, timed, ..
+            } => {
+                let completion = completed.expect("the poll above found the completion");
+                Poll::Ready(operation.complete(seen(completion, timed)))
+            }
             State::Done => panic!("`Op` polled after it completed"),
         }
     }
@@ -297,11 +299,13 @@ impl<T: Operation> Future for Op<T> {
 
 impl<T: Operation> Drop for Op<T> {
     fn drop(&mut self) {
-        if let State::Submitted {
-            operation,
-            user_data,
-            ..
-        } = mem::replace(&mut self.state, State::Done)
+        // Most operations are dropped done; only one in flight is moved out.
+        if matches!(self.state, State::Submitted { .. })
+            && let State::Submitted {
+                operation,
+                user_data,
+                ..
+            } = mem::replace(&mut self.state, State::Done)
         {
             self.driver.orphan(user_data, operation, true);
         }
