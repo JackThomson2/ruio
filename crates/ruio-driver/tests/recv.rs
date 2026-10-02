@@ -198,6 +198,61 @@ fn the_stream_rearms_once_an_exhausted_pool_has_a_buffer() {
     assert_eq!(pool.available(), 2);
 }
 
+/// A buffer that returns to an exhausted pool wakes one of the streams
+/// waiting for it, the first to have asked, rather than all of them: woken
+/// all at once, every one would ask the kernel for the one buffer.
+#[test]
+fn a_returning_buffer_wakes_one_waiting_stream() {
+    let driver = Driver::new().unwrap();
+    let pool = BufPool::new(&driver, 2, 16).unwrap();
+    let (first_socket, mut first_peer) = UnixStream::pair().unwrap();
+    let (second_socket, mut second_peer) = UnixStream::pair().unwrap();
+    let mut first = RecvStream::new(&driver, first_socket.as_raw_fd(), &pool);
+    let mut second = RecvStream::new(&driver, second_socket.as_raw_fd(), &pool);
+
+    // The first stream's receive takes both buffers, and both streams have
+    // data waiting with none left.
+    first_peer.write_all(&[1; 32]).unwrap();
+    let bundle = block_on(&driver, first.next()).unwrap().unwrap();
+    assert_eq!(pool.available(), 0);
+    first_peer.write_all(&[2; 8]).unwrap();
+    second_peer.write_all(&[3; 8]).unwrap();
+    let (first_woken, first_waker) = Counter::waker();
+    let (second_woken, second_waker) = Counter::waker();
+    for _ in 0..3 {
+        assert!(
+            first
+                .poll_next(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        assert!(
+            second
+                .poll_next(&mut Context::from_waker(&second_waker))
+                .is_pending()
+        );
+        driver.submit().unwrap();
+    }
+    let starved = (first_woken.count(), second_woken.count());
+
+    let mut leases = bundle.into_iter();
+    drop(leases.next());
+    assert_eq!(
+        (first_woken.count(), second_woken.count()),
+        (starved.0 + 1, starved.1),
+        "one buffer wakes the first to have asked"
+    );
+    drop(leases.next());
+    assert_eq!(
+        (first_woken.count(), second_woken.count()),
+        (starved.0 + 1, starved.1 + 1),
+        "the next wakes the other"
+    );
+    let data = block_on(&driver, first.next()).unwrap().unwrap();
+    assert_eq!(data.to_vec(), [2; 8]);
+    let data = block_on(&driver, second.next()).unwrap().unwrap();
+    assert_eq!(data.to_vec(), [3; 8]);
+}
+
 /// A producer outpaces a consumer that has two small buffers, so the kernel
 /// keeps running the pool dry and the stream keeps re-arming the receive;
 /// every byte must still arrive, in order.

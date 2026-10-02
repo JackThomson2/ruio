@@ -234,6 +234,47 @@ fn a_chain_too_long_for_the_ring_fails_every_operation() {
     assert_eq!(driver.in_flight(), 0);
 }
 
+/// A detached chain runs in order with nobody waiting, each operation once
+/// the one before has completed, and its outputs are dropped.
+#[test]
+fn a_detached_chain_runs_in_order() {
+    let driver = Driver::new().unwrap();
+    let (input, mut feed) = io::pipe().unwrap();
+    let (mut output, sink) = io::pipe().unwrap();
+    driver.detach_chain(vec![
+        driver.op(Write::new(sink.as_raw_fd(), b"first".to_vec())),
+        driver.op(Write::new(sink.as_raw_fd(), b" then".to_vec())),
+    ]);
+    driver.detach_chain(vec![
+        driver.op(Read::new(input.as_raw_fd(), Vec::with_capacity(4))),
+    ]);
+    driver.submit().unwrap();
+    idle(&driver);
+    let mut out = [0; 10];
+    output.read_exact(&mut out).unwrap();
+    assert_eq!(&out, b"first then");
+    assert_eq!(driver.in_flight(), 1, "the read waits for data");
+    feed.write_all(b"data").unwrap();
+    settle(&driver);
+    assert_eq!(driver.stats().operations, 3);
+}
+
+/// A failure in a detached chain cancels the rest of it.
+#[test]
+fn a_failure_cancels_the_rest_of_a_detached_chain() {
+    let driver = Driver::new().unwrap();
+    let (input, _feed) = io::pipe().unwrap();
+    let (output, sink) = io::pipe().unwrap();
+    driver.detach_chain(vec![
+        driver.op(Write::new(input.as_raw_fd(), b"wrong".to_vec())),
+        driver.op(Write::new(sink.as_raw_fd(), b"never".to_vec())),
+    ]);
+    settle(&driver);
+    assert!(!has_data(&output));
+    driver.detach_chain(Vec::<ruio_driver::Op<Nop>>::new());
+    assert_eq!(driver.stats().operations, 2);
+}
+
 /// An operation whose `prepare` panics.
 struct Panics;
 

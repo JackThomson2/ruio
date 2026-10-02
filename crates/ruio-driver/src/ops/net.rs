@@ -328,14 +328,17 @@ fn prepare_send<B: IoBuf>(sqe: &mut sys::io_uring_sqe, fd: Fd, buf: &B, flags: i
 /// connected socket, like `sendmsg(2)` with a vector of them: a stream
 /// socket sends them as one stream of bytes.
 ///
-/// A single buffer, or a single one left after [`skip`](SendVectored::skip),
-/// goes as a plain [`Send`]. At most `IOV_MAX` (1024) buffers go in one
-/// send; the rest wait for another. The buffers come back with the result.
+/// A single buffer, or what of a single one is left after
+/// [`skip`](SendVectored::skip) and [`limit`](SendVectored::limit), goes as
+/// a plain [`Send`]. At most `IOV_MAX` (1024) buffers go in one send; the
+/// rest wait for another. The buffers come back with the result.
 #[derive(Debug)]
 pub struct SendVectored<V> {
     fd: Fd,
     bufs: V,
     skip: usize,
+    /// The most bytes to send, after those skipped.
+    limit: usize,
     flags: i32,
     // Boxed, as for `Connect`: the header and vector the kernel reads, made
     // only for a send of more than one buffer.
@@ -364,6 +367,7 @@ impl<V: IoBufs> SendVectored<V> {
             fd: fd.into(),
             bufs,
             skip: 0,
+            limit: usize::MAX,
             flags: 0,
             msg: None,
         }
@@ -372,6 +376,13 @@ impl<V: IoBufs> SendVectored<V> {
     /// Leaves out the first `bytes` bytes, sent before.
     pub fn skip(mut self, bytes: usize) -> Self {
         self.skip = bytes;
+        self
+    }
+
+    /// Sends at most `bytes` bytes, after those skipped, leaving the rest
+    /// for another send.
+    pub fn limit(mut self, bytes: usize) -> Self {
+        self.limit = bytes;
         self
     }
 
@@ -402,14 +413,15 @@ unsafe impl<V: IoBufs> Operation for SendVectored<V> {
         }
         self.fd.apply(sqe);
         sqe.op_flags = self.flags.cast_unsigned();
-        if first + 1 >= count {
-            let (start, len) = match first {
-                last if last < count => bufs.buf(last),
-                _ => (ptr::null(), 0),
-            };
+        let (start, len) = match first {
+            first if first < count => bufs.buf(first),
+            _ => (ptr::null(), 0),
+        };
+        let len = (len - offset.min(len)).min(self.limit);
+        if first + 1 >= count || len == self.limit {
             sqe.opcode = sys::IORING_OP_SEND;
             sqe.addr = start.wrapping_add(offset).expose_provenance() as u64;
-            sqe.len = u32::try_from(len - offset.min(len)).unwrap_or(u32::MAX);
+            sqe.len = u32::try_from(len).unwrap_or(u32::MAX);
             return;
         }
         let msg = self.msg.get_or_insert_with(|| {
@@ -420,13 +432,19 @@ unsafe impl<V: IoBufs> Operation for SendVectored<V> {
             })
         });
         msg.iovecs.clear();
+        let mut left = self.limit;
         for index in first..count.min(first + IOV_MAX) {
             let (start, len) = bufs.buf(index);
             let skip = if index == first { offset } else { 0 };
+            let len = (len - skip).min(left);
             msg.iovecs.push(libc::iovec {
                 iov_base: start.wrapping_add(skip).cast_mut().cast(),
-                iov_len: len - skip,
+                iov_len: len,
             });
+            left -= len;
+            if left == 0 {
+                break;
+            }
         }
         msg.header.msg_iov = msg.iovecs.as_mut_ptr();
         msg.header.msg_iovlen = msg.iovecs.len();

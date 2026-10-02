@@ -206,6 +206,11 @@ impl Ring {
         self.sq.entries - self.queued()
     }
 
+    /// The number of submission queue slots.
+    pub(crate) fn sq_entries(&self) -> u32 {
+        self.sq.entries
+    }
+
     /// The next submission queue entry, zeroed, or `None` if the queue is
     /// full. The entry reaches the kernel at the next [`Ring::enter`].
     pub(crate) fn next_sqe(&mut self) -> Option<&mut sys::io_uring_sqe> {

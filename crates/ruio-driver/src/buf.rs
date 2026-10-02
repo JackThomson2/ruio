@@ -24,6 +24,7 @@
 use std::fmt;
 use std::io;
 use std::ops::{Bound, RangeBounds};
+use std::rc::Rc;
 
 pub use crate::aligned::AlignedBuf;
 pub use crate::fixed::{FixedBuf, FixedBuffers, FixedIoBuf};
@@ -33,7 +34,8 @@ pub use crate::pool::{BufBundle, BufLease, BufPool};
 pub type BufResult<T, B> = (io::Result<T>, B);
 
 /// Buffers to send one after another, as a single stream of bytes: a
-/// [`BufBundle`], or a vector of [`IoBuf`]s.
+/// [`BufBundle`], a vector or an array of [`IoBuf`]s, or an `Rc` of any of
+/// them, which several sends can hold at once, each sending its part.
 ///
 /// # Safety
 ///
@@ -68,6 +70,36 @@ unsafe impl<B: IoBuf> IoBufs for Vec<B> {
 
     fn buf(&self, index: usize) -> (*const u8, usize) {
         (self[index].stable_ptr(), self[index].bytes_init())
+    }
+}
+
+// SAFETY: each buffer keeps its memory in place as `IoBuf` promises,
+// wherever the array holding the buffers moves; the entry points into the
+// buffers, not into the array.
+unsafe impl<B: IoBuf, const N: usize> IoBufs for [B; N] {
+    fn buf_count(&self) -> usize {
+        N
+    }
+
+    fn buf(&self, index: usize) -> (*const u8, usize) {
+        (self[index].stable_ptr(), self[index].bytes_init())
+    }
+}
+
+// SAFETY: the buffers stay where the shared value keeps them, on the heap,
+// which nothing can change through a shared reference, and each keeps its
+// memory in place as `IoBufs` promises.
+unsafe impl<V: IoBufs> IoBufs for Rc<V> {
+    fn buf_count(&self) -> usize {
+        (**self).buf_count()
+    }
+
+    fn buf(&self, index: usize) -> (*const u8, usize) {
+        (**self).buf(index)
+    }
+
+    fn bytes_init(&self) -> usize {
+        (**self).bytes_init()
     }
 }
 

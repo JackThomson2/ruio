@@ -2,10 +2,11 @@
 //! when data arrives.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::iter;
-use std::mem::{self, offset_of};
+use std::mem::offset_of;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::rc::Rc;
@@ -76,8 +77,11 @@ struct Pool {
     spare: RefCell<Vec<u16>>,
     /// Buffers in the ring, which the kernel may pick.
     available: Cell<usize>,
-    /// Tasks waiting for a buffer to return to the ring.
-    waiters: RefCell<Vec<Waker>>,
+    /// Tasks waiting for a buffer to return to the ring, in the order they
+    /// came. Each buffer that returns wakes the first of them, rather than
+    /// all of them: woken all at once, every waiter would ask the kernel
+    /// again for the one buffer, and all but one starve again.
+    waiters: RefCell<VecDeque<Waker>>,
     /// Whether the kernel consumes the buffers incrementally
     /// (`IOU_PBUF_RING_INC`): each completion takes as much of a buffer as
     /// its data fills, from where the last left off, and the kernel keeps
@@ -148,7 +152,7 @@ impl BufPool {
             taken: (0..count).map(|_| Cell::new(false)).collect(),
             spare: RefCell::new(Vec::with_capacity(usize::from(count))),
             available: Cell::new(0),
-            waiters: RefCell::new(Vec::new()),
+            waiters: RefCell::new(VecDeque::new()),
             incremental: flags & sys::IOU_PBUF_RING_INC != 0,
             filled: (0..count).map(|_| Cell::new(0)).collect(),
             shares: (0..count).map(|_| Cell::new(0)).collect(),
@@ -194,14 +198,21 @@ impl BufPool {
     }
 
     /// Whether a buffer is available; if not, arranges for the task to be
-    /// woken when one returns.
+    /// woken when one returns. Buffers that return wake the tasks waiting
+    /// in the order they asked, one for each buffer.
     pub fn poll_available(&self, cx: &mut Context<'_>) -> Poll<()> {
         if self.available() > 0 {
             return Poll::Ready(());
         }
         let mut waiters = self.pool.waiters.borrow_mut();
-        if !waiters.iter().any(|waiter| waiter.will_wake(cx.waker())) {
-            waiters.push(cx.waker().clone());
+        // A task that asks again before it is woken is still at the back.
+        // One that asks again later is woken once for each time it asked,
+        // which costs a wake-up, not a buffer.
+        if !waiters
+            .back()
+            .is_some_and(|waiter| waiter.will_wake(cx.waker()))
+        {
+            waiters.push_back(cx.waker().clone());
         }
         Poll::Pending
     }
@@ -465,17 +476,15 @@ impl Pool {
             low = low.wrapping_add(1);
         }
         self.low.set(low);
-        let mut published = false;
+        let mut published = 0;
         while self.has_free_slot() {
             let Some(bid) = self.spare.borrow_mut().pop() else {
                 break;
             };
             self.publish(bid);
-            published = true;
+            published += 1;
         }
-        if published {
-            self.wake_waiters();
-        }
+        self.wake_waiters(published);
     }
 
     /// Whether the slot of the tail can take a buffer: its last buffer has
@@ -492,7 +501,7 @@ impl Pool {
             return;
         }
         self.publish(bid);
-        self.wake_waiters();
+        self.wake_waiters(1);
     }
 
     /// Puts buffer `bid` in the slot of the tail, which must be free, and
@@ -540,10 +549,17 @@ impl Pool {
         self.available.set(self.available.get() + 1);
     }
 
-    fn wake_waiters(&self) {
-        let waiters = mem::take(&mut *self.waiters.borrow_mut());
-        for waiter in waiters {
-            waiter.wake();
+    /// Wakes the first `count` tasks waiting for a buffer, one for each
+    /// buffer that returned to the ring.
+    fn wake_waiters(&self, count: usize) {
+        for _ in 0..count {
+            let waiter = self.waiters.borrow_mut().pop_front();
+            match waiter {
+                // Outside the borrow: a wake can run code that asks for a
+                // buffer.
+                Some(waiter) => waiter.wake(),
+                None => break,
+            }
         }
     }
 }

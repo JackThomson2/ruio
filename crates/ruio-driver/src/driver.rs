@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use ruio_sys as sys;
 
 use crate::Probe;
-use crate::link::private::Member;
+use crate::link::private::{Linkable, Member};
 use crate::op::{Completion, Op, Operation, Orphan};
 use crate::remote::{Remote, RemoteRing};
 use crate::ring::Ring;
@@ -182,6 +182,7 @@ impl Builder {
             wakers: Vec::new(),
             released: Vec::new(),
             deliveries: Vec::new(),
+            last_turn: 0,
             stats: Stats::default(),
             shutdown_timeout: self.shutdown_timeout,
         }));
@@ -314,6 +315,9 @@ struct Inner {
     released: Vec<(Box<dyn Orphan>, Completion)>,
     /// Orphaned streams with completions to hand over, likewise.
     deliveries: Vec<u64>,
+    /// How many completions the last turn delivered; see
+    /// [`Driver::completions_last_turn`].
+    last_turn: usize,
     stats: Stats,
     shutdown_timeout: Duration,
 }
@@ -342,6 +346,41 @@ impl Driver {
     /// polled.
     pub fn stream<T: Multishot>(&self, request: T) -> MultiOp<T> {
         MultiOp::new(self.clone(), request)
+    }
+
+    /// Leaves `operations` to finish as a chain with nobody waiting for them:
+    /// queues them linked, as a [`Link`](crate::Link) is queued, so that the
+    /// kernel runs them in order, each once the one before has succeeded,
+    /// and one that fails cancels the rest; and hands each to the driver, as
+    /// [`Op::detach`] does, which drops its output once the kernel is done.
+    /// Each operation's [`timeout`](Op::timeout) bounds it alone.
+    ///
+    /// If the chain cannot be queued, every operation completes with the
+    /// error at once.
+    ///
+    /// # Panics
+    ///
+    /// If an operation has been submitted, or is on another ring.
+    pub fn detach_chain<T: Operation>(&self, mut operations: Vec<Op<T>>) {
+        assert!(
+            operations.iter().all(Op::unsubmitted),
+            "an operation can be linked only before it is submitted"
+        );
+        assert!(
+            operations.iter().all(|op| self.same_ring(op.driver())),
+            "linked operations must be on the same ring"
+        );
+        if operations.is_empty() {
+            return;
+        }
+        let mut members: Vec<&mut dyn Member> = operations
+            .iter_mut()
+            .map(|op| op as &mut dyn Member)
+            .collect();
+        self.queue_chain(&mut members, Waker::noop());
+        for op in operations {
+            op.detach();
+        }
     }
 
     /// Submits the queued operations, and delivers the completions that are
@@ -423,10 +462,27 @@ impl Driver {
         self.inner.borrow().stats
     }
 
+    /// How many completions the last turn of the ring, a [`submit`] or a
+    /// [`park`], delivered: a measure of the load on the thread. A thread
+    /// that waits on one peer at a time, as a single connection's does, sees
+    /// one completion a turn; a loaded one sees a batch.
+    ///
+    /// [`submit`]: Driver::submit
+    /// [`park`]: Driver::park
+    pub fn completions_last_turn(&self) -> usize {
+        self.inner.borrow().last_turn
+    }
+
     /// The number of slots in the ring's registered file table, which holds
     /// its direct descriptors; see [`Builder::files`].
     pub fn files(&self) -> u32 {
         self.inner.borrow().files
+    }
+
+    /// The number of entries in the ring's submission queue; see
+    /// [`Builder::entries`]. A chain can have no more.
+    pub fn sq_entries(&self) -> u32 {
+        self.inner.borrow().ring.sq_entries()
     }
 
     /// A number that identifies the driver's ring among every ring the
@@ -518,10 +574,11 @@ impl Driver {
 
     fn enter(&self, min_complete: u32, timeout: Option<Duration>) -> io::Result<()> {
         let timeout = timeout.map(timespec);
-        let result = self
-            .inner
-            .borrow_mut()
-            .enter(min_complete, timeout.as_ref());
+        let (result, before) = {
+            let mut inner = self.inner.borrow_mut();
+            let before = inner.stats.completions;
+            (inner.enter(min_complete, timeout.as_ref()), before)
+        };
         self.deliver();
         // Completions that did not fit in the queue wait in the kernel, which
         // moves them in when entered again, now that there is room.
@@ -529,6 +586,8 @@ impl Driver {
             self.inner.borrow_mut().enter(0, None)?;
             self.deliver();
         }
+        let mut inner = self.inner.borrow_mut();
+        inner.last_turn = usize::try_from(inner.stats.completions - before).unwrap_or(usize::MAX);
         result
     }
 
