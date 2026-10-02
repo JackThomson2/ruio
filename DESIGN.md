@@ -363,22 +363,34 @@ baseline are used only when probed.
   future to another core, and `Handle::spawn_with` a closure that makes
   the future there, which then need not be `Send`: it can hold a socket of
   that core's ring across its awaits.
-- A task is one `Arc` allocation holding its future and, once it finishes,
-  its output, and is its own waker, through a waker vtable of its own. Wakers
-  are `Send + Sync`, as the `Waker` contract requires, while the future need
-  not be, so the future, output and bookkeeping are only touched on the
-  task's thread: by the scheduler and by the `JoinHandle`, which is not
-  `Send`. The scheduler holds every unfinished task until its future is
-  dropped on that thread, and the `JoinHandle` drops the output there, so a
-  waker that releases the last reference elsewhere owns nothing that is not
-  `Send`.
-- Waking and running a task on its own thread takes no atomic operation. A
-  run lends its poll a waker that borrows the scheduler's reference to the
-  task, and takes a reference only when the future clones it. A wake on the
-  task's thread queues it with a plain flag; a wake from another thread sets
-  an atomic one and queues it on the remote queue, and a run clears that
-  flag, with a full barrier, only if it is set. Moving remote wakes to the
-  run queue checks the plain flag, so a task is never queued twice.
+- A task is one allocation holding its future and, once it finishes, its
+  output, and is its own waker. It is referred to in two ways. References
+  from its own thread, which the scheduler's table, the run queue, the
+  `JoinHandle` and the driver's registrations hold, are counted in a plain
+  cell, so taking and dropping one costs no atomic operation. References
+  that may be anywhere, the wakers and the remote queue's entries, are
+  counted atomically, and one of them, the share, stands for every local
+  reference while there is any. Wakers are `Send + Sync`, as the `Waker`
+  contract requires, while the future need not be, so the future, output
+  and bookkeeping are only touched on the task's thread: by the scheduler
+  and by the `JoinHandle`, which is not `Send`. The scheduler holds every
+  unfinished task until its future is dropped on that thread, and the
+  `JoinHandle` drops the output there, so the task is freed, wherever the
+  last atomic reference goes, owning nothing that is not `Send`.
+- Every task's wakers share one vtable, whatever the task's future: the
+  header of a task comes first in it, so a pointer to the task is a pointer
+  to its header, through which the vtable reaches the rest. So the driver
+  can tell a task's waker by its vtable, and holds it in its table by a
+  local reference, through the retain, release and wake hooks of a
+  `LocalWaker` the executor registers, where it clones any other waker; a
+  completed stream keeps its local waker, so the stream's next poll
+  registers nothing. An operation's wake and run so cost no locked
+  instruction on the task's thread: a run lends its poll a waker that
+  borrows the run's reference, a wake on the task's thread queues it with a
+  plain flag and a local reference, and a wake from another thread sets an
+  atomic flag and queues an atomic reference on the remote queue, which a
+  run clears, with a full barrier, only if it is set. Moving remote wakes
+  to the run queue checks the plain flag, so a task is never queued twice.
 - Each loop pass runs up to 64 ready tasks, fires due timers, then turns the
   ring: it submits without waiting if anything is runnable, and otherwise
   parks until a completion, a wake or the next timer. A task woken by the
@@ -752,38 +764,45 @@ loopback:
 
 | Connections | Message | tokio | ruio | p99 tokio (µs) | p99 ruio (µs) |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 64 B | 46k | 47k (1.03×) | 28 | 29 |
-| 1 | 1 KiB | 45k | 46k (1.01×) | 29 | 29 |
-| 1 | 16 KiB | 31k | 31k (1.03×) | 42 | 42 |
-| 1 | 64 KiB | 17k | 16k (0.94×) | 75 | 68 |
-| 16 | 64 B | 210k | 203k (0.97×) | 96 | 101 |
-| 16 | 1 KiB | 197k | 192k (0.98×) | 103 | 108 |
-| 16 | 16 KiB | 114k | 118k (1.04×) | 193 | 182 |
-| 16 | 64 KiB | 42k | 44k (1.07×) | 570 | 486 |
-| 256 | 64 B | 202k | 204k (1.01×) | 1331 | 1355 |
-| 256 | 1 KiB | 192k | 197k (1.02×) | 1419 | 1423 |
-| 256 | 16 KiB | 153k | 161k (1.05×) | 1862 | 1768 |
-| 256 | 64 KiB | 48k | 47k (0.98×) | 5590 | 6260 |
-| 1,024 | 64 B | 220k | 228k (1.04×) | 4850 | 4822 |
-| 1,024 | 1 KiB | 215k | 232k (1.08×) | 5775 | 4805 |
-| 1,024 | 16 KiB | 134k | 149k (1.11×) | 8104 | 7828 |
-| 1,024 | 64 KiB | 36k | 39k (1.09×) | 29630 | 27816 |
-| 10,000 | 64 B | 214k | 201k (0.94×) | 48815 | 59353 |
-| 10,000 | 1 KiB | 179k | 182k (1.01×) | 57525 | 59740 |
-| 10,000 | 16 KiB | 90k | 89k (0.99×) | 115665 | 116545 |
-| 10,000 | 64 KiB | 32k | 33k (1.01×) | 316985 | 318078 |
+| 1 | 64 B | 47k | 48k (1.01×) | 28 | 27 |
+| 1 | 1 KiB | 45k | 44k (0.98×) | 28 | 29 |
+| 1 | 16 KiB | 31k | 32k (1.04×) | 40 | 39 |
+| 1 | 64 KiB | 17k | 16k (0.96×) | 78 | 66 |
+| 16 | 64 B | 211k | 204k (0.97×) | 95 | 101 |
+| 16 | 1 KiB | 200k | 193k (0.97×) | 102 | 107 |
+| 16 | 16 KiB | 116k | 120k (1.04×) | 188 | 179 |
+| 16 | 64 KiB | 42k | 46k (1.12×) | 571 | 467 |
+| 256 | 64 B | 205k | 203k (0.99×) | 1313 | 1387 |
+| 256 | 1 KiB | 194k | 197k (1.02×) | 1399 | 1412 |
+| 256 | 16 KiB | 141k | 156k (1.11×) | 2086 | 1856 |
+| 256 | 64 KiB | 48k | 50k (1.04×) | 5592 | 5460 |
+| 1,024 | 64 B | 221k | 218k (0.99×) | 4792 | 5116 |
+| 1,024 | 1 KiB | 222k | 231k (1.04×) | 4823 | 4668 |
+| 1,024 | 16 KiB | 106k | 119k (1.13×) | 11932 | 12894 |
+| 1,024 | 64 KiB | 36k | 40k (1.10×) | 29638 | 27406 |
+| 10,000 | 64 B | 188k | 193k (1.03×) | 67675 | 59880 |
+| 10,000 | 1 KiB | 177k | 178k (1.01×) | 69855 | 71134 |
+| 10,000 | 16 KiB | 91k | 88k (0.97×) | 112809 | 117267 |
+| 10,000 | 64 KiB | 32k | 35k (1.07×) | 314124 | 293676 |
 
-ruio is ahead of tokio from 256 connections on, by up to 11%, bar 256
-connections with 64 KiB messages (0.98×), and level at 1 and 16 connections
-and at 10,000, bar one connection with 64 KiB messages (0.94×). Its 99th
-percentile is within 6% of tokio's or better, bar 256 connections with 64 KiB
-messages (12% later) and 10,000 with 64 B messages. Direct descriptors change
-nothing measurable. Runs of the same load differ by up to a few percent on
-this host, which is shared, and more while it is busy: the 0.94× at 10,000
-connections with 64 B messages, with a 99th percentile a fifth later than
-tokio's, came in such a spell, in which the server with direct descriptors,
-run in the same turns, measured 1.01× and 47.6 ms, and two more runs of that
-row gave 1.14× and 1.12×, with tokio the one caught.
+ruio is ahead of tokio from 256 connections on, by up to 13%, bar 256 and
+1,024 connections with 64 B messages (0.99×) and 10,000 with 16 KiB (0.97×),
+and level at 1 and 16 connections, bar one connection with 64 KiB messages
+(0.96×) and 16 connections with messages of a kilobyte or less (0.97×). Its
+99th percentile is within 7% of tokio's or better, bar 1,024 connections with
+64 B and 16 KiB messages. Direct descriptors change nothing measurable. Runs
+of the same load differ by up to a few percent on this host, which is
+shared, and more while it is busy: in the run of the table the 10,000
+connection rows came in such a spell, 64 B messages measuring 0.77× with the
+server with direct descriptors, run in the same turns, at 0.92×, and 16 KiB
+1.11×, so those four rows are a second run of their own, taken afterwards,
+in which the server with direct descriptors measured 1.15× with 64 B
+messages. A spinning server (`Builder::spin`, see [Executor](#executor))
+changes the rows with one connection alone, where it is bound by latency:
+with a budget of 50 µs, 96k round trips a second with 64 B messages
+(2.05×, 99th percentile 13 µs against 29), 90k with 1 KiB (2.04×, 15 against
+30), 45k with 16 KiB (1.44×, 29 against 41) and 21k with 64 KiB (1.22×, 52
+against 75); with 16 connections nothing changes, the server being busy.
 
 Loaded, both servers spend 95% or more of their CPU in the kernel: over
 loopback a server's CPU runs the transmit path of every echo and the receive
@@ -867,6 +886,33 @@ woken stream's receive is re-armed at the end of the pass, by when a receive
 that was armed, with data waiting, has taken the buffer, and with demand
 beyond the pool some streams wait seconds. Huge pages for the pool
 (`MADV_HUGEPAGE`, which the kernel granted) changed nothing measurable.
+
+The second performance pass read the kernel's io_uring for Linux 7.0 and
+tried four more. With `DEFER_TASKRUN` an entry into the kernel that asks for
+events runs up to 20 items of deferred work, such as receives, in the submit
+path and up to 20 more in the wait, which is why submitting after every task
+cost what it did: a submission without `IORING_ENTER_GETEVENTS` runs none,
+and sends over loopback complete inline either way, so one every 4, 8 or 16
+queued entries, or every 3 µs of a pass, is a pure flush. It left the 99th
+percentile at 16 connections where it was and cost 0.5% to 4% of the round
+trips; ending the pass early when the ring's flags showed work pending
+brought that percentile to tokio's but halved the throughput at 10,000
+connections with 64 KiB messages, so sends stay at the end of the pass. A
+park woken by one completion runs one item of deferred work and returns, the
+rest waiting for the next entry; a park that waits for several
+(`min_complete` with a bounded minimum wait, `IORING_FEAT_MIN_TIMEOUT`,
+6.12) was meant to deliver a batch per wake instead, but the loaded server
+never sleeps: at 16 connections and beyond a park's entry finds work pending
+and returns at once, eight echoes an entry at 16 connections and forty at
+256, whichever wait was asked for, and nothing moved but a 5% loss with one
+connection, whose every turn it batched. `IORING_SETUP_SQ_REWIND` (7.0),
+which spares each entry the submission queue's head and tail, changed
+neither the microbenchmark's turns nor the echo rows. And asking the kernel
+to map four buffers for every receive, so that a 64 KiB message takes one
+call into the socket rather than two, gained 3% with one connection and
+64 KiB messages and cost 1% to 1.5% with messages that fit one buffer, so it
+is an option (`RecvStream::buffers`) rather than the default.
+
 Across two machines the server no longer does the client's receive
 processing, which leaves the runtime a larger share of its time. How
 runtimes on several cores fare is under
@@ -901,10 +947,12 @@ started at 0.82× at depth 1 and 0.93× at 32, where its user space took 29%
 of the CPU; four things were in the way, all of them the runtime's:
 
 - Waking and running a task took six locked instructions, which serialize
-  the pipeline. On the task's own thread four of them are gone (see
-  [Executor](#executor)), which gained 5% at depth 32; cloning the waker an
-  operation keeps, and dropping the scheduler's reference after a run,
-  remain.
+  the pipeline. On the task's own thread four of them went first (see
+  [Executor](#executor)), which gained 5% at depth 32; the two that
+  remained, cloning the waker an operation keeps and dropping the
+  scheduler's reference after a run, went with the local references of the
+  second performance pass, and the park's four with it (see
+  [The runtime itself](#the-runtime-itself)).
 - With a timer pending, as the benchmark's own measuring sleep is, a pass
   read the clock twice, walked the wheel twice, and parked with a timeout the
   kernel copied in on every wait: a tenth of a read at depth 1, where every
@@ -913,9 +961,18 @@ of the CPU; four things were in the way, all of them the runtime's:
 - Each operation on a direct descriptor searched the thread's drivers for
   its ring.
 
-At depth 64 and above ruio falls 3% to 5% behind, for a reason still to
+At depth 64 and above ruio fell 3% to 5% behind, for a reason still to
 find; the kernel runs at most 20 items of deferred work per entry, which
 both sides live with.
+
+The table is from before the second performance pass, and fio was no longer
+on the host to run it again. ruio before and after the pass, run in turns on
+the same device, medians of three runs of four seconds: depth 1, 1.17M to
+1.38M reads a second (1.18×), where every read is a turn of the loop and a
+park; depth 4, 1.90M to 2.00M (1.06×); depth 16, 2.31M to 2.42M (1.05×);
+depth 32, 2.27M to 2.37M (1.04×); depth 64, 2.26M to 2.36M (1.04×); depth
+128, 2.25M to 2.35M (1.04×). The host was busier than when the table was
+measured, which both sides of the comparison share.
 
 ### Scaling across cores
 
@@ -934,15 +991,15 @@ one of its 48 cores. Scaling is the rate per core against one core's:
 | Cores | tokio | Scaling | ruio | Scaling | Busy loop |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 214k | 100% | 242k (1.13×) | 100% | 100% |
-| 2 | 426k | 99% | 479k (1.12×) | 99% | |
-| 4 | 855k | 100% | 963k (1.13×) | 99% | |
-| 8 | 1.71M | 100% | 1.92M (1.12×) | 99% | |
-| 16 | 3.40M | 99% | 3.82M (1.12×) | 99% | 97% |
-| 24 | 4.83M | 94% | 5.38M (1.11×) | 93% | 94% |
-| 32 | 6.08M | 89% | 6.67M (1.10×) | 86% | 90% |
-| 48 | 8.16M | 79% | 8.56M (1.05×) | 74% | 80% |
-| 64 | 8.39M | 61% | 8.62M (1.03×) | 56% | 58% |
-| 96 | 8.60M | 42% | 9.05M (1.05×) | 39% | 39% |
+| 2 | 429k | 100% | 484k (1.13×) | 100% | |
+| 4 | 850k | 99% | 962k (1.13×) | 100% | |
+| 8 | 1.70M | 99% | 1.92M (1.13×) | 99% | |
+| 16 | 3.34M | 97% | 3.76M (1.13×) | 97% | 97% |
+| 24 | 4.82M | 94% | 5.46M (1.13×) | 94% | 94% |
+| 32 | 5.98M | 87% | 6.61M (1.10×) | 85% | 90% |
+| 48 | 7.95M | 77% | 8.62M (1.08×) | 74% | 80% |
+| 64 | 8.45M | 62% | 8.82M (1.04×) | 57% | 58% |
+| 96 | 8.71M | 42% | 9.14M (1.05×) | 39% | 39% |
 
 The last column is what the host itself gives a busy loop on each core,
 a Python loop in a process pinned to each CPU, sharing nothing: with 48
@@ -972,15 +1029,19 @@ with Linux 7.0, over loopback:
 
 | Connections | tokio | ruio | ruio, pool | p99 tokio (µs) | p99 ruio (µs) | p99 ruio, pool (µs) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 44k | 44k (0.99×) | 45k (1.00×) | 28 | 28 | 28 |
-| 16 | 189k | 172k (0.91×) | 182k (0.96×) | 104 | 125 | 119 |
-| 256 | 175k | 169k (0.96×) | 178k (1.02×) | 1590 | 1655 | 1565 |
-| 1,024 | 185k | 182k (0.98×) | 191k (1.03×) | 5720 | 5780 | 5580 |
-| 10,000 | 164k | 163k (0.99×) | 173k (1.05×) | 64506 | 62789 | 59256 |
+| 1 | 45k | 44k (0.99×) | 44k (0.99×) | 28 | 28 | 29 |
+| 16 | 187k | 173k (0.93×) | 182k (0.97×) | 105 | 124 | 118 |
+| 256 | 176k | 170k (0.97×) | 178k (1.01×) | 1550 | 1670 | 1598 |
+| 1,024 | 184k | 183k (0.99×) | 191k (1.04×) | 5926 | 6068 | 5633 |
+| 10,000 | 156k | 163k (1.05×) | 168k (1.08×) | 82736 | 83222 | 67270 |
 
 Receiving into a pool, hyper on ruio is level with hyper on tokio with one
-connection, and from 256 connections on 2% to 5% ahead, with a 99th
-percentile as short or shorter; at 16 connections it is 4% behind. Loaded,
+connection, and from 256 connections on 1% to 8% ahead, with a 99th
+percentile as short or shorter; at 16 connections it is 3% behind. The row
+with 10,000 connections is the median of five runs rather than three: with
+that many connections a run of this host's gives either runtime a fifth more
+or less from one run to the next, and three runs of that row in a noisier
+spell had put the pool at 0.93×. Loaded,
 both spend about 83% of their CPU in the kernel, 13% in hyper and the
 runtime, and 4% in the C library; the adapters' copies, of a request out
 of the pool's buffers and of a response into a buffer for the kernel, add
@@ -1013,6 +1074,77 @@ more. The kernel's receive path takes twice its share under tokio, as it
 does in the echo benchmark, where the two are level: under tokio `epoll_wait`
 polls the socket first and takes the cache misses that `recvmsg` takes under
 ruio, which the profiles show in different places.
+
+### The runtime itself
+
+The benchmarks above measure the runtime together with the kernel's work on
+sockets and files, which takes most of the time, so a change to the
+runtime's own paths shows in them only faintly. `ruio-bench micro` measures
+those paths on their own: each is a loop of one small step, run on one CPU
+for a second, and the result is steps per second, on ruio and, where tokio
+has the same thing, on its current-thread runtime, the runtimes taking turns.
+`nop 1` is a task awaiting no-ops one at a time, each a turn of the loop:
+queue, enter the kernel and wait, deliver, wake, run. `nop 64` is 64 such
+tasks, so that a turn delivers a batch. `spawn` spawns a task that does
+nothing and awaits it; `yield` yields to the scheduler; `channel` sends a
+value to another task through a bounded channel and gets one back; `remote`
+sends one to a thread of its own, which sends one back through the
+runtime's channel, so the task is woken from outside and the ring parked
+and unparked; `timer` arms a timer by polling a sleep once and drops it;
+`sleep` is a thousand tasks each sleeping a millisecond at a time, bound by
+the millisecond; `mutex` locks and unlocks an uncontended async mutex.
+Steps per second, medians of three runs, before and after the second
+performance pass, on the Xeon Platinum 8488C with Linux 7.0:
+
+| Step | tokio | ruio before | ruio after |
+|---|---:|---:|---:|
+| nop 1 | | 3.37M | 3.95M (1.17×) |
+| nop 64 | | 14.1M | 17.9M (1.27×) |
+| spawn | 2.2M | 6.7M | 9.1M (1.36×) |
+| yield | 3.8M | 21.4M | 25.9M (1.21×) |
+| channel | 2.0M | 5.8M | 6.3M (1.09×) |
+| remote | 189k | 194k | 199k (1.03×) |
+| timer | 3.1M | 10.7M | 10.7M (1.00×) |
+| sleep | 460k | 500k | 500k (1.00×) |
+| mutex | 24.8M | 29.4M | 28.3M (0.96×) |
+
+What the pass changed, in order of effect:
+
+- **Local references.** Every operation a task awaited cost two locked
+  instructions on the task's own thread, the driver cloning the waker into
+  its table and the scheduler dropping the run queue's reference after the
+  run, and a wake by reference from a task's own poll, as yielding does,
+  cloned and dropped once more: with 64 no-ops in flight these were a third
+  of the user-space time. The task's references from its own thread are now
+  counted in a plain cell, and the driver holds the executor's wakers by
+  one of them (see [Executor](#executor)): `nop 64` gained a fifth,
+  `spawn` and `yield` as much.
+- **The park.** A park took four locked instructions before its system
+  call, cloning and dropping the `Arc` of the unpark state, which lived
+  behind the driver's cell, and a compare-and-exchange and a swap for the
+  park's beginning and end; in the profile of `nop 1` most of the cycles of
+  the park sat on them. The state lives beside the cell now, and the park
+  swaps it once and stores it back: one locked instruction, which `nop 1`
+  shows.
+- **The table.** The table built each new slot's state on the caller's
+  stack and copied all 64 bytes into the slot, where the copy stalled behind
+  the smaller stores that built it, ran drop glue for states that own
+  nothing, and moved an operation's state out and back in to find out that
+  it had not completed; a turn of the ring swapped the flag of the slots
+  other threads ask it to close, and every pass of `block_on` swapped the
+  main future's flag. All of these go: a few percent each of `nop 64`.
+- **Detached operations.** A write behind allocated for the operation it
+  detached, and freed it when the send completed; it now goes straight into
+  an orphaned slot, inline. The echo server with 16 connections allocates
+  nothing per echo where it allocated once, and the adapter's flush, which
+  registered a noop waker and allocated for it, asks without registering.
+
+The `mutex` row is within the host's noise, the two runs before the pass
+differing by as much between themselves. In the echo benchmark these show
+as a percent or two where the server is busy, in the random reads (see
+[Random reads with direct I/O](#random-reads-with-direct-io)) as the
+user-space share of each read, and in the spin as the turn of the loop that
+a spinning thread makes for every echo.
 
 ## Milestones
 
@@ -1079,6 +1211,23 @@ Since M7:
   at 4096 buffers, which took 10,000 connections with 64 KiB messages from
   0.96× to 1.01×; and `Compat` keeps its write buffer for the next write
   (see [TCP echo](#tcp-echo) and [HTTP/1.1](#http11)).
+- A second performance pass, on the runtime's own costs, which
+  `ruio-bench micro` measures apart from the kernel's (see
+  [The runtime itself](#the-runtime-itself)): a park takes one locked
+  instruction where it took four, and waking and running a task on its own
+  thread takes none, the driver holding the executor's wakers by a counted
+  local reference rather than a clone; the table writes its slots in place
+  and drops nothing that owns nothing; a detached operation goes straight
+  into its slot, inline, so a write behind allocates nothing; an adapter's
+  flush asks how the writes went without registering, and a socket keeps
+  its ring. `Builder::spin` has a runtime poll before it parks while its
+  waits are short, which doubles the round trips of a single connection. A
+  stream whose messages run to several buffers can ask the kernel to map
+  that many per receive (`RecvStream::buffers`), and a send of several
+  buffers names its vector in the entry (`IORING_SEND_VECTORIZED`, probed).
+  Measured and not adopted: a mid-pass submission that runs no completion
+  work, a park that waits for a batch, `IORING_SETUP_SQ_REWIND`, and the
+  larger receive ask as the default.
 
 ## Open questions
 

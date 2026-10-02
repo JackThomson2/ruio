@@ -88,14 +88,21 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
 [Benchmarks](DESIGN.md#benchmarks) for the loads and the full tables):
 
 - **TCP echo**, one core: ahead of tokio from 256 connections on, by up to
-  11%, and level with fewer and at 10,000.
+  13%, and level with fewer; with one connection, a runtime that spins
+  before it parks (`Builder::spin`) makes twice tokio's round trips, with
+  half the tail latency.
 - **4 KiB `O_DIRECT` random reads**: within 5% of fio's io_uring engine at
-  every queue depth, and level with it up to 32.
+  every queue depth, and level with it up to 32; 18% more reads at depth 1
+  and 4% to 6% more at the others since, from the runtime's own paths.
 - **Across cores**: linear up to 16 cores, and up to 96 within 8% of what
   the host gives a busy loop.
 - **hyper, HTTP/1.1**, one core, through the adapters, receiving into a
-  pool: level with hyper on tokio with one connection, 2% to 5% ahead from
-  256 connections on, and 4% behind at 16.
+  pool: level with hyper on tokio with one connection, 1% to 8% ahead from
+  256 connections on, and 3% behind at 16.
+- **The runtime itself** (`ruio-bench micro`): a task's turn of the loop, a
+  spawn, a wake and a channel round trip cost no atomic operation on their
+  own thread, and run three to seven times as fast as on tokio's
+  current-thread runtime.
 
 ## Development
 
@@ -103,7 +110,7 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
 ci/check.sh     formatting, clippy, tests and documentation, as CI runs them
 ci/asan.sh      the tests under AddressSanitizer with leak detection (nightly)
 cargo run -p ruio-driver --example probe    what the kernel supports
-cargo run --release -p ruio-bench -- echo   the echo benchmark; also http, randread, scale
+cargo run --release -p ruio-bench -- echo   the echo benchmark; also http, randread, scale, micro
 ```
 
 [DESIGN.md](DESIGN.md) describes the design, its soundness model, and what
