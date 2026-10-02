@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use ruio::buf::BufPool;
 use ruio::net::{TcpListener, TcpStream};
 use ruio::sync::oneshot;
+use ruio::uring::ops::Nop;
 
 use support::within;
 
@@ -138,6 +139,31 @@ async fn writes_behind_arrive_in_order() -> io::Result<()> {
         within(client.write_behind(vec![message])).await?;
     }
     within(client.flush()).await?;
+    assert!(reader.await.unwrap()? == expected);
+    Ok(())
+}
+
+/// While the thread waits on one peer at a time, a large write behind goes
+/// as a chain of sends, which arrive in order, and the other writes wait
+/// for the last of them.
+#[ruio::test]
+async fn a_large_write_behind_goes_as_a_chain_while_idle() -> io::Result<()> {
+    let (client, server) = pair().await?;
+    let bufs: Vec<Vec<u8>> = (0..10).map(|seed| pattern(20 << 10, seed)).collect();
+    let expected = [bufs.concat(), b"tail".to_vec()].concat();
+    let len = expected.len();
+    let reader = ruio::spawn(async move {
+        let (read, received) = within(server.read_exact(Vec::with_capacity(len))).await;
+        read.map(|()| received)
+    });
+    // One completion in the last turn of the ring: the thread is idle.
+    let driver = ruio::driver();
+    driver.op(Nop).await?;
+    assert_eq!(driver.completions_last_turn(), 1);
+    let before = driver.stats().operations;
+    within(client.write_behind(bufs)).await?;
+    assert_eq!(driver.stats().operations - before, 4, "four sends");
+    within(client.write_all(b"tail".to_vec())).await.0?;
     assert!(reader.await.unwrap()? == expected);
     Ok(())
 }
