@@ -35,6 +35,11 @@ pub(crate) struct Ring {
     enter_fd: c_int,
     /// `IORING_ENTER_REGISTERED_RING` when `enter_fd` is a registered index.
     enter_flags: u32,
+    /// What an entry that waits adds to `enter_flags`:
+    /// `IORING_ENTER_NO_IOWAIT`, if the kernel takes it, so that a ring
+    /// waiting for its sockets, or its timer, is not counted as waiting for
+    /// a disk.
+    wait_flags: u32,
     // Declared after the queues, which point into them, and before the
     // descriptor, so they are unmapped before it is closed.
     _rings: Mapping,
@@ -155,11 +160,18 @@ impl Ring {
             Some(index) => (index, sys::IORING_ENTER_REGISTERED_RING),
             None => (fd.as_raw_fd(), 0),
         };
+        // An older kernel refuses the flag, as it does any it does not know.
+        let wait_flags = if params.features & sys::IORING_FEAT_NO_IOWAIT != 0 {
+            sys::IORING_ENTER_NO_IOWAIT
+        } else {
+            0
+        };
         Ok(Self {
             sq,
             cq,
             enter_fd,
             enter_flags,
+            wait_flags,
             _rings: rings,
             _sqes: sqes,
             fd,
@@ -291,6 +303,9 @@ impl Ring {
         unsafe { atomic(self.sq.tail) }.store(self.sq.local_tail, Ordering::Release);
         let to_submit = self.queued();
         let mut flags = sys::IORING_ENTER_GETEVENTS | self.enter_flags;
+        if min_complete > 0 {
+            flags |= self.wait_flags;
+        }
         let arg;
         let (arg_ptr, arg_len) = match timeout {
             Some(timeout) => {
