@@ -11,6 +11,11 @@
 //! its future and output are gone: the scheduler drops the future on the
 //! task's thread, and the join handle its output, both before they let go of
 //! their local references.
+//!
+//! A task holds the shared part of its scheduler, which its wakes from
+//! other threads reach, for as long as it lives. It holds it by the count of
+//! the runtime's thread, which costs no atomic operation, unless it may be
+//! freed on another thread: then it holds an atomic reference of its own.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -60,8 +65,14 @@ enum Stage<F: Future> {
 /// the vtable through which they reach the rest.
 pub(crate) struct Header {
     vtable: &'static Vtable,
-    /// The shared part of the scheduler that owns the task.
-    shared: Arc<Shared>,
+    /// The shared part of the scheduler that owns the task, as its `Arc`
+    /// gives it, which the task holds as `hold` says.
+    shared: NonNull<Shared>,
+    /// How the task holds `shared`. It changes on the task's thread alone,
+    /// while a local reference or the share keeps the task, and only from
+    /// local to atomic; the thread that frees the task reads it after the
+    /// release of the task's last reference.
+    hold: Cell<Hold>,
     /// References that may be anywhere: wakers, whichever thread holds them,
     /// the entries of the remote queue, and the share, one reference standing
     /// for every local one while there is any.
@@ -92,6 +103,17 @@ struct Vtable {
     dealloc: unsafe fn(*const Header),
 }
 
+/// How a task holds the shared part of the scheduler that owns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+    /// By the count of the runtime's thread; see [`Shared::hold`]. A task
+    /// holds its owner so from its spawn until it may be freed on another
+    /// thread, where the count may not be touched.
+    Local,
+    /// By an atomic reference of its own.
+    Atomic,
+}
+
 /// The index of the header of the future given to `block_on`, which is in no
 /// scheduler's list of tasks; see [`Main`].
 const MAIN: usize = usize::MAX;
@@ -110,6 +132,28 @@ impl Header {
     #[inline]
     fn is_main(&self) -> bool {
         self.index.get() == MAIN
+    }
+
+    /// The shared part of the scheduler that owns the task, which stays
+    /// alive while the task does.
+    #[inline]
+    fn owner(&self) -> *const Shared {
+        self.shared.as_ptr().cast_const()
+    }
+
+    /// Has the task hold its owner by an atomic reference of its own, if it
+    /// holds it by the count of the runtime's thread: before it may be freed
+    /// on another thread. Only on the task's thread, while a local reference
+    /// or the share keeps the task.
+    fn hold_atomically(&self) {
+        if self.hold.replace(Hold::Atomic) == Hold::Local {
+            // SAFETY: the count's hold keeps the part alive, and the pointer
+            // is the one its `Arc` gives.
+            unsafe { Arc::increment_strong_count(self.owner()) };
+            // SAFETY: this is the runtime's thread, and the count held the
+            // part for the task, which now holds it otherwise.
+            unsafe { Shared::release_hold(self.owner()) };
+        }
     }
 }
 
@@ -194,7 +238,7 @@ impl LocalRef {
     /// running on this thread, and otherwise on its remote queue.
     #[inline]
     fn wake(self) {
-        let owner = Arc::as_ptr(&self.header().shared);
+        let owner = self.header().owner();
         let mut task = Some(self);
         context::with_owner(owner, |scheduler| {
             let task = task.take().expect("the reference is still held");
@@ -256,9 +300,12 @@ pub(crate) struct RemoteRef {
 // SAFETY: a remote reference reaches only what any thread may of the task:
 // the atomic counts, the vtable and the owning scheduler's shared part. The
 // cells are touched on the task's thread alone, by local references and by
-// the scheduler when it takes the remote queue. The task is freed on
-// whichever thread lets go of the last atomic reference, by which time its
-// future and output are gone, so nothing that is not `Send` goes with it.
+// the scheduler when it takes the remote queue, but for `hold`, which the
+// thread that frees the task reads after the last release. The task is
+// freed on whichever thread lets go of the last atomic reference, by which
+// time its future and output are gone, so nothing that is not `Send` goes
+// with it, and it holds its owner by an atomic reference, unless that is
+// the runtime's thread.
 unsafe impl Send for RemoteRef {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for RemoteRef {}
@@ -312,7 +359,7 @@ impl RemoteRef {
         let header = self.header.as_ptr();
         // The owner's address alone: the reference may be let go of below,
         // which could free the task.
-        let owner = Arc::as_ptr(&self.header().shared);
+        let owner = self.header().owner();
         let mut remote = Some(self);
         let on_owner = context::with_owner(owner, |scheduler| {
             let remote = remote.take().expect("the reference is still held");
@@ -334,8 +381,14 @@ impl RemoteRef {
             return;
         }
         // The shared part is kept alive for the call: the queue, if it has
-        // closed, drops the reference, which could be the task's last.
-        let shared = Arc::clone(&self.header().shared);
+        // closed, drops the reference, which could be the task's last, and
+        // the task's hold on the part goes with it.
+        let owner = self.header().owner();
+        // SAFETY: the reference keeps the task alive, and the task the part,
+        // and the pointer is the one its `Arc` gives.
+        unsafe { Arc::increment_strong_count(owner) };
+        // SAFETY: the reference just counted.
+        let shared = unsafe { Arc::from_raw(owner) };
         shared.schedule_remote(self);
     }
 }
@@ -379,9 +432,10 @@ unsafe fn release(header: *const Header) {
 /// finished, and no waker of it is held anywhere else. Then it takes no
 /// read-modify-write: taking a reference takes one already held, so with
 /// no other held, nothing counts meanwhile, and the acquire load sees what
-/// the threads that let theirs go did. It is cold, kept out of the drops of
-/// local references, which come and go all the time and reach it once in a
-/// task's life.
+/// the threads that let theirs go did. Otherwise the task may be freed on
+/// another thread, and holds its owner by an atomic reference from then on.
+/// It is cold, kept out of the drops of local references, which come and go
+/// all the time and reach it once in a task's life.
 ///
 /// # Safety
 ///
@@ -394,6 +448,7 @@ unsafe fn release_share(header: *const Header) {
         // SAFETY: the share was the last reference.
         unsafe { free(header) };
     } else {
+        task.hold_atomically();
         // SAFETY: the share is one of the atomic count.
         unsafe { release(header) };
     }
@@ -407,10 +462,35 @@ unsafe fn release_share(header: *const Header) {
 /// so that nothing reaches the task again.
 #[inline]
 unsafe fn free(header: *const Header) {
-    // SAFETY: the task is alive.
-    let dealloc = unsafe { (*header).vtable.dealloc };
+    let (dealloc, owner, hold) = {
+        // SAFETY: the task is alive.
+        let task = unsafe { &*header };
+        (task.vtable.dealloc, task.owner(), task.hold.get())
+    };
     // SAFETY: nothing reaches the task again; the vtable is the task's own.
     unsafe { dealloc(header) };
+    // The hold goes after the task, whose output, dropped with it, may yet
+    // reach the runtime.
+    match hold {
+        // SAFETY: a task that holds its owner by the count is freed on the
+        // runtime's thread: it holds it so only while a local reference or
+        // the share keeps it, and those are let go of there; see
+        // `release_share`.
+        Hold::Local => unsafe { Shared::release_hold(owner) },
+        // SAFETY: the task's own reference to the part.
+        Hold::Atomic => unsafe { Arc::decrement_strong_count(owner) },
+    }
+}
+
+/// Counts a hold of `scheduler`'s shared part by the count of its thread,
+/// for a new task of it, and returns the part as a task's header names it.
+#[inline]
+fn hold_owner(scheduler: &Scheduler) -> NonNull<Shared> {
+    let shared = scheduler.shared();
+    // SAFETY: a scheduler is reached only on its runtime's thread.
+    unsafe { Shared::hold(shared) };
+    // SAFETY: an `Arc`'s pointer is not null.
+    unsafe { NonNull::new_unchecked(Arc::as_ptr(shared).cast_mut()) }
 }
 
 /// Queues the task at `header` to run, as a wake by reference does: on its
@@ -424,7 +504,7 @@ unsafe fn free(header: *const Header) {
 unsafe fn wake_by_ref(header: *const Header) {
     // SAFETY: the task is alive.
     let task = unsafe { &*header };
-    let on_owner = context::with_owner(Arc::as_ptr(&task.shared), |scheduler| {
+    let on_owner = context::with_owner(task.owner(), |scheduler| {
         if task.claim() && !task.is_main() {
             // SAFETY: the task is alive, and this is its thread.
             scheduler.schedule(unsafe { LocalRef::retain(header) });
@@ -494,7 +574,7 @@ unsafe fn retain_local(header: *const ()) -> bool {
     let header = header.cast::<Header>();
     // SAFETY: the waker the driver was given holds a reference, or borrows
     // a run's, so the task is alive.
-    let owner = Arc::as_ptr(unsafe { &(*header).shared });
+    let owner = unsafe { (*header).owner() };
     context::with_owner(owner, |_| {
         // SAFETY: the task is alive, and this is its thread.
         mem::forget(unsafe { LocalRef::retain(header) });
@@ -536,7 +616,7 @@ impl JoinWaker {
             let header = waker.data().cast::<Header>();
             // SAFETY: a waker with the tasks' vtable names a live task, which
             // it holds a reference to, or borrows a run's.
-            let owner = Arc::as_ptr(unsafe { &(*header).shared });
+            let owner = unsafe { (*header).owner() };
             // SAFETY: the task is alive, and, its runtime running on this
             // thread, it is of this thread.
             let local = context::with_owner(owner, |_| unsafe { LocalRef::retain(header) });
@@ -613,7 +693,8 @@ impl Main {
     pub(crate) fn new(scheduler: &Scheduler) -> Self {
         let header = Box::new(Header {
             vtable: &MAIN_VTABLE,
-            shared: Arc::clone(scheduler.shared()),
+            shared: hold_owner(scheduler),
+            hold: Cell::new(Hold::Local),
             strong: AtomicUsize::new(1),
             local: Cell::new(1),
             woken: AtomicBool::new(false),
@@ -688,7 +769,8 @@ where
         let task = Box::new(Self {
             header: Header {
                 vtable: &Self::VTABLE,
-                shared: Arc::clone(scheduler.shared()),
+                shared: hold_owner(scheduler),
+                hold: Cell::new(Hold::Local),
                 strong: AtomicUsize::new(1),
                 local: Cell::new(1),
                 woken: AtomicBool::new(false),

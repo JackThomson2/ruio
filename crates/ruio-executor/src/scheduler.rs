@@ -35,7 +35,24 @@ pub(crate) struct Shared {
     unparker: Unparker,
     /// The ring, for other rings to send descriptors to.
     ring: RemoteRing,
+    /// What holds the part from the runtime's thread; see [`Holds`].
+    holds: Holds,
 }
+
+/// How many hold a runtime's shared part by a count of the runtime's thread
+/// rather than an atomic reference each: the scheduler, until it is dropped,
+/// and the tasks it spawned, from their spawn until they are freed or may be
+/// freed on another thread. Holding the part so takes no atomic operation,
+/// and while anything is counted the count holds one reference of the
+/// part's own for all of them, as a task's local references hold one of the
+/// task's.
+struct Holds(Cell<usize>);
+
+// SAFETY: only the runtime's thread touches the count: the scheduler, which
+// stays on its thread, and the tasks counted, which are spawned and freed
+// there. A task that may be freed on another thread lets go of its count
+// first, on the runtime's thread, and holds an atomic reference instead.
+unsafe impl Sync for Holds {}
 
 /// A spawn from another thread, which makes a task on the runtime's own.
 pub(crate) type RemoteSpawn = Box<dyn FnOnce() + Send>;
@@ -121,6 +138,44 @@ impl Shared {
         &self.ring
     }
 
+    /// Counts a hold of the part `this` names from the runtime's thread; the
+    /// first takes the count's reference to the part. It takes the `Arc`
+    /// rather than the part, so that the count's reference is taken through
+    /// the `Arc`'s own pointer, which reaches its counts.
+    ///
+    /// # Safety
+    ///
+    /// Only on the runtime's thread, for its scheduler or a task of it.
+    #[inline]
+    pub(crate) unsafe fn hold(this: &Arc<Shared>) {
+        let held = this.holds.0.get();
+        if held == 0 {
+            // SAFETY: the `Arc` keeps the part alive, and the pointer is the
+            // one it gives.
+            unsafe { Arc::increment_strong_count(Arc::as_ptr(this)) };
+        }
+        this.holds.0.set(held + 1);
+    }
+
+    /// Lets go of a hold that [`Shared::hold`] counted, and, with the last,
+    /// of the count's reference to the part, which may free it.
+    ///
+    /// # Safety
+    ///
+    /// Only on the runtime's thread, for a counted hold that nothing else
+    /// lets go of; `this` must be the pointer the part's `Arc` gives.
+    #[inline]
+    pub(crate) unsafe fn release_hold(this: *const Shared) {
+        // SAFETY: the hold keeps the part alive.
+        let holds = unsafe { &(*this).holds.0 };
+        let left = holds.get() - 1;
+        holds.set(left);
+        if left == 0 {
+            // SAFETY: the count's reference, which the first hold took.
+            unsafe { Arc::decrement_strong_count(this) };
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Remote> {
         self.remote.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -198,7 +253,11 @@ impl Scheduler {
             pending: AtomicBool::new(false),
             unparker: driver.unparker(),
             ring: driver.remote(),
+            holds: Holds(Cell::new(0)),
         });
+        // SAFETY: this is the runtime's thread. The scheduler lets go of its
+        // hold as it is dropped.
+        unsafe { Shared::hold(&shared) };
         // SAFETY: the retain counts a local reference only to a task of the
         // runtime running on this thread, the driver's, which keeps the task
         // alive until the release or the wake that lets go of it, on this
@@ -454,5 +513,14 @@ impl Scheduler {
         let queued = mem::take(&mut *self.queue.borrow_mut());
         let lifo = self.lifo.borrow_mut().take();
         drop((queued, lifo));
+    }
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        // Tasks still held, by their handles, may hold the part beyond it.
+        // SAFETY: this is the runtime's thread, the scheduler stays on it,
+        // and its hold, counted as it was made, is let go of once.
+        unsafe { Shared::release_hold(Arc::as_ptr(&self.shared)) };
     }
 }

@@ -477,6 +477,44 @@ fn wakes_after_the_runtime_is_gone_are_harmless() {
     thread::spawn(move || slot.send(1)).join().unwrap();
 }
 
+/// Join handles can outlive their runtime: the tasks, one finished and one
+/// cancelled at shutdown, are freed as the handles go, after the scheduler,
+/// and only then let go of the runtime's shared part.
+#[test]
+fn join_handles_can_outlive_their_runtime() {
+    let runtime = Runtime::new().unwrap();
+    let pending = runtime.spawn(std::future::pending::<()>());
+    let done = runtime.spawn(async { 7 });
+    runtime.block_on(yield_now());
+    assert!(done.is_finished());
+    drop(runtime);
+    drop((pending, done));
+}
+
+/// A task whose waker outlives its local references, here on its own
+/// thread, is freed when the waker's reference goes, through the remote
+/// queue of a runtime that has not shut down yet.
+#[test]
+fn a_task_outlived_by_its_waker_is_freed_after_it() {
+    let runtime = Runtime::new().unwrap();
+    let kept: Rc<RefCell<Option<Waker>>> = Rc::default();
+    let task_kept = kept.clone();
+    runtime.block_on(async move {
+        let task = spawn(poll_fn(move |cx| {
+            *task_kept.borrow_mut() = Some(cx.waker().clone());
+            Poll::Ready(())
+        }));
+        task.await.unwrap();
+    });
+    let waker = kept.borrow_mut().take().expect("the task kept its waker");
+    // Outside the runtime, so through its remote queue, which holds the
+    // task's last reference until the runtime takes it or shuts down.
+    waker.wake_by_ref();
+    drop(waker);
+    runtime.block_on(yield_now());
+    drop(runtime);
+}
+
 #[test]
 #[should_panic(expected = "inside another one")]
 fn block_on_inside_block_on_panics() {
