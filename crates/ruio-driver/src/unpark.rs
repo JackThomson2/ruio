@@ -15,6 +15,14 @@ const NOTIFIED: u8 = 2;
 /// `state` records whether the driver is parked and whether an unpark is
 /// waiting for it. A parked driver has a poll on `eventfd` in flight, which a
 /// write completes.
+///
+/// Parking and unparking each change the state with one read-modify-write,
+/// which are totally ordered, so one of the two always sees the other: an
+/// unparker that finds the driver parked writes the eventfd, and a driver
+/// that finds an unpark waiting does not wait. A park that ends puts the
+/// state back with a plain store; an unpark that came meanwhile has written
+/// the eventfd already, and what it announces, work queued elsewhere, has a
+/// flag of its own that the driver's loop checks before it parks again.
 #[derive(Debug)]
 pub(crate) struct Notify {
     state: AtomicU8,
@@ -43,21 +51,20 @@ impl Notify {
     /// Records that the driver is about to park, and returns `true`; or, if
     /// an unpark is waiting, consumes it and returns `false`.
     pub(crate) fn begin_park(&self) -> bool {
-        if self
-            .state
-            .compare_exchange(EMPTY, PARKED, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
+        if self.state.swap(PARKED, Ordering::SeqCst) == EMPTY {
             return true;
         }
-        self.state.swap(EMPTY, Ordering::SeqCst);
+        // An unpark that comes between the swap and the store finds the
+        // driver parked and writes the eventfd, which the next park's poll
+        // finds readable: a wake for nothing, and no wake lost.
+        self.state.store(EMPTY, Ordering::SeqCst);
         false
     }
 
-    /// Records that the driver is no longer parked, consuming an unpark that
-    /// arrived meanwhile.
+    /// Records that the driver is no longer parked. An unpark that arrived
+    /// meanwhile found it parked, and has written the eventfd.
     pub(crate) fn end_park(&self) {
-        self.state.swap(EMPTY, Ordering::SeqCst);
+        self.state.store(EMPTY, Ordering::Release);
     }
 
     fn unpark(&self) {

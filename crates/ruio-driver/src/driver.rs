@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::io;
 use std::mem;
-use std::os::fd::{IntoRawFd, OwnedFd};
+use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::rc::{Rc, Weak};
@@ -72,7 +72,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     /// The drivers of this thread by ID, for resources that name their ring
     /// without keeping it alive, such as direct descriptors.
-    static DRIVERS: RefCell<Vec<(u64, Weak<RefCell<Inner>>)>> = const { RefCell::new(Vec::new()) };
+    static DRIVERS: RefCell<Vec<(u64, Weak<Shared>)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Configures and creates a [`Driver`].
@@ -166,12 +166,11 @@ impl Builder {
         let notify = Arc::new(Notify::new()?);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let remote = Remote::new(id, ring.raw_fd(), Unparker::new(Arc::clone(&notify)));
-        let inner = Rc::new(RefCell::new(Inner {
+        let state = RefCell::new(Inner {
             id,
             table: Table::with_capacity(cq_entries as usize),
             ring,
             files,
-            notify,
             remote,
             wake_armed: false,
             timer: None,
@@ -185,7 +184,8 @@ impl Builder {
             last_turn: 0,
             stats: Stats::default(),
             shutdown_timeout: self.shutdown_timeout,
-        }));
+        });
+        let inner = Rc::new(Shared { notify, state });
         DRIVERS.with(|drivers| {
             let mut drivers = drivers.borrow_mut();
             drivers.retain(|(_, driver)| driver.strong_count() > 0);
@@ -264,7 +264,7 @@ pub struct Stats {
 /// ```
 #[derive(Clone)]
 pub struct Driver {
-    inner: Rc<RefCell<Inner>>,
+    inner: Rc<Shared>,
 }
 
 /// A handle to a driver that does not keep it alive, for resources that
@@ -273,13 +273,22 @@ pub struct Driver {
 /// them.
 #[derive(Clone)]
 pub(crate) struct WeakDriver {
-    inner: Weak<RefCell<Inner>>,
+    inner: Weak<Shared>,
 }
 
 impl WeakDriver {
     pub(crate) fn upgrade(&self) -> Option<Driver> {
         self.inner.upgrade().map(|inner| Driver { inner })
     }
+}
+
+/// What every handle to a driver shares: the ring's state, behind the cell
+/// that its one thread borrows for each use, and beside it what parking
+/// reaches on every turn without borrowing anything.
+struct Shared {
+    /// What the driver shares with its unparkers.
+    notify: Arc<Notify>,
+    state: RefCell<Inner>,
 }
 
 struct Inner {
@@ -290,8 +299,6 @@ struct Inner {
     files: u32,
     /// Every operation the kernel may still own.
     table: Table<Box<dyn Orphan>>,
-    /// What the driver shares with its unparkers.
-    notify: Arc<Notify>,
     /// What the driver shares with the threads that send it descriptors.
     remote: Arc<Remote>,
     /// Whether the multishot poll on the unparkers' eventfd is in flight.
@@ -405,11 +412,11 @@ impl Driver {
     ///
     /// As for [`Driver::submit`]. Timing out is not an error.
     pub fn park(&self, timeout: Option<Duration>) -> io::Result<()> {
-        let notify = Arc::clone(&self.inner.borrow().notify);
+        let notify = &self.inner.notify;
         if !notify.begin_park() {
             return self.enter(0, None);
         }
-        let armed = self.inner.borrow_mut().arm_wake();
+        let armed = self.inner.state.borrow_mut().arm_wake(notify.eventfd());
         let result = armed.and_then(|()| self.enter(1, timeout));
         notify.end_park();
         result
@@ -431,35 +438,35 @@ impl Driver {
     /// As for [`Driver::submit`], if the submission queue is full and
     /// submitting it fails.
     pub fn wake_at(&self, deadline: Duration) -> io::Result<()> {
-        self.inner.borrow_mut().wake_at(deadline)
+        self.inner.state.borrow_mut().wake_at(deadline)
     }
 
     /// Whether the timer [`wake_at`](Driver::wake_at) armed has fired since
     /// this was last asked. Asking clears it.
     pub fn timer_fired(&self) -> bool {
-        mem::take(&mut self.inner.borrow_mut().timer_fired)
+        mem::take(&mut self.inner.state.borrow_mut().timer_fired)
     }
 
     /// A handle that wakes this driver from any thread.
     pub fn unparker(&self) -> Unparker {
-        Unparker::new(Arc::clone(&self.inner.borrow().notify))
+        Unparker::new(Arc::clone(&self.inner.notify))
     }
 
     /// The driver's ring as other threads see it, for them to send direct
     /// descriptors to with [`DirectFd::send_to`](crate::DirectFd::send_to).
     pub fn remote(&self) -> RemoteRing {
-        RemoteRing::new(Arc::clone(&self.inner.borrow().remote))
+        RemoteRing::new(Arc::clone(&self.inner.state.borrow().remote))
     }
 
     /// The number of operations the kernel may still own, including those
     /// whose [`Op`] was dropped.
     pub fn in_flight(&self) -> usize {
-        self.inner.borrow().table.in_flight()
+        self.inner.state.borrow().table.in_flight()
     }
 
     /// Counts of the driver's work so far.
     pub fn stats(&self) -> Stats {
-        self.inner.borrow().stats
+        self.inner.state.borrow().stats
     }
 
     /// How many completions the last turn of the ring, a [`submit`] or a
@@ -470,25 +477,25 @@ impl Driver {
     /// [`submit`]: Driver::submit
     /// [`park`]: Driver::park
     pub fn completions_last_turn(&self) -> usize {
-        self.inner.borrow().last_turn
+        self.inner.state.borrow().last_turn
     }
 
     /// The number of slots in the ring's registered file table, which holds
     /// its direct descriptors; see [`Builder::files`].
     pub fn files(&self) -> u32 {
-        self.inner.borrow().files
+        self.inner.state.borrow().files
     }
 
     /// The number of entries in the ring's submission queue; see
     /// [`Builder::entries`]. A chain can have no more.
     pub fn sq_entries(&self) -> u32 {
-        self.inner.borrow().ring.sq_entries()
+        self.inner.state.borrow().ring.sq_entries()
     }
 
     /// A number that identifies the driver's ring among every ring the
     /// process has had.
     pub fn id(&self) -> u64 {
-        self.inner.borrow().id
+        self.inner.state.borrow().id
     }
 
     /// The driver of this thread with ID `id`, if it still exists.
@@ -515,7 +522,7 @@ impl Driver {
     /// busy, as it is when code it runs closes a descriptor, or has no room
     /// for the request even after submitting, `fd` is closed at once.
     pub fn close_in_order(&self, fd: OwnedFd) {
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+        if let Ok(mut inner) = self.inner.state.try_borrow_mut() {
             // Without room for the request, the descriptor is dropped here.
             let _ = inner.queue_close_fd(fd);
         }
@@ -528,7 +535,7 @@ impl Driver {
     /// If the driver is busy, as it is when code it runs drops a direct
     /// descriptor, the slot stays taken until the ring is closed.
     pub(crate) fn close_direct(&self, slot: u32) {
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+        if let Ok(mut inner) = self.inner.state.try_borrow_mut() {
             // Without room even after submitting, the slot stays taken.
             let _ = inner.queue_close(slot);
         }
@@ -536,7 +543,7 @@ impl Driver {
 
     /// A provided-buffer group ID for a new pool.
     pub(crate) fn next_buffer_group(&self) -> u16 {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.state.borrow_mut();
         let group = inner.next_group;
         inner.next_group = group.wrapping_add(1);
         group
@@ -566,6 +573,7 @@ impl Driver {
     ) -> io::Result<u32> {
         let inner = self
             .inner
+            .state
             .try_borrow()
             .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
         // SAFETY: the caller upholds the contract of `io_uring_register`.
@@ -575,18 +583,18 @@ impl Driver {
     fn enter(&self, min_complete: u32, timeout: Option<Duration>) -> io::Result<()> {
         let timeout = timeout.map(timespec);
         let (result, before) = {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.state.borrow_mut();
             let before = inner.stats.completions;
             (inner.enter(min_complete, timeout.as_ref()), before)
         };
         self.deliver();
         // Completions that did not fit in the queue wait in the kernel, which
         // moves them in when entered again, now that there is room.
-        while self.inner.borrow().ring.sq_flags() & sys::IORING_SQ_CQ_OVERFLOW != 0 {
-            self.inner.borrow_mut().enter(0, None)?;
+        while self.inner.state.borrow().ring.sq_flags() & sys::IORING_SQ_CQ_OVERFLOW != 0 {
+            self.inner.state.borrow_mut().enter(0, None)?;
             self.deliver();
         }
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.state.borrow_mut();
         inner.last_turn = usize::try_from(inner.stats.completions - before).unwrap_or(usize::MAX);
         result
     }
@@ -596,7 +604,7 @@ impl Driver {
     /// control, which may use the driver, so they run after it is released.
     fn deliver(&self) {
         let (mut wakers, mut released, mut deliveries) = {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.state.borrow_mut();
             let mut wakers = mem::take(&mut inner.wakers);
             let mut released = mem::take(&mut inner.released);
             let mut deliveries = mem::take(&mut inner.deliveries);
@@ -612,7 +620,7 @@ impl Driver {
         for user_data in deliveries.drain(..) {
             self.deliver_stream(user_data);
         }
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.state.borrow_mut();
         inner.wakers = wakers;
         inner.released = released;
         // Anything abandoned meanwhile waits for the next delivery.
@@ -624,7 +632,12 @@ impl Driver {
     /// outside the driver, since the payload runs code of its own.
     fn deliver_stream(&self, user_data: u64) {
         loop {
-            let taken = self.inner.borrow_mut().table.take_deliveries(user_data);
+            let taken = self
+                .inner
+                .state
+                .borrow_mut()
+                .table
+                .take_deliveries(user_data);
             let Some((mut payload, completions, ended)) = taken else {
                 return;
             };
@@ -636,7 +649,12 @@ impl Driver {
             if ended {
                 return;
             }
-            let adopted = self.inner.borrow_mut().table.adopt(user_data, payload);
+            let adopted = self
+                .inner
+                .state
+                .borrow_mut()
+                .table
+                .adopt(user_data, payload);
             match adopted {
                 Ok(true) => {}
                 Ok(false) => return,
@@ -656,16 +674,19 @@ impl Driver {
         timeout: Option<Duration>,
         waker: &Waker,
     ) -> io::Result<u64> {
-        self.inner
-            .borrow_mut()
-            .queue_entry(|sqe| operation.prepare(sqe), false, timeout, waker)
+        self.inner.state.borrow_mut().queue_entry(
+            |sqe| operation.prepare(sqe),
+            false,
+            timeout,
+            waker,
+        )
     }
 
     /// Queues the operations of a chain, each linked to the next, and
     /// records in each its `user_data`, or, if the chain cannot be queued,
     /// the error; see [`Link`](crate::Link).
     pub(crate) fn queue_chain(&self, members: &mut [&mut dyn Member], waker: &Waker) {
-        self.inner.borrow_mut().queue_chain(members, waker);
+        self.inner.state.borrow_mut().queue_chain(members, waker);
     }
 
     /// Whether `other` drives the same ring.
@@ -680,6 +701,7 @@ impl Driver {
         waker: &Waker,
     ) -> io::Result<u64> {
         self.inner
+            .state
             .borrow_mut()
             .queue_entry(|sqe| request.prepare(sqe), true, None, waker)
     }
@@ -687,7 +709,12 @@ impl Driver {
     /// Takes a stream's next completion, or arranges for `waker` to be woken
     /// when one arrives.
     pub(crate) fn poll_stream(&self, user_data: u64, waker: &Waker) -> Option<Completion> {
-        let polled = self.inner.borrow_mut().table.poll_stream(user_data, waker);
+        let polled = self
+            .inner
+            .state
+            .borrow_mut()
+            .table
+            .poll_stream(user_data, waker);
         // A replaced waker is dropped here, after the driver is released.
         polled.ok()
     }
@@ -695,14 +722,14 @@ impl Driver {
     /// Takes a stream's next completion if it has arrived, without
     /// arranging for anything to be woken.
     pub(crate) fn take_stream(&self, user_data: u64) -> Option<Completion> {
-        self.inner.borrow_mut().table.take_stream(user_data)
+        self.inner.state.borrow_mut().table.take_stream(user_data)
     }
 
     /// Takes over the request of a stream dropped while armed: hands it the
     /// completions the stream had not taken, cancels it, and keeps it until
     /// the kernel is done.
     pub(crate) fn abandon<T: Multishot>(&self, user_data: u64, request: T) {
-        let Ok(mut inner) = self.inner.try_borrow_mut() else {
+        let Ok(mut inner) = self.inner.state.try_borrow_mut() else {
             // Dropped by code running inside the driver; see `orphan`.
             mem::forget(request);
             return;
@@ -726,7 +753,7 @@ impl Driver {
         if abandoned.ended {
             return;
         }
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.state.borrow_mut();
         match inner.table.adopt(user_data, payload) {
             Ok(true) => inner.deliveries.push(user_data),
             Ok(false) => {}
@@ -740,7 +767,7 @@ impl Driver {
     /// Takes the operation's completion, or arranges for `waker` to be woken
     /// when it arrives.
     pub(crate) fn poll_completion(&self, user_data: u64, waker: &Waker) -> Option<Completion> {
-        let polled = self.inner.borrow_mut().table.poll(user_data, waker);
+        let polled = self.inner.state.borrow_mut().table.poll(user_data, waker);
         // A replaced waker is dropped here, after the driver is released.
         polled.ok()
     }
@@ -748,7 +775,7 @@ impl Driver {
     /// Takes over the operation of an `Op` dropped while in flight, and
     /// cancels it unless `cancel` is false, when it runs to completion.
     pub(crate) fn orphan<T: Operation>(&self, user_data: u64, operation: T, cancel: bool) {
-        let Ok(mut inner) = self.inner.try_borrow_mut() else {
+        let Ok(mut inner) = self.inner.state.try_borrow_mut() else {
             // Dropped by code running inside the driver, such as a waker's
             // destructor. The kernel may still use the operation's memory, so
             // it cannot be freed; leaking it is safe.
@@ -1011,10 +1038,11 @@ impl Inner {
         Ok(())
     }
 
-    /// Queues the multishot poll on the unparkers' eventfd, unless it is in
-    /// flight. The eventfd is never read: each write completes the poll once,
-    /// and a poll armed while the eventfd is readable completes at once.
-    fn arm_wake(&mut self) -> io::Result<()> {
+    /// Queues the multishot poll on `eventfd`, the unparkers', unless it is
+    /// in flight. The eventfd is never read: each write completes the poll
+    /// once, and a poll armed while the eventfd is readable completes at
+    /// once.
+    fn arm_wake(&mut self, eventfd: RawFd) -> io::Result<()> {
         if self.wake_armed {
             return Ok(());
         }
@@ -1026,7 +1054,7 @@ impl Inner {
             .next_sqe()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))?;
         sqe.opcode = sys::IORING_OP_POLL_ADD;
-        sqe.fd = self.notify.eventfd();
+        sqe.fd = eventfd;
         sqe.op_flags = libc::POLLIN as u32;
         sqe.len = sys::IORING_POLL_ADD_MULTI;
         sqe.user_data = WAKE;
@@ -1208,7 +1236,7 @@ impl Drop for Inner {
 impl fmt::Debug for Driver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("Driver");
-        if let Ok(inner) = self.inner.try_borrow() {
+        if let Ok(inner) = self.inner.state.try_borrow() {
             debug.field("in_flight", &inner.table.in_flight());
         }
         debug.finish_non_exhaustive()
@@ -1270,7 +1298,7 @@ mod tests {
         let timeout = Duration::from_millis(50);
         let driver = Driver::builder().shutdown_timeout(timeout).build().unwrap();
         {
-            let mut inner = driver.inner.borrow_mut();
+            let mut inner = driver.inner.state.borrow_mut();
             let user_data = inner.table.insert(None);
             let _ = inner.table.orphan(user_data, Box::new(Stuck));
         }
