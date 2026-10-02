@@ -201,6 +201,55 @@ fn a_semaphore_works_across_threads() {
     assert_eq!(semaphore.available_permits(), 2);
 }
 
+/// Tasks on several runtimes, each taking one permit or several at a time,
+/// and now and then giving up its place after waiting a while, never hold
+/// more permits at once than the semaphore has, and give every one back:
+/// an acquire that finds permits free takes them without the lock, racing
+/// the queue of those that wait, and the releases that serve it.
+#[test]
+fn permits_are_never_held_twice_under_contention() {
+    const PERMITS: usize = 3;
+    let semaphore = Arc::new(Semaphore::new(PERMITS));
+    let held = Arc::new(AtomicUsize::new(0));
+    let threads: Vec<_> = (0..4)
+        .map(|thread| {
+            let (semaphore, held) = (semaphore.clone(), held.clone());
+            thread::spawn(move || {
+                Runtime::new().unwrap().block_on(async move {
+                    for round in 0..2000 {
+                        let wanted = 1 + (thread + round) % PERMITS;
+                        let permit = if round % 5 == 0 {
+                            let mut acquire = pin!(semaphore.acquire_many(wanted));
+                            match poll_once(acquire.as_mut()).await {
+                                Poll::Ready(permit) => permit,
+                                Poll::Pending => {
+                                    // Given up, perhaps once its permits
+                                    // were set aside for it.
+                                    yield_now().await;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            semaphore.acquire_many(wanted).await
+                        };
+                        let now = held.fetch_add(wanted, Ordering::SeqCst) + wanted;
+                        assert!(now <= PERMITS, "{now} permits held at once");
+                        if round % 3 == 0 {
+                            yield_now().await;
+                        }
+                        held.fetch_sub(wanted, Ordering::SeqCst);
+                        drop(permit);
+                    }
+                });
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(semaphore.available_permits(), PERMITS);
+}
+
 /// A loop over permits that are always free yields once its budget is
 /// spent.
 #[test]

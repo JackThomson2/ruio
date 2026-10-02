@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker, ready};
 
@@ -44,15 +45,27 @@ use crate::coop;
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub struct Semaphore {
-    state: Mutex<State>,
+    /// The permits neither held nor set aside for a waiter, in [`PERMIT`]s,
+    /// and the [`WAITERS`] flag. While nobody waits, an acquire that finds
+    /// enough permits takes them here, and a release gives them back here,
+    /// each with one atomic operation and without the lock.
+    count: AtomicUsize,
+    queue: Mutex<Queue>,
 }
 
-struct State {
-    /// The permits neither held nor set aside for a waiter.
-    permits: usize,
+/// Set in a semaphore's count while waiters are queued, so that an acquire
+/// queues behind them and a release hands its permits to them; it changes
+/// only with the queue locked.
+const WAITERS: usize = 1;
+
+/// One permit, in a semaphore's count, above the flag.
+const PERMIT: usize = 2;
+
+/// A semaphore's waiters.
+struct Queue {
     /// The waiters that have no permits yet, by ticket: in the order they
     /// began to wait.
-    queue: BTreeMap<u64, Waiter>,
+    waiters: BTreeMap<u64, Waiter>,
     /// The tickets of waiters whose permits are set aside, until they take
     /// them.
     granted: BTreeSet<u64>,
@@ -64,21 +77,44 @@ struct Waiter {
     waker: Waker,
 }
 
-impl State {
-    /// Sets permits aside for the waiters at the head of the queue, as many
-    /// as there are permits for, and returns their wakers.
-    fn grant(&mut self) -> Vec<Waker> {
+impl Queue {
+    /// Sets permits of `count` aside for the waiters at the head of the
+    /// queue, as many as there are permits for, and returns their wakers;
+    /// once none is left waiting, clears the flag.
+    fn grant(&mut self, count: &AtomicUsize) -> Vec<Waker> {
         let mut wakers = Vec::new();
-        while let Some(entry) = self.queue.first_entry() {
-            if entry.get().permits > self.permits {
+        while let Some(entry) = self.waiters.first_entry() {
+            if !take_queued(count, entry.get().permits) {
                 break;
             }
             let (ticket, waiter) = entry.remove_entry();
-            self.permits -= waiter.permits;
             self.granted.insert(ticket);
             wakers.push(waiter.waker);
         }
+        if self.waiters.is_empty() {
+            count.fetch_and(!WAITERS, Ordering::Relaxed);
+        }
         wakers
+    }
+}
+
+/// Takes `permits` permits from `count` if it holds as many, with the queue
+/// locked and the flag set: no acquire takes any meanwhile, and a release
+/// may only add some.
+fn take_queued(count: &AtomicUsize, permits: usize) -> bool {
+    let Some(wanted) = permits.checked_mul(PERMIT) else {
+        return false;
+    };
+    let mut current = count.load(Ordering::Relaxed);
+    loop {
+        if current & !WAITERS < wanted {
+            return false;
+        }
+        let taken = current - wanted;
+        match count.compare_exchange_weak(current, taken, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
     }
 }
 
@@ -94,9 +130,9 @@ impl Semaphore {
     pub const fn new(permits: usize) -> Self {
         assert!(permits <= Self::MAX_PERMITS, "too many permits");
         Self {
-            state: Mutex::new(State {
-                permits,
-                queue: BTreeMap::new(),
+            count: AtomicUsize::new(permits * PERMIT),
+            queue: Mutex::new(Queue {
+                waiters: BTreeMap::new(),
                 granted: BTreeSet::new(),
                 next_ticket: 0,
             }),
@@ -105,7 +141,7 @@ impl Semaphore {
 
     /// How many permits can be acquired now, as far as nobody waits.
     pub fn available_permits(&self) -> usize {
-        lock(&self.state).permits
+        self.count.load(Ordering::Acquire) / PERMIT
     }
 
     /// Adds `permits` permits, which go to the waiters first.
@@ -178,31 +214,84 @@ impl Semaphore {
         })
     }
 
-    /// Takes `permits` permits at once if they are free and nobody waits.
+    /// Takes `permits` permits at once if they are free and nobody waits,
+    /// with one compare-and-exchange.
+    #[inline]
     fn take(&self, permits: usize) -> bool {
-        let mut state = lock(&self.state);
-        if state.queue.is_empty() && state.permits >= permits {
-            state.permits -= permits;
-            true
-        } else {
-            false
+        let Some(wanted) = permits.checked_mul(PERMIT) else {
+            return false;
+        };
+        let mut current = self.count.load(Ordering::Relaxed);
+        loop {
+            if current & WAITERS != 0 || current < wanted {
+                return false;
+            }
+            let taken = current - wanted;
+            match self.count.compare_exchange_weak(
+                current,
+                taken,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
         }
     }
 
-    /// Gives back `permits` permits, and wakes the waiters they go to.
+    /// Gives back `permits` permits, and wakes the waiters they go to: with
+    /// one compare-and-exchange, unless some wait.
     #[inline]
     fn release(&self, permits: usize) {
         if permits == 0 {
             return;
         }
-        let wakers = {
-            let mut state = lock(&self.state);
-            state.permits = state
-                .permits
+        let mut current = self.count.load(Ordering::Relaxed);
+        loop {
+            let total = (current / PERMIT)
                 .checked_add(permits)
                 .filter(|&total| total <= Self::MAX_PERMITS)
                 .expect("too many permits");
-            state.grant()
+            let given = (total * PERMIT) | (current & WAITERS);
+            match self.count.compare_exchange_weak(
+                current,
+                given,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        if current & WAITERS != 0 {
+            self.grant();
+        }
+    }
+
+    /// Sets the free permits aside for the waiters they go to, and wakes
+    /// them.
+    #[cold]
+    fn grant(&self) {
+        let wakers = lock(&self.queue).grant(&self.count);
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Takes the waiter with `ticket`, for `permits` permits, out of the
+    /// queue, giving back the permits set aside for it if any, and lets the
+    /// waiters behind it have what it held up.
+    #[cold]
+    fn leave(&self, ticket: u64, permits: usize) {
+        let wakers = {
+            let mut queue = lock(&self.queue);
+            if queue.granted.remove(&ticket) {
+                // They were taken from the count, so they fit back in it.
+                self.count.fetch_add(permits * PERMIT, Ordering::Release);
+            } else {
+                queue.waiters.remove(&ticket);
+            }
+            queue.grant(&self.count)
         };
         for waker in wakers {
             waker.wake();
@@ -212,10 +301,10 @@ impl Semaphore {
 
 impl fmt::Debug for Semaphore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = lock(&self.state);
+        let waiters = lock(&self.queue).waiters.len();
         f.debug_struct("Semaphore")
-            .field("permits", &state.permits)
-            .field("waiters", &state.queue.len())
+            .field("permits", &self.available_permits())
+            .field("waiters", &waiters)
             .finish()
     }
 }
@@ -247,60 +336,69 @@ impl Wait {
     fn poll(&mut self, semaphore: &Semaphore, cx: &mut Context<'_>) -> Poll<()> {
         assert!(!self.done, "an acquire polled after it completed");
         let proceed = ready!(coop::poll_proceed(cx));
-        let mut state = lock(&semaphore.state);
-        match self.ticket {
-            None => {
-                if state.queue.is_empty() && state.permits >= self.permits {
-                    state.permits -= self.permits;
-                } else {
-                    let ticket = state.next_ticket;
-                    state.next_ticket += 1;
-                    let waiter = Waiter {
-                        permits: self.permits,
-                        waker: cx.waker().clone(),
-                    };
-                    state.queue.insert(ticket, waiter);
-                    self.ticket = Some(ticket);
-                    return Poll::Pending;
-                }
-            }
-            Some(ticket) => {
-                if !state.granted.remove(&ticket) {
-                    let waiter = state
-                        .queue
-                        .get_mut(&ticket)
-                        .expect("a waiter is queued until it is granted");
-                    if !waiter.waker.will_wake(cx.waker()) {
-                        waiter.waker = cx.waker().clone();
-                    }
-                    return Poll::Pending;
-                }
-                self.ticket = None;
-            }
+        let ready = match self.ticket {
+            None => semaphore.take(self.permits) || self.wait(semaphore, cx.waker()),
+            Some(ticket) => self.granted(semaphore, ticket, cx.waker()),
+        };
+        if !ready {
+            return Poll::Pending;
         }
         self.done = true;
         proceed.made_progress();
         Poll::Ready(())
     }
 
+    /// Takes the permits if they are free now and nobody waits, or else
+    /// joins the queue, for `waker` to be woken once they are set aside;
+    /// returns whether it took them.
+    #[cold]
+    fn wait(&mut self, semaphore: &Semaphore, waker: &Waker) -> bool {
+        let mut queue = lock(&semaphore.queue);
+        if queue.waiters.is_empty() {
+            // First in line. With the flag set, a release goes through the
+            // queue, which the lock holds until this waiter is in it; one
+            // that came before the flag, the look after it finds.
+            semaphore.count.fetch_or(WAITERS, Ordering::Relaxed);
+            if take_queued(&semaphore.count, self.permits) {
+                semaphore.count.fetch_and(!WAITERS, Ordering::Relaxed);
+                return true;
+            }
+        }
+        let ticket = queue.next_ticket;
+        queue.next_ticket += 1;
+        let waiter = Waiter {
+            permits: self.permits,
+            waker: waker.clone(),
+        };
+        queue.waiters.insert(ticket, waiter);
+        self.ticket = Some(ticket);
+        false
+    }
+
+    /// Whether the permits have been set aside for the waiter with `ticket`;
+    /// if not, has `waker` woken once they are.
+    fn granted(&mut self, semaphore: &Semaphore, ticket: u64, waker: &Waker) -> bool {
+        let mut queue = lock(&semaphore.queue);
+        if queue.granted.remove(&ticket) {
+            self.ticket = None;
+            return true;
+        }
+        let waiter = queue
+            .waiters
+            .get_mut(&ticket)
+            .expect("a waiter is queued until it is granted");
+        if !waiter.waker.will_wake(waker) {
+            waiter.waker = waker.clone();
+        }
+        false
+    }
+
     /// Leaves the queue, giving back the permits set aside for the waiter,
     /// if any, and letting the waiters behind it have what it held up.
     #[inline]
     fn cancel(&mut self, semaphore: &Semaphore) {
-        let Some(ticket) = self.ticket.take() else {
-            return;
-        };
-        let wakers = {
-            let mut state = lock(&semaphore.state);
-            if state.granted.remove(&ticket) {
-                state.permits += self.permits;
-            } else {
-                state.queue.remove(&ticket);
-            }
-            state.grant()
-        };
-        for waker in wakers {
-            waker.wake();
+        if let Some(ticket) = self.ticket.take() {
+            semaphore.leave(ticket, self.permits);
         }
     }
 }
