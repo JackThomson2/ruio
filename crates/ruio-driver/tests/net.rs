@@ -183,6 +183,50 @@ fn vectored_sends_send_buffers_one_after_another() {
     assert_eq!(pool.available(), 8);
 }
 
+/// A bundle of several buffers goes back out in one send, as one stream of
+/// bytes, and so does what is left of it after a part was sent.
+#[test]
+fn a_bundle_of_several_buffers_goes_out_in_one_send() {
+    let driver = Driver::new().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut peer = patient(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+    let (socket, _) = listener.accept().unwrap();
+
+    // Three buffers' worth, all there before the receive is armed, so that
+    // one receive gathers it into a bundle of several buffers.
+    let pool = BufPool::new(&driver, 8, 16).unwrap();
+    let data: Vec<u8> = (0..44).collect();
+    peer.write_all(&data).unwrap();
+    let mut stream = RecvStream::new(&driver, socket.as_raw_fd(), &pool);
+    let mut bundle = block_on(&driver, stream.next()).unwrap().unwrap();
+    while bundle.len() < data.len() {
+        bundle.append(block_on(&driver, stream.next()).unwrap().unwrap());
+    }
+    assert!(bundle.buffers() > 1, "{} buffer(s)", bundle.buffers());
+    assert_eq!(bundle.to_vec(), data);
+
+    let send = SendVectored::new(socket.as_raw_fd(), bundle).flags(libc::MSG_WAITALL);
+    let (sent, bundle) = block_on(&driver, driver.op(send));
+    assert_eq!(sent.unwrap(), data.len());
+    let mut echoed = vec![0; data.len()];
+    peer.read_exact(&mut echoed).unwrap();
+    assert_eq!(echoed, data);
+
+    // The same bundle again, less its first buffer and a half, and capped,
+    // so that a vector of parts of buffers goes.
+    let send = SendVectored::new(socket.as_raw_fd(), bundle)
+        .skip(24)
+        .limit(12)
+        .flags(libc::MSG_WAITALL);
+    let (sent, bundle) = block_on(&driver, driver.op(send));
+    assert_eq!(sent.unwrap(), 12);
+    let mut echoed = [0; 12];
+    peer.read_exact(&mut echoed).unwrap();
+    assert_eq!(echoed, data[24..36]);
+    drop(bundle);
+    assert_eq!(pool.available(), 8);
+}
+
 #[test]
 fn a_direct_socket_connects() {
     let driver = Driver::new().unwrap();

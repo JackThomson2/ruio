@@ -222,6 +222,12 @@ impl BufPool {
         self.pool.group
     }
 
+    /// Whether the kernel consumes the buffers incrementally; see
+    /// [`BufPool::incremental`].
+    pub(crate) fn is_incremental(&self) -> bool {
+        self.pool.incremental
+    }
+
     /// The lease of the buffer a completion reports, if it reports one.
     ///
     /// # Panics

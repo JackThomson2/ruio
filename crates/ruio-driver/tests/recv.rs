@@ -42,8 +42,8 @@ fn data_arrives_until_the_peer_shuts_down() {
 }
 
 /// Data waiting fills as many buffers as it needs per completion. Not all
-/// of it need come at once: a request's first receive does not know how
-/// much is waiting, and takes a single buffer.
+/// of it need come at once: a receive maps one buffer before it knows how
+/// much is waiting, unless asked for more, and the rest comes with the next.
 #[test]
 fn a_receive_fills_as_many_buffers_as_it_needs() {
     let driver = Driver::new().unwrap();

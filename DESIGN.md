@@ -242,8 +242,9 @@ its own flag set.
   queues an `IORING_OP_CLOSE` of its slot at once, so the close reaches the
   kernel before anything queued later.
 - The socket operations are `Socket`, `Connect`, `Accept`, `AcceptMulti`,
-  `Send`, `SendTo` (`addr2`, 6.1), `SendVectored` (`sendmsg` over an
-  `IoBufs`, such as a bundle), `SendZc`, `Recv`, `RecvFrom` (through
+  `Send`, `SendTo` (`addr2`, 6.1), `SendVectored` (a send of an `IoBufs`,
+  such as a bundle, naming the vector in the entry, `IORING_SEND_VECTORIZED`,
+  6.17, probed, or through `sendmsg`), `SendZc`, `Recv`, `RecvFrom` (through
   `recvmsg`, for the sender's address) and `Shutdown`. With `MSG_WAITALL` the
   kernel carries on through short sends and receives on a stream socket, so
   one request moves a whole buffer, or a whole vector. `SockAddr` holds an
@@ -275,8 +276,17 @@ its own flag set.
   data waits in the socket meanwhile, so none is lost. Each buffer that
   returns to a pool wakes one waiting stream, the first to have asked:
   woken all at once, every one would ask the kernel again for the one
-  buffer, and all but one would starve again. The kernel does not bundle a request's first receive, not knowing
-  yet how much is waiting.
+  buffer, and all but one would starve again. The kernel maps a receive's
+  buffers before it knows how much is waiting, as many as the entry's `len`
+  asks for: one buffer unless asked for more, so a message of several
+  buffers' worth that has arrived whole takes two calls into the socket, one
+  for the first buffer and one for the rest. A stream whose messages run to
+  several buffers can ask for that many (`RecvStream::buffers`), and such a
+  message then takes one call: 3% more round trips with one connection and
+  64 KiB messages. But every receive then walks that many ring entries,
+  which costs messages that fit one buffer 1% to 1.5%, in the echo rows
+  with 16 and 256 connections and in hyper's requests alike, so the ask is
+  not the default.
   `ReadStream` keeps a multishot read into a pool armed the same way, one
   buffer to a read, for files the kernel can poll: pipes, FIFOs and
   character devices; it refuses others with `EBADFD`. A file that does

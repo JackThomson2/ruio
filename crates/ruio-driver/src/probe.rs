@@ -11,6 +11,8 @@ use std::sync::OnceLock;
 
 use ruio_sys as sys;
 
+use crate::ring::Ring;
+
 /// Every `IORING_FEAT_*` bit that Linux 6.10 reports.
 const BASELINE_FEATURES: u32 = sys::IORING_FEAT_SINGLE_MMAP
     | sys::IORING_FEAT_NODROP
@@ -121,6 +123,7 @@ pub struct Probe {
     opcodes: [u64; 4],
     last_opcode: u8,
     incremental_buffers: bool,
+    vectorized_send: bool,
 }
 
 impl Probe {
@@ -146,6 +149,7 @@ impl Probe {
             opcodes,
             last_opcode,
             incremental_buffers: probe_incremental_buffers(&ring),
+            vectorized_send: probe_vectorized_send(),
         })
     }
 
@@ -210,6 +214,13 @@ impl Probe {
     /// lends each buffer to as many completions as fit in it.
     pub fn supports_incremental_buffers(&self) -> bool {
         self.incremental_buffers
+    }
+
+    /// Whether a send takes a vector of buffers (`IORING_SEND_VECTORIZED`,
+    /// Linux 6.17): an `IORING_OP_SEND` whose address and length name an
+    /// array of `iovec`s.
+    pub fn supports_vectorized_send(&self) -> bool {
+        self.vectorized_send
     }
 
     /// Checks the kernel against ruio's baseline, the capabilities of Linux
@@ -308,7 +319,13 @@ impl fmt::Display for Probe {
         } else {
             "unsupported"
         };
-        writeln!(f, "buffers   incremental consumption {incremental}")
+        writeln!(f, "buffers   incremental consumption {incremental}")?;
+        let vectorized = if self.vectorized_send {
+            "supported"
+        } else {
+            "unsupported"
+        };
+        writeln!(f, "sends     vectorized {vectorized}")
     }
 }
 
@@ -450,6 +467,37 @@ fn probe_incremental_buffers(ring: &OwnedFd) -> bool {
     registered.is_ok()
 }
 
+/// Whether the kernel takes a vectorized send: one is issued on a ring of
+/// its own, on no descriptor, and the kernel either rejects the flag as it
+/// takes the entry, with `EINVAL`, or finds no file, with `EBADF`, once it
+/// has read the vector.
+fn probe_vectorized_send() -> bool {
+    let Ok(mut ring) = Ring::new(PROBE_ENTRIES, PROBE_ENTRIES, 0) else {
+        return false;
+    };
+    let mut byte = 0u8;
+    let iovec = libc::iovec {
+        iov_base: ptr::from_mut(&mut byte).cast(),
+        iov_len: 1,
+    };
+    let Some(sqe) = ring.next_sqe() else {
+        return false;
+    };
+    sqe.opcode = sys::IORING_OP_SEND;
+    sqe.fd = -1;
+    sqe.ioprio = sys::IORING_SEND_VECTORIZED;
+    sqe.addr = ptr::from_ref(&iovec).expose_provenance() as u64;
+    sqe.len = 1;
+    // SAFETY: the entry points to `iovec`, which points to `byte`; both
+    // outlive the call, which waits for the completion, and the kernel
+    // reads the vector as it takes the entry and never gets to the byte,
+    // having no file to send on.
+    let entered = unsafe { ring.enter(1, None) };
+    let completion = ring.pop_cqe();
+    ring.release_cqes();
+    entered.is_ok() && completion.is_some_and(|cqe| cqe.res == -libc::EBADF)
+}
+
 fn kernel_release() -> String {
     fs::read_to_string("/proc/sys/kernel/osrelease").map_or_else(
         |_| "unknown".to_owned(),
@@ -473,6 +521,7 @@ mod tests {
             opcodes: bits,
             last_opcode: opcodes.iter().copied().max().unwrap_or(0),
             incremental_buffers: false,
+            vectorized_send: false,
         }
     }
 

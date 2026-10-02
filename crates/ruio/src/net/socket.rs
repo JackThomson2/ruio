@@ -852,6 +852,16 @@ pub struct RecvStream<'a> {
 }
 
 impl RecvStream<'_> {
+    /// Has each receive ask for `count` buffers' worth, for a stream whose
+    /// messages run to several buffers: such a message then takes the kernel
+    /// one call into the socket rather than two, where every receive walks
+    /// that many of the pool's entries; see [`ops::RecvMulti::buffers`]. Set
+    /// before the stream is first polled.
+    pub fn buffers(mut self, count: u32) -> Self {
+        self.stream = self.stream.buffers(count);
+        self
+    }
+
     /// The next data, or `None` once the peer has shut down or an error has
     /// been yielded.
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufBundle>>> {
