@@ -28,7 +28,7 @@
 //! `ruio-bench micro` measures the runtime itself, apart from the kernel: what
 //! a turn of the loop, a task, a wake, a timer or a channel costs, as steps
 //! per second of a loop of one small step each, on ruio and, where tokio has
-//! the same thing, on its current-thread runtime (see [`micro`]).
+//! the same thing, on its current-thread runtime (see [`micro`](mod@micro)).
 //!
 //! `ruio-bench randread` compares random reads with direct I/O against fio's,
 //! on a file or block device: for each queue depth, ruio's reader and fio's
@@ -375,7 +375,7 @@ fn scale_run(options: &Options) -> Result<(), String> {
 }
 
 /// Measures the runtime's own overheads, each the median of a few runs, which
-/// the runtimes take in turns; see [`micro`].
+/// the runtimes take in turns; see [`micro`](mod@micro).
 fn micro(options: &Options) -> Result<(), String> {
     let runs: usize = options.get("runs", 3)?;
     if runs == 0 {
