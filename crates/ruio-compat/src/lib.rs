@@ -61,6 +61,7 @@
 //! family's, or call through the trait, as in
 //! `futures_util::AsyncWriteExt::write_all(&mut stream, data)`.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
@@ -68,9 +69,10 @@ use std::io::{self, IoSlice};
 use std::mem;
 use std::net::Shutdown;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker, ready};
 
-use ruio::buf::{BufLease, BufPool};
+use ruio::buf::{BufLease, BufPool, IoBuf, IoBufs};
 use ruio::net::{Flush, TcpStream, UnixStream, WriteBehind};
 use ruio::uring::ops::{self, Recv};
 use ruio::uring::{Driver, Fd, Op};
@@ -93,6 +95,11 @@ const DEFAULT_CAPACITY: usize = 16 << 10;
 /// a write in flight holds.
 const MAX_WRITE: usize = 256 << 10;
 
+/// The largest write buffer an adapter keeps for its next write, once the
+/// send is done with it, rather than freeing it: what an idle connection
+/// may hold.
+const KEPT_WRITE: usize = 16 << 10;
+
 /// A stream socket of ruio's that a [`Compat`] adapts: a [`TcpStream`] or a
 /// [`UnixStream`].
 pub trait StreamSocket: sealed::Sealed {}
@@ -107,7 +114,7 @@ mod sealed {
     pub trait Sealed {
         fn fd(&self) -> Fd;
 
-        fn write_behind(&self, bufs: Vec<Vec<u8>>) -> WriteBehind<'_, Vec<Vec<u8>>>;
+        fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V>;
 
         fn flush(&self) -> Flush<'_>;
     }
@@ -117,7 +124,7 @@ mod sealed {
             TcpStream::fd(self)
         }
 
-        fn write_behind(&self, bufs: Vec<Vec<u8>>) -> WriteBehind<'_, Vec<Vec<u8>>> {
+        fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V> {
             TcpStream::write_behind(self, bufs)
         }
 
@@ -131,7 +138,7 @@ mod sealed {
             UnixStream::fd(self)
         }
 
-        fn write_behind(&self, bufs: Vec<Vec<u8>>) -> WriteBehind<'_, Vec<Vec<u8>>> {
+        fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V> {
             UnixStream::write_behind(self, bufs)
         }
 
@@ -156,6 +163,9 @@ pub struct Compat<S> {
     reader: Reader,
     /// The shutdown in flight.
     shutdown: Option<Op<ops::Shutdown>>,
+    /// The buffer of the last write, once its send is done with it, for
+    /// the next write to fill: a write then allocates nothing.
+    spare: Rc<Cell<Option<Vec<u8>>>>,
     /// Whether the writing half of the connection has been shut down.
     closed: bool,
     /// The ring the adapter's own operations run on: the thread's, taken at
@@ -365,6 +375,7 @@ impl<S: StreamSocket> Compat<S> {
         Self {
             reader,
             shutdown: None,
+            spare: Rc::default(),
             closed: false,
             driver: None,
             stream,
@@ -470,13 +481,19 @@ impl<S: StreamSocket> Compat<S> {
         }
         ready!(self.poll_behind(cx))?;
         let len = total.min(MAX_WRITE);
-        let mut data = Vec::with_capacity(len);
+        // The last write's buffer is back by now, as its send has finished.
+        let mut data = self.spare.take().unwrap_or_default();
+        data.reserve(len);
         for buf in bufs {
             let take = buf.len().min(len - data.len());
             data.extend_from_slice(&buf[..take]);
         }
+        let buf = WriteBuf {
+            data,
+            spare: Rc::clone(&self.spare),
+        };
         // Nothing is in flight now, so the write goes ahead at once.
-        ready!(Pin::new(&mut self.stream.write_behind(vec![data])).poll(cx))?;
+        ready!(Pin::new(&mut self.stream.write_behind([buf])).poll(cx))?;
         Poll::Ready(Ok(len))
     }
 
@@ -521,6 +538,41 @@ impl<S: StreamSocket> Compat<S> {
 fn target<S: StreamSocket>(driver: &mut Option<Driver>, stream: &S) -> (Driver, Fd) {
     let driver = driver.get_or_insert_with(ruio::driver).clone();
     (driver, stream.fd())
+}
+
+/// The copy of a write's bytes that its send holds, which goes back to the
+/// adapter, emptied, once the send is done with it, unless it has grown
+/// past what an idle connection should hold.
+struct WriteBuf {
+    data: Vec<u8>,
+    spare: Rc<Cell<Option<Vec<u8>>>>,
+}
+
+// SAFETY: the bytes lie on the heap, where the vector keeps them in place,
+// and nothing touches them while the send holds the buffer.
+unsafe impl IoBuf for WriteBuf {
+    fn stable_ptr(&self) -> *const u8 {
+        self.data.as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.data.len()
+    }
+
+    fn bytes_total(&self) -> usize {
+        self.data.capacity()
+    }
+}
+
+impl Drop for WriteBuf {
+    fn drop(&mut self) {
+        if self.data.capacity() > KEPT_WRITE {
+            return;
+        }
+        let mut data = mem::take(&mut self.data);
+        data.clear();
+        self.spare.set(Some(data));
+    }
 }
 
 // Nothing is pinned: the operations are `Unpin`, and the stream is only
