@@ -1,13 +1,22 @@
 //! The runtime the current thread is running, if any.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::scheduler::{Scheduler, Shared, TaskRef};
+use crate::scheduler::{Scheduler, Shared};
 
 thread_local! {
+    /// The thread's current scheduler, which the thread's `block_on` keeps
+    /// alive.
     static CURRENT: RefCell<Option<Rc<Scheduler>>> = const { RefCell::new(None) };
+
+    /// The same scheduler, as the hot paths reach it: a plain pointer, null
+    /// outside a runtime, read without the cell's bookkeeping. Set after
+    /// `CURRENT` and cleared before it, so that it never names a scheduler
+    /// `CURRENT` does not keep alive.
+    static ACTIVE: Cell<*const Scheduler> = const { Cell::new(ptr::null()) };
 }
 
 /// Makes `scheduler` the thread's current one until the guard is dropped.
@@ -16,6 +25,7 @@ thread_local! {
 ///
 /// If the thread is already running a runtime.
 pub(crate) fn enter(scheduler: Rc<Scheduler>) -> Enter {
+    let active = Rc::as_ptr(&scheduler);
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         assert!(
@@ -24,6 +34,7 @@ pub(crate) fn enter(scheduler: Rc<Scheduler>) -> Enter {
         );
         *current = Some(scheduler);
     });
+    ACTIVE.with(|slot| slot.set(active));
     Enter(())
 }
 
@@ -40,6 +51,7 @@ pub(crate) struct Enter(());
 
 impl Drop for Enter {
     fn drop(&mut self) {
+        let _ = ACTIVE.try_with(|slot| slot.set(ptr::null()));
         // Dropped outside the borrow, since dropping a scheduler runs code
         // that may look at the current runtime.
         let previous = CURRENT.try_with(|current| current.borrow_mut().take());
@@ -55,32 +67,29 @@ pub(crate) fn current() -> Option<Rc<Scheduler>> {
         .flatten()
 }
 
-/// Whether the thread is running the runtime `shared` belongs to.
-pub(crate) fn is_current(shared: &Arc<Shared>) -> bool {
-    CURRENT
-        .try_with(|current| {
-            current
-                .borrow()
-                .as_ref()
-                .is_some_and(|scheduler| Arc::ptr_eq(scheduler.shared(), shared))
-        })
-        .unwrap_or(false)
+/// Runs `f` with the thread's current scheduler, if the thread is inside a
+/// runtime.
+pub(crate) fn with_current<R>(f: impl FnOnce(&Scheduler) -> R) -> Option<R> {
+    let scheduler = ACTIVE.try_with(Cell::get).unwrap_or(ptr::null());
+    if scheduler.is_null() {
+        return None;
+    }
+    // SAFETY: `ACTIVE` names a scheduler only while `CURRENT` keeps it
+    // alive, and the thread's `block_on` holds `CURRENT` for as long as it
+    // runs, so the scheduler outlives this call.
+    Some(f(unsafe { &*scheduler }))
 }
 
-/// Queues `task` on the thread's scheduler, unless it is queued there
-/// already, if that is the scheduler whose shared part is at `owner`: its
-/// own. Otherwise hands the task back. Compared by address, so that the
-/// caller needs no reference to the shared part.
-pub(crate) fn schedule_local(owner: *const Shared, task: TaskRef) -> Result<(), TaskRef> {
-    let mut task = Some(task);
-    let _ = CURRENT.try_with(|current| {
-        if let Some(scheduler) = current.borrow().as_ref()
-            && std::ptr::eq(Arc::as_ptr(scheduler.shared()), owner)
-            && let Some(task) = task.take()
-            && task.claim()
-        {
-            scheduler.schedule(task);
-        }
-    });
-    task.map_or(Ok(()), Err)
+/// Runs `f` with the thread's current scheduler, if that is the one whose
+/// shared part is at `owner`: the owner of what the address was taken from.
+/// Compared by address, so that the caller need not keep a reference to the
+/// shared part alive across `f`.
+pub(crate) fn with_owner<R>(owner: *const Shared, f: impl FnOnce(&Scheduler) -> R) -> Option<R> {
+    with_current(|scheduler| ptr::eq(Arc::as_ptr(scheduler.shared()), owner).then(|| f(scheduler)))
+        .flatten()
+}
+
+/// Whether the thread is running the runtime `shared` belongs to.
+pub(crate) fn is_current(shared: &Arc<Shared>) -> bool {
+    with_owner(Arc::as_ptr(shared), |_| ()).is_some()
 }

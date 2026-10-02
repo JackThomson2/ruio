@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use ruio_driver::{Driver, RemoteRing, Unparker};
 
-use crate::task::{JoinHandle, Task};
+use crate::task::{self, JoinHandle, LocalRef, RemoteRef, Task};
 use crate::time::Timers;
 use crate::wheel::Key;
 
@@ -22,29 +22,6 @@ const BUDGET: usize = 64;
 /// How many tasks in a row may come from the LIFO slot before the queue gets
 /// a turn, so that tasks waking each other cannot starve the rest.
 const LIFO_LIMIT: u32 = 3;
-
-/// A task, as the scheduler and wakers hold it.
-pub(crate) type TaskRef = Arc<dyn Runnable>;
-
-/// What the scheduler needs from a task, whatever its future. Only called on
-/// the thread that owns the task.
-pub(crate) trait Runnable: Send + Sync {
-    /// Polls the task, finishing it if its future completes or it was
-    /// aborted.
-    fn run(self: Arc<Self>, scheduler: &Scheduler);
-
-    /// Drops the future of an unfinished task, which then reports that it
-    /// was cancelled.
-    fn cancel(&self);
-
-    /// Marks the task queued to run, unless it is queued already: whether
-    /// the caller is to queue it.
-    fn claim(&self) -> bool;
-
-    /// Queues the task on its scheduler's remote queue, from another thread,
-    /// unless it is there already.
-    fn wake_remote(self: Arc<Self>);
-}
 
 /// The part of a scheduler that other threads reach: the tasks woken there,
 /// the timers dropped there, and the unparker of the scheduler's ring.
@@ -62,7 +39,7 @@ pub(crate) struct Shared {
 pub(crate) type RemoteSpawn = Box<dyn FnOnce() + Send>;
 
 struct Remote {
-    tasks: Vec<TaskRef>,
+    tasks: Vec<RemoteRef>,
     spawns: Vec<RemoteSpawn>,
     /// Timers of the scheduler's wheel to remove, whose sleeps were dropped
     /// or moved where the wheel cannot be reached.
@@ -74,7 +51,7 @@ struct Remote {
 
 impl Shared {
     /// Queues a task woken on another thread and wakes the scheduler.
-    pub(crate) fn schedule_remote(&self, task: TaskRef) {
+    pub(crate) fn schedule_remote(&self, task: RemoteRef) {
         let refused = {
             let mut remote = self.lock();
             if remote.closed {
@@ -155,12 +132,12 @@ impl Shared {
 /// The tasks a scheduler owns, each at a fixed index until it finishes.
 #[derive(Default)]
 struct Tasks {
-    slots: Vec<Option<TaskRef>>,
+    slots: Vec<Option<LocalRef>>,
     free: Vec<usize>,
 }
 
 impl Tasks {
-    fn insert(&mut self, task: TaskRef) -> usize {
+    fn insert(&mut self, task: LocalRef) -> usize {
         match self.free.pop() {
             Some(index) => {
                 self.slots[index] = Some(task);
@@ -173,13 +150,13 @@ impl Tasks {
         }
     }
 
-    fn remove(&mut self, index: usize) -> Option<TaskRef> {
+    fn remove(&mut self, index: usize) -> Option<LocalRef> {
         let task = self.slots.get_mut(index)?.take()?;
         self.free.push(index);
         Some(task)
     }
 
-    fn take_all(&mut self) -> Vec<TaskRef> {
+    fn take_all(&mut self) -> Vec<LocalRef> {
         self.free.clear();
         self.slots.drain(..).flatten().collect()
     }
@@ -190,10 +167,10 @@ pub(crate) struct Scheduler {
     driver: Driver,
     shared: Arc<Shared>,
     /// Tasks ready to run, in the order they were woken.
-    queue: RefCell<VecDeque<TaskRef>>,
+    queue: RefCell<VecDeque<LocalRef>>,
     /// The task most recently woken by the running task. It runs next, while
     /// what the running task produced for it is likely still in the cache.
-    lifo: RefCell<Option<TaskRef>>,
+    lifo: RefCell<Option<LocalRef>>,
     /// How many tasks in a row came from the LIFO slot.
     lifo_streak: Cell<u32>,
     /// The task being polled, if any, as a thin pointer.
@@ -217,6 +194,12 @@ impl Scheduler {
             unparker: driver.unparker(),
             ring: driver.remote(),
         });
+        // SAFETY: a task's wakers reach the driver of the task's thread only,
+        // as tasks and the operations they poll stay on theirs; the retain
+        // counts a local reference, which keeps the task alive until the
+        // release; and the wake queues the task on this scheduler, or on its
+        // remote queue, without using the driver.
+        unsafe { driver.set_local_waker(task::LOCAL_WAKER) };
         Self {
             driver,
             shared,
@@ -250,7 +233,7 @@ impl Scheduler {
     }
 
     /// Takes ownership of a new task and returns its index.
-    pub(crate) fn adopt(&self, task: TaskRef) -> usize {
+    pub(crate) fn adopt(&self, task: LocalRef) -> usize {
         self.tasks.borrow_mut().insert(task)
     }
 
@@ -263,9 +246,9 @@ impl Scheduler {
     /// Queues a woken task. One woken by the running task, other than
     /// itself, takes the LIFO slot; the task it displaces, and any other,
     /// joins the back of the queue.
-    pub(crate) fn schedule(&self, task: TaskRef) {
+    pub(crate) fn schedule(&self, task: LocalRef) {
         let running = self.running.get();
-        let task = if !running.is_null() && !ptr::eq(Arc::as_ptr(&task).cast::<()>(), running) {
+        let task = if !running.is_null() && !ptr::eq(task.as_ptr().cast::<()>(), running) {
             match self.lifo.borrow_mut().replace(task) {
                 Some(displaced) => displaced,
                 None => return,
@@ -277,12 +260,12 @@ impl Scheduler {
     }
 
     /// Queues a new task, at the back of the queue.
-    pub(crate) fn schedule_new(&self, task: TaskRef) {
+    pub(crate) fn schedule_new(&self, task: LocalRef) {
         self.queue.borrow_mut().push_back(task);
     }
 
     /// The next task to run: the LIFO slot's, unless it has had its share.
-    fn next_task(&self) -> Option<TaskRef> {
+    fn next_task(&self) -> Option<LocalRef> {
         let lifo = self.lifo.borrow_mut().take();
         if let Some(task) = lifo {
             if self.lifo_streak.get() < LIFO_LIMIT {
@@ -312,7 +295,7 @@ impl Scheduler {
             let Some(task) = self.next_task() else {
                 break;
             };
-            self.running.set(Arc::as_ptr(&task).cast());
+            self.running.set(task.as_ptr().cast());
             task.run(self);
             self.running.set(ptr::null());
         }
@@ -359,7 +342,11 @@ impl Scheduler {
             let mut remote = self.shared.lock();
             if !remote.tasks.is_empty() {
                 // A task woken here meanwhile is in the queue already.
-                let claimed = remote.tasks.drain(..).filter(|task| task.claim());
+                let claimed = remote
+                    .tasks
+                    .drain(..)
+                    .filter(RemoteRef::claim)
+                    .map(LocalRef::adopt);
                 self.queue.borrow_mut().extend(claimed);
             }
             (mem::take(&mut remote.timers), mem::take(&mut remote.spawns))

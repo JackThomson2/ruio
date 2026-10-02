@@ -7,11 +7,13 @@
 
 use std::collections::VecDeque;
 use std::mem;
+use std::ptr;
 use std::task::Waker;
 
 use ruio_sys as sys;
 
 use crate::op::Completion;
+use crate::waker::LocalWaker;
 
 /// The `user_data` of internal requests, such as cancellations, whose
 /// completions are ignored.
@@ -31,6 +33,9 @@ pub(crate) struct Table<P> {
     free: u32,
     /// Slots whose request the kernel has not finished.
     in_flight: usize,
+    /// The wakers of the executor on this thread, held without cloning; see
+    /// [`LocalWaker`].
+    local: Option<LocalWaker>,
 }
 
 struct Slot<P> {
@@ -43,7 +48,7 @@ enum State<P> {
         next: u32,
     },
     /// Submitted and not yet completed; completion wakes the waker.
-    Waiting(Option<Waker>),
+    Waiting(Wake),
     /// Completed; the result waits for its future to collect it.
     Completed(Completion),
     /// Submitted, and its future dropped; the payload waits for completion.
@@ -56,9 +61,23 @@ enum State<P> {
     OrphanedStream(OrphanStream<P>),
 }
 
+/// How a slot wakes the task waiting on it.
+///
+/// A local wake is only ever let go of through [`Table::release`], which
+/// hands its reference back to the executor; dropping it would leak that.
+pub(crate) enum Wake {
+    /// Nobody waits.
+    None,
+    /// A waker of the executor on this thread, held by the `data` of the
+    /// waker, which the executor counts; see [`LocalWaker`].
+    Local(*const ()),
+    /// Any other waker, cloned.
+    Foreign(Waker),
+}
+
 struct Stream {
     completions: VecDeque<Completion>,
-    waker: Option<Waker>,
+    waker: Wake,
     /// Whether the last completion, without `IORING_CQE_F_MORE`, arrived.
     ended: bool,
 }
@@ -77,7 +96,8 @@ fn is_last(completion: &Completion) -> bool {
 
 /// What a completion means for the table.
 pub(crate) enum Outcome<P> {
-    /// An operation completed; wake its task.
+    /// An operation completed; wake its task, unless the table has, with a
+    /// local waker.
     Wake(Option<Waker>),
     /// An orphaned operation completed; its payload can be released.
     Release(P),
@@ -103,7 +123,13 @@ impl<P> Table<P> {
             slots: Vec::with_capacity(capacity),
             free: NONE,
             in_flight: 0,
+            local: None,
         }
+    }
+
+    /// Holds the wakers `local` describes by reference from now on.
+    pub(crate) fn set_local(&mut self, local: LocalWaker) {
+        self.local = Some(local);
     }
 
     /// Operations the kernel may still own: waiting or orphaned.
@@ -111,19 +137,93 @@ impl<P> Table<P> {
         self.in_flight
     }
 
+    /// How a slot is to wake `waker`: by a counted reference if it is one of
+    /// the executor's on this thread, and otherwise by a clone.
+    pub(crate) fn wake_of(&self, waker: &Waker) -> Wake {
+        match self.local {
+            Some(local) if ptr::eq(waker.vtable(), local.vtable) => {
+                // SAFETY: the waker's vtable is the executor's, so its data
+                // names a task of this thread, which the executor keeps alive
+                // while the reference is counted; see `LocalWaker`.
+                unsafe { (local.retain)(waker.data()) };
+                Wake::Local(waker.data())
+            }
+            _ => Wake::Foreign(waker.clone()),
+        }
+    }
+
+    /// Whether `wake` wakes the task `waker` does.
+    fn will_wake(&self, wake: &Wake, waker: &Waker) -> bool {
+        match wake {
+            Wake::None => false,
+            Wake::Local(data) => {
+                ptr::eq(*data, waker.data())
+                    && self
+                        .local
+                        .is_some_and(|local| ptr::eq(waker.vtable(), local.vtable))
+            }
+            Wake::Foreign(current) => current.will_wake(waker),
+        }
+    }
+
+    /// Lets go of `wake`: a local one is handed back to the executor, and a
+    /// foreign one returned, for the caller to drop after releasing the
+    /// table, since dropping a waker can run arbitrary code.
+    fn release(&self, wake: Wake) -> Option<Waker> {
+        match wake {
+            Wake::None => None,
+            Wake::Local(data) => {
+                let local = self.local.expect("a local wake comes from a local waker");
+                // SAFETY: `data` was retained through this table's local
+                // waker, and is released once.
+                unsafe { (local.release)(data) };
+                None
+            }
+            Wake::Foreign(waker) => Some(waker),
+        }
+    }
+
+    /// Wakes `wake`: a local one here, as the executor is on this thread,
+    /// and a foreign one by returning it, for the caller to wake after
+    /// releasing the table. `wake` stays as it is.
+    fn wake(&self, wake: &mut Wake) -> Option<Waker> {
+        match wake {
+            Wake::None => None,
+            Wake::Local(data) => {
+                let local = self.local.expect("a local wake comes from a local waker");
+                // SAFETY: `data` is retained through this table's local
+                // waker, so the task it names is alive.
+                unsafe { (local.wake)(*data) };
+                None
+            }
+            Wake::Foreign(_) => match mem::replace(wake, Wake::None) {
+                Wake::Foreign(waker) => Some(waker),
+                _ => unreachable!(),
+            },
+        }
+    }
+
     /// Adds a submitted operation and returns its `user_data`.
-    pub(crate) fn insert(&mut self, waker: Option<Waker>) -> u64 {
+    pub(crate) fn insert(&mut self, waker: Option<&Waker>) -> u64 {
+        let wake = waker.map_or(Wake::None, |waker| self.wake_of(waker));
+        self.insert_wake(wake)
+    }
+
+    /// Adds a submitted operation to be woken by `wake`, and returns its
+    /// `user_data`.
+    pub(crate) fn insert_wake(&mut self, wake: Wake) -> u64 {
         let index = self.occupy();
         let slot = &mut self.slots[index as usize];
         // Written into the slot where it is, rather than built elsewhere
         // and copied: this is the table's hottest path. The slot was free,
         // and so owned nothing.
-        forget_trivial(mem::replace(&mut slot.state, State::Waiting(waker)));
+        forget_trivial(mem::replace(&mut slot.state, State::Waiting(wake)));
         user_data(index, slot.generation)
     }
 
     /// Adds a submitted multishot request and returns its `user_data`.
-    pub(crate) fn insert_stream(&mut self, waker: Option<Waker>) -> u64 {
+    pub(crate) fn insert_stream(&mut self, waker: Option<&Waker>) -> u64 {
+        let waker = waker.map_or(Wake::None, |waker| self.wake_of(waker));
         let index = self.occupy();
         let slot = &mut self.slots[index as usize];
         let stream = State::Streaming(Stream {
@@ -175,21 +275,22 @@ impl<P> Table<P> {
             debug_assert!(false, "polled an operation that is not in the table");
             return Err(None);
         };
-        match &mut self.slots[index as usize].state {
+        match &self.slots[index as usize].state {
             State::Completed(completion) => {
                 let completion = *completion;
                 forget_trivial(self.free(index));
                 Ok(completion)
             }
             State::Waiting(current) => {
-                if current
-                    .as_ref()
-                    .is_some_and(|current| current.will_wake(waker))
-                {
-                    Err(None)
-                } else {
-                    Err(current.replace(waker.clone()))
+                if self.will_wake(current, waker) {
+                    return Err(None);
                 }
+                let wake = self.wake_of(waker);
+                let State::Waiting(current) = &mut self.slots[index as usize].state else {
+                    unreachable!();
+                };
+                let replaced = mem::replace(current, wake);
+                Err(self.release(replaced))
             }
             State::Orphaned(_)
             | State::Streaming(_)
@@ -203,7 +304,8 @@ impl<P> Table<P> {
 
     /// Takes the stream's next completion, freeing the slot after the last,
     /// or, if none is queued, arranges for `waker` to be woken when one
-    /// arrives. A replaced waker is returned, as by [`Table::poll`].
+    /// arrives. A replaced waker is returned, as by [`Table::poll`], and so
+    /// is the stream's own after the last completion.
     pub(crate) fn poll_stream(
         &mut self,
         user_data: u64,
@@ -217,22 +319,24 @@ impl<P> Table<P> {
             debug_assert!(false, "polled a stream that is not streaming");
             return Err(None);
         };
-        match stream.completions.pop_front() {
-            Some(completion) => {
-                if is_last(&completion) {
-                    self.free(index);
-                }
-                Ok(completion)
+        if let Some(completion) = stream.completions.pop_front() {
+            if is_last(&completion) {
+                drop(self.free_stream(index));
             }
-            None if stream
-                .waker
-                .as_ref()
-                .is_some_and(|current| current.will_wake(waker)) =>
-            {
-                Err(None)
-            }
-            None => Err(stream.waker.replace(waker.clone())),
+            return Ok(completion);
         }
+        let State::Streaming(stream) = &self.slots[index as usize].state else {
+            unreachable!();
+        };
+        if self.will_wake(&stream.waker, waker) {
+            return Err(None);
+        }
+        let wake = self.wake_of(waker);
+        let State::Streaming(stream) = &mut self.slots[index as usize].state else {
+            unreachable!();
+        };
+        let replaced = mem::replace(&mut stream.waker, wake);
+        Err(self.release(replaced))
     }
 
     /// Takes the stream's next completion if one is queued, freeing the slot
@@ -245,7 +349,7 @@ impl<P> Table<P> {
         };
         let completion = stream.completions.pop_front()?;
         if is_last(&completion) {
-            self.free(index);
+            drop(self.free_stream(index));
         }
         Some(completion)
     }
@@ -255,26 +359,30 @@ impl<P> Table<P> {
     /// which [`Table::adopt`] gives it.
     pub(crate) fn abandon(&mut self, user_data: u64) -> Option<Abandoned> {
         let index = self.index(user_data)?;
-        let state = &mut self.slots[index as usize].state;
-        let State::Streaming(stream) = state else {
+        let State::Streaming(stream) = &mut self.slots[index as usize].state else {
             debug_assert!(false, "abandoned a stream that is not streaming");
             return None;
         };
-        let abandoned = Abandoned {
-            waker: stream.waker.take(),
-            completions: mem::take(&mut stream.completions),
-            ended: stream.ended,
-        };
-        if abandoned.ended {
-            self.free(index);
+        let (wake, completions, ended) = (
+            mem::replace(&mut stream.waker, Wake::None),
+            mem::take(&mut stream.completions),
+            stream.ended,
+        );
+        let waker = self.release(wake);
+        if ended {
+            drop(self.free_stream(index));
         } else {
-            *state = State::OrphanedStream(OrphanStream {
+            self.slots[index as usize].state = State::OrphanedStream(OrphanStream {
                 payload: None,
                 completions: VecDeque::new(),
                 ended: false,
             });
         }
-        Some(abandoned)
+        Some(Abandoned {
+            waker,
+            completions,
+            ended,
+        })
     }
 
     /// Gives an abandoned stream's slot its payload, or hands the payload back
@@ -336,10 +444,10 @@ impl<P> Table<P> {
         match self.index(user_data) {
             Some(index) if matches!(self.slots[index as usize].state, State::Waiting(_)) => {
                 let state = &mut self.slots[index as usize].state;
-                let State::Waiting(waker) = mem::replace(state, State::Orphaned(payload)) else {
+                let State::Waiting(wake) = mem::replace(state, State::Orphaned(payload)) else {
                     unreachable!();
                 };
-                waker
+                self.release(wake)
             }
             _ => {
                 // Unreachable. Leaking is the safe response: the kernel may
@@ -358,9 +466,15 @@ impl<P> Table<P> {
         };
         let state = &mut self.slots[index as usize].state;
         match state {
-            State::Waiting(waker) => {
-                let waker = waker.take();
-                // Its waker taken, the state owns nothing.
+            State::Waiting(wake) => {
+                // Woken before the reference is let go of, so that the
+                // task stays alive for the wake.
+                let mut wake = mem::replace(wake, Wake::None);
+                let waker = self.wake(&mut wake);
+                let dropped = self.release(wake);
+                debug_assert!(dropped.is_none(), "a foreign waker is taken by the wake");
+                // Its wake taken, the state owns nothing.
+                let state = &mut self.slots[index as usize].state;
                 forget_trivial(mem::replace(state, State::Completed(completion)));
                 self.in_flight -= 1;
                 Outcome::Wake(waker)
@@ -378,7 +492,15 @@ impl<P> Table<P> {
                     self.in_flight -= 1;
                 }
                 stream.completions.push_back(completion);
-                Outcome::Wake(stream.waker.take())
+                // A local waker stays, so the stream's next poll finds it
+                // and clones nothing; a foreign one is taken to be woken.
+                let mut wake = mem::replace(&mut stream.waker, Wake::None);
+                let waker = self.wake(&mut wake);
+                let State::Streaming(stream) = &mut self.slots[index as usize].state else {
+                    unreachable!();
+                };
+                stream.waker = wake;
+                Outcome::Wake(waker)
             }
             State::OrphanedStream(orphan) => {
                 if is_last(&completion) {
@@ -434,14 +556,53 @@ impl<P> Table<P> {
         (current && !matches!(slot.state, State::Free { .. })).then_some(index)
     }
 
-    /// Frees a slot, returning its previous state.
+    /// Frees a slot, returning its previous state, which owns no wake: a
+    /// slot that waits is freed through [`Table::free_stream`] or has had
+    /// its wake taken.
     fn free(&mut self, index: u32) -> State<P> {
         let slot = &mut self.slots[index as usize];
         // Generation 0 is never used, so a zeroed `user_data` never matches.
         slot.generation = slot.generation.wrapping_add(1).max(1);
         let state = mem::replace(&mut slot.state, State::Free { next: self.free });
         self.free = index;
+        debug_assert!(
+            !matches!(
+                &state,
+                State::Waiting(Wake::Local(_))
+                    | State::Streaming(Stream {
+                        waker: Wake::Local(_),
+                        ..
+                    })
+            ),
+            "a slot is freed with its local wake released"
+        );
         state
+    }
+
+    /// Frees a streaming slot, letting go of its wake, and returns the
+    /// stream's foreign waker if it had one, for the caller to drop.
+    fn free_stream(&mut self, index: u32) -> Option<Waker> {
+        let State::Streaming(stream) = &mut self.slots[index as usize].state else {
+            unreachable!("only a streaming slot is freed as a stream");
+        };
+        let wake = mem::replace(&mut stream.waker, Wake::None);
+        let waker = self.release(wake);
+        drop(self.free(index));
+        waker
+    }
+}
+
+impl<P> Drop for Table<P> {
+    fn drop(&mut self) {
+        // The wakes of slots still waiting go back to the executor.
+        for index in 0..self.slots.len() {
+            let wake = match &mut self.slots[index].state {
+                State::Waiting(wake) => mem::replace(wake, Wake::None),
+                State::Streaming(stream) => mem::replace(&mut stream.waker, Wake::None),
+                _ => continue,
+            };
+            drop(self.release(wake));
+        }
     }
 }
 
@@ -450,14 +611,14 @@ fn user_data(index: u32, generation: u32) -> u64 {
 }
 
 /// Lets go of a state that owns nothing: free, completed, or waiting with
-/// its waker taken. Dropping it would run the state's drop glue for nothing,
+/// its wake taken. Dropping it would run the state's drop glue for nothing,
 /// on the hottest path of the table, so it is forgotten instead, which leaks
 /// nothing of such a state.
 fn forget_trivial<P>(state: State<P>) {
     debug_assert!(
         matches!(
             state,
-            State::Free { .. } | State::Completed(_) | State::Waiting(None)
+            State::Free { .. } | State::Completed(_) | State::Waiting(Wake::None)
         ),
         "a state that owns something is dropped, not forgotten"
     );
@@ -499,7 +660,7 @@ mod tests {
     fn completion_wakes_and_is_collected_once() {
         let mut table = Table::<()>::with_capacity(4);
         let (count, waker) = waker();
-        let op = table.insert(Some(waker.clone()));
+        let op = table.insert(Some(&waker));
         assert_eq!(table.in_flight(), 1);
         assert!(matches!(table.poll(op, &waker), Err(None)));
 
@@ -516,7 +677,7 @@ mod tests {
         let mut table = Table::<()>::with_capacity(4);
         let (first, first_waker) = waker();
         let (second, second_waker) = waker();
-        let op = table.insert(Some(first_waker));
+        let op = table.insert(Some(&first_waker));
         let replaced = table.poll(op, &second_waker).unwrap_err();
         assert!(replaced.is_some(), "the first waker is handed back");
 

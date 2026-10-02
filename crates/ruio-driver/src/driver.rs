@@ -24,8 +24,9 @@ use crate::op::{Completion, Op, Operation, Orphan};
 use crate::remote::{Remote, RemoteRing};
 use crate::ring::Ring;
 use crate::stream::{MultiOp, Multishot, Stranded};
-use crate::table::{IGNORED, Outcome, Table};
+use crate::table::{IGNORED, Outcome, Table, Wake};
 use crate::unpark::{Notify, Unparker};
+use crate::waker::LocalWaker;
 
 /// The `user_data` of the poll on the eventfd that unparkers write to.
 const WAKE: u64 = IGNORED - 1;
@@ -447,6 +448,20 @@ impl Driver {
         mem::take(&mut self.inner.state.borrow_mut().timer_fired)
     }
 
+    /// Holds the wakers `local` describes, those of the executor on this
+    /// thread, by a reference the executor counts rather than by a clone;
+    /// see [`LocalWaker`].
+    ///
+    /// # Safety
+    ///
+    /// Every waker with `local.vtable` that reaches this driver must name a
+    /// task of this thread, which `local.retain` keeps alive until the
+    /// matching `local.release`; `local.wake` must wake it as
+    /// `Waker::wake_by_ref` would, without using this driver.
+    pub unsafe fn set_local_waker(&self, local: LocalWaker) {
+        self.inner.state.borrow_mut().table.set_local(local);
+    }
+
     /// A handle that wakes this driver from any thread.
     pub fn unparker(&self) -> Unparker {
         Unparker::new(Arc::clone(&self.inner.notify))
@@ -846,9 +861,9 @@ impl Inner {
             entry.sqe.flags |= sys::IOSQE_IO_LINK;
         }
         let user_data = if stream {
-            self.table.insert_stream(Some(waker.clone()))
+            self.table.insert_stream(Some(waker))
         } else {
-            self.table.insert(Some(waker.clone()))
+            self.table.insert(Some(waker))
         };
         entry.sqe.user_data = user_data;
         entry.prepared = true;
@@ -872,7 +887,7 @@ impl Inner {
     ///
     /// The kernel links only entries submitted together, so the chain gets
     /// room for all of its entries before any is queued. Every entry is
-    /// prepared, and every waker cloned, before any reaches the queue, so
+    /// prepared, and every wake taken, before any reaches the queue, so
     /// that a panic in an operation's `prepare`, or a waker's `clone`,
     /// leaves nothing queued that points to memory the panic frees.
     fn queue_chain(&mut self, members: &mut [&mut dyn Member], waker: &Waker) {
@@ -888,18 +903,18 @@ impl Inner {
             }
             return;
         }
-        let entries: Vec<(sys::io_uring_sqe, Waker)> = members
+        let entries: Vec<(sys::io_uring_sqe, Wake)> = members
             .iter_mut()
             .map(|member| {
                 let mut sqe = sys::io_uring_sqe::default();
                 member.prepare(&mut sqe);
                 debug_assert_eq!(sqe.flags & FORBIDDEN_SQE_FLAGS, 0);
                 sqe.flags &= !FORBIDDEN_SQE_FLAGS;
-                (sqe, waker.clone())
+                (sqe, self.table.wake_of(waker))
             })
             .collect();
         let last = members.len() - 1;
-        for (index, (member, (entry, waker))) in members.iter_mut().zip(entries).enumerate() {
+        for (index, (member, (entry, wake))) in members.iter_mut().zip(entries).enumerate() {
             let timeout = member.timeout();
             // The room was made above, and nothing has taken it since.
             let sqe = self.ring.next_sqe().expect("no room for a linked entry");
@@ -907,7 +922,7 @@ impl Inner {
             if timeout.is_some() || index < last {
                 sqe.flags |= sys::IOSQE_IO_LINK;
             }
-            let user_data = self.table.insert(Some(waker));
+            let user_data = self.table.insert_wake(wake);
             sqe.user_data = user_data;
             if let Some(timeout) = timeout {
                 let link = self

@@ -56,6 +56,7 @@ mod sockaddr;
 mod stream;
 mod table;
 mod unpark;
+mod waker;
 
 pub use driver::{Builder, Driver, Stats, monotonic_now};
 pub use fd::{Descriptor, DirectFd, Fd};
@@ -66,3 +67,4 @@ pub use remote::{RemoteRing, SentFd};
 pub use sockaddr::SockAddr;
 pub use stream::{MultiOp, Multishot};
 pub use unpark::Unparker;
+pub use waker::LocalWaker;
