@@ -201,9 +201,9 @@ impl Scheduler {
         });
         // SAFETY: the retain counts a local reference only to a task of the
         // runtime running on this thread, the driver's, which keeps the task
-        // alive until the release, on this thread; and the wake queues the
-        // task on its scheduler, or on its remote queue, without using the
-        // driver.
+        // alive until the release or the wake that lets go of it, on this
+        // thread; and the wakes queue the task on its scheduler, or on its
+        // remote queue, without using the driver.
         unsafe { driver.set_local_waker(task::LOCAL_WAKER) };
         Self {
             driver,

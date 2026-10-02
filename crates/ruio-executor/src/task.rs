@@ -479,6 +479,7 @@ pub(crate) const LOCAL_WAKER: LocalWaker = LocalWaker {
     retain: retain_local,
     release: release_local,
     wake: wake_waker_by_ref,
+    wake_release: wake_release_local,
 };
 
 /// Counts a local reference to the task at `header` for the driver, if it is
@@ -503,6 +504,14 @@ unsafe fn retain_local(header: *const ()) -> bool {
 unsafe fn release_local(header: *const ()) {
     // SAFETY: the reference `retain_local` counted, on the task's thread.
     drop(unsafe { LocalRef::from_raw(header.cast()) });
+}
+
+/// Wakes the task at `header` by the reference `retain_local` counted,
+/// which goes to the run queue with it rather than being let go of.
+#[inline]
+unsafe fn wake_release_local(header: *const ()) {
+    // SAFETY: the reference `retain_local` counted, on the task's thread.
+    unsafe { LocalRef::from_raw(header.cast()) }.wake();
 }
 
 /// Who a task wakes as it finishes: the one awaiting its handle, held by a

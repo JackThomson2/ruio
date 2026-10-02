@@ -29,4 +29,9 @@ pub struct LocalWaker {
     pub release: unsafe fn(*const ()),
     /// Wakes the task a waker's `data` names, which `retain` holds.
     pub wake: unsafe fn(*const ()),
+    /// Wakes the task a waker's `data` names as `wake` does, and lets go of
+    /// the reference `retain` counted as `release` does, at once: as an
+    /// operation completes, after which the driver holds its task no more,
+    /// so that the executor can queue the task by that reference.
+    pub wake_release: unsafe fn(*const ()),
 }

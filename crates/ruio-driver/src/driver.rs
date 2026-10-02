@@ -1,7 +1,7 @@
 //! The driver: a ring, the operations in flight on it, and the loop that
 //! submits them and delivers their completions.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt;
@@ -175,9 +175,7 @@ impl Builder {
             files,
             remote,
             wake_armed: false,
-            timer: None,
             timer_at: Box::default(),
-            timer_fired: false,
             next_group: 0,
             cancels: Vec::new(),
             wakers: Vec::new(),
@@ -187,7 +185,11 @@ impl Builder {
             stats: Stats::default(),
             shutdown_timeout: self.shutdown_timeout,
         });
-        let inner = Rc::new(Shared { notify, state });
+        let inner = Rc::new(Shared {
+            notify,
+            timer: Timer::default(),
+            state,
+        });
         DRIVERS.with(|drivers| {
             let mut drivers = drivers.borrow_mut();
             drivers.retain(|(_, driver)| driver.strong_count() > 0);
@@ -285,12 +287,24 @@ impl WeakDriver {
 }
 
 /// What every handle to a driver shares: the ring's state, behind the cell
-/// that its one thread borrows for each use, and beside it what parking
-/// reaches on every turn without borrowing anything.
+/// that its one thread borrows for each use, and beside it what parking and
+/// the runtime's timers reach on every turn without borrowing anything.
 struct Shared {
     /// What the driver shares with its unparkers.
     notify: Arc<Notify>,
+    timer: Timer,
     state: RefCell<Inner>,
+}
+
+/// The wake timer's state; see [`Driver::wake_at`].
+#[derive(Default)]
+struct Timer {
+    /// The deadline the timer is armed for, while it is in flight, on
+    /// `CLOCK_MONOTONIC`.
+    armed: Cell<Option<Duration>>,
+    /// Whether the timer has fired since [`Driver::timer_fired`] last said
+    /// so.
+    fired: Cell<bool>,
 }
 
 struct Inner {
@@ -305,20 +319,16 @@ struct Inner {
     remote: Arc<Remote>,
     /// Whether the multishot poll on the unparkers' eventfd is in flight.
     wake_armed: bool,
-    /// The deadline the wake timer is armed for, while it is in flight, on
-    /// `CLOCK_MONOTONIC`; see [`Driver::wake_at`].
-    timer: Option<Duration>,
     /// Where the kernel reads the wake timer's deadline from as it takes an
     /// entry that arms or moves it: always the latest deadline.
     timer_at: Box<sys::__kernel_timespec>,
-    /// Whether the wake timer has fired since [`Driver::timer_fired`] last
-    /// said so.
-    timer_fired: bool,
     /// The provided-buffer group ID the next pool gets.
     next_group: u16,
     /// Dropped operations to cancel, by `user_data`.
     cancels: Vec<u64>,
-    /// Wakers of a batch of completions, kept to reuse the allocation.
+    /// Wakers of a batch of completions, other than the executor's, which
+    /// the table wakes itself: woken once the driver is released, as waking
+    /// can run code that uses it. Kept between batches, for the room.
     wakers: Vec<Waker>,
     /// Orphaned payloads released by a batch of completions, likewise.
     released: Vec<(Payload, Completion)>,
@@ -404,7 +414,7 @@ impl Driver {
     /// completions were lost (`EBADR`).
     #[inline]
     pub fn submit(&self) -> io::Result<()> {
-        self.enter(0, None)
+        self.turn(0, None, false)
     }
 
     /// Whether a [`park`](Driver::park) would return at once: the kernel has
@@ -435,10 +445,9 @@ impl Driver {
     pub fn park(&self, timeout: Option<Duration>) -> io::Result<()> {
         let notify = &self.inner.notify;
         if !notify.begin_park() {
-            return self.enter(0, None);
+            return self.turn(0, None, false);
         }
-        let armed = self.inner.state.borrow_mut().arm_wake(notify.eventfd());
-        let result = armed.and_then(|()| self.enter(1, timeout));
+        let result = self.turn(1, timeout, true);
         notify.end_park();
         result
     }
@@ -460,14 +469,19 @@ impl Driver {
     /// submitting it fails.
     #[inline]
     pub fn wake_at(&self, deadline: Duration) -> io::Result<()> {
-        self.inner.state.borrow_mut().wake_at(deadline)
+        // Nearly every turn finds the timer armed for the deadline already.
+        let armed = &self.inner.timer.armed;
+        if armed.get().is_some_and(|armed| armed <= deadline) {
+            return Ok(());
+        }
+        self.inner.state.borrow_mut().arm_timer(deadline, armed)
     }
 
     /// Whether the timer [`wake_at`](Driver::wake_at) armed has fired since
     /// this was last asked. Asking clears it.
     #[inline]
     pub fn timer_fired(&self) -> bool {
-        mem::take(&mut self.inner.state.borrow_mut().timer_fired)
+        self.inner.timer.fired.take()
     }
 
     /// Holds the wakers `local` describes, those of the executor on this
@@ -477,11 +491,12 @@ impl Driver {
     /// # Safety
     ///
     /// Every waker with `local.vtable` that reaches this driver must name a
-    /// live task. `local.retain` must return `true` only if `local.release`
-    /// and `local.wake` may then use the task from this thread, and must
-    /// then keep it alive until the matching `local.release`; `local.wake`
-    /// must wake it as `Waker::wake_by_ref` would, without using this
-    /// driver.
+    /// live task. `local.retain` must return `true` only if `local.release`,
+    /// `local.wake` and `local.wake_release` may then use the task from this
+    /// thread, and must then keep it alive until the matching
+    /// `local.release` or `local.wake_release`; `local.wake` must wake it as
+    /// `Waker::wake_by_ref` would, and `local.wake_release` as `local.wake`
+    /// and then `local.release` would, without using this driver.
     pub unsafe fn set_local_waker(&self, local: LocalWaker) {
         self.inner.state.borrow_mut().table.set_local(local);
     }
@@ -625,36 +640,56 @@ impl Driver {
         unsafe { inner.ring.register(opcode, arg, nr_args) }
     }
 
-    fn enter(&self, min_complete: u32, timeout: Option<Duration>) -> io::Result<()> {
+    /// Turns the ring: submits what is queued, and enters the kernel to wait
+    /// for `min_complete` completions or until `timeout`, with the poll on
+    /// the unparkers' eventfd armed first for a turn that `parks`; then
+    /// takes the completions. The driver is borrowed once for all of it,
+    /// unless the completions have wakers other than the executor's to
+    /// wake, orphans to finish or streams to hand over to, which run code
+    /// that may use the driver, and so run once it is released.
+    fn turn(&self, min_complete: u32, timeout: Option<Duration>, parks: bool) -> io::Result<()> {
         let timeout = timeout.map(timespec);
-        let (result, before) = {
-            let mut inner = self.inner.state.borrow_mut();
-            let before = inner.stats.completions;
-            (inner.enter(min_complete, timeout.as_ref()), before)
+        let shared = &*self.inner;
+        let mut inner = shared.state.borrow_mut();
+        let before = inner.stats.completions;
+        let mut result = if parks {
+            inner.arm_wake(shared.notify.eventfd())
+        } else {
+            Ok(())
         };
-        self.deliver();
-        // Completions that did not fit in the queue wait in the kernel, which
-        // moves them in when entered again, now that there is room.
-        while self.inner.state.borrow().ring.sq_flags() & sys::IORING_SQ_CQ_OVERFLOW != 0 {
-            self.inner.state.borrow_mut().enter(0, None)?;
-            self.deliver();
+        if result.is_ok() {
+            result = inner.enter(min_complete, timeout.as_ref());
         }
-        let mut inner = self.inner.state.borrow_mut();
+        loop {
+            inner.reap(&shared.timer);
+            if inner.has_deliveries() {
+                drop(inner);
+                self.deliver();
+                inner = shared.state.borrow_mut();
+            }
+            // Completions that did not fit in the queue wait in the kernel,
+            // which moves them in when entered again, now that there is room.
+            if inner.ring.sq_flags() & sys::IORING_SQ_CQ_OVERFLOW == 0 {
+                break;
+            }
+            inner.enter(0, None)?;
+        }
         inner.last_turn = usize::try_from(inner.stats.completions - before).unwrap_or(usize::MAX);
         result
     }
 
-    /// Processes the posted completions: wakes the tasks waiting for them and
-    /// finishes orphaned operations. Both run code the driver does not
-    /// control, which may use the driver, so they run after it is released.
+    /// Wakes the wakers, finishes the orphans and hands the streams the
+    /// completions that reaping collected for them: code the driver does
+    /// not control, which may use the driver, so it runs while the driver
+    /// is not borrowed.
     fn deliver(&self) {
         let (mut wakers, mut released, mut deliveries) = {
             let mut inner = self.inner.state.borrow_mut();
-            let mut wakers = mem::take(&mut inner.wakers);
-            let mut released = mem::take(&mut inner.released);
-            let mut deliveries = mem::take(&mut inner.deliveries);
-            inner.reap(&mut wakers, &mut released, &mut deliveries);
-            (wakers, released, deliveries)
+            (
+                mem::take(&mut inner.wakers),
+                mem::take(&mut inner.released),
+                mem::take(&mut inner.deliveries),
+            )
         };
         for waker in wakers.drain(..) {
             waker.wake();
@@ -1098,25 +1133,15 @@ impl Inner {
         Ok(())
     }
 
-    /// Arms the wake timer for `deadline`, or moves it there if it is armed
-    /// for later; see [`Driver::wake_at`].
-    #[inline]
-    fn wake_at(&mut self, deadline: Duration) -> io::Result<()> {
-        // Nearly every turn finds the timer armed for the deadline already.
-        if self.timer.is_some_and(|armed| armed <= deadline) {
-            return Ok(());
-        }
-        self.arm_timer(deadline)
-    }
-
-    /// Queues the entry that arms the wake timer for `deadline`, or moves
-    /// it there.
-    fn arm_timer(&mut self, deadline: Duration) -> io::Result<()> {
+    /// Queues the entry that arms the wake timer for `deadline`, or moves it
+    /// there from the deadline `armed` holds, which then holds `deadline`;
+    /// see [`Driver::wake_at`].
+    fn arm_timer(&mut self, deadline: Duration, armed: &Cell<Option<Duration>>) -> io::Result<()> {
         // An entry queued for an earlier deadline, and not yet submitted,
         // reads this one instead, which is as well.
         *self.timer_at = timespec(deadline);
         let at = (&raw const *self.timer_at).expose_provenance() as u64;
-        let moving = self.timer.is_some();
+        let moving = armed.get().is_some();
         let sqe = loop {
             match self.ring.next_sqe() {
                 Some(sqe) => break sqe,
@@ -1139,7 +1164,7 @@ impl Inner {
             sqe.op_flags = sys::IORING_TIMEOUT_ABS;
             sqe.user_data = TIMER;
         }
-        self.timer = Some(deadline);
+        armed.set(Some(deadline));
         Ok(())
     }
 
@@ -1227,7 +1252,8 @@ impl Inner {
         if self.queue_cancel_all().is_err() {
             return;
         }
-        let (mut wakers, mut released, mut deliveries) = (Vec::new(), Vec::new(), Vec::new());
+        // Nothing asks about the wake timer any more.
+        let timer = Timer::default();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             // Once the time is up, one last pass collects what is ready.
@@ -1238,12 +1264,11 @@ impl Inner {
             {
                 break;
             }
-            self.reap(&mut wakers, &mut released, &mut deliveries);
-            for (mut payload, completion) in released.drain(..) {
+            self.reap(&timer);
+            for (mut payload, completion) in mem::take(&mut self.released) {
                 payload.deliver(completion);
             }
-            deliveries.append(&mut self.deliveries);
-            for user_data in deliveries.drain(..) {
+            for user_data in mem::take(&mut self.deliveries) {
                 self.deliver_stream(user_data);
             }
             if self.table.in_flight() == 0 || remaining.is_zero() {
@@ -1252,7 +1277,7 @@ impl Inner {
         }
         // Only orphans are in flight: every waiting operation has an `Op`,
         // which keeps the driver alive.
-        debug_assert!(wakers.is_empty());
+        debug_assert!(self.wakers.is_empty());
     }
 
     /// Hands an orphaned stream's payload its completions while the driver is
@@ -1278,17 +1303,23 @@ impl Inner {
         }
     }
 
-    /// Moves posted completions into the table, collecting the wakers to wake,
-    /// the orphaned payloads to finish and the orphaned streams to deliver
-    /// to.
-    fn reap(
-        &mut self,
-        wakers: &mut Vec<Waker>,
-        released: &mut Vec<(Payload, Completion)>,
-        deliveries: &mut Vec<u64>,
-    ) {
-        while let Some(cqe) = self.ring.pop_cqe() {
-            self.stats.completions += 1;
+    /// Whether reaping collected anything to deliver once the driver is
+    /// released: wakers other than the executor's, orphans to finish or
+    /// streams to hand over to.
+    #[inline]
+    fn has_deliveries(&self) -> bool {
+        !(self.wakers.is_empty() && self.released.is_empty() && self.deliveries.is_empty())
+    }
+
+    /// Moves the posted completions into the table, all that the queue held
+    /// as the reap began: wakes the executor's tasks that wait for them,
+    /// and collects the other wakers to wake, the orphaned payloads to
+    /// finish and the orphaned streams to deliver to. The wake timer's
+    /// completion goes to `timer`.
+    fn reap(&mut self, timer: &Timer) {
+        let mut completions = self.ring.completions();
+        self.stats.completions += u64::from(completions.len());
+        for cqe in &mut completions {
             if cqe.user_data == WAKE {
                 // An unparker's write. Without IORING_CQE_F_MORE the poll
                 // has ended, and the next park arms another.
@@ -1300,19 +1331,20 @@ impl Inner {
             if cqe.user_data == TIMER {
                 // The wake timer has ended: fired, or cancelled as the ring
                 // shuts down.
-                self.timer = None;
-                self.timer_fired |= cqe.res == -libc::ETIME;
+                timer.armed.set(None);
+                if cqe.res == -libc::ETIME {
+                    timer.fired.set(true);
+                }
                 continue;
             }
             let completion = Completion::new(cqe.res, cqe.flags);
             match self.table.complete(cqe.user_data, completion) {
-                Outcome::Wake(Some(waker)) => wakers.push(waker),
+                Outcome::Wake(Some(waker)) => self.wakers.push(waker),
                 Outcome::Wake(None) | Outcome::Ignore => {}
-                Outcome::Release(payload) => released.push((payload, completion)),
-                Outcome::Deliver(user_data) => deliveries.push(user_data),
+                Outcome::Release(payload) => self.released.push((payload, completion)),
+                Outcome::Deliver(user_data) => self.deliveries.push(user_data),
             }
         }
-        self.ring.release_cqes();
     }
 }
 

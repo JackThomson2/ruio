@@ -53,6 +53,10 @@ struct SubmissionQueue {
     /// One past the last entry written. Entries up to here reach the kernel
     /// when [`Ring::enter`] publishes the tail.
     local_tail: u32,
+    /// The kernel's head, as the last [`Ring::enter`] left it: the kernel
+    /// consumes entries only while it is entered, there being no polling
+    /// thread, so between entries this is the head, read once per entry.
+    local_head: u32,
     /// The duration of each slot's linked timeout, which the slot's entry
     /// points to; see [`Ring::next_link_timeout`].
     link_timeouts: Box<[sys::__kernel_timespec]>,
@@ -136,6 +140,7 @@ impl Ring {
             entries: params.sq_entries,
             sqes: sqes.ptr().cast(),
             local_tail: 0,
+            local_head: 0,
             link_timeouts: vec![sys::__kernel_timespec::default(); params.sq_entries as usize]
                 .into_boxed_slice(),
         };
@@ -198,9 +203,7 @@ impl Ring {
     /// Entries written and not yet consumed by the kernel.
     #[inline]
     pub(crate) fn queued(&self) -> u32 {
-        // SAFETY: `sq.head` points to the head field in the live mapping.
-        let head = unsafe { atomic(self.sq.head) }.load(Ordering::Acquire);
-        self.sq.local_tail.wrapping_sub(head)
+        self.sq.local_tail.wrapping_sub(self.sq.local_head)
     }
 
     /// Free submission queue slots.
@@ -302,7 +305,7 @@ impl Ring {
         };
         // SAFETY: the caller vouches for the queued entries, and `arg` and the
         // timeout it points to outlive the call.
-        unsafe {
+        let entered = unsafe {
             sys::io_uring_enter(
                 self.enter_fd,
                 to_submit,
@@ -311,7 +314,12 @@ impl Ring {
                 arg_ptr,
                 arg_len,
             )
-        }
+        };
+        // Read whether or not the call failed: it may have consumed entries
+        // before failing.
+        // SAFETY: `sq.head` points to the head field in the live mapping.
+        self.sq.local_head = unsafe { atomic(self.sq.head) }.load(Ordering::Acquire);
+        entered
     }
 
     /// Whether the kernel has posted completions that have not been popped.
@@ -322,12 +330,41 @@ impl Ring {
         self.cq.local_head != tail
     }
 
-    /// The next completion, if the kernel has posted one.
+    /// The completions the kernel has posted, as many as the queue holds
+    /// now, oldest first. Their slots go back to the kernel, once read, as
+    /// the iterator is dropped.
     #[inline]
-    pub(crate) fn pop_cqe(&mut self) -> Option<sys::io_uring_cqe> {
+    pub(crate) fn completions(&mut self) -> Completions<'_> {
         // SAFETY: `cq.tail` points to the tail field in the live mapping.
         let tail = unsafe { atomic(self.cq.tail) }.load(Ordering::Acquire);
-        if self.cq.local_head == tail {
+        Completions {
+            cq: &mut self.cq,
+            tail,
+        }
+    }
+}
+
+/// The completions a ring's queue held as [`Ring::completions`] looked: the
+/// tail is read once for all of them.
+pub(crate) struct Completions<'a> {
+    cq: &'a mut CompletionQueue,
+    tail: u32,
+}
+
+impl Completions<'_> {
+    /// How many there are left to read.
+    #[inline]
+    pub(crate) fn len(&self) -> u32 {
+        self.tail.wrapping_sub(self.cq.local_head)
+    }
+}
+
+impl Iterator for Completions<'_> {
+    type Item = sys::io_uring_cqe;
+
+    #[inline]
+    fn next(&mut self) -> Option<sys::io_uring_cqe> {
+        if self.cq.local_head == self.tail {
             return None;
         }
         let cqe = self
@@ -336,14 +373,16 @@ impl Ring {
             .wrapping_add((self.cq.local_head & self.cq.mask) as usize);
         self.cq.local_head = self.cq.local_head.wrapping_add(1);
         // SAFETY: the entry lies before the tail the kernel published, so the
-        // acquire load above makes its contents visible, and the kernel does
-        // not reuse it until the head is released past it.
+        // acquire load that read the tail makes its contents visible, and the
+        // kernel does not reuse it until the head is released past it.
         Some(unsafe { cqe.read() })
     }
+}
 
-    /// Returns the popped completion slots to the kernel.
+impl Drop for Completions<'_> {
     #[inline]
-    pub(crate) fn release_cqes(&mut self) {
+    fn drop(&mut self) {
+        // Returns the slots read to the kernel.
         // SAFETY: `cq.head` points to the head field in the live mapping.
         unsafe { atomic(self.cq.head) }.store(self.cq.local_head, Ordering::Release);
     }
@@ -431,13 +470,12 @@ mod tests {
     fn complete(ring: &mut Ring, n: u32) -> Vec<u64> {
         // SAFETY: no-ops point to no memory.
         unsafe { ring.enter(n, None) }.unwrap();
-        let mut done = Vec::new();
-        while let Some(cqe) = ring.pop_cqe() {
-            assert_eq!(cqe.res, 0);
-            done.push(cqe.user_data);
-        }
-        ring.release_cqes();
-        done
+        ring.completions()
+            .map(|cqe| {
+                assert_eq!(cqe.res, 0);
+                cqe.user_data
+            })
+            .collect()
     }
 
     #[test]
@@ -457,7 +495,7 @@ mod tests {
             assert_eq!(ring.queued(), 3);
             assert_eq!(complete(&mut ring, 3), [1, 2, 3]);
             assert_eq!(ring.queued(), 0);
-            assert_eq!(ring.pop_cqe().map(|cqe| cqe.user_data), None);
+            assert_eq!(ring.completions().next().map(|cqe| cqe.user_data), None);
         }
     }
 

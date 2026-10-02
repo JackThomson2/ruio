@@ -210,6 +210,25 @@ impl<P> Table<P> {
         }
     }
 
+    /// Wakes `wake` and lets go of it: a local one here, handing its
+    /// reference to the executor, which queues the task by it, and a
+    /// foreign one by returning it, for the caller to wake after releasing
+    /// the table.
+    #[inline]
+    fn wake_release(&self, wake: Wake) -> Option<Waker> {
+        match wake {
+            Wake::None => None,
+            Wake::Local(data) => {
+                let local = self.local.expect("a local wake comes from a local waker");
+                // SAFETY: `data` was retained through this table's local
+                // waker, and is let go of once, by this.
+                unsafe { (local.wake_release)(data) };
+                None
+            }
+            Wake::Foreign(waker) => Some(waker),
+        }
+    }
+
     /// Adds a submitted operation and returns its `user_data`.
     #[inline]
     pub(crate) fn insert(&mut self, waker: Option<&Waker>) -> u64 {
@@ -493,12 +512,8 @@ impl<P> Table<P> {
         let state = &mut self.slots[index as usize].state;
         match state {
             State::Waiting(wake) => {
-                // Woken before the reference is let go of, so that the
-                // task stays alive for the wake.
-                let mut wake = mem::replace(wake, Wake::None);
-                let waker = self.wake(&mut wake);
-                let dropped = self.release(wake);
-                debug_assert!(dropped.is_none(), "a foreign waker is taken by the wake");
+                let wake = mem::replace(wake, Wake::None);
+                let waker = self.wake_release(wake);
                 // Its wake taken, the state owns nothing.
                 let state = &mut self.slots[index as usize].state;
                 forget_trivial(mem::replace(state, State::Completed(completion)));

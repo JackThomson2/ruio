@@ -496,8 +496,7 @@ fn probe_vectorized_send() -> bool {
     // reads the vector as it takes the entry and never gets to the byte,
     // having no file to send on.
     let entered = unsafe { ring.enter(1, None) };
-    let completion = ring.pop_cqe();
-    ring.release_cqes();
+    let completion = ring.completions().next();
     entered.is_ok() && completion.is_some_and(|cqe| cqe.res == -libc::EBADF)
 }
 
