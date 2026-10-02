@@ -6,7 +6,7 @@ mod support;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{self, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
@@ -250,14 +250,29 @@ fn a_direct_socket_connects() {
 #[test]
 fn a_refused_connection_fails() {
     let driver = Driver::new().unwrap();
-    // A port that was free a moment ago, with nothing listening on it.
-    let addr = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // A port that a socket is bound to and does not listen on, so that it
+    // refuses connections: bound without `SO_REUSEADDR`, unlike a listener,
+    // so that no other socket, such as a listener of a test running beside
+    // this one, can bind it meanwhile.
+    // SAFETY: `socket` touches no memory.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: the descriptor is new, and nothing else owns it.
+    let held = unsafe { OwnedFd::from_raw_fd(fd) };
+    let loopback = SockAddr::from(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let len = loopback.len() as libc::socklen_t;
+    // SAFETY: `bind` reads the address's `len` bytes, which it has.
+    let bound = unsafe { libc::bind(held.as_raw_fd(), loopback.as_ptr(), len) };
+    assert_eq!(bound, 0, "{}", std::io::Error::last_os_error());
+    // The standard library's type, to ask the port the kernel chose; it does
+    // not make the socket listen.
+    let held = TcpListener::from(held);
+    let addr = held.local_addr().unwrap();
+
     let socket = tcp_socket(&driver);
     let err = block_on(&driver, driver.op(Connect::new(socket.fd(), addr))).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ECONNREFUSED));
+    drop(held);
 }
 
 #[test]
