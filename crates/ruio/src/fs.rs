@@ -55,7 +55,7 @@ use ruio_driver::ops::{
 };
 use ruio_driver::{Chain, Driver, Fd, Link, Op, Operation};
 
-use crate::net::{Sock, ThreadBound};
+use crate::net::{Desc, Sock, ThreadBound};
 
 mod dir;
 
@@ -294,12 +294,12 @@ impl File {
     ///
     /// What `close(2)` reports.
     pub async fn close(self) -> io::Result<()> {
-        match self.sock {
-            Sock::Plain(file) => {
+        match self.sock.into_desc() {
+            Desc::Plain(file) => {
                 let file = file.into_inner();
                 crate::driver().op(ops::Close::new(file.into())).await
             }
-            Sock::Direct(fd) => fd.close().await,
+            Desc::Direct(fd) => fd.close().await,
         }
     }
 }

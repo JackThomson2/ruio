@@ -84,7 +84,7 @@ mod udp;
 mod unix;
 
 pub use behind::{Flush, WriteBehind};
-pub(crate) use socket::{Plain, Sock, ThreadBound};
+pub(crate) use socket::{Desc, Plain, Sock, ThreadBound};
 pub use socket::{ReadExact, RecvStream, SendZc, SocketOp, WriteAll, WriteAllVectored};
 pub use tcp::{Incoming, SentTcpStream, TcpListener, TcpStream};
 pub use udp::UdpSocket;

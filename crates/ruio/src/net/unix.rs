@@ -16,7 +16,7 @@ use ruio_driver::{Descriptor, Fd, SockAddr};
 
 use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
-    Plain, ReadExact, RecvStream, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
+    Desc, Plain, ReadExact, RecvStream, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
 };
 use super::tcp::{Incoming, listen};
 
@@ -230,6 +230,13 @@ impl UnixStream {
         Flush::new(&self.behind)
     }
 
+    /// Reports whether a [`write_behind`](Self::write_behind) failed, if
+    /// none is in flight, without waiting for one that is; see
+    /// [`TcpStream::try_flush`](super::TcpStream::try_flush).
+    pub fn try_flush(&self) -> Option<io::Result<()>> {
+        self.behind.status()
+    }
+
     /// The data arriving on the connection, received into `pool`, which
     /// must belong to the stream's ring, as it arrives.
     pub fn recv_stream(&self, pool: &BufPool) -> RecvStream<'_> {
@@ -312,9 +319,9 @@ impl UnixDatagram {
     }
 
     fn socket(&self) -> &net::UnixDatagram {
-        match &self.sock {
-            Sock::Plain(socket) => socket,
-            Sock::Direct(_) => unreachable!("Unix datagram sockets have plain descriptors"),
+        match self.sock.desc() {
+            Desc::Plain(socket) => socket,
+            Desc::Direct(_) => unreachable!("Unix datagram sockets have plain descriptors"),
         }
     }
 

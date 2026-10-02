@@ -480,12 +480,18 @@ baseline are used only when probed.
   of its sends. Nobody waits for a write behind, so its failure
   comes out later: it fails every write after it, handing buffers back
   unsent, as the stream now has a gap, and `flush` waits for it and reports
-  it. The kernel reports a `MSG_WAITALL` send it stopped short as the bytes
+  it; `try_flush` reports what is known without waiting, and without
+  arranging to be woken, which is what an adapter's flush wants. The
+  kernel reports a `MSG_WAITALL` send it stopped short as the bytes
   sent, so one cut short counts as timed out if it had a timeout and as a
   broken pipe otherwise. The failure is kept as an errno, so the writes it
   fails report it as the kernel would have.
 - Every operation borrows its socket, so the descriptor stays open until the
   kernel has the operation: dropping the socket first does not compile.
+  A socket keeps the ring its first operation ran on, the thread's for a
+  plain descriptor and its own for a direct one, so the operations after
+  it are spared the search for the thread's runtime; it is taken then
+  rather than as the socket is made, which `from_std` may do outside one.
   An operation that outlives its future, as a write behind or a cancelled
   receive does, still sits in the submission queue until the end of the
   loop pass, so a plain descriptor closes as a direct one does: with an

@@ -1,6 +1,7 @@
 //! What the socket types share: their descriptors, and the futures of their
 //! operations.
 
+use std::cell::OnceCell;
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -169,16 +170,28 @@ impl<S: Into<OwnedFd> + fmt::Debug> fmt::Debug for Plain<S> {
 /// A socket's or a file's descriptor: a plain one, as the standard library's
 /// type, which does what the ring cannot, or a direct descriptor. Either
 /// closes after the operations queued on it.
-pub(crate) enum Sock<S: Into<OwnedFd>> {
+pub(crate) enum Desc<S: Into<OwnedFd>> {
     Plain(Plain<S>),
     Direct(DirectFd),
+}
+
+/// A socket or a file: its descriptor, and the ring its operations run on.
+pub(crate) struct Sock<S: Into<OwnedFd>> {
+    desc: Desc<S>,
+    /// The ring the operations run on: the thread's for a plain descriptor,
+    /// and its own for a direct one. Taken at the first operation rather
+    /// than as the socket is made, which `from_std` may do outside a
+    /// runtime, and kept, so that every operation after it is spared the
+    /// search for the thread's ring. Holding it keeps the ring open, and a
+    /// direct descriptor's slot with it.
+    driver: OnceCell<Driver>,
 }
 
 impl<S: Into<OwnedFd> + From<OwnedFd>> Sock<S> {
     pub(crate) fn new(descriptor: Descriptor) -> Self {
         match descriptor {
             Descriptor::Plain(fd) => Sock::from_std(S::from(fd)),
-            Descriptor::Direct(fd) => Sock::Direct(fd),
+            Descriptor::Direct(fd) => Sock::wrap(Desc::Direct(fd)),
         }
     }
 }
@@ -186,7 +199,24 @@ impl<S: Into<OwnedFd> + From<OwnedFd>> Sock<S> {
 impl<S: Into<OwnedFd>> Sock<S> {
     /// Wraps a plain descriptor, as the standard library's type.
     pub(crate) fn from_std(socket: S) -> Self {
-        Sock::Plain(Plain::new(socket))
+        Sock::wrap(Desc::Plain(Plain::new(socket)))
+    }
+
+    fn wrap(desc: Desc<S>) -> Self {
+        Self {
+            desc,
+            driver: OnceCell::new(),
+        }
+    }
+
+    /// The descriptor, plain or direct.
+    pub(crate) fn desc(&self) -> &Desc<S> {
+        &self.desc
+    }
+
+    /// The descriptor, plain or direct, out of the socket.
+    pub(crate) fn into_desc(self) -> Desc<S> {
+        self.desc
     }
 
     /// Sends the socket to core `core` of the thread's run: a plain
@@ -201,11 +231,11 @@ impl<S: Into<OwnedFd>> Sock<S> {
     /// Outside a run of several cores, or if it has no core `core`.
     pub(crate) async fn send_to(self, core: usize) -> Result<Sent<S>, (io::Error, Self)> {
         let handle = crate::handle_of(core);
-        match self {
-            Sock::Plain(socket) => Ok(Sent::Plain(socket)),
-            Sock::Direct(fd) => match fd.send_to(handle.ring()).await {
+        match self.desc {
+            Desc::Plain(socket) => Ok(Sent::Plain(socket)),
+            Desc::Direct(fd) => match fd.send_to(handle.ring()).await {
                 Ok(sent) => Ok(Sent::Direct(sent)),
-                Err((err, fd)) => Err((err, Sock::Direct(fd))),
+                Err((err, fd)) => Err((err, Sock::wrap(Desc::Direct(fd)))),
             },
         }
     }
@@ -227,9 +257,9 @@ impl<S: Into<OwnedFd>> Sent<S> {
     /// For a direct descriptor, on any other core.
     pub(crate) fn receive(self) -> Sock<S> {
         match self {
-            Sent::Plain(socket) => Sock::Plain(socket),
+            Sent::Plain(socket) => Sock::wrap(Desc::Plain(socket)),
             Sent::Direct(sent) => match sent.claim() {
-                Ok(fd) => Sock::Direct(fd),
+                Ok(fd) => Sock::wrap(Desc::Direct(fd)),
                 Err(_) => panic!("a direct descriptor is received on the core it was sent to"),
             },
         }
@@ -239,45 +269,51 @@ impl<S: Into<OwnedFd>> Sent<S> {
 impl<S: AsRawFd + Into<OwnedFd>> Sock<S> {
     /// The descriptor, for operations on the socket's ring.
     pub(crate) fn fd(&self) -> Fd {
-        match self {
-            Sock::Plain(socket) => Fd::Plain(socket.as_raw_fd()),
-            Sock::Direct(fd) => fd.fd(),
+        match &self.desc {
+            Desc::Plain(socket) => Fd::Plain(socket.as_raw_fd()),
+            Desc::Direct(fd) => fd.fd(),
         }
     }
 
     pub(crate) fn is_direct(&self) -> bool {
-        matches!(self, Sock::Direct(_))
+        matches!(self.desc, Desc::Direct(_))
     }
 
     /// The ring to run an operation on, and the descriptor to give it: the
     /// thread's for a plain descriptor, and its own for a direct one.
     pub(crate) fn target(&self) -> (Driver, Fd) {
-        match self {
-            Sock::Plain(socket) => (crate::driver(), Fd::Plain(socket.as_raw_fd())),
-            Sock::Direct(fd) => {
+        if let Some(driver) = self.driver.get() {
+            return (driver.clone(), self.fd());
+        }
+        let (driver, fd) = match &self.desc {
+            Desc::Plain(socket) => (crate::driver(), Fd::Plain(socket.as_raw_fd())),
+            Desc::Direct(fd) => {
                 // A direct descriptor almost always belongs to the thread's
                 // own ring, which takes no search to find.
                 let current = crate::driver();
                 if fd.belongs_to(&current) {
-                    return (current, fd.fd());
-                }
-                match fd.driver() {
-                    Some(driver) => (driver, fd.fd()),
-                    // The ring is gone, and the file with it. No table has
-                    // this slot, so the kernel fails the operation with
-                    // `EBADF`.
-                    None => (current, Fd::Direct(u32::MAX)),
+                    (current, fd.fd())
+                } else {
+                    match fd.driver() {
+                        Some(driver) => (driver, fd.fd()),
+                        // The ring is gone, and the file with it. No table
+                        // has this slot, so the kernel fails the operation
+                        // with `EBADF`. Not kept: the thread's ring is not
+                        // the descriptor's.
+                        None => return (current, Fd::Direct(u32::MAX)),
+                    }
                 }
             }
-        }
+        };
+        (self.driver.get_or_init(|| driver).clone(), fd)
     }
 
     /// The standard library's socket, for what only a plain descriptor can
     /// do.
     pub(crate) fn plain(&self) -> io::Result<&S> {
-        match self {
-            Sock::Plain(socket) => Ok(socket),
-            Sock::Direct(_) => Err(io::Error::new(
+        match &self.desc {
+            Desc::Plain(socket) => Ok(socket),
+            Desc::Direct(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "not available for a direct descriptor",
             )),
@@ -371,9 +407,9 @@ impl<S: AsRawFd + Into<OwnedFd>> Sock<S> {
 
 impl<S: Into<OwnedFd> + fmt::Debug> fmt::Debug for Sock<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Sock::Plain(socket) => socket.fmt(f),
-            Sock::Direct(fd) => fd.fmt(f),
+        match &self.desc {
+            Desc::Plain(socket) => socket.fmt(f),
+            Desc::Direct(fd) => fd.fmt(f),
         }
     }
 }

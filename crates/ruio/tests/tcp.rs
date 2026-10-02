@@ -214,6 +214,35 @@ async fn a_failed_write_behind_fails_what_comes_after() -> io::Result<()> {
     Ok(())
 }
 
+/// Asked without waiting, a stream says nothing while a write behind is in
+/// flight, and how the writes went once none is.
+#[ruio::test]
+async fn try_flush_reports_only_what_is_known() -> io::Result<()> {
+    let (client, server) = pair().await?;
+    assert!(matches!(client.try_flush(), Some(Ok(()))));
+    within(client.write_behind(vec![vec![7; 64 << 20]])).await?;
+    assert!(client.try_flush().is_none(), "the write is in flight");
+    let (read, _) = within(server.read_exact(Vec::with_capacity(64 << 20))).await;
+    read?;
+    within(client.flush()).await?;
+    assert!(matches!(client.try_flush(), Some(Ok(()))));
+
+    let (client, _server) = pair().await?;
+    within(
+        client
+            .write_behind(vec![vec![7; 64 << 20]])
+            .timeout(Duration::from_millis(50)),
+    )
+    .await?;
+    within(client.flush()).await.unwrap_err();
+    let err = client
+        .try_flush()
+        .expect("nothing is in flight")
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+    Ok(())
+}
+
 /// A peer that resets the connection part of the way through a write behind
 /// cuts it short, which fails the stream's writes from then on.
 #[ruio::test]

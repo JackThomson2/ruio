@@ -70,7 +70,7 @@ use std::mem;
 use std::net::Shutdown;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker, ready};
+use std::task::{Context, Poll, ready};
 
 use ruio::buf::{BufLease, BufPool, IoBuf, IoBufs};
 use ruio::net::{Flush, TcpStream, UnixStream, WriteBehind};
@@ -117,6 +117,8 @@ mod sealed {
         fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V>;
 
         fn flush(&self) -> Flush<'_>;
+
+        fn try_flush(&self) -> Option<io::Result<()>>;
     }
 
     impl Sealed for TcpStream {
@@ -131,6 +133,10 @@ mod sealed {
         fn flush(&self) -> Flush<'_> {
             TcpStream::flush(self)
         }
+
+        fn try_flush(&self) -> Option<io::Result<()>> {
+            TcpStream::try_flush(self)
+        }
     }
 
     impl Sealed for UnixStream {
@@ -144,6 +150,10 @@ mod sealed {
 
         fn flush(&self) -> Flush<'_> {
             UnixStream::flush(self)
+        }
+
+        fn try_flush(&self) -> Option<io::Result<()>> {
+            UnixStream::try_flush(self)
         }
     }
 }
@@ -506,12 +516,7 @@ impl<S: StreamSocket> Compat<S> {
     /// the write in flight, whose failure the next write, flush or close
     /// reports.
     fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Asked with a waker that does nothing, as nobody waits here.
-        let mut asking = Context::from_waker(Waker::noop());
-        match Pin::new(&mut self.stream.flush()).poll(&mut asking) {
-            Poll::Pending => Poll::Ready(Ok(())),
-            known => known,
-        }
+        Poll::Ready(self.stream.try_flush().unwrap_or(Ok(())))
     }
 
     /// Waits for the write in flight, then shuts down the writing half of

@@ -16,7 +16,7 @@ use ruio_driver::{Descriptor, Driver, Fd};
 
 use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
-    Plain, ReadExact, RecvStream, SendZc, Sent, Sock, SocketOp, ThreadBound, WriteAll,
+    Desc, Plain, ReadExact, RecvStream, SendZc, Sent, Sock, SocketOp, ThreadBound, WriteAll,
     WriteAllVectored, bind_reuseport,
 };
 
@@ -320,10 +320,10 @@ impl TcpStream {
     /// descriptor from [`TcpListener::incoming`], which has no way to learn
     /// it.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        match (&self.sock, self.peer) {
-            (Sock::Plain(stream), _) => stream.peer_addr(),
-            (Sock::Direct(_), Some(peer)) => Ok(peer),
-            (Sock::Direct(_), None) => Err(io::Error::new(
+        match (self.sock.desc(), self.peer) {
+            (Desc::Plain(stream), _) => stream.peer_addr(),
+            (Desc::Direct(_), Some(peer)) => Ok(peer),
+            (Desc::Direct(_), None) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "the peer's address of a direct descriptor from a multishot accept is unknown",
             )),
@@ -407,6 +407,15 @@ impl TcpStream {
     /// and reports whether one failed; see [`Flush`].
     pub fn flush(&self) -> Flush<'_> {
         Flush::new(&self.behind)
+    }
+
+    /// Reports whether a [`write_behind`](Self::write_behind) failed, if
+    /// none is in flight, without waiting for one that is: `None` then, as
+    /// how it goes is not yet known. Unlike [`flush`](Self::flush), this
+    /// arranges for nothing to be woken, so a task that only wants to know
+    /// what is known so far costs the stream nothing.
+    pub fn try_flush(&self) -> Option<io::Result<()>> {
+        self.behind.status()
     }
 
     /// Writes all of `buf`'s initialized bytes without copying them; see

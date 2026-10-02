@@ -9,7 +9,7 @@ use ruio_driver::buf::{BufPool, BufResult, IoBuf, IoBufMut};
 use ruio_driver::ops::{self, Recv, RecvFrom, Send, SendTo};
 use ruio_driver::{Fd, SockAddr};
 
-use super::socket::{RecvStream, SendZc, Sock, SocketOp, ThreadBound, bind_reuseport};
+use super::socket::{Desc, RecvStream, SendZc, Sock, SocketOp, ThreadBound, bind_reuseport};
 
 /// A UDP socket.
 ///
@@ -55,9 +55,9 @@ impl UdpSocket {
     }
 
     fn socket(&self) -> &net::UdpSocket {
-        match &self.sock {
-            Sock::Plain(socket) => socket,
-            Sock::Direct(_) => unreachable!("UDP sockets have plain descriptors"),
+        match self.sock.desc() {
+            Desc::Plain(socket) => socket,
+            Desc::Direct(_) => unreachable!("UDP sockets have plain descriptors"),
         }
     }
 

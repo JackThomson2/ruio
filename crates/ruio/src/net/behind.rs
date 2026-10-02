@@ -57,10 +57,21 @@ impl Behind {
             }
             return Poll::Pending;
         }
-        Poll::Ready(match self.error.get() {
+        Poll::Ready(self.outcome())
+    }
+
+    /// How the writes behind went, if none is in flight, without arranging
+    /// to be told when one finishes: `None` while one is.
+    pub(crate) fn status(&self) -> Option<io::Result<()>> {
+        (self.in_flight.get() == 0).then(|| self.outcome())
+    }
+
+    /// `Ok`, unless a write behind failed.
+    fn outcome(&self) -> io::Result<()> {
+        match self.error.get() {
             None => Ok(()),
             Some(code) => Err(io::Error::from_raw_os_error(code)),
-        })
+        }
     }
 
     /// Records how a send of the write in flight went, failing with `error`
@@ -76,9 +87,16 @@ impl Behind {
         if left > 0 {
             return;
         }
-        let waiters = mem::take(&mut *self.waiters.borrow_mut());
-        for waiter in waiters {
+        // Woken outside the borrow, as waking runs code of the task's, and
+        // the vector goes back, with its room, for the next write's waiters,
+        // unless one has already been put there meanwhile.
+        let mut waiters = mem::take(&mut *self.waiters.borrow_mut());
+        for waiter in waiters.drain(..) {
             waiter.wake();
+        }
+        let mut current = self.waiters.borrow_mut();
+        if current.is_empty() {
+            *current = waiters;
         }
     }
 }
