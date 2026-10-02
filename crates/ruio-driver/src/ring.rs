@@ -26,7 +26,7 @@ const UNSUPPORTED_FLAGS: u32 = sys::IORING_SETUP_IOPOLL
 ///
 /// The ring knows nothing about operations. Callers fill entries from
 /// [`Ring::next_sqe`], hand them to the kernel with [`Ring::enter`], and read
-/// completions with [`Ring::pop_cqe`] and [`Ring::release_cqes`].
+/// completions with [`Ring::completions`].
 pub(crate) struct Ring {
     sq: SubmissionQueue,
     cq: CompletionQueue,
@@ -74,7 +74,8 @@ struct CompletionQueue {
     mask: u32,
     cqes: *const sys::io_uring_cqe,
     /// One past the last entry read. The kernel may reuse entries up to here
-    /// once [`Ring::release_cqes`] publishes the head.
+    /// once the [`Completions`] that read them, as it is dropped, publishes
+    /// the head.
     local_head: u32,
 }
 

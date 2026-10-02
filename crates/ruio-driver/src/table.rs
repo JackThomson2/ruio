@@ -64,8 +64,9 @@ enum State<P> {
 
 /// How a slot wakes the task waiting on it.
 ///
-/// A local wake is only ever let go of through [`Table::release`], which
-/// hands its reference back to the executor; dropping it would leak that.
+/// A local wake is only ever let go of through [`Table::release`] or
+/// [`Table::wake_release`], which hand its reference back to the executor;
+/// dropping it would leak that.
 pub(crate) enum Wake {
     /// Nobody waits.
     None,

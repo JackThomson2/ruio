@@ -1252,6 +1252,10 @@ impl Inner {
         if self.queue_cancel_all().is_err() {
             return;
         }
+        // Wakers that a reap which panicked part way left behind: their
+        // operations completed, and nobody waits for them now, every waiting
+        // operation having an `Op`, which keeps the driver alive.
+        drop(mem::take(&mut self.wakers));
         // Nothing asks about the wake timer any more.
         let timer = Timer::default();
         loop {
