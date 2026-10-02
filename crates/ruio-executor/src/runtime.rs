@@ -102,7 +102,10 @@ impl Runtime {
         let mut cx = Context::from_waker(&waker);
         let mut future = pin!(future);
         loop {
-            if main.woken.swap(false, Ordering::SeqCst)
+            // A plain load first: most passes find the flag clear, and only
+            // consuming a wake needs the read-modify-write.
+            if main.woken.load(Ordering::Acquire)
+                && main.woken.swap(false, Ordering::SeqCst)
                 && let Poll::Ready(output) = coop::budgeted(|| future.as_mut().poll(&mut cx))
             {
                 return output;
