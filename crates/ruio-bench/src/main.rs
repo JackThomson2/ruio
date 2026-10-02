@@ -25,6 +25,11 @@
 //! row's, for ruio on its cores and for tokio with a current-thread runtime
 //! per core, each run in a process of its own, in turns.
 //!
+//! `ruio-bench micro` measures the runtime itself, apart from the kernel: what
+//! a turn of the loop, a task, a wake, a timer or a channel costs, as steps
+//! per second of a loop of one small step each, on ruio and, where tokio has
+//! the same thing, on its current-thread runtime (see [`micro`]).
+//!
 //! `ruio-bench randread` compares random reads with direct I/O against fio's,
 //! on a file or block device: for each queue depth, ruio's reader and fio's
 //! io_uring engine each run in a process of their own on the same CPU, with
@@ -44,10 +49,12 @@
 //! ruio-bench http-client ADDR [--connections N] [--seconds S] [--warmup S] [--cpus LIST]
 //! ruio-bench scale-run ruio|tokio [--cores N] [--connections N] [--size BYTES] [--seconds S]
 //!                                 [--warmup S]
+//! ruio-bench micro [--only LIST] [--runs N] [--seconds S] [--cpu N]
 //! ```
 
 mod client;
 mod http;
+mod micro;
 mod randread;
 mod scale;
 mod server;
@@ -81,7 +88,8 @@ const USAGE: &str =
        ruio-bench scale [--cores LIST] [--connections N] [--size BYTES] [--runs N] \
                      [--seconds S] [--warmup S]
        ruio-bench scale-run ruio|tokio [--cores N] [--connections N] [--size BYTES] \
-                     [--seconds S] [--warmup S]";
+                     [--seconds S] [--warmup S]
+       ruio-bench micro [--only LIST] [--runs N] [--seconds S] [--cpu N]";
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -97,6 +105,7 @@ fn main() {
         Some("randread-ruio") => randread_ruio(&options),
         Some("scale") => scale(&options),
         Some("scale-run") => scale_run(&options),
+        Some("micro") => micro(&options),
         _ => Err(USAGE.to_owned()),
     });
     if let Err(err) = result {
@@ -362,6 +371,73 @@ fn scale_run(options: &Options) -> Result<(), String> {
     };
     let rate = rate.map_err(|err| format!("{runtime} on {} cores: {err}", load.cores))?;
     println!("rate={rate:.0}");
+    Ok(())
+}
+
+/// Measures the runtime's own overheads, each the median of a few runs, which
+/// the runtimes take in turns; see [`micro`].
+fn micro(options: &Options) -> Result<(), String> {
+    let runs: usize = options.get("runs", 3)?;
+    if runs == 0 {
+        return Err("--runs must be at least 1".to_owned());
+    }
+    let only: String = options.get("only", String::new())?;
+    let wanted: Vec<&str> = only.split(',').filter(|name| !name.is_empty()).collect();
+    let load = micro::Load {
+        measure: options.duration("seconds", 1.0)?,
+        cpu: options.get("cpu", 0)?,
+    };
+    sys::pin(&[load.cpu]).map_err(|err| format!("pinning to CPU {}: {err}", load.cpu))?;
+    let benchmarks = micro::ALL
+        .iter()
+        .filter(|benchmark| wanted.is_empty() || wanted.contains(&benchmark.name));
+
+    println!(
+        "Steps per second of the runtime's own loops, on CPU {}, medians of {runs} runs of \
+         {:.1} s; see the module documentation of ruio-bench's micro.rs for what each step is.",
+        load.cpu,
+        load.measure.as_secs_f64()
+    );
+    println!();
+    print!("| benchmark |");
+    for runtime in micro::Runtime::ALL {
+        print!(" {runtime} |");
+    }
+    println!();
+    println!("|---|{}", "---:|".repeat(micro::Runtime::ALL.len()));
+    for benchmark in benchmarks {
+        let mut samples: Vec<Vec<f64>> = micro::Runtime::ALL.iter().map(|_| Vec::new()).collect();
+        for round in 1..=runs {
+            for (runtime, samples) in micro::Runtime::ALL.into_iter().zip(&mut samples) {
+                let Some(measured) = benchmark.run(runtime, &load) else {
+                    continue;
+                };
+                eprintln!("{}: {runtime}, run {round}", benchmark.name);
+                samples.push(
+                    measured.map_err(|err| format!("{} on {runtime}: {err}", benchmark.name))?,
+                );
+            }
+        }
+        let rates: Vec<Option<f64>> = samples
+            .iter()
+            .map(|samples| (!samples.is_empty()).then(|| median(samples.iter().copied())))
+            .collect();
+        print!("| {} |", benchmark.name);
+        for (runtime, rate) in micro::Runtime::ALL.iter().zip(&rates) {
+            match rate {
+                None => print!(" - |"),
+                Some(rate) if *runtime == micro::Runtime::Ruio && rates[0].is_some() => {
+                    print!(
+                        " {} ({:.2}x) |",
+                        thousands(*rate),
+                        rate / rates[0].unwrap_or(1.0)
+                    );
+                }
+                Some(rate) => print!(" {} |", thousands(*rate)),
+            }
+        }
+        println!();
+    }
     Ok(())
 }
 
