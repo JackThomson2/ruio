@@ -375,11 +375,13 @@ unsafe fn release(header: *const Header) {
 }
 
 /// Lets go of the share, as the last local reference goes, freeing the task
-/// if it was the last reference: as it usually is, the task having
-/// finished with no waker of it held elsewhere. Then it takes no
+/// if that was its last reference, as it usually is: by then the task has
+/// finished, and no waker of it is held anywhere else. Then it takes no
 /// read-modify-write: taking a reference takes one already held, so with
 /// no other held, nothing counts meanwhile, and the acquire load sees what
-/// the threads that let theirs go did.
+/// the threads that let theirs go did. It is cold, kept out of the drops of
+/// local references, which come and go all the time and reach it once in a
+/// task's life.
 ///
 /// # Safety
 ///
@@ -632,10 +634,9 @@ impl Main {
         if !header.queued.replace(false) {
             return false;
         }
-        // As for a task's run: a remote wake's flag is cleared only if set,
-        // with the order of the wake's own swap.
-        if header.woken.load(Ordering::SeqCst) {
-            header.woken.store(false, Ordering::SeqCst);
+        // As for a task's run.
+        if header.woken.load(Ordering::Relaxed) {
+            header.woken.swap(false, Ordering::SeqCst);
         }
         true
     }
@@ -730,11 +731,15 @@ where
         // SAFETY: the vtable's contract.
         let this = unsafe { Self::get(header) };
         // Cleared before polling, so a wake during the poll queues it again.
-        // A remote wake's flag is cleared only if set, with the same order
-        // as the wake's own swap, so that the poll sees what it woke for.
+        // A remote wake's flag is cleared only if set, and then with a swap,
+        // which reads the last of the wakes' own swaps: a waker that found
+        // it set queued nothing, trusting this poll to see what it woke
+        // for. The load needs no order of its own: a flag set for this run
+        // was set before the remote queue, under its lock, handed the task
+        // on.
         this.header.queued.set(false);
-        if this.header.woken.load(Ordering::SeqCst) {
-            this.header.woken.store(false, Ordering::SeqCst);
+        if this.header.woken.load(Ordering::Relaxed) {
+            this.header.woken.swap(false, Ordering::SeqCst);
         }
         if this.aborted.get() {
             if matches!(*this.stage.borrow(), Stage::Running(_)) {
