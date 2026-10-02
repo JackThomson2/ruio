@@ -6,15 +6,14 @@ use std::io;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::Poll;
 use std::time::Duration;
 
 use ruio_driver::Driver;
 
 use crate::handle::Handle;
-use crate::scheduler::{Scheduler, Shared};
-use crate::task::JoinHandle;
+use crate::scheduler::Scheduler;
+use crate::task::{JoinHandle, Main};
 use crate::{context, coop};
 
 /// Configures and creates a [`Runtime`].
@@ -118,23 +117,18 @@ impl Runtime {
     /// If the thread is already inside `block_on`, or if `future` panics.
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         let _enter = context::enter(Rc::clone(&self.scheduler));
-        let main = Arc::new(MainWaker {
-            woken: AtomicBool::new(true),
-            shared: Arc::clone(self.scheduler.shared()),
-        });
-        let waker = Waker::from(Arc::clone(&main));
-        let mut cx = Context::from_waker(&waker);
+        // Wakers of the future name it as a task's name the task, so that
+        // waking it on this thread takes no atomic operation.
+        let main = Main::new(&self.scheduler);
         let mut future = pin!(future);
         loop {
-            // A plain load first: most passes find the flag clear, and only
-            // consuming a wake needs the read-modify-write.
-            if main.woken.load(Ordering::Acquire)
-                && main.woken.swap(false, Ordering::SeqCst)
-                && let Poll::Ready(output) = coop::budgeted(|| future.as_mut().poll(&mut cx))
+            if main.take_wake()
+                && let Poll::Ready(output) =
+                    main.poll(|cx| coop::budgeted(|| future.as_mut().poll(cx)))
             {
                 return output;
             }
-            self.scheduler.tick(&main.woken);
+            self.scheduler.tick(&main);
         }
     }
 
@@ -172,26 +166,5 @@ impl Drop for Runtime {
 impl fmt::Debug for Runtime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Runtime").finish_non_exhaustive()
-    }
-}
-
-/// The waker of the future given to `block_on`.
-struct MainWaker {
-    woken: AtomicBool,
-    shared: Arc<Shared>,
-}
-
-impl Wake for MainWaker {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.woken.store(true, Ordering::SeqCst);
-        // On the runtime's own thread the flag is enough: the loop checks it
-        // before parking.
-        if !context::is_current(&self.shared) {
-            self.shared.unpark();
-        }
     }
 }

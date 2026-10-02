@@ -90,11 +90,22 @@ struct Vtable {
     dealloc: unsafe fn(*const Header),
 }
 
+/// The index of the header of the future given to `block_on`, which is in no
+/// scheduler's list of tasks; see [`Main`].
+const MAIN: usize = usize::MAX;
+
 impl Header {
     /// Marks the task queued to run, unless it is already: whether the caller
     /// is to queue it. Only on the task's thread.
     fn claim(&self) -> bool {
         !self.queued.replace(true)
+    }
+
+    /// Whether this is the header of the future given to `block_on`, which
+    /// its loop polls once it is marked queued, rather than a run of the
+    /// scheduler's. Only on the task's thread.
+    fn is_main(&self) -> bool {
+        self.index.get() == MAIN
     }
 }
 
@@ -269,7 +280,7 @@ impl RemoteRef {
         let mut remote = Some(self);
         let on_owner = context::with_owner(owner, |scheduler| {
             let remote = remote.take().expect("the reference is still held");
-            if remote.claim() {
+            if remote.claim() && !remote.header().is_main() {
                 scheduler.schedule(LocalRef::adopt(remote));
             }
         });
@@ -337,7 +348,7 @@ unsafe fn wake_by_ref(header: *const Header) {
     // SAFETY: the task is alive.
     let task = unsafe { &*header };
     let on_owner = context::with_owner(Arc::as_ptr(&task.shared), |scheduler| {
-        if task.claim() {
+        if task.claim() && !task.is_main() {
             // SAFETY: the task is alive, and this is its thread.
             scheduler.schedule(unsafe { LocalRef::retain(header) });
         }
@@ -352,7 +363,8 @@ unsafe fn wake_by_ref(header: *const Header) {
 /// that the driver can tell a task's waker by it and hold it by a counted
 /// reference rather than a clone (see [`LOCAL_WAKER`]). A waker's data is
 /// the task's header, and the waker holds one atomic reference, except for
-/// the one a run lends its poll, which is never dropped.
+/// the ones a run lends its poll and `block_on` its future's polls, which
+/// are never dropped.
 static WAKER: RawWakerVTable =
     RawWakerVTable::new(clone_waker, wake_waker, wake_waker_by_ref, drop_waker);
 
@@ -400,6 +412,94 @@ unsafe fn retain_local(header: *const ()) {
 unsafe fn release_local(header: *const ()) {
     // SAFETY: the reference `retain_local` counted, on the task's thread.
     drop(unsafe { LocalRef::from_raw(header.cast()) });
+}
+
+/// What the header of the future given to `block_on` does when asked what a
+/// task's does: nothing, as its loop polls the future, which a task's run
+/// does not; but it frees itself after its last reference, as a task does.
+static MAIN_VTABLE: Vtable = Vtable {
+    run: run_main,
+    cancel: ignore_main,
+    is_finished: main_is_finished,
+    abort: ignore_main,
+    detach: ignore_main,
+    dealloc: dealloc_main,
+};
+
+/// A run of the main header, which the remote queue can hand the scheduler:
+/// claiming it marked the future to poll already.
+fn run_main(_: *const Header, _: &Scheduler) {}
+
+fn ignore_main(_: *const Header) {}
+
+fn main_is_finished(_: *const Header) -> bool {
+    false
+}
+
+unsafe fn dealloc_main(header: *const Header) {
+    // SAFETY: the vtable's contract; a main header is a boxed `Header`.
+    drop(unsafe { Box::from_raw(header.cast_mut()) });
+}
+
+/// The header of the future given to `block_on`, which its wakers name as a
+/// task's wakers name the task. They share the tasks' vtable, so the driver
+/// holds them by a local reference rather than a clone, and a wake on the
+/// runtime's thread marks the future to poll with the plain flag that marks
+/// a task queued, without queueing anything or an atomic operation. A wake
+/// from another thread goes through the remote queue, as a task's does, and
+/// the scheduler sets the flag as it takes it.
+pub(crate) struct Main {
+    task: LocalRef,
+}
+
+impl Main {
+    /// The header of a `block_on` of `scheduler`'s, marked to poll its
+    /// future first.
+    pub(crate) fn new(scheduler: &Scheduler) -> Self {
+        let header = Box::new(Header {
+            vtable: &MAIN_VTABLE,
+            shared: Arc::clone(scheduler.shared()),
+            strong: AtomicUsize::new(1),
+            local: Cell::new(1),
+            woken: AtomicBool::new(false),
+            queued: Cell::new(true),
+            index: Cell::new(MAIN),
+        });
+        // SAFETY: the new header counts one local reference, taken here, and
+        // one atomic one, its share.
+        let task = unsafe { LocalRef::from_raw(Box::into_raw(header)) };
+        Self { task }
+    }
+
+    /// Whether the future has been woken since this was last asked, and so
+    /// is to be polled; a wake during the poll marks it again.
+    pub(crate) fn take_wake(&self) -> bool {
+        let header = self.task.header();
+        if !header.queued.replace(false) {
+            return false;
+        }
+        // As for a task's run: a remote wake's flag is cleared only if set,
+        // with the order of the wake's own swap.
+        if header.woken.load(Ordering::SeqCst) {
+            header.woken.store(false, Ordering::SeqCst);
+        }
+        true
+    }
+
+    /// Whether the future has been woken, and is to be polled.
+    pub(crate) fn is_woken(&self) -> bool {
+        self.task.header().queued.get()
+    }
+
+    /// Runs `poll` with a context whose waker names the future.
+    pub(crate) fn poll<R>(&self, poll: impl FnOnce(&mut Context<'_>) -> R) -> R {
+        let raw = RawWaker::new(self.task.as_ptr().cast(), &WAKER);
+        // SAFETY: as for a task's run: the waker borrows the reference
+        // `self` holds, which outlives the call, and is never dropped, so it
+        // releases no reference it does not hold.
+        let waker = ManuallyDrop::new(unsafe { Waker::from_raw(raw) });
+        poll(&mut Context::from_waker(&waker))
+    }
 }
 
 impl<F> Task<F>

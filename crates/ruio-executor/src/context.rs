@@ -88,8 +88,3 @@ pub(crate) fn with_owner<R>(owner: *const Shared, f: impl FnOnce(&Scheduler) -> 
     with_current(|scheduler| ptr::eq(Arc::as_ptr(scheduler.shared()), owner).then(|| f(scheduler)))
         .flatten()
 }
-
-/// Whether the thread is running the runtime `shared` belongs to.
-pub(crate) fn is_current(shared: &Arc<Shared>) -> bool {
-    with_owner(Arc::as_ptr(shared), |_| ()).is_some()
-}

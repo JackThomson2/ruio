@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use ruio_driver::{Driver, RemoteRing, Unparker};
 
-use crate::task::{self, JoinHandle, LocalRef, RemoteRef, Task};
+use crate::task::{self, JoinHandle, LocalRef, Main, RemoteRef, Task};
 use crate::time::Timers;
 use crate::wheel::Key;
 
@@ -114,11 +114,6 @@ impl Shared {
             self.pending.store(true, Ordering::Release);
             self.unparker.unpark();
         }
-    }
-
-    /// Wakes the scheduler's ring.
-    pub(crate) fn unpark(&self) {
-        self.unparker.unpark();
     }
 
     /// The scheduler's ring, as other threads see it.
@@ -300,7 +295,7 @@ impl Scheduler {
     /// # Panics
     ///
     /// If the driver fails, which means completions were lost.
-    pub(crate) fn tick(&self, main_woken: &AtomicBool) {
+    pub(crate) fn tick(&self, main: &Main) {
         for _ in 0..BUDGET {
             let Some(task) = self.next_task() else {
                 break;
@@ -318,8 +313,8 @@ impl Scheduler {
             .next_deadline()
             .map_or(Ok(()), |deadline| self.driver.wake_at(deadline))
             .and_then(|()| {
-                if !self.has_ready_tasks() && !main_woken.load(Ordering::SeqCst) {
-                    self.wait(main_woken)
+                if !self.has_ready_tasks() && !main.is_woken() {
+                    self.wait(main)
                 } else {
                     self.driver.submit()
                 }
@@ -336,13 +331,13 @@ impl Scheduler {
     /// spins and its last wait was short enough for spinning to have caught
     /// what ended it: then it polls for the work first, with the thread
     /// awake, for up to the spin budget.
-    fn wait(&self, main_woken: &AtomicBool) -> io::Result<()> {
+    fn wait(&self, main: &Main) -> io::Result<()> {
         if self.spin.is_zero() {
             return self.driver.park(None);
         }
         let started = Instant::now();
         let waited = if self.last_wait.get() <= self.spin {
-            self.spin_then_park(main_woken)
+            self.spin_then_park(main)
         } else {
             self.driver.park(None)
         };
@@ -352,12 +347,12 @@ impl Scheduler {
 
     /// Polls for work for up to the spin budget, then parks if none has
     /// come; see [`Scheduler::wait`].
-    fn spin_then_park(&self, main_woken: &AtomicBool) -> io::Result<()> {
+    fn spin_then_park(&self, main: &Main) -> io::Result<()> {
         // What the pass queued goes to the kernel first, as a park would
         // send it: what is waited for may be a reply to it. A completion
         // this delivers ends the wait before it begins.
         self.driver.submit()?;
-        if self.has_ready_tasks() || main_woken.load(Ordering::Acquire) {
+        if self.has_ready_tasks() || main.is_woken() {
             return Ok(());
         }
         let started = Instant::now();
@@ -367,8 +362,8 @@ impl Scheduler {
                 // posted completions, or an unpark, which it consumes.
                 return self.driver.park(None);
             }
-            if self.shared.pending.load(Ordering::Acquire) || main_woken.load(Ordering::Acquire) {
-                // Work of this thread's own, which the pass takes next.
+            if self.shared.pending.load(Ordering::Acquire) {
+                // Work from another thread, which the pass takes next.
                 return Ok(());
             }
             if started.elapsed() >= self.spin {
