@@ -3,11 +3,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::hint;
+use std::io;
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ruio_driver::{Driver, RemoteRing, Unparker};
 
@@ -179,10 +181,16 @@ pub(crate) struct Scheduler {
     /// task alive while nothing else refers to it.
     tasks: RefCell<Tasks>,
     timers: Timers,
+    /// How long a wait for work polls the ring before it parks; see
+    /// [`Builder::spin`](crate::Builder::spin). Zero parks at once.
+    spin: Duration,
+    /// How long the last wait for work took, polling and parking together.
+    /// A wait polls only if the one before ended within the budget.
+    last_wait: Cell<Duration>,
 }
 
 impl Scheduler {
-    pub(crate) fn new(driver: Driver) -> Self {
+    pub(crate) fn new(driver: Driver, spin: Duration) -> Self {
         let shared = Arc::new(Shared {
             remote: Mutex::new(Remote {
                 tasks: Vec::new(),
@@ -209,6 +217,8 @@ impl Scheduler {
             running: Cell::new(ptr::null()),
             tasks: RefCell::new(Tasks::default()),
             timers: Timers::new(),
+            spin,
+            last_wait: Cell::new(Duration::ZERO),
         }
     }
 
@@ -309,7 +319,7 @@ impl Scheduler {
             .map_or(Ok(()), |deadline| self.driver.wake_at(deadline))
             .and_then(|()| {
                 if !self.has_ready_tasks() && !main_woken.load(Ordering::SeqCst) {
-                    self.driver.park(None)
+                    self.wait(main_woken)
                 } else {
                     self.driver.submit()
                 }
@@ -319,6 +329,53 @@ impl Scheduler {
         }
         self.take_remote();
         self.fire_timers();
+    }
+
+    /// Waits for work: a completion, the ring's timer, or a task woken or
+    /// spawned on another thread. Parks the thread, unless the scheduler
+    /// spins and its last wait was short enough for spinning to have caught
+    /// what ended it: then it polls for the work first, with the thread
+    /// awake, for up to the spin budget.
+    fn wait(&self, main_woken: &AtomicBool) -> io::Result<()> {
+        if self.spin.is_zero() {
+            return self.driver.park(None);
+        }
+        let started = Instant::now();
+        let waited = if self.last_wait.get() <= self.spin {
+            self.spin_then_park(main_woken)
+        } else {
+            self.driver.park(None)
+        };
+        self.last_wait.set(started.elapsed());
+        waited
+    }
+
+    /// Polls for work for up to the spin budget, then parks if none has
+    /// come; see [`Scheduler::wait`].
+    fn spin_then_park(&self, main_woken: &AtomicBool) -> io::Result<()> {
+        // What the pass queued goes to the kernel first, as a park would
+        // send it: what is waited for may be a reply to it. A completion
+        // this delivers ends the wait before it begins.
+        self.driver.submit()?;
+        if self.has_ready_tasks() || main_woken.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let started = Instant::now();
+        loop {
+            if self.driver.has_work() {
+                // Something the park takes at once: the kernel's work,
+                // posted completions, or an unpark, which it consumes.
+                return self.driver.park(None);
+            }
+            if self.shared.pending.load(Ordering::Acquire) || main_woken.load(Ordering::Acquire) {
+                // Work of this thread's own, which the pass takes next.
+                return Ok(());
+            }
+            if started.elapsed() >= self.spin {
+                return self.driver.park(None);
+            }
+            hint::spin_loop();
+        }
     }
 
     /// Fires the timers due, once the ring's timer has said some may be.

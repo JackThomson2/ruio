@@ -41,8 +41,8 @@
 //!
 //! ```text
 //! ruio-bench echo [--quick] [--connections LIST] [--runs N] [--seconds S] [--warmup S]
-//!                 [--server-cpu N] [--client-cpus LIST]
-//! ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
+//!                 [--server-cpu N] [--client-cpus LIST] [--spin US]
+//! ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N] [--spin US]
 //! ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] [--warmup S]
 //!                             [--cpus LIST]
 //! ruio-bench http-server ruio|ruio-pool|tokio ADDR [--cpu N] [--buffers N]
@@ -75,8 +75,8 @@ use server::Server;
 
 const USAGE: &str =
     "usage: ruio-bench echo [--quick] [--connections LIST] [--runs N] [--seconds S] \
-                     [--warmup S] [--server-cpu N] [--client-cpus LIST]
-       ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N]
+                     [--warmup S] [--server-cpu N] [--client-cpus LIST] [--spin US]
+       ruio-bench echo-server ruio|ruio-direct|tokio ADDR [--cpu N] [--buffers N] [--spin US]
        ruio-bench echo-client ADDR [--connections N] [--size BYTES] [--seconds S] \
                      [--warmup S] [--cpus LIST]
        ruio-bench http [--quick] [--connections LIST] [--runs N] [--seconds S] [--warmup S] \
@@ -446,9 +446,10 @@ fn echo_server(options: &Options) -> Result<(), String> {
     let addr: SocketAddr = options.positional(1, "address")?;
     let cpu = options.get("cpu", 0)?;
     let buffers = options.get("buffers", 1024)?;
+    let spin = Duration::from_micros(options.get("spin", 0)?);
     sys::pin(&[cpu]).map_err(|err| format!("pinning to CPU {cpu}: {err}"))?;
     sys::raise_file_limit().map_err(|err| format!("raising the file limit: {err}"))?;
-    server::run(server, addr, buffers).map_err(|err| format!("{server} echo server: {err}"))
+    server::run(server, addr, buffers, spin).map_err(|err| format!("{server} echo server: {err}"))
 }
 
 fn echo_client(options: &Options) -> Result<(), String> {
@@ -558,11 +559,15 @@ fn echo(options: &Options) -> Result<(), String> {
     if runs == 0 {
         return Err("--runs must be at least 1".to_owned());
     }
+    let spin: u64 = options.get("spin", 0)?;
 
     println!(
         "Round trips per second, and 99th percentile round-trip time, medians of {runs} \
          runs; servers on CPU {server_cpu}, the client on {client_cpus}."
     );
+    if spin != 0 {
+        println!("The ruio servers spin for up to {spin} µs before they park.");
+    }
     println!();
     print!("| connections | message |");
     for server in Server::ALL {
@@ -587,6 +592,7 @@ fn echo(options: &Options) -> Result<(), String> {
                     size,
                     seconds,
                     warmup,
+                    spin,
                 };
                 samples.push(run.measure()?);
             }
@@ -669,6 +675,7 @@ fn http(options: &Options) -> Result<(), String> {
                     size: 0,
                     seconds,
                     warmup,
+                    spin: 0,
                 };
                 samples.push(run.measure()?);
             }
@@ -708,17 +715,25 @@ struct Run<'a> {
     size: usize,
     seconds: Duration,
     warmup: Duration,
+    /// How long a ruio echo server spins before it parks, in microseconds;
+    /// 0 parks at once, as tokio's does.
+    spin: u64,
 }
 
 impl Run<'_> {
     fn measure(&self) -> Result<Row, String> {
         let addr = free_addr().map_err(|err| format!("finding a free port: {err}"))?;
-        let mut server = Command::new(self.exe)
+        let mut server = Command::new(self.exe);
+        server
             .arg(format!("{}-server", self.benchmark))
             .arg(&self.server)
             .arg(addr.to_string())
             .args(["--cpu", &self.server_cpu.to_string()])
-            .args(["--buffers", &self.pool_buffers().to_string()])
+            .args(["--buffers", &self.pool_buffers().to_string()]);
+        if self.benchmark == "echo" && self.spin != 0 {
+            server.args(["--spin", &self.spin.to_string()]);
+        }
+        let mut server = server
             .stdin(Stdio::null())
             .spawn()
             .map_err(|err| format!("starting the {} server: {err}", self.server))?;

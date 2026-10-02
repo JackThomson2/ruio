@@ -406,6 +406,20 @@ impl Driver {
         self.enter(0, None)
     }
 
+    /// Whether a [`park`](Driver::park) would return at once: the kernel has
+    /// work for the ring, such as the completions of operations that have
+    /// finished, which it runs when entered; completions are posted, or did
+    /// not fit in the queue; or an [`Unparker`] has been used since the last
+    /// park. A thread that would rather not sleep can poll this before it
+    /// parks.
+    pub fn has_work(&self) -> bool {
+        let pending = sys::IORING_SQ_TASKRUN | sys::IORING_SQ_CQ_OVERFLOW;
+        let inner = self.inner.state.borrow();
+        inner.ring.sq_flags() & pending != 0
+            || inner.ring.cq_ready()
+            || self.inner.notify.is_notified()
+    }
+
     /// Submits the queued operations, waits until at least one completion is
     /// ready, an [`Unparker`] is used or `timeout` passes, and delivers the
     /// completions.

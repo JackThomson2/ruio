@@ -374,6 +374,19 @@ baseline are used only when probed.
   parks until a completion, a wake or the next timer. A task woken by the
   running task takes a LIFO slot and runs next, at most three in a row;
   everything else queues in FIFO order.
+- A runtime may spin before it parks (`Builder::spin`, off unless set):
+  with nothing runnable it submits what the pass queued, then polls, for
+  up to the budget given, the ring's flags (`IORING_SQ_TASKRUN`, overflow),
+  the completion queue's tail, the unpark state and its own queue of remote
+  wakes, and parks only if nothing has come by then. It spins only if its
+  last wait, spinning and parking together, ended within the budget, so an
+  idle thread parks at once and a thread that waits on one peer at a time,
+  whose turns come within microseconds, never sleeps. A spinning thread
+  occupies its core, so this is for cores given to the runtime. The echo
+  server with one connection, whose round trip is latency-bound, makes
+  twice the round trips with a 50 µs budget, with a 99th percentile half
+  as long and a dozen context switches in a run instead of one per echo;
+  with 16 connections, where the server is busy, nothing changes.
 - Every io_uring operation yields at least once, as its completion comes
   through the ring, but a channel or a lock can be ready every time it is
   polled. So each poll of a task, and of the future given to `block_on`,

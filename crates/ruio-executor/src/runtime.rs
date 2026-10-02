@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
 use ruio_driver::Driver;
 
@@ -20,6 +21,7 @@ use crate::{context, coop};
 #[derive(Clone, Debug, Default)]
 pub struct Builder {
     driver: ruio_driver::Builder,
+    spin: Duration,
 }
 
 impl Builder {
@@ -42,6 +44,28 @@ impl Builder {
         self
     }
 
+    /// Has the runtime, when it runs out of work, poll the ring for up to
+    /// `budget` before it parks, as long as its waits are that short.
+    ///
+    /// A runtime with nothing to run parks its thread until a completion
+    /// arrives, a timer is due or another thread wakes a task, and the
+    /// kernel wakes the thread, which takes a few microseconds, and longer on
+    /// a busy host. With a budget, a runtime whose last wait ended within it
+    /// polls for the budget instead, with the thread awake, and parks only
+    /// if nothing has come by then; a runtime whose waits are longer parks
+    /// at once, so an idle one never polls. A thread that polls occupies its
+    /// core, so this is for cores given to the runtime, as [`Cores`] pins
+    /// them, and for work whose turns come within the budget: a single
+    /// connection's round trip, say.
+    ///
+    /// Off unless set; `Duration::ZERO` turns it off.
+    ///
+    /// [`Cores`]: crate::Cores
+    pub fn spin(mut self, budget: Duration) -> Self {
+        self.spin = budget;
+        self
+    }
+
     /// Creates the runtime.
     ///
     /// # Errors
@@ -50,7 +74,7 @@ impl Builder {
     pub fn build(&self) -> io::Result<Runtime> {
         let driver = self.driver.build()?;
         Ok(Runtime {
-            scheduler: Rc::new(Scheduler::new(driver)),
+            scheduler: Rc::new(Scheduler::new(driver, self.spin)),
         })
     }
 }

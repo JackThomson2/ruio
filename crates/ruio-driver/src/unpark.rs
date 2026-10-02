@@ -61,6 +61,13 @@ impl Notify {
         false
     }
 
+    /// Whether an unpark is waiting for the next park, which then returns
+    /// at once. An unparker writes the eventfd only while the driver is
+    /// parked, so between parks the state alone tells.
+    pub(crate) fn is_notified(&self) -> bool {
+        self.state.load(Ordering::Acquire) == NOTIFIED
+    }
+
     /// Records that the driver is no longer parked. An unpark that arrived
     /// meanwhile found it parked, and has written the eventfd.
     pub(crate) fn end_park(&self) {

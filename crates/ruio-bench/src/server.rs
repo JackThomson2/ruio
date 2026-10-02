@@ -6,6 +6,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::str::FromStr;
+use std::time::Duration;
 
 use ruio::buf::BufPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,17 +61,24 @@ impl fmt::Display for Server {
 }
 
 /// Runs `server` on `addr` until the process is killed. `buffers` sizes
-/// ruio's pool; tokio's connections have a buffer each.
-pub(crate) fn run(server: Server, addr: SocketAddr, buffers: u16) -> io::Result<()> {
+/// ruio's pool; tokio's connections have a buffer each. `spin` is how long
+/// a ruio runtime polls before it parks (see
+/// [`ruio::Builder::spin`]); tokio's parks at once.
+pub(crate) fn run(
+    server: Server,
+    addr: SocketAddr,
+    buffers: u16,
+    spin: Duration,
+) -> io::Result<()> {
     match server {
-        Server::Ruio => ruio(addr, buffers, false),
-        Server::RuioDirect => ruio(addr, buffers, true),
+        Server::Ruio => ruio(addr, buffers, spin, false),
+        Server::RuioDirect => ruio(addr, buffers, spin, true),
         Server::Tokio => tokio(addr),
     }
 }
 
-fn ruio(addr: SocketAddr, buffers: u16, direct: bool) -> io::Result<()> {
-    let mut builder = ruio::Runtime::builder().entries(4096);
+fn ruio(addr: SocketAddr, buffers: u16, spin: Duration, direct: bool) -> io::Result<()> {
+    let mut builder = ruio::Runtime::builder().entries(4096).spin(spin);
     if direct {
         builder = builder.files(1 << 16);
     }

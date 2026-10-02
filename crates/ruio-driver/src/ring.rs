@@ -308,6 +308,13 @@ impl Ring {
         }
     }
 
+    /// Whether the kernel has posted completions that have not been popped.
+    pub(crate) fn cq_ready(&self) -> bool {
+        // SAFETY: `cq.tail` points to the tail field in the live mapping.
+        let tail = unsafe { atomic(self.cq.tail) }.load(Ordering::Acquire);
+        self.cq.local_head != tail
+    }
+
     /// The next completion, if the kernel has posted one.
     pub(crate) fn pop_cqe(&mut self) -> Option<sys::io_uring_cqe> {
         // SAFETY: `cq.tail` points to the tail field in the live mapping.
