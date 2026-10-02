@@ -156,11 +156,23 @@ its own flag set.
   operations were queued. Timers wake the ring through its own timer
   (`Driver::wake_at`), a timeout of the kernel's at the earliest deadline,
   so the wait passes no timeout (`EXT_ARG`), which the kernel would copy in
-  on every wait.
+  on every wait. A turn borrows the driver's state once, for the entry,
+  the reap and the overflow check; wakers other than the executor's,
+  orphans to finish and streams to hand over to are taken out only if
+  there are any, to run once the state is released. The timer's state
+  lives in cells beside it, which the scheduler reads without a borrow.
+- A wait leaves itself out of iowait accounting (`IORING_ENTER_NO_IOWAIT`,
+  Linux 6.15, probed through `IORING_FEAT_NO_IOWAIT`). The kernel counts a
+  wait as one for I/O while the task has requests in flight, which a ring
+  always has, so every park of an idle or latency-bound server was counted
+  as waiting for a disk.
 - A full submission queue is submitted early instead of failing the
   operation. An operation with a linked timeout needs two entries that reach
   the kernel together, so queueing makes room for both.
-- The completion queue is drained fully on every pass. Overflow is handled
+- The completion queue is drained fully on every pass, its tail read once
+  for the batch, and the submission queue's head is read once per entry
+  into the kernel, which consumes entries only while it is entered: no
+  counter the kernel shares is read per operation. Overflow is handled
   (`NODROP` backlog, `IORING_SQ_CQ_OVERFLOW`) rather than assumed away;
   multishot operations make it realistic.
 
@@ -376,21 +388,41 @@ baseline are used only when probed.
   and by the `JoinHandle`, which is not `Send`. The scheduler holds every
   unfinished task until its future is dropped on that thread, and the
   `JoinHandle` drops the output there, so the task is freed, wherever the
-  last atomic reference goes, owning nothing that is not `Send`.
+  last atomic reference goes, owning nothing that is not `Send`. A task
+  that awaits another's `JoinHandle` is held by a local reference too,
+  when it is a task of the runtime on the thread, and the share goes with
+  a plain load when it is the last reference, as it nearly always is once
+  a task has finished: a spawn and its join take two locked instructions,
+  the count of the scheduler's shared part, which the task holds.
 - Every task's wakers share one vtable, whatever the task's future: the
   header of a task comes first in it, so a pointer to the task is a pointer
   to its header, through which the vtable reaches the rest. So the driver
   can tell a task's waker by its vtable, and holds it in its table by a
-  local reference, through the retain, release and wake hooks of a
-  `LocalWaker` the executor registers, where it clones any other waker; a
-  completed stream keeps its local waker, so the stream's next poll
+  local reference, through the retain, release, wake and wake-release
+  hooks of a `LocalWaker` the executor registers, where it clones any
+  other waker. The retain counts a reference only for a task of the
+  runtime running on the thread: a waker sent to another thread, which the
+  vtable does not tell apart, can poll an operation there, whose driver
+  may not touch the task's local count. A completed operation hands the
+  driver's reference to the run queue, through the wake-release hook, and
+  a completed stream keeps its local waker, so the stream's next poll
   registers nothing. An operation's wake and run so cost no locked
   instruction on the task's thread: a run lends its poll a waker that
   borrows the run's reference, a wake on the task's thread queues it with a
   plain flag and a local reference, and a wake from another thread sets an
   atomic flag and queues an atomic reference on the remote queue, which a
-  run clears, with a full barrier, only if it is set. Moving remote wakes
-  to the run queue checks the plain flag, so a task is never queued twice.
+  run clears with a swap, only if it is set, so that the poll sees what
+  every waker that found it set woke it for. Moving remote wakes to the
+  run queue checks the plain flag, so a task is never queued twice.
+- The future given to `block_on` has a header shaped as a task's, whose
+  wakers share the tasks' vtable: the driver holds them by a local
+  reference, and a wake on the runtime's thread marks the future to poll
+  with the plain flag that marks a task queued, queueing nothing. The loop
+  polls the future when it finds the flag set, and the scheduler does not
+  park while it is. A wake from another thread goes through the remote
+  queue, as a task's does, and the scheduler sets the flag as it takes
+  it. The header frees itself after its last reference, which a waker kept
+  past `block_on` may hold.
 - Each loop pass runs up to 64 ready tasks, fires due timers, then turns the
   ring: it submits without waiting if anything is runnable, and otherwise
   parks until a completion, a wake or the next timer. A task woken by the
@@ -458,14 +490,19 @@ baseline are used only when probed.
   task wherever it runs.
 - `sync` also has a `Semaphore`, and on it a `Mutex` and an `RwLock` whose
   guards may be held across awaits, and `Notify`. Like the channels they
-  keep their state behind a standard mutex, wake outside it, and work
-  across cores. The semaphore serves its waiters in the order they came,
-  each with all the permits it asked for at once, so one that needs many
-  is not passed by later ones that need fewer, and a writer, which takes
-  every permit a reader takes one of, cannot be starved by readers. A
-  waiter dropped after its permits were set aside gives them back, and a
-  `Notified` dropped after `notify_one` chose it passes the notification
-  on, so cancelling a wait loses nothing.
+  keep their waiters behind a standard mutex, wake outside it, and work
+  across cores. The semaphore's free permits are an atomic count beside
+  its queue, with a flag that is set while waiters are queued and changes
+  only with the queue locked: an acquire that finds enough permits and
+  nobody waiting takes them with one compare-and-exchange, and a release
+  with nobody waiting gives them back with one, so an uncontended `Mutex`
+  locks and unlocks without the lock. The semaphore serves its waiters in
+  the order they came, each with all the permits it asked for at once, so
+  one that needs many is not passed by later ones that need fewer, and a
+  writer, which takes every permit a reader takes one of, cannot be
+  starved by readers. A waiter dropped after its permits were set aside
+  gives them back, and a `Notified` dropped after `notify_one` chose it
+  passes the notification on, so cancelling a wait loses nothing.
 
 ### Keeping work stealing possible
 
@@ -962,8 +999,14 @@ of the CPU; four things were in the way, all of them the runtime's:
   its ring.
 
 At depth 64 and above ruio fell 3% to 5% behind, for a reason still to
-find; the kernel runs at most 20 items of deferred work per entry, which
-both sides live with.
+find. Reading Linux 7.0 since gives two candidates, neither measured yet.
+An entry into the kernel runs at most 20 items of deferred work, such as
+these reads' completions, as it submits, and 20 more as it waits, so a
+pass that submits 64 reads gets at most 40 of their completions back from
+its entry, where fio submits 32 at a time. And the block layer sets
+requests up in a batch only for the first 32 of a plug
+(`BLK_MAX_REQUEST_COUNT`), and the rest one by one: a pass of up to 64
+tasks submits up to 64 reads in one plug, and fio 32.
 
 The table is from before the second performance pass, and fio was no longer
 on the host to run it again. ruio before and after the pass, run in turns on
@@ -1146,6 +1189,94 @@ as a percent or two where the server is busy, in the random reads (see
 user-space share of each read, and in the spin as the turn of the loop that
 a spinning thread makes for every echo.
 
+The third pass began with what the runtime's own costs were made of
+between its crates. Nothing in the workspace was marked `#[inline]` and
+nothing builds it with link-time optimization, so every non-generic
+function of the driver's that an operation touches was a call that the
+executor, and the futures compiled in the user's crate, could not inline:
+the same code built with fat LTO and one codegen unit ran these loops 7%
+to 16% faster. Before and after the third pass, medians of five runs taken
+in turns, on the Xeon Platinum 8488C with Linux 7.0, with tokio's
+current-thread runtime for reference:
+
+| Step | tokio | ruio before | ruio after |
+|---|---:|---:|---:|
+| nop 1 | | 4.06M | 4.51M (1.11×) |
+| nop 64 | | 17.6M | 20.4M (1.16×) |
+| spawn | 2.2M | 9.1M | 15.2M (1.67×) |
+| yield | 3.8M | 25.6M | 63.9M (2.50×) |
+| channel | 2.0M | 6.4M | 8.1M (1.27×) |
+| remote | 186k | 196k | 196k (1.00×) |
+| timer | 3.1M | 10.7M | 11.0M (1.03×) |
+| sleep | 455k | 500k | 500k (1.00×) |
+| mutex | 24.8M | 28.8M | 53.0M (1.85×) |
+
+What the pass changed, in order of effect:
+
+- **One borrow a turn.** A turn of the ring borrowed the driver's state
+  five times and moved six vectors out and back whether or not anything
+  was in them, and the scheduler borrowed the state three times more a
+  pass, for the wake timer. A turn borrows it once now, and the timer's
+  state is in cells beside it. Reaping reads the completion queue's tail
+  once, the submission queue's head is read once an entry into the kernel
+  rather than twice an operation, and a completion hands the driver's
+  reference to its task straight to the run queue: `yield`, whose step is
+  a turn, 1.56×, `spawn` 1.21×, `nop 1` 1.12×.
+- **The semaphore's free permits in an atomic.** An uncontended lock and
+  unlock of a `Mutex` took the semaphore's standard mutex twice, four
+  locked instructions, and takes two compare-and-exchanges now: `mutex`
+  1.60×.
+- **The main future's waker.** The future given to `block_on` had an
+  `Arc` waker of its own, which the driver could not tell from any other:
+  every operation it awaited cloned and dropped it, and every wake stored
+  a flag with a full barrier, which the loop took with a swap, four locked
+  instructions for an operation and two for a wake. It has a task's
+  header now: `yield` 1.29×, `spawn` 1.08×.
+- **A task's atomics, and the executor's inlining.** A task awaiting
+  another's handle is held by a local reference, the share goes without a
+  read-modify-write when it is the last reference, and the executor's hot
+  paths are marked `#[inline]`: `spawn` 1.30×, `yield` 1.19×, `mutex`
+  1.12×.
+- **The driver's inlining.** The driver's small functions on the paths of
+  an operation, a stream and a lease, marked `#[inline]`: `nop 64` 1.13×
+  and `nop 1` 1.05×, as much as the LTO build gave them.
+- **Timers without a clone of the runtime.** Arming and disarming a sleep
+  reached the runtime by cloning its `Rc`, under a borrow, and now by the
+  thread's pointer to it: `timer` 1.06×.
+- **Parks out of iowait.** Every park was counted as waiting for a disk.
+  The echo server with one connection showed CPU 0 waiting for I/O half
+  its time, and shows none now; its round trips are within the runs'
+  noise.
+
+The benchmarks that the kernel dominates move by as much as the
+runtime's share of them allows, and none moved back. Medians of five runs
+taken in turns, before and after the pass: the echo benchmark with one
+connection and 64 B messages 47.5k and 47.4k round trips a second, with
+16 connections 205k and 206k, with 256 and 1 KiB messages 197k and 197k,
+and with 1,024 and 16 KiB messages 152k and 152k; hyper, receiving into a
+pool, 45.0k and 45.1k requests a second with one connection, 182k and
+183k with 16, its 99th percentile 123 µs and 118, and 177k and 179k with
+256.
+
+The pass closed a hole that safe code could reach, too. Every task's
+wakers share one vtable, which is how the driver tells them, and a task's
+waker sent to another thread and used there to poll an operation of that
+thread's ring made the driver count references to the task from the
+wrong thread. The executor's retain hook now counts one only for a task
+of the runtime running on the thread, which costs `nop 64` at most a
+percent and a half. And a run, and `block_on`, clear a remote wake's flag
+with a swap rather than a store, which on x86 was an `xchg` already, but
+which the memory model needs for the poll to see what every waker that
+found the flag set woke it for.
+
+Measured and not adopted: putting a task's small fields before its
+future rather than after made no difference, and inlining the release of
+the share into every drop of a local reference only moved code about, as
+did leaving the executor's inlining out of either half. Reaching the
+runtime without a clone of its `Rc` for `spawn` and the driver measured
+within the runs' noise, and the code does so anyway, as the sleeps and
+the wakes do.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -1228,6 +1359,17 @@ Since M7:
   Measured and not adopted: a mid-pass submission that runs no completion
   work, a park that waits for a batch, `IORING_SETUP_SQ_REWIND`, and the
   larger receive ask as the default.
+- A third performance pass, on calls across the crates and on the
+  runtime's own atomics and borrows (see
+  [The runtime itself](#the-runtime-itself)): the hot paths are marked
+  `#[inline]`, which nothing was; the main future's waker is a task's; a
+  task awaiting a handle is held by a local reference, and a finished one
+  freed without a read-modify-write; a turn of the ring borrows the driver
+  once; an uncontended semaphore, and so a `Mutex`, takes and gives back
+  its permits with a compare-and-exchange; sleeps and spawns reach the
+  runtime without cloning it; and parks leave iowait out. It also made the
+  driver hold a task's waker by reference only on the task's own thread,
+  which a waker sent to another thread could have it do from there.
 
 ## Open questions
 

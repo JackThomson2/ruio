@@ -99,10 +99,11 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
 - **hyper, HTTP/1.1**, one core, through the adapters, receiving into a
   pool: level with hyper on tokio with one connection, 1% to 8% ahead from
   256 connections on, and 3% behind at 16.
-- **The runtime itself** (`ruio-bench micro`): a task's turn of the loop, a
-  spawn, a wake and a channel round trip cost no atomic operation on their
-  own thread, and run three to seven times as fast as on tokio's
-  current-thread runtime.
+- **The runtime itself** (`ruio-bench micro`): a task's turn of the loop and
+  a wake on its own thread cost no atomic operation, and the runtime's loops
+  run two to seventeen times as fast as on tokio's current-thread runtime:
+  spawning and joining a task 6.9 times as fast, a yield 17 times, a channel
+  round trip 3.9 times and an uncontended async mutex 2.1 times.
 
 ## Development
 
