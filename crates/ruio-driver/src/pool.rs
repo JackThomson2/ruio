@@ -183,16 +183,19 @@ impl BufPool {
     }
 
     /// The number of buffers.
+    #[inline]
     pub fn count(&self) -> usize {
         usize::from(self.pool.count)
     }
 
     /// The size of each buffer.
+    #[inline]
     pub fn buffer_size(&self) -> usize {
         self.pool.size as usize
     }
 
     /// The number of buffers the kernel may pick, which are not leased.
+    #[inline]
     pub fn available(&self) -> usize {
         self.pool.available.get()
     }
@@ -218,12 +221,14 @@ impl BufPool {
     }
 
     /// The buffer group ID that submission entries select from.
+    #[inline]
     pub(crate) fn group(&self) -> u16 {
         self.pool.group
     }
 
     /// Whether the kernel consumes the buffers incrementally; see
     /// [`BufPool::incremental`].
+    #[inline]
     pub(crate) fn is_incremental(&self) -> bool {
         self.pool.incremental
     }
@@ -321,6 +326,7 @@ impl BufPool {
 }
 
 impl Pool {
+    #[inline]
     fn buffer(&self, bid: u16) -> *mut u8 {
         self.memory
             .ptr()
@@ -328,12 +334,14 @@ impl Pool {
     }
 
     /// The slot of the ring that `position` falls in.
+    #[inline]
     fn slot(&self, position: u16) -> usize {
         usize::from(position & (self.count - 1))
     }
 
     /// The length the entry at `position` gives its buffer, which the kernel
     /// shortens when it fills the buffer with less than a whole one.
+    #[inline]
     fn entry_len(&self, position: u16) -> usize {
         let entry = self
             .ring
@@ -352,6 +360,7 @@ impl Pool {
     }
 
     /// A lease of buffer `bid`, taken from the ring, holding `len` bytes.
+    #[inline]
     fn lease_taken(self: &Rc<Self>, bid: u16, len: usize) -> BufLease {
         BufLease {
             pool: Rc::clone(self),
@@ -495,12 +504,14 @@ impl Pool {
 
     /// Whether the slot of the tail can take a buffer: its last buffer has
     /// been reported taken.
+    #[inline]
     fn has_free_slot(&self) -> bool {
         self.tail.get().wrapping_sub(self.low.get()) < self.count
     }
 
     /// Puts buffer `bid` in the ring for the kernel to pick, or keeps it
     /// spare until a slot is free.
+    #[inline]
     fn put(&self, bid: u16) {
         if !self.has_free_slot() {
             self.spare.borrow_mut().push(bid);
@@ -512,6 +523,7 @@ impl Pool {
 
     /// Puts buffer `bid` in the slot of the tail, which must be free, and
     /// publishes it.
+    #[inline]
     fn publish(&self, bid: u16) {
         debug_assert!(self.has_free_slot(), "no slot is free");
         let tail = self.tail.get();
@@ -557,6 +569,7 @@ impl Pool {
 
     /// Wakes the first `count` tasks waiting for a buffer, one for each
     /// buffer that returned to the ring.
+    #[inline]
     fn wake_waiters(&self, count: usize) {
         for _ in 0..count {
             let waiter = self.waiters.borrow_mut().pop_front();
@@ -621,11 +634,13 @@ pub struct BufLease {
 
 impl BufLease {
     /// How many bytes of data the lease holds.
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the lease holds no data.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -633,11 +648,13 @@ impl BufLease {
     /// How much the lease can hold: the size of the buffer, or, for a part
     /// of a buffer that the kernel consumes incrementally, and may fill on
     /// past the part, only its data.
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.room
     }
 
     /// Where the lease's room starts.
+    #[inline]
     fn ptr(&self) -> *mut u8 {
         self.pool.buffer(self.bid).wrapping_add(self.start)
     }
@@ -646,6 +663,7 @@ impl BufLease {
 impl Deref for BufLease {
     type Target = [u8];
 
+    #[inline]
     fn deref(&self) -> &[u8] {
         // SAFETY: the buffer is mapped for as long as the pool lives, which
         // the lease keeps alive, and all of it is initialized. While leased,
@@ -657,6 +675,7 @@ impl Deref for BufLease {
 }
 
 impl DerefMut for BufLease {
+    #[inline]
     fn deref_mut(&mut self) -> &mut [u8] {
         // SAFETY: as in `deref`; the lease is its room's only user.
         unsafe { slice::from_raw_parts_mut(self.ptr(), self.len) }
@@ -667,14 +686,17 @@ impl DerefMut for BufLease {
 // alive and which does not move; only the lease and the operation holding
 // it use it, as for `Deref`. All of it is initialized.
 unsafe impl IoBuf for BufLease {
+    #[inline]
     fn stable_ptr(&self) -> *const u8 {
         self.ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.capacity()
     }
@@ -683,16 +705,19 @@ unsafe impl IoBuf for BufLease {
 // SAFETY: as for `IoBuf`; `set_init` only moves the length within the
 // room, all of which is initialized.
 unsafe impl IoBufMut for BufLease {
+    #[inline]
     fn stable_mut_ptr(&mut self) -> *mut u8 {
         self.ptr()
     }
 
+    #[inline]
     unsafe fn set_init(&mut self, pos: usize) {
         self.len = self.len.max(pos.min(self.capacity()));
     }
 }
 
 impl Drop for BufLease {
+    #[inline]
     fn drop(&mut self) {
         if self.pool.incremental {
             self.pool.release(self.bid);
@@ -725,21 +750,25 @@ pub struct BufBundle {
 
 impl BufBundle {
     /// How many bytes of data the bundle holds.
+    #[inline]
     pub fn len(&self) -> usize {
         self.iter().map(BufLease::len).sum()
     }
 
     /// Whether the bundle holds no data.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// How many buffers the data fills.
+    #[inline]
     pub fn buffers(&self) -> usize {
         1 + self.rest.len()
     }
 
     /// The leases, in order.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &BufLease> {
         iter::once(&self.first).chain(&self.rest)
     }
@@ -749,6 +778,7 @@ impl BufBundle {
     /// # Panics
     ///
     /// If the bundle has no lease `index`.
+    #[inline]
     pub(crate) fn lease(&self, index: usize) -> &BufLease {
         match index {
             0 => &self.first,
@@ -758,6 +788,7 @@ impl BufBundle {
 
     /// Adds `other`'s leases after this bundle's, as for data that arrived
     /// after it.
+    #[inline]
     pub fn append(&mut self, other: BufBundle) {
         self.rest.reserve(other.buffers());
         self.rest.push(other.first);

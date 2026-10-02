@@ -48,6 +48,7 @@ enum Install {
 
 impl Install {
     /// The entry's `file_index`.
+    #[inline]
     fn file_index(self) -> u32 {
         match self {
             Install::Plain => 0,
@@ -80,10 +81,12 @@ pub struct Nop;
 unsafe impl Operation for Nop {
     type Output = io::Result<()>;
 
+    #[inline]
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
         sqe.opcode = sys::IORING_OP_NOP;
     }
 
+    #[inline]
     fn complete(self, completion: Completion) -> io::Result<()> {
         completion.result().map(drop)
     }
@@ -389,6 +392,7 @@ impl ReadPooled {
 unsafe impl Operation for ReadPooled {
     type Output = io::Result<Option<BufLease>>;
 
+    #[inline]
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
         sqe.opcode = sys::IORING_OP_READ;
         self.fd.apply(sqe);
@@ -409,6 +413,7 @@ unsafe impl Operation for ReadPooled {
 
 /// The data of a completion into a pool: the lease, `None` at the end of the
 /// data, or the error.
+#[inline]
 fn pooled_data(completion: Completion, lease: Option<BufLease>) -> io::Result<Option<BufLease>> {
     match completion.result()? {
         0 => Ok(None),
@@ -479,6 +484,7 @@ unsafe impl Multishot for RecvMulti {
     /// The entry's `len` is how much the kernel maps for a receive before it
     /// knows how much is waiting, which 0 leaves at one buffer; see
     /// [`RecvMulti::buffers`].
+    #[inline]
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
         sqe.opcode = sys::IORING_OP_RECV;
         self.fd.apply(sqe);
@@ -491,6 +497,7 @@ unsafe impl Multishot for RecvMulti {
         }
     }
 
+    #[inline]
     fn item(&mut self, completion: Completion) -> Self::Item {
         // Taken before looking at the result, as for `ReadPooled`.
         let bundle = self.pool.bundle(completion.flags(), completion.res());
@@ -563,6 +570,7 @@ impl RecvStream {
 
     /// The next data, or `None` once the peer has shut down or an error has
     /// been yielded.
+    #[inline]
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufBundle>>> {
         self.inner.poll_next(cx)
     }
@@ -580,6 +588,7 @@ impl RecvStream {
     /// A message that arrives while the stream is armed can come in two
     /// receives, since the kernel takes a single buffer when it does not
     /// know yet how much is waiting; with this, a reader takes both at once.
+    #[inline]
     pub fn next_ready(&mut self) -> Option<io::Result<BufBundle>> {
         self.inner.next_ready()
     }
@@ -680,6 +689,7 @@ impl ReadStream {
 
     /// The next data, or `None` at the end of the file or once an error has
     /// been yielded.
+    #[inline]
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufLease>>> {
         self.inner.poll_next(cx)
     }
@@ -691,6 +701,7 @@ impl ReadStream {
 
     /// The next data if it has arrived already, without waiting, or `None`;
     /// see [`RecvStream::next_ready`].
+    #[inline]
     pub fn next_ready(&mut self) -> Option<io::Result<BufLease>> {
         self.inner.next_ready()
     }

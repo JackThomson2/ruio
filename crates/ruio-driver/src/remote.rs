@@ -65,6 +65,7 @@ impl Remote {
     }
 
     /// The slots that other threads have asked the ring to close.
+    #[inline]
     pub(crate) fn take_closes(&self) -> Vec<u32> {
         // A plain load on every turn of the ring, which almost always finds
         // nothing. A slot queued after the check sets the flag again, and

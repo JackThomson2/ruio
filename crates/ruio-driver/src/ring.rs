@@ -189,12 +189,14 @@ impl Ring {
     }
 
     /// The `IORING_SQ_*` flags.
+    #[inline]
     pub(crate) fn sq_flags(&self) -> u32 {
         // SAFETY: `sq.flags` points to the flags field in the live mapping.
         unsafe { atomic(self.sq.flags) }.load(Ordering::Relaxed)
     }
 
     /// Entries written and not yet consumed by the kernel.
+    #[inline]
     pub(crate) fn queued(&self) -> u32 {
         // SAFETY: `sq.head` points to the head field in the live mapping.
         let head = unsafe { atomic(self.sq.head) }.load(Ordering::Acquire);
@@ -202,17 +204,20 @@ impl Ring {
     }
 
     /// Free submission queue slots.
+    #[inline]
     pub(crate) fn sq_space(&self) -> u32 {
         self.sq.entries - self.queued()
     }
 
     /// The number of submission queue slots.
+    #[inline]
     pub(crate) fn sq_entries(&self) -> u32 {
         self.sq.entries
     }
 
     /// The next submission queue entry, zeroed, or `None` if the queue is
     /// full. The entry reaches the kernel at the next [`Ring::enter`].
+    #[inline]
     pub(crate) fn next_sqe(&mut self) -> Option<&mut sys::io_uring_sqe> {
         if self.queued() == self.sq.entries {
             return None;
@@ -240,6 +245,7 @@ impl Ring {
     /// points to. That is enough: the kernel copies the duration when it
     /// consumes the entry (`IORING_FEAT_SUBMIT_STABLE`), and the slot is not
     /// reused, so the duration not rewritten, before then.
+    #[inline]
     pub(crate) fn next_link_timeout(
         &mut self,
         duration: sys::__kernel_timespec,
@@ -309,6 +315,7 @@ impl Ring {
     }
 
     /// Whether the kernel has posted completions that have not been popped.
+    #[inline]
     pub(crate) fn cq_ready(&self) -> bool {
         // SAFETY: `cq.tail` points to the tail field in the live mapping.
         let tail = unsafe { atomic(self.cq.tail) }.load(Ordering::Acquire);
@@ -316,6 +323,7 @@ impl Ring {
     }
 
     /// The next completion, if the kernel has posted one.
+    #[inline]
     pub(crate) fn pop_cqe(&mut self) -> Option<sys::io_uring_cqe> {
         // SAFETY: `cq.tail` points to the tail field in the live mapping.
         let tail = unsafe { atomic(self.cq.tail) }.load(Ordering::Acquire);
@@ -334,6 +342,7 @@ impl Ring {
     }
 
     /// Returns the popped completion slots to the kernel.
+    #[inline]
     pub(crate) fn release_cqes(&mut self) {
         // SAFETY: `cq.head` points to the head field in the live mapping.
         unsafe { atomic(self.cq.head) }.store(self.cq.local_head, Ordering::Release);
@@ -389,6 +398,7 @@ fn register(fd: &OwnedFd) -> Option<c_int> {
 ///
 /// `ptr` must point to an aligned `u32` in a live ring mapping. The kernel
 /// accesses these fields only with atomic operations.
+#[inline]
 unsafe fn atomic<'a>(ptr: *mut u32) -> &'a AtomicU32 {
     // SAFETY: the caller's guarantees are the requirements of `from_ptr`.
     unsafe { AtomicU32::from_ptr(ptr) }

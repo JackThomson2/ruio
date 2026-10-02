@@ -106,10 +106,12 @@ unsafe impl<V: IoBufs> IoBufs for Rc<V> {
 // SAFETY: each lease is an `IoBuf`, whose memory lies in its pool's mapping
 // wherever the lease is.
 unsafe impl IoBufs for BufBundle {
+    #[inline]
     fn buf_count(&self) -> usize {
         self.buffers()
     }
 
+    #[inline]
     fn buf(&self, index: usize) -> (*const u8, usize) {
         let lease = self.lease(index);
         (lease.stable_ptr(), lease.bytes_init())
@@ -174,14 +176,17 @@ pub unsafe trait IoBufMut: IoBuf {
 // SAFETY: a vector's contents live on the heap, which moving the vector
 // leaves in place. `len` of its `capacity` bytes are initialized.
 unsafe impl IoBuf for Vec<u8> {
+    #[inline]
     fn stable_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len()
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.capacity()
     }
@@ -190,10 +195,12 @@ unsafe impl IoBuf for Vec<u8> {
 // SAFETY: as for `IoBuf`; `set_init` extends the length only as far as the
 // caller vouches for.
 unsafe impl IoBufMut for Vec<u8> {
+    #[inline]
     fn stable_mut_ptr(&mut self) -> *mut u8 {
         self.as_mut_ptr()
     }
 
+    #[inline]
     unsafe fn set_init(&mut self, pos: usize) {
         if pos > self.len() {
             // SAFETY: the caller guarantees that the first `pos` bytes are
@@ -205,14 +212,17 @@ unsafe impl IoBufMut for Vec<u8> {
 
 // SAFETY: a boxed slice lives on the heap, all of it initialized.
 unsafe impl IoBuf for Box<[u8]> {
+    #[inline]
     fn stable_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len()
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.len()
     }
@@ -220,24 +230,29 @@ unsafe impl IoBuf for Box<[u8]> {
 
 // SAFETY: as for `IoBuf`; every byte is initialized already.
 unsafe impl IoBufMut for Box<[u8]> {
+    #[inline]
     fn stable_mut_ptr(&mut self) -> *mut u8 {
         self.as_mut_ptr()
     }
 
+    #[inline]
     unsafe fn set_init(&mut self, _pos: usize) {}
 }
 
 // SAFETY: `'static` memory never moves, and a shared reference keeps it from
 // changing.
 unsafe impl IoBuf for &'static [u8] {
+    #[inline]
     fn stable_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len()
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.len()
     }
@@ -245,14 +260,17 @@ unsafe impl IoBuf for &'static [u8] {
 
 // SAFETY: as for `&'static [u8]`.
 unsafe impl IoBuf for &'static str {
+    #[inline]
     fn stable_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len()
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.len()
     }
@@ -260,14 +278,17 @@ unsafe impl IoBuf for &'static str {
 
 // SAFETY: a string's contents live on the heap, as for `Vec<u8>`.
 unsafe impl IoBuf for String {
+    #[inline]
     fn stable_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len()
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.capacity()
     }

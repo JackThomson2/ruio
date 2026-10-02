@@ -44,12 +44,14 @@ impl Notify {
         })
     }
 
+    #[inline]
     pub(crate) fn eventfd(&self) -> RawFd {
         self.eventfd.as_raw_fd()
     }
 
     /// Records that the driver is about to park, and returns `true`; or, if
     /// an unpark is waiting, consumes it and returns `false`.
+    #[inline]
     pub(crate) fn begin_park(&self) -> bool {
         if self.state.swap(PARKED, Ordering::SeqCst) == EMPTY {
             return true;
@@ -64,16 +66,19 @@ impl Notify {
     /// Whether an unpark is waiting for the next park, which then returns
     /// at once. An unparker writes the eventfd only while the driver is
     /// parked, so between parks the state alone tells.
+    #[inline]
     pub(crate) fn is_notified(&self) -> bool {
         self.state.load(Ordering::Acquire) == NOTIFIED
     }
 
     /// Records that the driver is no longer parked. An unpark that arrived
     /// meanwhile found it parked, and has written the eventfd.
+    #[inline]
     pub(crate) fn end_park(&self) {
         self.state.store(EMPTY, Ordering::Release);
     }
 
+    #[inline]
     fn unpark(&self) {
         // Only a parked driver needs the system call. Otherwise the state
         // alone makes its next park return.
@@ -105,6 +110,7 @@ impl Unparker {
     ///
     /// This costs a system call only while the driver is parked, and works
     /// after the driver is gone, when it does nothing.
+    #[inline]
     pub fn unpark(&self) {
         self.notify.unpark();
     }

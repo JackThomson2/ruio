@@ -402,6 +402,7 @@ impl Driver {
     ///
     /// Fails if the kernel rejects the submission, or reports that
     /// completions were lost (`EBADR`).
+    #[inline]
     pub fn submit(&self) -> io::Result<()> {
         self.enter(0, None)
     }
@@ -412,6 +413,7 @@ impl Driver {
     /// not fit in the queue; or an [`Unparker`] has been used since the last
     /// park. A thread that would rather not sleep can poll this before it
     /// parks.
+    #[inline]
     pub fn has_work(&self) -> bool {
         let pending = sys::IORING_SQ_TASKRUN | sys::IORING_SQ_CQ_OVERFLOW;
         let inner = self.inner.state.borrow();
@@ -456,12 +458,14 @@ impl Driver {
     ///
     /// As for [`Driver::submit`], if the submission queue is full and
     /// submitting it fails.
+    #[inline]
     pub fn wake_at(&self, deadline: Duration) -> io::Result<()> {
         self.inner.state.borrow_mut().wake_at(deadline)
     }
 
     /// Whether the timer [`wake_at`](Driver::wake_at) armed has fired since
     /// this was last asked. Asking clears it.
+    #[inline]
     pub fn timer_fired(&self) -> bool {
         mem::take(&mut self.inner.state.borrow_mut().timer_fired)
     }
@@ -493,11 +497,13 @@ impl Driver {
 
     /// The number of operations the kernel may still own, including those
     /// whose [`Op`] was dropped.
+    #[inline]
     pub fn in_flight(&self) -> usize {
         self.inner.state.borrow().table.in_flight()
     }
 
     /// Counts of the driver's work so far.
+    #[inline]
     pub fn stats(&self) -> Stats {
         self.inner.state.borrow().stats
     }
@@ -509,24 +515,28 @@ impl Driver {
     ///
     /// [`submit`]: Driver::submit
     /// [`park`]: Driver::park
+    #[inline]
     pub fn completions_last_turn(&self) -> usize {
         self.inner.state.borrow().last_turn
     }
 
     /// The number of slots in the ring's registered file table, which holds
     /// its direct descriptors; see [`Builder::files`].
+    #[inline]
     pub fn files(&self) -> u32 {
         self.inner.state.borrow().files
     }
 
     /// The number of entries in the ring's submission queue; see
     /// [`Builder::entries`]. A chain can have no more.
+    #[inline]
     pub fn sq_entries(&self) -> u32 {
         self.inner.state.borrow().ring.sq_entries()
     }
 
     /// A number that identifies the driver's ring among every ring the
     /// process has had.
+    #[inline]
     pub fn id(&self) -> u64 {
         self.inner.state.borrow().id
     }
@@ -748,6 +758,7 @@ impl Driver {
     }
 
     /// Whether `other` drives the same ring.
+    #[inline]
     pub(crate) fn same_ring(&self, other: &Driver) -> bool {
         Rc::ptr_eq(&self.inner, &other.inner)
     }
@@ -772,6 +783,7 @@ impl Driver {
 
     /// Takes a stream's next completion, or arranges for `waker` to be woken
     /// when one arrives.
+    #[inline]
     pub(crate) fn poll_stream(&self, user_data: u64, waker: &Waker) -> Option<Completion> {
         let polled = self
             .inner
@@ -785,6 +797,7 @@ impl Driver {
 
     /// Takes a stream's next completion if it has arrived, without
     /// arranging for anything to be woken.
+    #[inline]
     pub(crate) fn take_stream(&self, user_data: u64) -> Option<Completion> {
         self.inner.state.borrow_mut().table.take_stream(user_data)
     }
@@ -830,6 +843,7 @@ impl Driver {
 
     /// Takes the operation's completion, or arranges for `waker` to be woken
     /// when it arrives.
+    #[inline]
     pub(crate) fn poll_completion(&self, user_data: u64, waker: &Waker) -> Option<Completion> {
         let polled = self.inner.state.borrow_mut().table.poll(user_data, waker);
         // A replaced waker is dropped here, after the driver is released.
@@ -1084,10 +1098,18 @@ impl Inner {
 
     /// Arms the wake timer for `deadline`, or moves it there if it is armed
     /// for later; see [`Driver::wake_at`].
+    #[inline]
     fn wake_at(&mut self, deadline: Duration) -> io::Result<()> {
+        // Nearly every turn finds the timer armed for the deadline already.
         if self.timer.is_some_and(|armed| armed <= deadline) {
             return Ok(());
         }
+        self.arm_timer(deadline)
+    }
+
+    /// Queues the entry that arms the wake timer for `deadline`, or moves
+    /// it there.
+    fn arm_timer(&mut self, deadline: Duration) -> io::Result<()> {
         // An entry queued for an earlier deadline, and not yet submitted,
         // reads this one instead, which is as well.
         *self.timer_at = timespec(deadline);
@@ -1333,6 +1355,7 @@ struct Entry<'a> {
 }
 
 impl Drop for Entry<'_> {
+    #[inline]
     fn drop(&mut self) {
         if !self.prepared {
             *self.sqe = sys::io_uring_sqe {
@@ -1344,6 +1367,7 @@ impl Drop for Entry<'_> {
     }
 }
 
+#[inline]
 pub(crate) fn timespec(duration: Duration) -> sys::__kernel_timespec {
     sys::__kernel_timespec {
         tv_sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),

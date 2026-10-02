@@ -159,6 +159,7 @@ impl Probe {
     /// # Errors
     ///
     /// As for [`Probe::detect`]. A failed detection is not cached.
+    #[inline]
     pub fn current() -> io::Result<&'static Probe> {
         static CURRENT: OnceLock<Probe> = OnceLock::new();
         if let Some(probe) = CURRENT.get() {
@@ -212,6 +213,7 @@ impl Probe {
     /// Whether the kernel consumes provided buffers incrementally
     /// (`IOU_PBUF_RING_INC`, Linux 6.12): a buffer ring registered for it
     /// lends each buffer to as many completions as fit in it.
+    #[inline]
     pub fn supports_incremental_buffers(&self) -> bool {
         self.incremental_buffers
     }
@@ -219,6 +221,7 @@ impl Probe {
     /// Whether a send takes a vector of buffers (`IORING_SEND_VECTORIZED`,
     /// Linux 6.17): an `IORING_OP_SEND` whose address and length name an
     /// array of `iovec`s.
+    #[inline]
     pub fn supports_vectorized_send(&self) -> bool {
         self.vectorized_send
     }

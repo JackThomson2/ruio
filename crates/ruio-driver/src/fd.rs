@@ -31,6 +31,7 @@ pub enum Fd {
 
 impl Fd {
     /// Points `sqe` at the file.
+    #[inline]
     pub(crate) fn apply(self, sqe: &mut sys::io_uring_sqe) {
         match self {
             Fd::Plain(fd) => sqe.fd = fd,
@@ -45,12 +46,14 @@ impl Fd {
 }
 
 impl From<RawFd> for Fd {
+    #[inline]
     fn from(fd: RawFd) -> Self {
         Fd::Plain(fd)
     }
 }
 
 impl From<BorrowedFd<'_>> for Fd {
+    #[inline]
     fn from(fd: BorrowedFd<'_>) -> Self {
         Fd::Plain(fd.as_raw_fd())
     }
@@ -94,11 +97,13 @@ impl DirectFd {
     }
 
     /// The slot the file is in.
+    #[inline]
     pub fn slot(&self) -> u32 {
         self.slot
     }
 
     /// The descriptor, for operations on its ring.
+    #[inline]
     pub fn fd(&self) -> Fd {
         Fd::Direct(self.slot)
     }
@@ -111,6 +116,7 @@ impl DirectFd {
 
     /// Whether the descriptor belongs to `driver`'s ring: a comparison,
     /// where [`driver`](DirectFd::driver) searches the thread's drivers.
+    #[inline]
     pub fn belongs_to(&self, driver: &Driver) -> bool {
         driver.id() == self.ring
     }

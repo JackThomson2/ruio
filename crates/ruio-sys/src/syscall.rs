@@ -8,6 +8,7 @@ use crate::io_uring_params;
 
 /// Turns a raw system call return value into a result, reading `errno` on
 /// failure.
+#[inline]
 fn check(ret: c_long) -> io::Result<c_long> {
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -50,6 +51,7 @@ pub unsafe fn io_uring_setup(entries: u32, params: &mut io_uring_params) -> io::
 /// point to `argsz` readable bytes of what `flags` selects: a signal mask, or
 /// an [`io_uring_getevents_arg`](crate::io_uring_getevents_arg) with
 /// [`IORING_ENTER_EXT_ARG`](crate::IORING_ENTER_EXT_ARG).
+#[inline]
 pub unsafe fn io_uring_enter(
     fd: c_int,
     to_submit: u32,

@@ -104,12 +104,14 @@ impl Payload {
         }
     }
 
+    #[inline]
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.storage.0.as_mut_ptr().cast()
     }
 }
 
 impl Orphan for Payload {
+    #[inline]
     fn deliver(&mut self, completion: Completion) {
         let (deliver, payload) = (self.vtable.deliver, self.as_mut_ptr());
         // SAFETY: the storage holds an initialized payload of the vtable's
@@ -126,6 +128,7 @@ impl fmt::Debug for Payload {
 }
 
 impl Drop for Payload {
+    #[inline]
     fn drop(&mut self) {
         let (drop, payload) = (self.vtable.drop, self.as_mut_ptr());
         // SAFETY: the storage holds an initialized payload of the vtable's

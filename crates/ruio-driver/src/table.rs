@@ -134,12 +134,14 @@ impl<P> Table<P> {
     }
 
     /// Operations the kernel may still own: waiting or orphaned.
+    #[inline]
     pub(crate) fn in_flight(&self) -> usize {
         self.in_flight
     }
 
     /// How a slot is to wake `waker`: by a counted reference if it is one of
     /// the executor's on this thread, and otherwise by a clone.
+    #[inline]
     pub(crate) fn wake_of(&self, waker: &Waker) -> Wake {
         match self.local {
             Some(local) if ptr::eq(waker.vtable(), local.vtable) => {
@@ -154,6 +156,7 @@ impl<P> Table<P> {
     }
 
     /// Whether `wake` wakes the task `waker` does.
+    #[inline]
     fn will_wake(&self, wake: &Wake, waker: &Waker) -> bool {
         match wake {
             Wake::None => false,
@@ -170,6 +173,7 @@ impl<P> Table<P> {
     /// Lets go of `wake`: a local one is handed back to the executor, and a
     /// foreign one returned, for the caller to drop after releasing the
     /// table, since dropping a waker can run arbitrary code.
+    #[inline]
     fn release(&self, wake: Wake) -> Option<Waker> {
         match wake {
             Wake::None => None,
@@ -187,6 +191,7 @@ impl<P> Table<P> {
     /// Wakes `wake`: a local one here, as the executor is on this thread,
     /// and a foreign one by returning it, for the caller to wake after
     /// releasing the table. `wake` stays as it is.
+    #[inline]
     fn wake(&self, wake: &mut Wake) -> Option<Waker> {
         match wake {
             Wake::None => None,
@@ -205,6 +210,7 @@ impl<P> Table<P> {
     }
 
     /// Adds a submitted operation and returns its `user_data`.
+    #[inline]
     pub(crate) fn insert(&mut self, waker: Option<&Waker>) -> u64 {
         let wake = waker.map_or(Wake::None, |waker| self.wake_of(waker));
         self.insert_wake(wake)
@@ -212,6 +218,7 @@ impl<P> Table<P> {
 
     /// Adds a submitted operation to be woken by `wake`, and returns its
     /// `user_data`.
+    #[inline]
     pub(crate) fn insert_wake(&mut self, wake: Wake) -> u64 {
         let index = self.occupy();
         let slot = &mut self.slots[index as usize];
@@ -224,6 +231,7 @@ impl<P> Table<P> {
 
     /// Adds a submitted operation that nobody waits for, which `payload`
     /// finishes when it completes, and returns its `user_data`.
+    #[inline]
     pub(crate) fn insert_orphan(&mut self, payload: P) -> u64 {
         let index = self.occupy();
         let slot = &mut self.slots[index as usize];
@@ -232,6 +240,7 @@ impl<P> Table<P> {
     }
 
     /// Adds a submitted multishot request and returns its `user_data`.
+    #[inline]
     pub(crate) fn insert_stream(&mut self, waker: Option<&Waker>) -> u64 {
         let waker = waker.map_or(Wake::None, |waker| self.wake_of(waker));
         let index = self.occupy();
@@ -247,6 +256,7 @@ impl<P> Table<P> {
 
     /// Takes a free slot, which stays in its free state for the caller to
     /// write, counting it in flight, and returns its index.
+    #[inline]
     fn occupy(&mut self) -> u32 {
         let index = if self.free == NONE {
             let index = u32::try_from(self.slots.len())
@@ -276,6 +286,7 @@ impl<P> Table<P> {
     /// A waker that `waker` replaces is returned rather than dropped, so the
     /// caller can drop it after releasing the table: dropping a waker can run
     /// arbitrary code.
+    #[inline]
     pub(crate) fn poll(
         &mut self,
         user_data: u64,
@@ -316,6 +327,7 @@ impl<P> Table<P> {
     /// or, if none is queued, arranges for `waker` to be woken when one
     /// arrives. A replaced waker is returned, as by [`Table::poll`], and so
     /// is the stream's own after the last completion.
+    #[inline]
     pub(crate) fn poll_stream(
         &mut self,
         user_data: u64,
@@ -351,6 +363,7 @@ impl<P> Table<P> {
 
     /// Takes the stream's next completion if one is queued, freeing the slot
     /// after the last, and leaves its waker alone.
+    #[inline]
     pub(crate) fn take_stream(&mut self, user_data: u64) -> Option<Completion> {
         let index = self.index(user_data)?;
         let State::Streaming(stream) = &mut self.slots[index as usize].state else {
@@ -438,6 +451,7 @@ impl<P> Table<P> {
 
     /// Takes the operation's completion and frees its slot, if it has
     /// completed.
+    #[inline]
     pub(crate) fn take_completed(&mut self, user_data: u64) -> Option<Completion> {
         let index = self.index(user_data)?;
         let State::Completed(completion) = self.slots[index as usize].state else {
@@ -470,6 +484,7 @@ impl<P> Table<P> {
     }
 
     /// Records the kernel's completion for `user_data`.
+    #[inline]
     pub(crate) fn complete(&mut self, user_data: u64, completion: Completion) -> Outcome<P> {
         let Some(index) = self.index(user_data) else {
             return Outcome::Ignore;
@@ -556,6 +571,7 @@ impl<P> Table<P> {
 
     /// The slot index `user_data` names, if its generation is current and the
     /// slot is in use.
+    #[inline]
     fn index(&self, user_data: u64) -> Option<u32> {
         if user_data == IGNORED {
             return None;
@@ -569,6 +585,7 @@ impl<P> Table<P> {
     /// Frees a slot, returning its previous state, which owns no wake: a
     /// slot that waits is freed through [`Table::free_stream`] or has had
     /// its wake taken.
+    #[inline]
     fn free(&mut self, index: u32) -> State<P> {
         let slot = &mut self.slots[index as usize];
         // Generation 0 is never used, so a zeroed `user_data` never matches.
@@ -591,6 +608,7 @@ impl<P> Table<P> {
 
     /// Frees a streaming slot, letting go of its wake, and returns the
     /// stream's foreign waker if it had one, for the caller to drop.
+    #[inline]
     fn free_stream(&mut self, index: u32) -> Option<Waker> {
         let State::Streaming(stream) = &mut self.slots[index as usize].state else {
             unreachable!("only a streaming slot is freed as a stream");
@@ -616,6 +634,7 @@ impl<P> Drop for Table<P> {
     }
 }
 
+#[inline]
 fn user_data(index: u32, generation: u32) -> u64 {
     u64::from(generation) << 32 | u64::from(index)
 }
@@ -624,6 +643,7 @@ fn user_data(index: u32, generation: u32) -> u64 {
 /// its wake taken. Dropping it would run the state's drop glue for nothing,
 /// on the hottest path of the table, so it is forgotten instead, which leaks
 /// nothing of such a state.
+#[inline]
 fn forget_trivial<P>(state: State<P>) {
     debug_assert!(
         matches!(
