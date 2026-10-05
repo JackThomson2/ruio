@@ -268,6 +268,23 @@ impl LocalRef {
         // SAFETY: as for `run`.
         unsafe { (self.header().vtable.cancel)(self.as_ptr()) }
     }
+
+    /// Cancels the task, unless it has finished: its future is dropped the
+    /// next time the scheduler reaches it, and it reports that it was
+    /// cancelled.
+    #[inline]
+    pub(crate) fn abort(&self) {
+        // SAFETY: as for `run`.
+        unsafe { (self.header().vtable.abort)(self.as_ptr()) }
+    }
+
+    /// Whether the task has finished, by completing, panicking or being
+    /// cancelled.
+    #[inline]
+    pub(crate) fn is_finished(&self) -> bool {
+        // SAFETY: as for `run`.
+        unsafe { (self.header().vtable.is_finished)(self.as_ptr()) }
+    }
 }
 
 impl Clone for LocalRef {
@@ -992,16 +1009,22 @@ impl<T> JoinHandle<T> {
     /// reaches it, and awaiting the handle then returns a cancelled
     /// [`JoinError`]. A finished task is left as it is.
     pub fn abort(&self) {
-        // SAFETY: the handle's reference keeps the task alive, and the
-        // vtable is the task's own.
-        unsafe { (self.task.header().vtable.abort)(self.task.as_ptr()) }
+        self.task.abort();
     }
 
     /// Whether the task has finished, by completing, panicking or being
     /// cancelled.
     pub fn is_finished(&self) -> bool {
-        // SAFETY: as for `abort`.
-        unsafe { (self.task.header().vtable.is_finished)(self.task.as_ptr()) }
+        self.task.is_finished()
+    }
+
+    /// A handle that aborts the task without awaiting it, which can be kept
+    /// or given away while this handle awaits the output; see
+    /// [`AbortHandle`].
+    pub fn abort_handle(&self) -> AbortHandle {
+        AbortHandle {
+            task: self.task.clone(),
+        }
     }
 }
 
@@ -1025,6 +1048,53 @@ impl<T> Drop for JoinHandle<T> {
 impl<T> fmt::Debug for JoinHandle<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JoinHandle")
+            .field("finished", &self.is_finished())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Aborts a spawned task without awaiting its output; made by
+/// [`JoinHandle::abort_handle`].
+///
+/// Clones abort the same task. Dropping an abort handle neither aborts the
+/// task nor detaches it, as dropping the [`JoinHandle`] does: the task runs
+/// on, and its output goes to the join handle, if there is one. A handle
+/// keeps the task's memory until it is dropped. Like the join handle, it is
+/// a reference from the task's own thread, counted without atomic
+/// operations, and stays on that thread.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ruio_executor::AbortHandle>();
+/// ```
+pub struct AbortHandle {
+    task: LocalRef,
+}
+
+impl AbortHandle {
+    /// Cancels the task; see [`JoinHandle::abort`].
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+
+    /// Whether the task has finished, by completing, panicking or being
+    /// cancelled.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
+impl Clone for AbortHandle {
+    fn clone(&self) -> Self {
+        Self {
+            task: self.task.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for AbortHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AbortHandle")
             .field("finished", &self.is_finished())
             .finish_non_exhaustive()
     }
