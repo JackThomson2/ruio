@@ -16,6 +16,8 @@
 use std::mem;
 use std::task::Waker;
 
+use crate::task::HeldWaker;
+
 const LEVELS: usize = 6;
 const SLOT_BITS: u32 = 6;
 const SLOTS: usize = 1 << SLOT_BITS;
@@ -56,7 +58,10 @@ struct Level {
 struct Entry {
     generation: u32,
     deadline: u64,
-    waker: Option<Waker>,
+    /// The task waiting for the timer, held as the thread holds wakers: a
+    /// task of its runtime by a local reference, which costs no atomic
+    /// operation to take, wake or drop.
+    waker: HeldWaker,
     state: State,
 }
 
@@ -95,9 +100,10 @@ impl Wheel {
     }
 
     /// Adds a timer due at `deadline`, which should be after the current
-    /// tick. A deadline beyond the wheel's reach is brought in to its edge,
-    /// so the timer fires early there and its owner has to check the time.
-    pub(crate) fn insert(&mut self, deadline: u64, waker: Waker) -> Key {
+    /// tick, to wake `waker`. A deadline beyond the wheel's reach is brought
+    /// in to its edge, so the timer fires early there and its owner has to
+    /// check the time.
+    pub(crate) fn insert(&mut self, deadline: u64, waker: HeldWaker) -> Key {
         debug_assert!(
             deadline > self.elapsed,
             "{deadline} is not after {}",
@@ -107,7 +113,7 @@ impl Wheel {
         let index = self.allocate();
         let entry = &mut self.entries[index as usize];
         entry.deadline = deadline;
-        entry.waker = Some(waker);
+        entry.waker = waker;
         let key = Key {
             index,
             generation: entry.generation,
@@ -125,31 +131,27 @@ impl Wheel {
     /// Makes a timer that has not fired wake `waker`. Returns the waker it
     /// replaces, for the caller to drop after releasing the wheel: dropping a
     /// waker can drop a task, and with it timers of this wheel.
-    pub(crate) fn set_waker(&mut self, key: Key, waker: &Waker) -> Option<Waker> {
+    pub(crate) fn set_waker(&mut self, key: Key, waker: &Waker) -> Option<HeldWaker> {
         let entry = self.entry_mut(key)?;
-        if !matches!(entry.state, State::Queued { .. }) {
+        if !matches!(entry.state, State::Queued { .. }) || entry.waker.will_wake(waker) {
             return None;
         }
-        if entry
-            .waker
-            .as_ref()
-            .is_some_and(|current| current.will_wake(waker))
-        {
-            return None;
-        }
-        entry.waker.replace(waker.clone())
+        Some(mem::replace(&mut entry.waker, HeldWaker::of(waker)))
     }
 
     /// Removes a timer, fired or not. Returns its waker, if it still had one,
     /// for the caller to drop after releasing the wheel.
-    pub(crate) fn remove(&mut self, key: Key) -> Option<Waker> {
+    pub(crate) fn remove(&mut self, key: Key) -> Option<HeldWaker> {
         self.entry(key)?;
         self.unlink(key.index);
         let entry = &mut self.entries[key.index as usize];
         entry.generation = entry.generation.wrapping_add(1);
         entry.state = State::Free { next: self.free };
         self.free = key.index;
-        entry.waker.take()
+        match mem::take(&mut entry.waker) {
+            HeldWaker::None => None,
+            waker => Some(waker),
+        }
     }
 
     /// The next tick at which the wheel has work: timers to fire, or timers
@@ -160,7 +162,7 @@ impl Wheel {
 
     /// Moves time forward to `now`, collecting the wakers of the timers that
     /// are due by then.
-    pub(crate) fn advance(&mut self, now: u64, wakers: &mut Vec<Waker>) {
+    pub(crate) fn advance(&mut self, now: u64, wakers: &mut Vec<HeldWaker>) {
         while let Some((level, slot, tick)) = self.next_slot() {
             if tick > now {
                 break;
@@ -182,7 +184,7 @@ impl Wheel {
                 let entry = &mut self.entries[index as usize];
                 if entry.deadline <= tick {
                     entry.state = State::Fired;
-                    wakers.extend(entry.waker.take());
+                    wakers.push(mem::take(&mut entry.waker));
                 } else {
                     self.link(index);
                 }
@@ -214,7 +216,7 @@ impl Wheel {
             self.entries.push(Entry {
                 generation: 0,
                 deadline: 0,
-                waker: None,
+                waker: HeldWaker::None,
                 state: State::Fired,
             });
             index
@@ -356,11 +358,16 @@ mod tests {
         (flag.clone(), Waker::from(flag))
     }
 
+    /// A waker as the wheel holds it: outside a runtime, by a clone.
+    fn held(waker: &Waker) -> HeldWaker {
+        HeldWaker::of(waker)
+    }
+
     fn advance(wheel: &mut Wheel, now: u64) -> usize {
         let mut wakers = Vec::new();
         wheel.advance(now, &mut wakers);
         let fired = wakers.len();
-        wakers.into_iter().for_each(Waker::wake);
+        wakers.into_iter().for_each(HeldWaker::wake);
         fired
     }
 
@@ -369,7 +376,7 @@ mod tests {
         let mut wheel = Wheel::new();
         for deadline in [1, 63, 64, 65, 4095, 4096, 300_000, 1 << 30, (1 << 36) - 2] {
             let (fired, waker) = flag();
-            let key = wheel.insert(wheel.elapsed() + deadline, waker);
+            let key = wheel.insert(wheel.elapsed() + deadline, held(&waker));
             let deadline = wheel.elapsed() + deadline;
             // Step to each tick the wheel reports, never past the deadline.
             while let Some(next) = wheel.next_expiration() {
@@ -393,7 +400,7 @@ mod tests {
     fn removed_timers_never_fire() {
         let mut wheel = Wheel::new();
         let (fired, waker) = flag();
-        let key = wheel.insert(100, waker);
+        let key = wheel.insert(100, held(&waker));
         assert!(wheel.remove(key).is_some());
         assert_eq!(wheel.next_expiration(), None);
         assert_eq!(advance(&mut wheel, 1000), 0);
@@ -405,9 +412,9 @@ mod tests {
     fn stale_keys_do_not_touch_the_entry_that_reused_the_slot() {
         let mut wheel = Wheel::new();
         let (_, waker) = flag();
-        let first = wheel.insert(10, waker.clone());
+        let first = wheel.insert(10, held(&waker));
         wheel.remove(first);
-        let second = wheel.insert(20, waker.clone());
+        let second = wheel.insert(20, held(&waker));
         assert_eq!(first.index, second.index);
         assert!(wheel.remove(first).is_none());
         assert!(wheel.set_waker(first, &waker).is_none());
@@ -418,7 +425,7 @@ mod tests {
     fn deadlines_beyond_reach_fire_at_the_edge() {
         let mut wheel = Wheel::new();
         let (_, waker) = flag();
-        let key = wheel.insert(u64::MAX, waker);
+        let key = wheel.insert(u64::MAX, held(&waker));
         advance(&mut wheel, MAX_DISTANCE - 2);
         assert!(!wheel.fired(key));
         advance(&mut wheel, MAX_DISTANCE - 1);
@@ -453,7 +460,7 @@ mod tests {
                     let distance = 1 + rng.below(1 << (6 * digits).min(40));
                     let deadline = wheel.elapsed() + distance;
                     let (fired, waker) = flag();
-                    let key = wheel.insert(deadline, waker);
+                    let key = wheel.insert(deadline, held(&waker));
                     let due = deadline.min(wheel.elapsed() + MAX_DISTANCE - 1);
                     live.push((key, due, fired));
                 }

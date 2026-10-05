@@ -15,6 +15,7 @@ use std::fmt;
 use std::future::{Future, IntoFuture, poll_fn};
 use std::io;
 use std::pin::{Pin, pin};
+use std::ptr;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -23,6 +24,7 @@ pub use std::time::Instant;
 
 use crate::context;
 use crate::scheduler::{Scheduler, Shared};
+use crate::task::HeldWaker;
 use crate::wheel::{Key, Wheel};
 
 /// A runtime's timers: its wheel, whose ticks are milliseconds since `start`.
@@ -31,7 +33,7 @@ pub(crate) struct Timers {
     wheel: RefCell<Wheel>,
     /// Wakers of the timers that fired together, kept to reuse the
     /// allocation.
-    fired: RefCell<Vec<Waker>>,
+    fired: RefCell<Vec<HeldWaker>>,
     /// When the wheel next has work, as its last change left it, or `None`
     /// if it has none: firing the timers before then has nothing to do.
     next: Cell<Option<Instant>>,
@@ -85,10 +87,10 @@ impl Timers {
     }
 
     #[inline]
-    fn insert(&self, deadline: Instant, waker: Waker) -> Key {
+    fn insert(&self, deadline: Instant, waker: &Waker) -> Key {
         let mut wheel = self.wheel.borrow_mut();
         let tick = self.tick_after(deadline).max(wheel.elapsed() + 1);
-        let key = wheel.insert(tick, waker);
+        let key = wheel.insert(tick, HeldWaker::of(waker));
         self.refresh(&wheel);
         key
     }
@@ -96,7 +98,7 @@ impl Timers {
     /// Removes a timer, fired or not. Returns its waker, if it still had one,
     /// for the caller to drop after releasing the wheel.
     #[inline]
-    pub(crate) fn remove(&self, key: Key) -> Option<Waker> {
+    pub(crate) fn remove(&self, key: Key) -> Option<HeldWaker> {
         let mut wheel = self.wheel.borrow_mut();
         let waker = wheel.remove(key);
         self.refresh(&wheel);
@@ -139,12 +141,22 @@ pub struct Sleep {
 }
 
 /// The timer of a [`Sleep`]: `key` in the wheel of the runtime whose shared
-/// part is `owner`, which removals from where the wheel cannot be reached
-/// go through.
+/// part is at `owner` and has `id`. The runtime is named rather than held,
+/// so that arming takes no atomic operation: a removal from where the wheel
+/// cannot be reached finds the runtime by its id among those alive, and a
+/// runtime that has gone has no wheel to remove the timer from.
 struct Armed {
-    owner: Arc<Shared>,
+    owner: *const Shared,
+    id: u64,
     key: Key,
 }
+
+// SAFETY: the pointer names the runtime, by address, and is never
+// dereferenced: the runtime is reached through the thread's own pointer to
+// it, or through the registry of live runtimes.
+unsafe impl Send for Armed {}
+// SAFETY: as above.
+unsafe impl Sync for Armed {}
 
 /// Waits for `duration`.
 pub fn sleep(duration: Duration) -> Sleep {
@@ -179,19 +191,26 @@ impl Sleep {
 
     #[inline]
     fn disarm(&mut self) {
-        let Some(Armed { owner, key }) = self.timer.take() else {
+        let Some(Armed { owner, id, key }) = self.timer.take() else {
             return;
         };
         // On the owner's thread, inside it, the wheel is at hand; anywhere
-        // else the owner removes the timer at its next turn.
-        let removed = context::with_owner(Arc::as_ptr(&owner), |scheduler| {
-            scheduler.timers().remove(key)
+        // else the owner, if it is still alive, removes the timer at its
+        // next turn. The id tells the owner from a later runtime at the same
+        // address.
+        let removed = context::with_owner(owner, |scheduler| {
+            (scheduler.shared().id() == id).then(|| scheduler.timers().remove(key))
         });
         match removed {
             // Dropped once the wheel is released, as dropping a waker can
             // run code that uses it.
-            Some(waker) => drop(waker),
-            None => owner.remove_timer(key),
+            Some(Some(waker)) => drop(waker),
+            Some(None) => {}
+            None => {
+                if let Some(owner) = Shared::find(id) {
+                    owner.remove_timer(key);
+                }
+            }
         }
     }
 
@@ -201,8 +220,10 @@ impl Sleep {
     #[inline]
     fn arm(&mut self, scheduler: &Scheduler, waker: &Waker) {
         let timers = scheduler.timers();
+        let shared = scheduler.shared();
         if let Some(armed) = &self.timer
-            && Arc::ptr_eq(&armed.owner, scheduler.shared())
+            && ptr::eq(armed.owner, Arc::as_ptr(shared))
+            && armed.id == shared.id()
         {
             let mut wheel = timers.wheel.borrow_mut();
             if !wheel.fired(armed.key) {
@@ -216,9 +237,10 @@ impl Sleep {
         // Not armed yet, armed by another runtime, or fired at the edge of
         // the wheel's reach, before the deadline: arm here.
         self.disarm();
-        let key = timers.insert(self.deadline, waker.clone());
+        let key = timers.insert(self.deadline, waker);
         self.timer = Some(Armed {
-            owner: Arc::clone(scheduler.shared()),
+            owner: Arc::as_ptr(shared),
+            id: shared.id(),
             key,
         });
     }
@@ -233,15 +255,27 @@ impl Future for Sleep {
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        if this.is_elapsed() {
-            this.disarm();
-            return Poll::Ready(());
-        }
         // The runtime by the thread's plain pointer to it, which the thread's
-        // `block_on` keeps alive, rather than a clone of its `Rc`.
-        context::with_current(|scheduler| this.arm(scheduler, cx.waker()))
-            .expect("a `Sleep` must be polled inside a ruio runtime");
-        Poll::Pending
+        // `block_on` keeps alive, rather than a clone of its `Rc`; and the
+        // time as the pass read it, which a deadline that has passed is
+        // behind, or else is armed against.
+        let polled = context::with_current(|scheduler| {
+            if scheduler.now() >= this.deadline {
+                this.disarm();
+                Poll::Ready(())
+            } else {
+                this.arm(scheduler, cx.waker());
+                Poll::Pending
+            }
+        });
+        match polled {
+            Some(poll) => poll,
+            None if this.is_elapsed() => {
+                this.disarm();
+                Poll::Ready(())
+            }
+            None => panic!("a `Sleep` must be polled inside a ruio runtime"),
+        }
     }
 }
 

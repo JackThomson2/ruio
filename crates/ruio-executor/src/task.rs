@@ -49,7 +49,7 @@ pub(crate) struct Task<F: Future> {
     aborted: Cell<bool>,
     /// Set when the `JoinHandle` is dropped: the output has no one to go to.
     detached: Cell<bool>,
-    join_waker: Cell<JoinWaker>,
+    join_waker: Cell<HeldWaker>,
     stage: RefCell<Stage<F>>,
 }
 
@@ -596,22 +596,23 @@ unsafe fn wake_release_local(header: *const ()) {
     unsafe { LocalRef::from_raw(header.cast()) }.wake();
 }
 
-/// Who a task wakes as it finishes: the one awaiting its handle, held by a
-/// local reference if that is a task of the runtime running on this thread,
-/// as an awaiter almost always is, so that holding and waking it take no
-/// atomic operation; and otherwise by its waker.
+/// A waker as this thread holds it, to wake once: a task of the runtime
+/// running on this thread by a local reference, so that holding and waking
+/// it take no atomic operation, and any other waker by a clone. A task
+/// holds the one awaiting its handle so, and the wheel the tasks waiting
+/// for its timers. Only the thread that took it may hold, wake or drop it.
 #[derive(Default)]
-enum JoinWaker {
+pub(crate) enum HeldWaker {
     #[default]
     None,
     Local(LocalRef),
     Foreign(Waker),
 }
 
-impl JoinWaker {
+impl HeldWaker {
     /// How to wake the task `waker` wakes.
     #[inline]
-    fn of(waker: &Waker) -> Self {
+    pub(crate) fn of(waker: &Waker) -> Self {
         if ptr::eq(waker.vtable(), &WAKER) {
             let header = waker.data().cast::<Header>();
             // SAFETY: a waker with the tasks' vtable names a live task, which
@@ -621,30 +622,30 @@ impl JoinWaker {
             // thread, it is of this thread.
             let local = context::with_owner(owner, |_| unsafe { LocalRef::retain(header) });
             if let Some(task) = local {
-                return JoinWaker::Local(task);
+                return HeldWaker::Local(task);
             }
         }
-        JoinWaker::Foreign(waker.clone())
+        HeldWaker::Foreign(waker.clone())
     }
 
     /// Whether this wakes the task `waker` does.
     #[inline]
-    fn will_wake(&self, waker: &Waker) -> bool {
+    pub(crate) fn will_wake(&self, waker: &Waker) -> bool {
         match self {
-            JoinWaker::None => false,
-            JoinWaker::Local(task) => {
+            HeldWaker::None => false,
+            HeldWaker::Local(task) => {
                 ptr::eq(waker.data(), task.as_ptr().cast()) && ptr::eq(waker.vtable(), &WAKER)
             }
-            JoinWaker::Foreign(current) => current.will_wake(waker),
+            HeldWaker::Foreign(current) => current.will_wake(waker),
         }
     }
 
     #[inline]
-    fn wake(self) {
+    pub(crate) fn wake(self) {
         match self {
-            JoinWaker::None => {}
-            JoinWaker::Local(task) => task.wake(),
-            JoinWaker::Foreign(waker) => waker.wake(),
+            HeldWaker::None => {}
+            HeldWaker::Local(task) => task.wake(),
+            HeldWaker::Foreign(waker) => waker.wake(),
         }
     }
 }
@@ -778,7 +779,7 @@ where
                 index: Cell::new(0),
             },
             stage: RefCell::new(Stage::Running(future)),
-            join_waker: Cell::new(JoinWaker::None),
+            join_waker: Cell::new(HeldWaker::None),
             detached: Cell::new(false),
             aborted: Cell::new(false),
         });
@@ -906,7 +907,7 @@ where
         // A task finishes, and wakes its awaiter, before its last reference
         // can go. Were one still held, it is a reference of the awaiter's
         // thread, which this may not be: leaking it is safe.
-        if let JoinWaker::Local(awaiter) = task.join_waker.take() {
+        if let HeldWaker::Local(awaiter) = task.join_waker.take() {
             debug_assert!(false, "a task is freed with its awaiter still held");
             mem::forget(awaiter);
         }
@@ -927,7 +928,7 @@ where
                 let waker = if current.will_wake(cx.waker()) {
                     current
                 } else {
-                    JoinWaker::of(cx.waker())
+                    HeldWaker::of(cx.waker())
                 };
                 this.join_waker.set(waker);
                 Poll::Pending

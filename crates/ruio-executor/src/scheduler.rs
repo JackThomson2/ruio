@@ -8,7 +8,7 @@ use std::io;
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use ruio_driver::{Driver, RemoteRing, Unparker};
@@ -28,6 +28,8 @@ const LIFO_LIMIT: u32 = 3;
 /// The part of a scheduler that other threads reach: the tasks woken there,
 /// the timers dropped there, and the unparker of the scheduler's ring.
 pub(crate) struct Shared {
+    /// The runtime's id, unique in the process: its driver's.
+    id: u64,
     remote: Mutex<Remote>,
     /// Set once anything is queued in `remote`, so that the scheduler takes
     /// the lock only when there may be something to take.
@@ -53,6 +55,11 @@ struct Holds(Cell<usize>);
 // there. A task that may be freed on another thread lets go of its count
 // first, on the runtime's thread, and holds an atomic reference instead.
 unsafe impl Sync for Holds {}
+
+/// The runtimes alive in the process, by id, for what names a runtime
+/// rather than holding it to find it again: a sleep dropped away from the
+/// thread of the wheel its timer is in; see [`Shared::find`].
+static RUNTIMES: Mutex<Vec<(u64, Weak<Shared>)>> = Mutex::new(Vec::new());
 
 /// A spawn from another thread, which makes a task on the runtime's own.
 pub(crate) type RemoteSpawn = Box<dyn FnOnce() + Send>;
@@ -136,6 +143,23 @@ impl Shared {
     /// The scheduler's ring, as other threads see it.
     pub(crate) fn ring(&self) -> &RemoteRing {
         &self.ring
+    }
+
+    /// The runtime's id, unique in the process.
+    #[inline]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The shared part of the runtime with `id`, if it is alive: registered
+    /// as its scheduler is made, and struck off as the scheduler is dropped,
+    /// after which there is no wheel to reach.
+    pub(crate) fn find(id: u64) -> Option<Arc<Shared>> {
+        let runtimes = RUNTIMES.lock().unwrap_or_else(PoisonError::into_inner);
+        runtimes
+            .iter()
+            .find(|(known, _)| *known == id)
+            .and_then(|(_, shared)| shared.upgrade())
     }
 
     /// Counts a hold of the part `this` names from the runtime's thread; the
@@ -239,11 +263,17 @@ pub(crate) struct Scheduler {
     /// How long the last wait for work took, polling and parking together.
     /// A wait polls only if the one before ended within the budget.
     last_wait: Cell<Duration>,
+    /// The clock as this pass has read it, if it has: the timers polled in a
+    /// pass share one reading, so a task arming many reads it once. Cleared
+    /// as the pass ends, after its wait; see [`Scheduler::now`].
+    now: Cell<Option<Instant>>,
 }
 
 impl Scheduler {
     pub(crate) fn new(driver: Driver, spin: Duration) -> Self {
+        let id = driver.id();
         let shared = Arc::new(Shared {
+            id,
             remote: Mutex::new(Remote {
                 tasks: Vec::new(),
                 spawns: Vec::new(),
@@ -258,6 +288,10 @@ impl Scheduler {
         // SAFETY: this is the runtime's thread. The scheduler lets go of its
         // hold as it is dropped.
         unsafe { Shared::hold(&shared) };
+        RUNTIMES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((id, Arc::downgrade(&shared)));
         // SAFETY: the retain counts a local reference only to a task of the
         // runtime running on this thread, the driver's, which keeps the task
         // alive until the release or the wake that lets go of it, on this
@@ -275,6 +309,23 @@ impl Scheduler {
             timers: Timers::new(),
             spin,
             last_wait: Cell::new(Duration::ZERO),
+            now: Cell::new(None),
+        }
+    }
+
+    /// The time, as the pass first read it: never later than now, and
+    /// earlier by at most the time the pass has run. A timer polled against
+    /// it may be armed with a deadline just past, and fires at the next
+    /// tick, rather than ending at once; none ends early.
+    #[inline]
+    pub(crate) fn now(&self) -> Instant {
+        match self.now.get() {
+            Some(now) => now,
+            None => {
+                let now = Instant::now();
+                self.now.set(Some(now));
+                now
+            }
         }
     }
 
@@ -394,6 +445,8 @@ impl Scheduler {
         }
         self.take_remote();
         self.fire_timers();
+        // The wait may have been long: the next pass reads the clock anew.
+        self.now.set(None);
     }
 
     /// Waits for work: a completion, the ring's timer, or a task woken or
@@ -447,7 +500,11 @@ impl Scheduler {
     #[inline]
     fn fire_timers(&self) {
         if self.driver.timer_fired() {
-            self.timers.fire(Instant::now());
+            // Read anew, however stale the pass's reading, and kept for the
+            // timers armed as the woken tasks run.
+            let now = Instant::now();
+            self.now.set(Some(now));
+            self.timers.fire(now);
         }
     }
 
@@ -518,9 +575,37 @@ impl Scheduler {
 
 impl Drop for Scheduler {
     fn drop(&mut self) {
+        // The wheel goes with the scheduler: nothing is left to find the
+        // runtime for.
+        let id = self.shared.id;
+        RUNTIMES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(known, _)| *known != id);
         // Tasks still held, by their handles, may hold the part beyond it.
         // SAFETY: this is the runtime's thread, the scheduler stays on it,
         // and its hold, counted as it was made, is let go of once.
         unsafe { Shared::release_hold(Arc::as_ptr(&self.shared)) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Runtime;
+
+    #[test]
+    fn a_runtime_is_found_by_its_id_while_it_lives() {
+        let runtime = Runtime::new().unwrap();
+        let id = runtime.driver().id();
+        let found = Shared::find(id).expect("a live runtime is registered");
+        assert_eq!(found.id(), id);
+        drop(found);
+        drop(runtime);
+        assert!(
+            Shared::find(id).is_none(),
+            "a dropped runtime is struck off"
+        );
+        assert!(Shared::find(u64::MAX).is_none());
     }
 }
