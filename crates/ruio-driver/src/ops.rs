@@ -576,11 +576,18 @@ unsafe impl Multishot for RecvMulti {
     /// waiting. See [`RecvMulti::buffers`].
     ///
     /// A capped receive is first issued only once the socket polls readable
-    /// (`IORING_RECVSEND_POLL_FIRST`). Issued at submission while data
-    /// waits, a receive the cap stops short goes on by arming poll, and with
-    /// a peer still writing that has been seen to miss the wake-up, leaving
-    /// the request armed and silent for good; issued from poll it goes on by
-    /// queueing itself again, which does not.
+    /// (`IORING_RECVSEND_POLL_FIRST`), as every receive is after its first
+    /// completion. Without the flag, a receive issued at submission while
+    /// data waits, and stopped short by the cap, posts its completion from
+    /// there, then arms poll, finds the socket readable and queues itself to
+    /// go on (`io_recv_finish`, `io_queue_async`, `__io_arm_poll_handler`
+    /// in Linux 7.0's io_uring); issued from poll, it posts the completion
+    /// and queues itself again (`IOU_REQUEUE`, `io_poll_task_func`). Both
+    /// leave the request armed with the rest to come, and the receive
+    /// stream's tests have run both without a stall. The flag is a
+    /// precaution: a stream was once seen to stop completing after a capped
+    /// completion of a receive issued at submission, with data in the
+    /// socket, and the cause was not found; see DESIGN.md.
     #[inline]
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
         sqe.opcode = sys::IORING_OP_RECV;

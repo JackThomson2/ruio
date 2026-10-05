@@ -321,13 +321,21 @@ its own flag set.
   stream changes its ask by restarting its request: a cancellation,
   whose own completion ends the request, after which it is submitted
   again; the completions posted before are yielded as usual, and what the
-  receive had not taken waits in the socket. A capped receive is issued
-  only once the socket polls readable (`IORING_RECVSEND_POLL_FIRST`):
-  issued at submission while data waited, with a peer still writing, the
-  kernel's receive was seen to fall silent for good after a capped
-  completion, and from poll it never did. `RecvStream::buffers` sets how
-  many buffers the messages take from the start, for a stream known to
-  carry large ones.
+  receive had not taken waits in the socket. The cancellation cannot miss
+  a receive that is armed: the kernel keeps an armed multishot request in
+  its cancellation table until it completes, the ring's thread is the
+  only one that issues and runs its task work, and a cancellation that
+  finds nothing (`ENOENT`) means the request has ended, whose last
+  completion re-arms the stream. A capped receive is issued only once the
+  socket polls readable (`IORING_RECVSEND_POLL_FIRST`), as every receive
+  is after its first completion. The flag is a precaution: a stream was
+  once seen to stop completing after a capped completion of a receive
+  issued at submission, with data in the socket, and the cause was not
+  found; the kernel's paths from either issue converge, and the stream's
+  tests have run both without a stall (see
+  [Open questions](#open-questions)).
+  `RecvStream::buffers` sets how many buffers the messages take from the
+  start, for a stream known to carry large ones.
   `ReadStream` keeps a multishot read into a pool armed the same way, one
   buffer to a read, for files the kernel can poll: pipes, FIFOs and
   character devices; it refuses others with `EBADFD`. A file that does
@@ -1658,3 +1666,45 @@ Since M7:
 ## Open questions
 
 - License. Crates are `publish = false` until one is chosen.
+- The receive stream's stall. While the ask of a buffer less (see
+  [Networking](#networking)) was built, the test of many re-arms once hung
+  within a few hundred cycles: a capped receive, issued at submission
+  while data waited and the peer still wrote, posted its capped completion
+  (`IORING_CQE_F_SOCK_NONEMPTY` set) and nothing more, with data in the
+  socket; issued from poll (`IORING_RECVSEND_POLL_FIRST`) it never did, so
+  the flag stayed. The cause was not found. In Linux 7.0's io_uring, a
+  receive issued at submission that the cap stops short posts its
+  completion and returns `IOU_RETRY` (net.c, `io_recv_finish`);
+  `io_queue_async` (io_uring.c) arms poll on the socket, which
+  `__io_arm_poll_handler` (poll.c) finds readable, so it takes ownership
+  of the request and queues its task work with the mask, and
+  `io_poll_task_func` receives the rest in the same entry into the kernel,
+  whose task work runs after its submissions (io_uring.c,
+  `__do_sys_io_uring_enter`; tw.c, `__io_run_local_work`). Issued from
+  poll, the same receive returns `IOU_REQUEUE` and `io_poll_task_func`
+  queues itself again with no mask, so the next run polls the socket
+  first. Both leave the request in the cancellation table, owned by queued
+  task work, with its wait entry on the socket, and a wake-up meanwhile
+  adds a reference that makes `io_poll_check_events` loop once more. The
+  restart's cancellation cannot miss it: `__io_poll_cancel` finds the
+  request by `user_data` in the table, where it stays until it completes,
+  marks it cancelled and kicks or joins its task work, and nothing but the
+  ring's thread runs that work (`IORING_SETUP_DEFER_TASKRUN`); `ENOENT`
+  means the request has ended, and its last completion re-arms the
+  stream, which drops the cancellation's own result. Traced with the
+  io_uring tracepoints, the tcp test of the ask ran the exact scenario:
+  the restarted receive completed capped 5 µs after its submission, before
+  its poll arm, and the rest followed from the task work the arm queued.
+  Without the flag that test passed 40 runs of 40, the test of many
+  re-arms 300 of 300, a harness that ran that test's cycle over 30 million
+  times across eight pool geometries, re-arming the receive 3 million
+  times, never stalled, and the echo benchmark did not stall in 35 runs with one
+  connection and 64 KiB messages, 42 with 16 and 30 with 2, where the ask
+  changes some ten times a run, on 7.0.0-1012-aws. One connection with
+  64 KiB messages measured the same with the flag and without, medians of
+  five runs in turns 16.9k and 16.8k round trips a second on a host whose
+  noise ran from 16.4k to 19.7k. The flag bears only on a receive's first
+  issue, so it costs nothing measurable, and stands until the stall is
+  seen again or explained. `ReadStream` and `AcceptStream` take the same
+  path from submission to poll, and single-shot receives have no cap; none
+  has shown a stall.
