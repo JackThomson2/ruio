@@ -856,10 +856,22 @@ baseline are used only when probed.
   from `accept`. When the file table is full the kernel closes the
   connection it could not install and fails the accept with `ENFILE`;
   `Incoming` yields that and carries on with plain descriptors.
-- Addresses resolve through `ToSocketAddrs`, so a host name blocks the
-  thread, as in the standard library. A Unix datagram sent to a path that
-  makes no address goes to the kernel as the unnamed address, which fails
-  with `EINVAL`, so the buffer comes back with the error.
+- `TcpStream::connect` and `net::lookup_host` take `net::ToSocketAddrs`,
+  a sealed trait over everything the standard library's is implemented
+  for. A literal costs nothing: an address resolves to itself through a
+  `Ready` future and an `Option`'s iterator, a slice through its own
+  iterator, and a string parses first and is ready with the one address if
+  it parses, with no allocation, no pool and no runtime. Only a string that
+  does not parse is a host name, and that goes to the blocking pool, where
+  `getaddrinfo(3)` runs on a thread of its own and the task's thread runs
+  its other tasks meanwhile; the lookup costs the string's copy, the job's
+  allocation and the addresses it comes back with. The binds and
+  `UdpSocket::connect` keep the standard library's trait and resolve on
+  the thread, as a program binds its listeners as it starts, and
+  `lookup_host` is there for a bind that must not block. A Unix datagram
+  sent to a path that makes no address goes to the kernel as the unnamed
+  address, which fails with `EINVAL`, so the buffer comes back with the
+  error.
 - `TcpListener::bind_reuseport` and `UdpSocket::bind_reuseport` set
   `SO_REUSEPORT` before binding, so that a socket on each core can bind one
   address, and the kernel spreads the connections, or the datagrams, among
@@ -925,12 +937,22 @@ baseline are used only when probed.
   cached; so buffered reads and writes that miss the page cache. A direct
   read goes to the device from the ring.
 - io_uring has no operation that reads a directory, so `read_dir` opens
-  one through the ring and `ReadDir` reads its entries with
-  `getdents64(2)` on the thread, 32 KiB at a time, as resolving a host
-  name runs on it: it blocks the thread while the kernel reads the
-  directory, which is quick once it is cached. Before each batch after
-  the first, the reader yields once, so that a large directory does not
-  hold up the other tasks. Entries share the directory's descriptor, and
+  one through the ring, whose open takes the cached path without a worker
+  thread, and `ReadDir` reads its entries with `getdents64(2)`, 32 KiB at
+  a time, on the blocking pool, and ahead: it keeps two buffers, and while
+  a task takes the entries of one batch the pool reads the next into the
+  other, so a task that takes the entries as fast as they come waits for
+  the pool once, for the first batch, which `read_dir` starts as it opens.
+  One read is in flight at a time, so the entries come in the directory's
+  order, and the read that finds the end costs a job that returns at once,
+  as a short batch does not say the directory has ended on every file
+  system. A batch is one job and no allocation, where tokio's reader
+  spawns a job for every 32 entries and allocates each. Before each batch
+  after the first, the reader yields once, so that a large directory does
+  not hold up the other tasks, which the budget alone would not see to, a
+  batch being some eight hundred entries of work between polls. A reader
+  dropped with a read in flight leaves it to finish on its own, the
+  directory staying open for it. Entries share the directory's descriptor, and
   their status comes from statx relative to it, so it is the status of
   the entry in the directory read, wherever the directory has moved; the
   type comes from the directory, or from statx where the file system
@@ -1901,6 +1923,23 @@ the runtime's driver, where ruio's job is one allocation handed over
 through one word, and the completion wakes the task through the remote
 queue and the eventfd, as any wake from another thread.
 
+`read dir`, added as the directory reads moved to the pool, lists a
+directory of a thousand empty files: opened through the ring, its entries
+read in batches on the blocking pool and every entry taken, against
+`tokio::fs::read_dir`. `resolve` resolves `("127.0.0.1", 80)` through
+`lookup_host`, which parses it, so the step costs no lookup and no pool on
+either runtime and guards the literal path. Medians of five runs taken in
+turns: `read dir` 6k listings a second on ruio and 3k on tokio, 2.4×, and
+`resolve` 27M against 21M. A listing on ruio is some 170 µs, of which the
+kernel's `getdents64` of the thousand entries is 114, measured apart with
+the bare system calls, and taking the thousand entries, an `OsString` and a
+reference to the directory each, most of the rest; tokio's reader spawns a
+job for every 32 entries and allocates each entry twice. At ten thousand
+entries, ten batches, ruio lists in 1.54 ms where the synchronous
+`std::fs::read_dir` takes 1.92 and the bare system calls 1.34: the pool
+reads a batch while the task takes the entries of the one before, so the
+task's work hides behind the kernel's.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -2059,8 +2098,17 @@ Since M7:
   being one allocation handed over through one word of state; a round trip
   makes 2.9× tokio's, and 858k a second with the pool and the runtime
   spinning (see [Executor](#executor) and [The runtime
-  itself](#the-runtime-itself)). Name lookups and `read_dir` still run on
-  the thread; moving them onto the pool is to come.
+  itself](#the-runtime-itself)).
+- Nothing blocks the runtime's thread any more: `TcpStream::connect` takes
+  `net::ToSocketAddrs`, which resolves a literal at once with no
+  allocation and a host name on the blocking pool, `lookup_host` resolves
+  for anything else, and `ReadDir` reads its batches on the pool and
+  ahead, two buffers taking turns, so a task that takes the entries as
+  they come waits for the pool once; `JoinSet::spawn_blocking` collects
+  blocking jobs as tasks. A thousand entries list 2.4× as fast as through
+  tokio's reader, and ten thousand faster than the standard library lists
+  them synchronously (see [Networking](#networking), [Files](#files) and
+  [The runtime itself](#the-runtime-itself)).
 
 ## Open questions
 

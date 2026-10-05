@@ -115,9 +115,13 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   unbounded channels 4.7 times, through broadcast channels 3.1 and through
   watch channels 4.0, two tasks meet at a barrier 6.3 times as often,
   arming a wait for a cancellation token and dropping it runs 2.3 times as
-  fast as tokio-util's, and a closure sent to the blocking pool and its
-  output awaited make 2.9 times the round trips of tokio's `spawn_blocking`,
-  858k a second with the pool and the runtime spinning.
+  fast as tokio-util's, a closure sent to the blocking pool and its output
+  awaited make 2.9 times the round trips of tokio's `spawn_blocking`, 858k
+  a second with the pool and the runtime spinning, and a directory of a
+  thousand entries lists 2.4 times as fast as through `tokio::fs::read_dir`.
+  Nothing blocks the runtime's thread: host names resolve and directories
+  are read on the blocking pool, directories read ahead so that a task
+  taking the entries waits for the pool once.
 
 ## Development
 
