@@ -27,6 +27,9 @@ pub(crate) struct Load {
     pub(crate) measure: Duration,
     /// The CPU to run on.
     pub(crate) cpu: usize,
+    /// Whether the reads are polled: ruio's on its polled ring, and fio's
+    /// with `hipri`, both `IORING_SETUP_IOPOLL`.
+    pub(crate) polled: bool,
 }
 
 /// The size of the file or device at `path`.
@@ -49,7 +52,8 @@ impl Rng {
 
 /// Reads with ruio: a task per outstanding read, each reading a block at a
 /// random offset into a registered buffer, again and again, from a file
-/// opened for direct I/O as a direct descriptor. Returns reads per second.
+/// opened for direct I/O as a direct descriptor, or for polled I/O, which
+/// takes a plain one. Returns reads per second.
 pub(crate) fn ruio(load: &Load) -> io::Result<f64> {
     sys::pin(&[load.cpu])?;
     let blocks = size(&load.path)? / load.block as u64;
@@ -66,7 +70,8 @@ pub(crate) fn ruio(load: &Load) -> io::Result<f64> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
-            .direct_descriptor(true)
+            .direct_descriptor(!load.polled)
+            .polled(load.polled)
             .open(&load.path)
             .await?;
         let file = Rc::new(file);
@@ -129,9 +134,9 @@ pub(crate) fn check_direct_io(path: &Path, block: usize) -> io::Result<()> {
 
 /// Reads with fio's io_uring engine, at its best: registered buffers and
 /// files, as ruio's reader has; no latency statistics (`gtod_reduce`),
-/// which ruio's does not gather either; and reads submitted in batches of up
-/// to 32, where by default fio enters the kernel for every one. Returns
-/// reads per second.
+/// which ruio's does not gather either; reads submitted in batches of up
+/// to 32, where by default fio enters the kernel for every one; and polled
+/// (`hipri`) for a polled load. Returns reads per second.
 pub(crate) fn fio(fio: &str, load: &Load) -> Result<f64, String> {
     let secs = |duration: Duration| format!("{}ms", duration.as_millis());
     let output = Command::new(fio)
@@ -139,6 +144,7 @@ pub(crate) fn fio(fio: &str, load: &Load) -> Result<f64, String> {
         .arg(format!("--filename={}", load.path.display()))
         .args(["--ioengine=io_uring", "--direct=1", "--rw=randread"])
         .args(["--fixedbufs=1", "--registerfiles=1", "--gtod_reduce=1"])
+        .arg(format!("--hipri={}", u8::from(load.polled)))
         .args(["--norandommap", "--randrepeat=0", "--numjobs=1"])
         // Nothing to drop from a cache for direct reads.
         .arg("--invalidate=0")

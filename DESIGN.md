@@ -1157,10 +1157,12 @@ runtimes on several cores fare is under
 
 `ruio-bench randread PATH` compares 4 KiB random reads with direct I/O
 against the io_uring engine of fio 3.43, each in a process of its own pinned
-to the same CPU, three runs each in turns, and reports the medians. The
-device is the kernel's null block device (`null_blk`, 16 GiB, 4 KiB blocks,
-completing reads inline with `irqmode=0`), which moves no data, so what the
-comparison measures is what each spends per read. fio runs at its best:
+to the same CPU, three runs each in turns, and reports the medians; with
+`--polled` both sides poll the device for completions instead of waiting
+for its interrupts (below). The device is the kernel's null block device
+(`null_blk`, 16 GiB, 4 KiB blocks, completing reads inline with
+`irqmode=0`), which moves no data, so what the comparison measures is what
+each spends per read. fio runs at its best:
 registered buffers and files, no latency statistics (`gtod_reduce`), and
 reads submitted up to 32 at a time; by default it enters the kernel for every
 read, and reads about 1.3M a second whatever the depth. ruio's reader runs a
@@ -1240,6 +1242,71 @@ The table is from after the plug batches, with fio 3.43 built from source.
 The host was shared with other work, which both sides of the comparison
 share; its load was between 2 and 5 as the table was measured. Two runs
 while it was higher, up to 19, put ruio 9% to 29% ahead.
+
+Polled I/O (`IORING_SETUP_IOPOLL`; see [Kernel features](#kernel-features))
+spares each read its interrupt and the softirq that completes it: the
+thread that submitted the read finds it done by asking the device, in the
+same entry into the kernel when the device is as quick as this one. For
+this comparison the device is loaded with a poll queue beside its one
+submit queue and completing through a softirq otherwise
+(`null_blk nr_devices=1 queue_mode=2 irqmode=1 gb=16 bs=4096 memory_backed=0
+submit_queues=1 poll_queues=1 hw_queue_depth=1024`), so that a polled read
+completes only in `null_poll` and an unpolled one only through the softirq.
+`ruio-bench randread PATH --polled` runs ruio's reader on a file opened
+with `OpenOptions::polled`, a plain descriptor installed into the polled
+ring's file table, with the same registered buffers, against fio with
+`hipri=1`, its own polled mode, with registered buffers and files as
+before. Reads per second on the same host, Linux 7.0, CPU 28, with ruio and
+fio in turns, 5 s runs after 1 s of warm-up; medians of three runs, and of
+five at depth 64, whose first three had fio at 2.10M in one of them, with
+the host's load between 4 and 9; the ratios are ruio against fio, and ruio
+polled against fio polled:
+
+| Depth | fio | fio `--hipri` | ruio | ruio polled |
+|---:|---:|---:|---:|---:|
+| 1 | 1.26M | 1.22M | 1.41M (1.12×) | 1.44M (1.18×) |
+| 4 | 1.78M | 1.96M | 2.04M (1.14×) | 2.23M (1.14×) |
+| 16 | 2.21M | 2.43M | 2.43M (1.10×) | 2.67M (1.10×) |
+| 32 | 2.36M | 2.58M | 2.62M (1.11×) | 2.90M (1.13×) |
+| 64 | 2.37M | 2.58M | 2.65M (1.12×) | 2.89M (1.12×) |
+| 128 | 2.37M | 2.61M | 2.55M (1.08×) | 2.90M (1.11×) |
+
+Polling gains ruio 9% to 14% from depth 4 up, 2.04M to 2.23M at depth 4
+and 2.55M to 2.90M at 128, and 2% at depth 1, where each read is a turn of
+the loop whichever way it completes; it gains fio 9% to 10% from depth 4
+up and nothing at depth 1. ruio polled stays ahead of fio polled at every
+depth, by 10% to 18%, as ruio is ahead of fio by 8% to 14%. Three things
+were measured on the way, each as medians of three runs of 2 s of ruio's
+reader alone, in turns with the variant it is compared with:
+
+- The polled ring's file table. Without it a polled file is a plain
+  descriptor, which the kernel looks up, and takes and drops a reference
+  to, on every read; with the table the open installs the descriptor into
+  a slot there, as fio's `registerfiles` does, and the reads name the
+  slot. The non-polled reader with plain descriptors in place of direct
+  ones read 2% fewer at depth 1 (1.40M to 1.43M) and 4% to 5% fewer at
+  depth 32 and 128 (2.53M to 2.65M, 2.52M to 2.64M); the polled reader
+  with plain descriptors, measured against fio polled in three runs of 5 s
+  before the table was added, read 1.44M, 2.15M, 2.55M, 2.72M, 2.75M and
+  2.79M at the six depths, 4% to 7% less than with it from depth 4 up.
+- `IORING_SETUP_HYBRID_IOPOLL` (6.13), which sleeps, before polling for a
+  request, for half the time the ring has seen a request take, so that a
+  slow device does not cost a spinning CPU. On this device, which has
+  completed before the poll begins, the sleep is pure cost: 436k reads a
+  second against 1.43M at depth 1, 1.78M against 2.77M at depth 32 and
+  1.61M against 2.74M at depth 128. The polled ring is set up without it;
+  a device slow enough for the sleep to pay would want a measurement of
+  its own.
+- How a park waits with polled reads in flight. The benchmark's own
+  measuring sleep keeps the wake timer armed, so its parks poll a pass at
+  a time and look at the main ring between passes; forced to wait inside
+  the kernel instead (one entry until a completion), or to poll a pass at
+  a time whatever is in flight, the reader measured the same within 1% at
+  depth 1, 32 and 128 (1.43M, 1.44M and 1.45M at depth 1). The null block
+  device completes a read in the pass that follows its submission, so
+  every policy takes one entry per turn there; they part on a device with
+  latency, where the kernel's wait spins without entries and the passes
+  cost one each.
 
 ### Scaling across cores
 

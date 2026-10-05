@@ -34,8 +34,9 @@
 //! on a file or block device: for each queue depth, ruio's reader and fio's
 //! io_uring engine each run in a process of their own on the same CPU, with
 //! registered buffers and files, in turns; fio submits in batches, at its
-//! best. The report gives reads per second
-//! and how ruio's compare.
+//! best. With `--polled` both poll the device for completions rather than
+//! wait for its interrupts: ruio's reader on its polled ring, fio with
+//! `hipri`. The report gives reads per second and how ruio's compare.
 //!
 //! The server and the load generator also run on their own:
 //!
@@ -83,8 +84,8 @@ const USAGE: &str =
                      [--server-cpu N] [--client-cpus LIST]
        ruio-bench http-server ruio|ruio-pool|tokio ADDR [--cpu N] [--buffers N]
        ruio-bench http-client ADDR [--connections N] [--seconds S] [--warmup S] [--cpus LIST]
-       ruio-bench randread PATH [--depths LIST] [--block BYTES] [--runs N] [--seconds S] \
-                     [--warmup S] [--cpu N] [--fio FIO]
+       ruio-bench randread PATH [--polled] [--depths LIST] [--block BYTES] [--runs N] \
+                     [--seconds S] [--warmup S] [--cpu N] [--fio FIO]
        ruio-bench scale [--cores LIST] [--connections N] [--size BYTES] [--runs N] \
                      [--seconds S] [--warmup S]
        ruio-bench scale-run ruio|tokio [--cores N] [--connections N] [--size BYTES] \
@@ -123,7 +124,7 @@ struct Options {
 
 impl Options {
     /// Options that take no value.
-    const FLAGS: &[&str] = &["quick"];
+    const FLAGS: &[&str] = &["quick", "polled"];
 
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut options = Self {
@@ -193,11 +194,13 @@ fn read_load(options: &Options, depth: usize) -> Result<randread::Load, String> 
         warmup: options.duration("warmup", 1.0)?,
         measure: options.duration("seconds", 5.0)?,
         cpu: options.get("cpu", 0)?,
+        polled: options.flag("polled"),
     })
 }
 
 /// Compares ruio's random reads with fio's, each in a process of its own on
-/// the same CPU, run by run in turns, for each queue depth.
+/// the same CPU, run by run in turns, for each queue depth; polled on both
+/// sides with `--polled`.
 fn randread(options: &Options) -> Result<(), String> {
     let exe = env::current_exe().map_err(|err| err.to_string())?;
     let fio: String = options.get("fio", "fio".to_owned())?;
@@ -207,14 +210,19 @@ fn randread(options: &Options) -> Result<(), String> {
     let load = read_load(options, 1)?;
     randread::check_direct_io(&load.path, load.block)
         .map_err(|err| format!("{} does not take direct I/O: {err}", load.path.display()))?;
+    let (how, fio_column, ruio_column) = if load.polled {
+        ("direct and polled", "fio --hipri", "ruio polled")
+    } else {
+        ("direct", "fio", "ruio")
+    };
     println!(
-        "{} B random reads of {}, direct, on CPU {}: reads per second, medians of {runs} runs.",
+        "{} B random reads of {}, {how}, on CPU {}: reads per second, medians of {runs} runs.",
         load.block,
         load.path.display(),
         load.cpu
     );
     println!();
-    println!("| depth | fio | ruio |");
+    println!("| depth | {fio_column} | {ruio_column} |");
     println!("|---:|---:|---:|");
     for depth in depths {
         let load = read_load(options, depth)?;
@@ -237,14 +245,19 @@ fn randread(options: &Options) -> Result<(), String> {
 
 /// Runs ruio's reader in a process of its own, and returns its rate.
 fn read_child(exe: &Path, load: &randread::Load) -> Result<f64, String> {
-    let output = Command::new(exe)
+    let mut reader = Command::new(exe);
+    reader
         .arg("randread-ruio")
         .arg(&load.path)
         .args(["--depth", &load.depth.to_string()])
         .args(["--block", &load.block.to_string()])
         .args(["--warmup", &load.warmup.as_secs_f64().to_string()])
         .args(["--seconds", &load.measure.as_secs_f64().to_string()])
-        .args(["--cpu", &load.cpu.to_string()])
+        .args(["--cpu", &load.cpu.to_string()]);
+    if load.polled {
+        reader.arg("--polled");
+    }
+    let output = reader
         .output()
         .map_err(|err| format!("could not run the reader: {err}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
