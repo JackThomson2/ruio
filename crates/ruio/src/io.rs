@@ -14,7 +14,9 @@
 //! futures that run the type's own future again until the buffer is done
 //! with, each polled where it lies. [`copy`] moves everything a reader has
 //! to a writer with two buffers, the next read in flight while a write
-//! runs, so that the writer and the reader keep each other busy.
+//! runs, so that the writer and the reader keep each other busy; [`splice`]
+//! moves everything one descriptor has to another through a pipe in the
+//! kernel, with no buffer in user space at all.
 //!
 //! A stream socket's own `read_exact` and `write_all` stay what they are,
 //! with their linked timeouts and `MSG_WAITALL`: a method call on a stream
@@ -45,6 +47,10 @@ use ruio_driver::ops::{self, Read, Recv, Write};
 
 use crate::fs::{File, FileOp};
 use crate::net::{SocketOp, TcpStream, UnixStream};
+
+mod splice;
+
+pub use splice::{Splice, Spliceable, splice};
 
 /// How many bytes each of [`copy`]'s two buffers holds.
 const COPY_BUF: usize = 64 << 10;
