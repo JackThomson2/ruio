@@ -23,6 +23,7 @@ use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
 
 mod barrier;
 pub mod broadcast;
+mod cancel;
 pub mod local;
 pub mod mpsc;
 mod mutex;
@@ -34,6 +35,7 @@ mod waker_slot;
 pub mod watch;
 
 pub use barrier::{Barrier, BarrierWaitResult, Wait};
+pub use cancel::{CancellationToken, DropGuard, WaitForCancellation, WaitForCancellationOwned};
 pub use mutex::{Mutex, MutexGuard};
 pub use notify::{Notified, Notify};
 pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
