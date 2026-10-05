@@ -16,7 +16,10 @@
 //! to a writer with two buffers, the next read in flight while a write
 //! runs, so that the writer and the reader keep each other busy; [`splice`]
 //! moves everything one descriptor has to another through a pipe in the
-//! kernel, with no buffer in user space at all.
+//! kernel, with no buffer in user space at all. [`AsyncFd`] wraps any other
+//! descriptor, a timer, an inotify instance, a device, so that a task can
+//! wait for it to be ready, once or again and again, and read and write it
+//! through the ring.
 //!
 //! A stream socket's own `read_exact` and `write_all` stay what they are,
 //! with their linked timeouts and `MSG_WAITALL`: a method call on a stream
@@ -48,8 +51,10 @@ use ruio_driver::ops::{self, Read, Recv, Write};
 use crate::fs::{File, FileOp};
 use crate::net::{SocketOp, TcpStream, UnixStream};
 
+mod async_fd;
 mod splice;
 
+pub use async_fd::{AsyncFd, FdOp, Readiness, Ready};
 pub use splice::{Splice, Spliceable, splice};
 
 /// How many bytes each of [`copy`]'s two buffers holds.
