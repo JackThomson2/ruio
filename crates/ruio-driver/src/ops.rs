@@ -28,6 +28,7 @@ use crate::{Completion, Descriptor, DirectFd, Driver, Fd, MultiOp, Multishot, Op
 
 mod fs;
 mod net;
+mod splice;
 
 pub(crate) use fs::CloseSlot;
 pub use fs::{
@@ -37,6 +38,7 @@ pub use net::{
     Accept, AcceptMulti, AcceptStream, Connect, Recv, RecvFrom, Send, SendTo, SendVectored, SendZc,
     Shutdown, Socket,
 };
+pub use splice::{PollAdd, Splice, Tee};
 
 /// Where an operation that makes a file puts it.
 #[derive(Clone, Copy, Debug)]
