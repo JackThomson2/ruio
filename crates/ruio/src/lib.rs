@@ -71,6 +71,7 @@ pub use ruio_driver::buf;
 pub mod fs;
 pub mod io;
 pub mod net;
+pub mod signal;
 
 /// The io_uring driver: operations, the futures that run them, and the types
 /// for writing new ones, down to the kernel's own structures in
