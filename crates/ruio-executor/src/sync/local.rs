@@ -28,22 +28,22 @@ use std::task::Waker;
 pub mod mpsc;
 pub mod oneshot;
 
-/// The waker of the one task that waits on a channel, kept across its
-/// waits and woken by reference.
+/// The waker of the one task that waits on a channel, or on a set of
+/// tasks, kept across its waits and woken by reference.
 ///
 /// The waker is kept once registered, so that a task that waits again
 /// clones nothing, and is woken by reference, so that waking it gives
 /// nothing up. A waker's clone, drop and wake can each run any code, so
 /// none is called while the cell is borrowed: the waker is taken out for
 /// its wake, and put back after, unless the wake registered another.
-struct WakerCell {
+pub(crate) struct WakerCell {
     /// Whether the task waits to be woken.
     waiting: Cell<bool>,
     waker: RefCell<Option<Waker>>,
 }
 
 impl WakerCell {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             waiting: Cell::new(false),
             waker: RefCell::new(None),
@@ -53,7 +53,7 @@ impl WakerCell {
     /// Asks for `waker` to be woken by the next [`wake`](Self::wake). The
     /// caller then looks again for what it waits for, as cloning a waker
     /// can run any code.
-    fn register(&self, waker: &Waker) {
+    pub(crate) fn register(&self, waker: &Waker) {
         self.waiting.set(true);
         if self
             .waker
@@ -70,7 +70,7 @@ impl WakerCell {
     }
 
     /// Wakes the registered waker, if its task waits.
-    fn wake(&self) {
+    pub(crate) fn wake(&self) {
         if !self.waiting.replace(false) {
             return;
         }

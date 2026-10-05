@@ -4,7 +4,8 @@
 //! io_uring [`Driver`] for their I/O. [`Runtime::block_on`] runs a future to
 //! completion; meanwhile [`spawn`] adds tasks, which run on the same thread
 //! and need not be `Send`. A task is a single allocation holding its future
-//! and, once it finishes, its output, which its [`JoinHandle`] awaits.
+//! and, once it finishes, its output, which its [`JoinHandle`] awaits; a
+//! [`JoinSet`] holds many tasks, and gives their outputs as they finish.
 //!
 //! [`Cores`] runs a runtime on each of several CPUs, each on a thread pinned
 //! to its CPU: thread per core. [`spawn_on`] sends a `Send` future from one
@@ -42,6 +43,7 @@ mod context;
 mod coop;
 mod cores;
 mod handle;
+mod join_set;
 mod runtime;
 mod scheduler;
 pub mod sync;
@@ -55,6 +57,7 @@ use std::task::Poll;
 
 pub use cores::{Core, Cores, core, core_count, handle_of, spawn_on};
 pub use handle::{Handle, RemoteJoinHandle};
+pub use join_set::JoinSet;
 pub use ruio_driver::Driver;
 pub use runtime::{Builder, Runtime};
 pub use task::{AbortHandle, JoinError, JoinHandle};

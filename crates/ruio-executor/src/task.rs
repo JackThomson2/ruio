@@ -1026,6 +1026,20 @@ impl<T> JoinHandle<T> {
             task: self.task.clone(),
         }
     }
+
+    /// The result of the task if it has finished, polled with a budget of
+    /// its own: for a set that collects the task, which knows it has
+    /// finished and spends a step of its own task's budget for the whole.
+    pub(crate) fn finished_output(&mut self) -> Option<Result<T, JoinError>> {
+        if !self.is_finished() {
+            return None;
+        }
+        let poll = coop::budgeted(|| Pin::new(self).poll(&mut Context::from_waker(Waker::noop())));
+        match poll {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        }
+    }
 }
 
 impl<T> Future for JoinHandle<T> {
