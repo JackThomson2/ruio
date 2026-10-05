@@ -10,9 +10,53 @@ use std::thread;
 
 use ruio_driver::Driver;
 use ruio_driver::buf::{BufLease, BufPool};
-use ruio_driver::ops::RecvStream;
+use ruio_driver::ops::{RecvMulti, RecvStream};
 
 use support::{Counter, block_on, settle};
+
+/// A restarted request yields the data posted before the cancellation
+/// reached it, not the cancellation itself, and is armed again for what
+/// comes after, so that nothing is lost.
+#[test]
+fn a_restarted_request_loses_nothing() {
+    let driver = Driver::new().unwrap();
+    let pool = BufPool::new(&driver, 8, 16).unwrap();
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    let mut stream = driver.stream(RecvMulti::new(socket.as_raw_fd(), &pool));
+    peer.write_all(b"first").unwrap();
+    let first = block_on(&driver, stream.next()).unwrap().unwrap().unwrap();
+    assert_eq!(first.to_vec(), b"first");
+    assert!(stream.is_armed());
+
+    // Posted before the cancellation is even queued.
+    peer.write_all(b"second").unwrap();
+    driver.submit().unwrap();
+    let before = driver.stats().operations;
+    stream.restart();
+    stream.restart();
+    assert_eq!(driver.stats().operations - before, 1, "one cancellation");
+    let second = block_on(&driver, stream.next()).unwrap().unwrap().unwrap();
+    assert_eq!(second.to_vec(), b"second");
+    assert!(stream.is_armed());
+
+    // Arrives while the cancellation is on its way, or once the request is
+    // armed again: either way it comes, and the cancellation's own
+    // completion does not.
+    peer.write_all(b"third").unwrap();
+    let third = block_on(&driver, stream.next()).unwrap().unwrap().unwrap();
+    assert_eq!(third.to_vec(), b"third");
+    assert!(stream.is_armed());
+    assert_eq!(
+        driver.stats().operations - before,
+        2,
+        "the request was submitted again"
+    );
+    drop(peer);
+    assert!(block_on(&driver, stream.next()).unwrap().unwrap().is_none());
+    assert!(block_on(&driver, stream.next()).is_none(), "ended for good");
+    drop((first, second, third));
+    assert_eq!(pool.available(), 8);
+}
 
 /// The byte at position `index` of the test data.
 fn pattern(index: usize) -> u8 {
@@ -271,9 +315,15 @@ fn no_data_is_lost_across_many_rearms() {
 
     let mut stream = RecvStream::new(&driver, socket.as_raw_fd(), &pool);
     let mut received = Vec::with_capacity(TOTAL);
+    // A buffer of each bundle is kept until the next arrives, so that the
+    // kernel keeps finding a single buffer in the ring, and takes the last.
+    let mut held = None;
     while let Some(bundle) = block_on(&driver, stream.next()) {
-        received.extend(bundle.unwrap().to_vec());
+        let bundle = bundle.unwrap();
+        received.extend(bundle.to_vec());
+        held = bundle.into_iter().next();
     }
+    drop(held);
     producer.join().unwrap();
 
     assert_eq!(received.len(), TOTAL);
@@ -283,10 +333,12 @@ fn no_data_is_lost_across_many_rearms() {
             .enumerate()
             .all(|(index, &byte)| byte == pattern(index))
     );
-    // Each submission after the first re-armed a receive the kernel ended.
+    // Each submission after the first re-armed a receive the kernel ended,
+    // or restarted one for another ask; how many there are depends on the
+    // producer's pace, so only that there was one is sure.
     let submissions = driver.stats().operations;
     assert!(
-        submissions >= 10,
+        submissions >= 2,
         "the receive was submitted {submissions} times"
     );
     assert_eq!(pool.available(), 2);

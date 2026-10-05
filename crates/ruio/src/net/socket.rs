@@ -852,11 +852,13 @@ pub struct RecvStream<'a> {
 }
 
 impl RecvStream<'_> {
-    /// Has each receive ask for `count` buffers' worth, for a stream whose
-    /// messages run to several buffers: such a message then takes the kernel
-    /// one call into the socket rather than two, where every receive walks
-    /// that many of the pool's entries; see [`ops::RecvMulti::buffers`]. Set
-    /// before the stream is first polled.
+    /// Takes the messages to run to `count` buffers from the start, for a
+    /// stream whose messages are known to be large. The stream otherwise
+    /// learns that from the messages themselves, and while the thread waits
+    /// on one peer at a time asks each receive for a buffer less, so that
+    /// the kernel hands over all but a message's last buffer before the
+    /// rest; see [`ops::RecvMulti::buffers`]. Set before the stream is
+    /// first polled.
     pub fn buffers(mut self, count: u32) -> Self {
         self.stream = self.stream.buffers(count);
         self

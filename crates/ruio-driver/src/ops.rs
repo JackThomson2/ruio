@@ -92,6 +92,39 @@ unsafe impl Operation for Nop {
     }
 }
 
+/// Cancels a request in flight, named by its `user_data`: an
+/// `IORING_OP_ASYNC_CANCEL`. Completes with `Ok(())` once the request is on
+/// its way out, `ENOENT` if none by that name is in flight, or `EALREADY`
+/// if it is finishing already.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Cancel {
+    target: u64,
+}
+
+impl Cancel {
+    /// Cancels the request whose `user_data` is `target`.
+    pub(crate) fn new(target: u64) -> Self {
+        Self { target }
+    }
+}
+
+// SAFETY: a cancellation points to no memory, naming its target by value,
+// and posts one completion.
+unsafe impl Operation for Cancel {
+    type Output = io::Result<()>;
+
+    #[inline]
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_ASYNC_CANCEL;
+        sqe.addr = self.target;
+    }
+
+    #[inline]
+    fn complete(self, completion: Completion) -> io::Result<()> {
+        completion.result().map(drop)
+    }
+}
+
 /// Completes once a duration has passed on the kernel's monotonic clock.
 #[derive(Debug)]
 pub struct Timeout {
@@ -435,10 +468,35 @@ fn pooled_data(completion: Completion, lease: Option<BufLease>) -> io::Result<Op
 pub struct RecvMulti {
     fd: Fd,
     pool: BufPool,
-    /// How many buffers' worth each receive asks the kernel to map; see
-    /// [`RecvMulti::buffers`].
-    buffers: u32,
+    /// How many buffers the largest message seen took: 1 until one spans
+    /// more; see [`RecvMulti::buffers`].
+    message: u32,
+    /// The buffers of the message under way that the receives before this
+    /// one took: each filled its whole ask with more waiting, so the message
+    /// goes on in the next.
+    carry: u32,
+    /// Whether the thread waits on one peer at a time, so that the ask is a
+    /// buffer short of the message, and the kernel hands over a message's
+    /// first part before the rest.
+    split: bool,
+    /// How much the thread has lately looked to be waiting on one peer at
+    /// a time, between `-STREAK` and [`STREAK`]: an item from a turn that
+    /// delivered one completion counts two towards it, one from a turn that
+    /// delivered more counts one against.
+    quiet: i8,
+    /// The ask the request was last prepared with, in buffers, and in bytes
+    /// as the entry's `len`; 0 leaves it to the kernel.
+    asked: u32,
+    asked_len: u32,
 }
+
+/// How far `quiet` runs before a receive splits its messages, or stops: a
+/// split message costs a completion and a send more, and a quiet thread's
+/// turns then deliver the send's own completion with the next data, which
+/// must not undo the split; so quiet turns weigh twice as much as busy
+/// ones, and the split holds while more than a third of the turns are
+/// quiet.
+const STREAK: i8 = 8;
 
 impl RecvMulti {
     /// Receives from `fd` into `pool`.
@@ -446,12 +504,17 @@ impl RecvMulti {
         Self {
             fd: fd.into(),
             pool: pool.clone(),
-            buffers: 1,
+            message: 1,
+            carry: 0,
+            split: false,
+            quiet: 0,
+            asked: 0,
+            asked_len: 0,
         }
     }
 
-    /// Has each receive ask for `count` buffers' worth, where it asks for
-    /// one unless set.
+    /// Takes the messages to run to `count` buffers from the start, where
+    /// the stream otherwise learns that from the messages themselves.
     ///
     /// The kernel maps the buffers of a receive before it knows how much is
     /// waiting: asked for one buffer's worth, it maps one, and a message of
@@ -465,13 +528,39 @@ impl RecvMulti {
     /// fills the whole ask is capped (`IORING_RECV_MSHOT_CAP`): the kernel
     /// appends no more to it and queues the request again for the rest, so
     /// an ask smaller than the messages costs each a completion and a
-    /// requeue. So the ask is for a stream whose messages run to several
-    /// buffers: four, say, for messages of four buffers' worth. A pool the
-    /// kernel consumes incrementally takes from a buffer what the data
-    /// fills, and asks for nothing whatever this is set to.
+    /// requeue.
+    ///
+    /// So the ask is left to the kernel, which takes a message of several
+    /// buffers' worth in two calls, as long as the thread is busy: asking
+    /// for the whole message instead gains nothing measurable, as the
+    /// second call costs little next to the copies. While the thread waits
+    /// on one peer at a time, which the ring's turns delivering one
+    /// completion each tell (`Driver::completions_last_turn`), the ask is a
+    /// buffer short of the largest message seen, counting a capped receive
+    /// and the one that takes the rest as one message: the kernel then hands
+    /// over all but the last buffer of a message as soon as it has them,
+    /// and the last on its own, so that a task answering the message has
+    /// most of it while the kernel still copies the rest, as it would with
+    /// a peer that sends as it goes; a connection echoing 64 KiB messages
+    /// gains a fifth that way. Under load the split would cost each message
+    /// a completion and a send, so the ask goes back to the kernel's then.
+    /// Each change of the ask submits the request again (see
+    /// [`Multishot::changed`]). A pool the kernel consumes incrementally
+    /// takes from a buffer what the data fills, and asks for nothing
+    /// whatever the messages.
     pub fn buffers(mut self, count: u32) -> Self {
-        self.buffers = count.max(1);
+        self.message = self.message.max(count);
         self
+    }
+
+    /// The ask, in buffers, for the messages seen and the load: 0 leaves it
+    /// to the kernel.
+    fn ask(&self) -> u32 {
+        if self.split && self.message > 1 {
+            self.message - 1
+        } else {
+            0
+        }
     }
 }
 
@@ -482,8 +571,16 @@ unsafe impl Multishot for RecvMulti {
     type Item = io::Result<Option<BufBundle>>;
 
     /// The entry's `len` is how much the kernel maps for a receive before it
-    /// knows how much is waiting, which 0 leaves at one buffer; see
-    /// [`RecvMulti::buffers`].
+    /// knows how much is waiting, and caps a receive at; 0 leaves it to the
+    /// kernel, which maps one buffer and appends what it then finds
+    /// waiting. See [`RecvMulti::buffers`].
+    ///
+    /// A capped receive is first issued only once the socket polls readable
+    /// (`IORING_RECVSEND_POLL_FIRST`). Issued at submission while data
+    /// waits, a receive the cap stops short goes on by arming poll, and with
+    /// a peer still writing that has been seen to miss the wake-up, leaving
+    /// the request armed and silent for good; issued from poll it goes on by
+    /// queueing itself again, which does not.
     #[inline]
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
         sqe.opcode = sys::IORING_OP_RECV;
@@ -491,9 +588,13 @@ unsafe impl Multishot for RecvMulti {
         sqe.ioprio = sys::IORING_RECV_MULTISHOT | sys::IORING_RECVSEND_BUNDLE;
         sqe.flags |= sys::IOSQE_BUFFER_SELECT;
         sqe.buf_index = self.pool.group();
-        if self.buffers > 1 && !self.pool.is_incremental() {
+        self.asked = self.ask();
+        self.asked_len = 0;
+        if self.asked > 0 && !self.pool.is_incremental() {
             let size = u32::try_from(self.pool.buffer_size()).unwrap_or(u32::MAX);
-            sqe.len = size.saturating_mul(self.buffers);
+            self.asked_len = size.saturating_mul(self.asked);
+            sqe.len = self.asked_len;
+            sqe.ioprio |= sys::IORING_RECVSEND_POLL_FIRST;
         }
     }
 
@@ -501,12 +602,51 @@ unsafe impl Multishot for RecvMulti {
     fn item(&mut self, completion: Completion) -> Self::Item {
         // Taken before looking at the result, as for `ReadPooled`.
         let bundle = self.pool.bundle(completion.flags(), completion.res());
+        if let Some(bundle) = &bundle
+            && !self.pool.is_incremental()
+        {
+            // A pool consumed incrementally hands out parts of a buffer,
+            // which say nothing of the messages.
+            let filled = u32::try_from(bundle.buffers()).unwrap_or(u32::MAX);
+            let capped = self.asked_len > 0 && completion.res().unsigned_abs() >= self.asked_len;
+            let more = completion.flags() & sys::IORING_CQE_F_SOCK_NONEMPTY != 0;
+            if capped && more {
+                // The message goes on in the next receive.
+                self.carry = self.carry.saturating_add(filled);
+            } else {
+                // No message takes more buffers than the pool holds.
+                let count = u32::try_from(self.pool.count()).unwrap_or(u32::MAX);
+                let whole = self.carry.saturating_add(filled).min(count);
+                self.message = self.message.max(whole);
+                self.carry = 0;
+            }
+        }
         match completion.result()? {
             0 => Ok(None),
             _ => bundle
                 .map(Some)
                 .ok_or_else(|| io::Error::other("the kernel filled no pooled buffer")),
         }
+    }
+
+    #[inline]
+    fn changed(&mut self, driver: &Driver) -> bool {
+        // Messages that fit one buffer leave the ask to the kernel whatever
+        // the load, so there is nothing to weigh for them.
+        if self.message <= 1 || self.pool.is_incremental() {
+            return false;
+        }
+        self.quiet = if driver.completions_last_turn() <= 1 {
+            self.quiet.saturating_add(2).min(STREAK)
+        } else {
+            self.quiet.saturating_sub(1).max(-STREAK)
+        };
+        if self.quiet >= STREAK {
+            self.split = true;
+        } else if self.quiet <= -STREAK {
+            self.split = false;
+        }
+        self.ask() != self.asked
     }
 }
 
@@ -558,12 +698,15 @@ impl RecvStream {
         })
     }
 
-    /// Has each receive ask for `count` buffers' worth, for a stream whose
-    /// messages run to several buffers; see [`RecvMulti::buffers`]. Set
-    /// before the stream is first polled, which arms the receive.
+    /// Takes the messages to run to `count` buffers from the start, for a
+    /// stream whose messages are known to be large; the stream otherwise
+    /// learns that from the messages themselves, and sizes each receive's
+    /// ask by it while the thread waits on one peer at a time (see
+    /// [`RecvMulti::buffers`]). Set before the stream is first polled,
+    /// which arms the receive.
     pub fn buffers(mut self, count: u32) -> Self {
         if let Some(request) = self.inner.stream.get_mut() {
-            request.buffers = count.max(1);
+            request.message = request.message.max(count);
         }
         self
     }

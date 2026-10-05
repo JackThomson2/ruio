@@ -2,9 +2,10 @@
 
 mod support;
 
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write as _};
 use std::net::Shutdown;
-use std::sync::{Barrier, Mutex, OnceLock};
+use std::sync::{Barrier, Mutex, OnceLock, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use ruio::buf::BufPool;
@@ -165,6 +166,64 @@ async fn a_large_write_behind_goes_as_a_chain_while_idle() -> io::Result<()> {
     assert_eq!(driver.stats().operations - before, 4, "four sends");
     within(client.write_all(b"tail".to_vec())).await.0?;
     assert!(reader.await.unwrap()? == expected);
+    Ok(())
+}
+
+/// A stream whose messages span several buffers learns how many, and,
+/// while the thread waits on one peer at a time, asks the kernel for all
+/// but the last buffer of a message, so that it hands over the first part
+/// before the rest. The change of the ask submits the receive again, and
+/// loses nothing.
+#[ruio::test]
+async fn a_receive_asks_for_the_buffers_its_messages_take() -> io::Result<()> {
+    const ROUNDS: usize = 16;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    // The peer is another thread, as a server's peers are other processes:
+    // on this ring a message's completion then comes in a turn of its own,
+    // as the thread waits for it, where a peer on the same ring would have
+    // its send complete in the same turn.
+    let (answered, answers) = mpsc::channel::<()>();
+    let peer = thread::spawn(move || -> io::Result<()> {
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        for round in 0..ROUNDS {
+            stream.write_all(&pattern(4096, round))?;
+            if answers.recv().is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+    let (server, _) = within(listener.accept()).await?;
+    let driver = ruio::driver();
+    let pool = BufPool::new(&driver, 16, 1024)?;
+    let mut received = server.recv_stream(&pool);
+    let before = driver.stats().operations;
+    let mut shapes = Vec::new();
+    for round in 0..ROUNDS {
+        let message = pattern(4096, round);
+        let mut echo = Vec::new();
+        let mut shape = Vec::new();
+        while echo.len() < message.len() {
+            // Awaited bare: a timeout's timer would be a completion too.
+            let data = received.next().await.unwrap()?;
+            shape.push(data.buffers());
+            echo.extend(data.to_vec());
+        }
+        assert!(echo == message, "round {round}");
+        shapes.push(shape);
+        answered.send(()).unwrap();
+    }
+    peer.join().unwrap()?;
+    // The receive, and the receive submitted again, with its cancellation,
+    // once the turns delivering one completion each have shown the thread
+    // idle.
+    assert_eq!(driver.stats().operations - before, 1 + 2, "{shapes:?}");
+    assert_eq!(shapes[0], [4], "the first message comes whole");
+    // The kernel caps a receive at its ask (`IORING_RECV_MSHOT_CAP`), so
+    // messages then come as three buffers and one.
+    let (_, split) = shapes.split_at(8);
+    assert!(split.iter().all(|shape| shape == &[3, 1]), "{shapes:?}");
     Ok(())
 }
 
