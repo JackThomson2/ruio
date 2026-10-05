@@ -96,7 +96,9 @@ it is dropped. Three rules follow.
 3. **Shutdown drains the ring.** Dropping a driver cancels everything in
    flight and waits for the completions. Anything that has not completed
    within a bound (a regular-file read stuck in an io-wq worker, say) is
-   leaked, never freed, and only then is the ring closed.
+   leaked, never freed, and only then is the ring closed. The bound is a
+   second unless set, through `shutdown_timeout` on the driver's builder
+   and the runtime's, which `Cores::builder` takes for every core.
 
 Receives let the kernel choose the buffer from a provided-buffer ring
 (`BufPool`), so idle connections do not pin memory. A completed receive
@@ -584,7 +586,29 @@ baseline are used only when probed.
 - Panics in tasks are caught and reported through `JoinError`; the payload
   only leaves by value, so `JoinError` is `Send + Sync`. Dropping the runtime
   drops every unfinished future on its thread before the driver drains their
-  operations.
+  operations. A task's `JoinHandle` awaits its output, and an
+  `AbortHandle`, made of it, aborts the task without awaiting it: a second
+  local reference, counted in the same plain cell, so that making, cloning
+  and dropping one takes no atomic operation; dropping it neither aborts
+  nor detaches the task.
+- A `JoinSet` holds many tasks and gives their outputs as they finish.
+  Each task's future is wrapped in a reporter, which pushes the output into
+  the set's queue as the future completes, or, if the future is dropped
+  first, as an aborted or a panicking task's is, a note that the task ended
+  without one; the queue is on `Rc` and cells, like the channels for one
+  thread, and the task awaiting the set is woken by reference through the
+  same waker cell. So a task's finishing costs a push on a deque and
+  nothing atomic, the set allocates nothing for a task beyond the task
+  itself, and `join_next` pops the oldest output rather than polling every
+  task, where tokio's set keeps an atomically counted entry per task and
+  moves it between lists behind a mutex as it is woken. The set keeps each
+  task's join handle in a slab the reporter's note indexes, for aborting
+  the tasks and for the error of one that ended without an output, which
+  it takes from the handle with a budget of its own. In `ruio-bench micro`
+  spawning a task that does nothing into a set and taking its output runs
+  16.9M times a second against 19.3M for a spawn and its join, 13% over
+  it, where tokio's set costs 26% over tokio's spawn; ruio's set makes
+  10.2× the steps of tokio's (see [The runtime itself](#the-runtime-itself)).
 - Timers live in a hierarchical wheel in user space, with millisecond ticks.
   The kernel sees a single timeout, the ring's timer at the wheel's next
   deadline, which moves only for an earlier one: a thousand concurrent
@@ -1827,6 +1851,14 @@ a token and its work does with every turn:
   left set, spares, at the price of one lock for the one cancellation of
   a token that has been waited on.
 
+`join set`, added with the `JoinSet`, spawns a task that does nothing into
+a set and takes its output from it, as `spawn` spawns the task and awaits
+its handle; medians of five runs taken in turns: `spawn` 19.3M a second on
+ruio and 2.24M on tokio, `join set` 16.9M and 1.65M. The set costs ruio
+13% of a spawn, the reporter around the future, the push of the output and
+the wake, and the pop and the slab's bookkeeping as the output is taken,
+and tokio 26% of its; ruio's set runs 10.2× tokio's.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -1975,6 +2007,11 @@ Since M7:
   as fast as tokio-util's, which a slab for the waiters' wakers, in place
   of a map that allocated a node for each, took from 1.3× (see [The
   runtime itself](#the-runtime-itself)).
+- An `AbortHandle` aborts a task without its join handle, a `JoinSet`
+  gives tasks' outputs as they finish, at 13% over a spawn and 10.2×
+  tokio's set, and the runtime's builder sets the shutdown timeout, which
+  only the driver's did (see [Executor](#executor) and [The runtime
+  itself](#the-runtime-itself)).
 
 ## Open questions
 
