@@ -1,7 +1,8 @@
 //! The HTTP/1.1 benchmark's servers: hyper answering every request with a
-//! short plaintext response, on one thread, on ruio through its adapters
-//! and on tokio's current-thread runtime; and what the load generator sends
-//! and checks.
+//! short plaintext response, on one thread, on ruio through its adapters,
+//! which have hyper's own traits, and on tokio's current-thread runtime
+//! through hyper-util's `TokioIo`; and what the load generator sends and
+//! checks.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -34,9 +35,8 @@ const BUFFER_SIZE: u32 = 4096;
 /// An HTTP server implementation: hyper, on one thread, on a runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HttpServer {
-    /// ruio, hyper's I/O going through `ruio_compat::Compat` and
-    /// hyper-util's `TokioIo`, each connection receiving into a buffer of
-    /// its own.
+    /// ruio, hyper's I/O going through `ruio_compat::Compat`, which has
+    /// hyper's traits, each connection receiving into a buffer of its own.
     Ruio,
     /// The same, with the connections receiving into a shared pool.
     RuioPool,
@@ -110,10 +110,10 @@ fn ruio(addr: SocketAddr, buffers: Option<u16>) -> io::Result<()> {
                         continue;
                     }
                 };
-                let io = TokioIo::new(match &pool {
+                let io = match &pool {
                     Some(pool) => Compat::with_pool(pool, stream),
                     None => Compat::new(stream),
-                });
+                };
                 let _detached = ruio::spawn(async move {
                     let _ = http1::Builder::new()
                         .serve_connection(io, service_fn(hello))

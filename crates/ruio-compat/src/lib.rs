@@ -38,8 +38,11 @@
 //! Like the streams, an adapter belongs to its thread, whose runtime's ring
 //! runs its I/O.
 //!
-//! With the `hyper` feature, on by default, [`Timer`] gives hyper ruio's
-//! timers, which its timeouts need: that for reading a request's head, say.
+//! With the `hyper` feature, on by default, an adapter has hyper's own I/O
+//! traits, `hyper::rt::Read` and `Write`, so hyper serves it, or connects
+//! through it, as it is, with nothing between them; and [`Timer`] gives
+//! hyper ruio's timers, which its timeouts need: that for reading a
+//! request's head, say.
 //!
 //! ```no_run
 //! use ruio::net::TcpStream;
@@ -80,6 +83,8 @@ use ruio::uring::{Driver, Fd, Op, Operation};
 
 #[cfg(feature = "futures-io")]
 mod futures_impls;
+#[cfg(feature = "hyper")]
+mod hyper_impls;
 #[cfg(feature = "hyper")]
 mod timer;
 #[cfg(feature = "tokio")]

@@ -8,15 +8,14 @@
 //! curl --data-binary @Cargo.toml http://127.0.0.1:3000/echo
 //! ```
 //!
-//! hyper takes its I/O through traits of its own, which hyper-util's
-//! `TokioIo` gives to anything with tokio's traits, as `Compat` gives them
-//! to ruio's streams. Each connection is a task of its core, which need not
-//! be `Send`, and receives into a pool of the core's with a multishot
-//! receive, which costs the ring no request for each read. hyper reads
-//! what arrives at once, into buffers of its own, so a connection holds a
-//! buffer of the pool only while a request waits for hyper, except while
-//! hyper has stopped reading a request's body to send an echo that the
-//! client is slow to read.
+//! hyper takes its I/O through traits of its own, which `Compat` gives to
+//! ruio's streams, so hyper serves an adapter as it is. Each connection is a
+//! task of its core, which need not be `Send`, and receives into a pool of
+//! the core's with a multishot receive, which costs the ring no request for
+//! each read. hyper reads what arrives at once, into buffers of its own, so
+//! a connection holds a buffer of the pool only while a request waits for
+//! hyper, except while hyper has stopped reading a request's body to send
+//! an echo that the client is slow to read.
 //!
 //! hyper's timeouts take ruio's timers through `ruio_compat::Timer`: a
 //! client that takes longer than 30 seconds to send a request's head, the
@@ -29,7 +28,6 @@ use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use ruio::buf::BufPool;
 use ruio::net::TcpListener;
 use ruio_compat::{Compat, Timer};
@@ -77,7 +75,7 @@ async fn main() -> io::Result<()> {
         };
         // Responses go out as soon as they are written.
         stream.set_nodelay(true)?;
-        let io = TokioIo::new(Compat::with_pool(&pool, stream));
+        let io = Compat::with_pool(&pool, stream);
         let connection = http.serve_connection(io, service_fn(serve));
         let _detached = ruio::spawn(async move {
             if let Err(err) = connection.await {

@@ -1,8 +1,9 @@
-//! hyper serves HTTP/1.1 through the adapters, to hyper's own client through
-//! them too, and to a blocking client of the standard library's; and with
-//! ruio's timer, times out a request's head that is slow to come.
+//! hyper serves HTTP/1.1 through the adapters, which have hyper's own
+//! traits, to hyper's own client through them too, and to a blocking client
+//! of the standard library's; and with ruio's timer, times out a request's
+//! head that is slow to come.
 
-#![cfg(feature = "tokio")]
+#![cfg(feature = "hyper")]
 
 mod support;
 
@@ -16,7 +17,6 @@ use hyper::client::conn::http1 as client;
 use hyper::server::conn::http1 as server;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use ruio::buf::BufPool;
 use ruio::net::{TcpListener, TcpStream};
 use ruio_compat::Compat;
@@ -62,10 +62,10 @@ fn serve_with(
         let mut served = Vec::new();
         for _ in 0..connections {
             let stream = incoming.next().await.unwrap().unwrap();
-            let io = TokioIo::new(match &pool {
+            let io = match &pool {
                 Some(pool) => Compat::with_pool(pool, stream),
                 None => Compat::new(stream),
-            });
+            };
             served.push(ruio::spawn(
                 builder.serve_connection(io, service_fn(service)),
             ));
@@ -87,7 +87,7 @@ async fn connect(
     ruio::JoinHandle<Result<(), hyper::Error>>,
 )> {
     let stream = within(TcpStream::connect(addr)).await?;
-    let io = TokioIo::new(Compat::new(stream));
+    let io = Compat::new(stream);
     let (sender, connection) = within(client::handshake(io))
         .await
         .map_err(io::Error::other)?;
