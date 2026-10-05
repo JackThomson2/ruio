@@ -92,15 +92,19 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   ahead at every connection count; with one connection, a runtime that
   spins before it parks (`Builder::spin`) makes twice tokio's round trips,
   with half the tail latency.
-- **4 KiB `O_DIRECT` random reads**: 13% to 16% ahead of fio's io_uring
-  engine at every queue depth. It was within 5% of fio when first compared;
-  the runtime's own paths, and submitting reads 32 to an entry into the
-  kernel as a block plug takes them, made up the rest.
+- **4 KiB `O_DIRECT` random reads**: 8% to 14% ahead of fio's io_uring
+  engine at every queue depth, and polled, on a device with poll queues
+  (`OpenOptions::polled`), 10% to 18% ahead of fio's polled engine, reading
+  up to 14% more a second than through interrupts. It was within 5% of fio
+  when first compared; the runtime's own paths, and submitting reads 32 to
+  an entry into the kernel as a block plug takes them, made up the rest.
 - **Across cores**: linear up to 16 cores, and up to 96 within 8% of what
   the host gives a busy loop.
 - **hyper, HTTP/1.1**, one core, through the adapters, receiving into a
   pool: level with hyper on tokio with one connection, 1% to 8% ahead from
-  256 connections on, and 3% behind at 16.
+  256 connections on, and 3% behind at 16, where the difference is cache
+  lines the client's core hands the server's for each wake, not the
+  runtime's own work.
 - **The runtime itself** (`ruio-bench micro`): a task's turn of the loop, a
   spawn and its join, a timer armed and dropped, and a wake on the task's
   own thread cost no locked instruction. Against tokio's current-thread

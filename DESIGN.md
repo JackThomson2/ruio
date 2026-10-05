@@ -1833,6 +1833,26 @@ Since M7:
   messages take, so that the server answers a large message while the
   kernel still copies its last buffer, which took one connection with
   64 KiB messages from 0.95x of tokio to 1.12x.
+- A sixth performance pass. The adapters send a response through an
+  operation of their own, polled with a waker that wakes nobody, rather
+  than a write behind whose payload was copied three times a response,
+  and the pool's reader keeps a lease and the bundle's own iterator in
+  place of a queue: 4% fewer instructions a request in user space, and the
+  HTTP benchmark at 16 connections where it was, 0.97x of tokio, the rest
+  of that gap being cache lines the client's core writes into the
+  receive's request and the server's core reads, which no user-space
+  change reaches (see [HTTP/1.1](#http11)). The receive stall of the fifth
+  pass did not reproduce in 40 runs of its exact scenario and over a
+  hundred benchmark runs without `IORING_RECVSEND_POLL_FIRST`, and the
+  cancel, the restart and the kernel's two issue paths read sound, so the
+  flag stays as a precaution and the stall is an open question. And
+  polled I/O came: a second ring set up with `IOPOLL`, which files opened
+  with `OpenOptions::polled` read and write through, with a file table of
+  its own and the main ring's buffers; on null_blk with a poll queue it
+  reads 9% to 14% more a second than the main ring from depth 4 up, and
+  stays 10% to 18% ahead of fio's polled engine (see
+  [Random reads with direct I/O](#random-reads-with-direct-io)).
+  `IORING_SETUP_HYBRID_IOPOLL` measured far slower and was not adopted.
 
 ## Open questions
 
