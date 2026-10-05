@@ -13,12 +13,24 @@
 //!   back: two wakes and two runs.
 //! - `local channel`: the same through the channels of one thread, which
 //!   take no atomic operation.
+//! - `unbounded channel`: the same through unbounded channels, whose send
+//!   never waits.
+//! - `local unbounded channel`: the same through the unbounded channels of
+//!   one thread.
+//! - `broadcast`: a value to another task and one back through broadcast
+//!   channels with one receiver each.
+//! - `watch`: a value to another task and one back through watch channels:
+//!   each way a send, and a wait for the change.
 //! - `remote`: a value sent to a thread of its own, which sends one back
 //!   through a channel: a wake from another thread, and a park and unpark.
 //! - `timer`: arm a timer by polling a sleep once, then drop it.
 //! - `sleep`: 1000 tasks each sleeping a millisecond at a time: timers that
 //!   fire.
 //! - `mutex`: lock and unlock an uncontended async mutex.
+//! - `barrier`: two tasks meeting at a barrier, again and again: each round
+//!   a wake and a run.
+//! - `cancel`: arm a wait for a token's cancellation by polling it once,
+//!   then drop it.
 
 use std::cell::Cell;
 use std::fmt;
@@ -122,6 +134,26 @@ pub(crate) const ALL: &[Micro] = &[
         tokio: None,
     },
     Micro {
+        name: "unbounded channel",
+        ruio: ruio_unbounded,
+        tokio: Some(tokio_unbounded),
+    },
+    Micro {
+        name: "local unbounded channel",
+        ruio: ruio_local_unbounded,
+        tokio: None,
+    },
+    Micro {
+        name: "broadcast",
+        ruio: ruio_broadcast,
+        tokio: Some(tokio_broadcast),
+    },
+    Micro {
+        name: "watch",
+        ruio: ruio_watch,
+        tokio: Some(tokio_watch),
+    },
+    Micro {
         name: "remote",
         ruio: ruio_remote,
         tokio: Some(tokio_remote),
@@ -140,6 +172,16 @@ pub(crate) const ALL: &[Micro] = &[
         name: "mutex",
         ruio: ruio_mutex,
         tokio: Some(tokio_mutex),
+    },
+    Micro {
+        name: "barrier",
+        ruio: ruio_barrier,
+        tokio: Some(tokio_barrier),
+    },
+    Micro {
+        name: "cancel",
+        ruio: ruio_cancel,
+        tokio: Some(tokio_cancel),
     },
 ];
 
@@ -488,6 +530,266 @@ fn tokio_mutex(load: &Load) -> io::Result<f64> {
         let mutex = tokio::sync::Mutex::new(0_u64);
         Ok(rate(measure, async || {
             *mutex.lock().await += 1;
+        })
+        .await)
+    })
+}
+
+/// A value to a second task and one back, through unbounded channels.
+fn ruio_unbounded(load: &Load) -> io::Result<f64> {
+    use ruio::sync::mpsc;
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (to_echo, mut echo_rx) = mpsc::unbounded_channel::<u32>();
+        let (to_main, mut main_rx) = mpsc::unbounded_channel::<u32>();
+        let echo = ruio::spawn(async move {
+            while let Some(value) = echo_rx.recv().await {
+                if to_main.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let rate = rate(measure, async || {
+            to_echo.send(1).expect("the echo task runs");
+            main_rx.recv().await.expect("the echo task answers");
+        })
+        .await;
+        drop(to_echo);
+        echo.await.map_err(io::Error::other)?;
+        Ok(rate)
+    })
+}
+
+/// A value to a second task and one back, through the unbounded channels of
+/// one thread.
+fn ruio_local_unbounded(load: &Load) -> io::Result<f64> {
+    use ruio::sync::local::mpsc;
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (to_echo, mut echo_rx) = mpsc::unbounded_channel::<u32>();
+        let (to_main, mut main_rx) = mpsc::unbounded_channel::<u32>();
+        let echo = ruio::spawn(async move {
+            while let Some(value) = echo_rx.recv().await {
+                if to_main.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let rate = rate(measure, async || {
+            to_echo.send(1).expect("the echo task runs");
+            main_rx.recv().await.expect("the echo task answers");
+        })
+        .await;
+        drop(to_echo);
+        echo.await.map_err(io::Error::other)?;
+        Ok(rate)
+    })
+}
+
+fn tokio_unbounded(load: &Load) -> io::Result<f64> {
+    use tokio::sync::mpsc;
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let (to_echo, mut echo_rx) = mpsc::unbounded_channel::<u32>();
+        let (to_main, mut main_rx) = mpsc::unbounded_channel::<u32>();
+        let echo = tokio::spawn(async move {
+            while let Some(value) = echo_rx.recv().await {
+                if to_main.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let rate = rate(measure, async || {
+            to_echo.send(1).expect("the echo task runs");
+            main_rx.recv().await.expect("the echo task answers");
+        })
+        .await;
+        drop(to_echo);
+        echo.await.map_err(io::Error::other)?;
+        Ok(rate)
+    })
+}
+
+/// A value to a second task and one back, through broadcast channels with
+/// one receiver each.
+fn ruio_broadcast(load: &Load) -> io::Result<f64> {
+    use ruio::sync::broadcast;
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (to_echo, mut echo_rx) = broadcast::channel::<u32>(16);
+        let (to_main, mut main_rx) = broadcast::channel::<u32>(16);
+        let echo = ruio::spawn(async move {
+            while let Ok(value) = echo_rx.recv().await {
+                if to_main.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let rate = rate(measure, async || {
+            to_echo.send(1).expect("the echo task runs");
+            main_rx.recv().await.expect("the echo task answers");
+        })
+        .await;
+        drop(to_echo);
+        echo.await.map_err(io::Error::other)?;
+        Ok(rate)
+    })
+}
+
+fn tokio_broadcast(load: &Load) -> io::Result<f64> {
+    use tokio::sync::broadcast;
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let (to_echo, mut echo_rx) = broadcast::channel::<u32>(16);
+        let (to_main, mut main_rx) = broadcast::channel::<u32>(16);
+        let echo = tokio::spawn(async move {
+            while let Ok(value) = echo_rx.recv().await {
+                if to_main.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let rate = rate(measure, async || {
+            to_echo.send(1).expect("the echo task runs");
+            main_rx.recv().await.expect("the echo task answers");
+        })
+        .await;
+        drop(to_echo);
+        echo.await.map_err(io::Error::other)?;
+        Ok(rate)
+    })
+}
+
+/// A value to a second task and one back, through watch channels: each way
+/// a send, and a wait for the change.
+fn ruio_watch(load: &Load) -> io::Result<f64> {
+    use ruio::sync::watch;
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (to_echo, mut echo_rx) = watch::channel::<u32>(0);
+        let (to_main, mut main_rx) = watch::channel::<u32>(0);
+        let echo = ruio::spawn(async move {
+            while echo_rx.changed().await.is_ok() {
+                let value = *echo_rx.borrow_and_update();
+                if to_main.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let rate = rate(measure, async || {
+            to_echo.send(1).expect("the echo task runs");
+            main_rx.changed().await.expect("the echo task answers");
+            main_rx.borrow_and_update();
+        })
+        .await;
+        drop(to_echo);
+        echo.await.map_err(io::Error::other)?;
+        Ok(rate)
+    })
+}
+
+fn tokio_watch(load: &Load) -> io::Result<f64> {
+    use tokio::sync::watch;
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let (to_echo, mut echo_rx) = watch::channel::<u32>(0);
+        let (to_main, mut main_rx) = watch::channel::<u32>(0);
+        let echo = tokio::spawn(async move {
+            while echo_rx.changed().await.is_ok() {
+                let value = *echo_rx.borrow_and_update();
+                if to_main.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let rate = rate(measure, async || {
+            to_echo.send(1).expect("the echo task runs");
+            main_rx.changed().await.expect("the echo task answers");
+            main_rx.borrow_and_update();
+        })
+        .await;
+        drop(to_echo);
+        echo.await.map_err(io::Error::other)?;
+        Ok(rate)
+    })
+}
+
+/// Two tasks meeting at a barrier, again and again. The other task is
+/// aborted at the end, out of its wait.
+fn ruio_barrier(load: &Load) -> io::Result<f64> {
+    use ruio::sync::Barrier;
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let barrier = Rc::new(Barrier::new(2));
+        let other = {
+            let barrier = Rc::clone(&barrier);
+            ruio::spawn(async move {
+                loop {
+                    barrier.wait().await;
+                }
+            })
+        };
+        let rate = rate(measure, async || {
+            barrier.wait().await;
+        })
+        .await;
+        other.abort();
+        let _ = other.await;
+        Ok(rate)
+    })
+}
+
+fn tokio_barrier(load: &Load) -> io::Result<f64> {
+    use tokio::sync::Barrier;
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let barrier = Arc::new(Barrier::new(2));
+        let other = {
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                loop {
+                    barrier.wait().await;
+                }
+            })
+        };
+        let rate = rate(measure, async || {
+            barrier.wait().await;
+        })
+        .await;
+        other.abort();
+        let _ = other.await;
+        Ok(rate)
+    })
+}
+
+/// Polls a wait for a token's cancellation once, which registers it, and
+/// drops it, which takes it back.
+fn ruio_cancel(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let token = ruio::sync::CancellationToken::new();
+        Ok(rate(measure, async || {
+            arm_and_drop(token.cancelled()).await;
+        })
+        .await)
+    })
+}
+
+fn tokio_cancel(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let token = tokio_util::sync::CancellationToken::new();
+        Ok(rate(measure, async || {
+            arm_and_drop(token.cancelled()).await;
         })
         .await)
     })
