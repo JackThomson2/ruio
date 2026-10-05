@@ -44,6 +44,13 @@
 //! - `sendfile`: a cached 1 MiB file spliced into a connection that a
 //!   thread on another CPU drains, as a server sends a file; tokio copies
 //!   it from its `File` with `io::copy`.
+//! - `readiness`: write to an eventfd, wait for it to be readable through
+//!   `AsyncFd`, one poll request a wait, and read it.
+//! - `readiness stream`: the same, the waits on one multishot poll kept
+//!   armed, so a wait submits nothing.
+//! - `signal`: send the process a signal and wait for it to be received: the
+//!   handler, the dispatcher and the listener's wake. ruio and tokio listen
+//!   for different signals, so neither pays the other's handler.
 //! - `timer`: arm a timer by polling a sleep once, then drop it.
 //! - `sleep`: 1000 tasks each sleeping a millisecond at a time: timers that
 //!   fire.
@@ -57,6 +64,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -218,6 +226,21 @@ pub(crate) const ALL: &[Micro] = &[
         name: "sendfile",
         ruio: ruio_sendfile,
         tokio: Some(tokio_sendfile),
+    },
+    Micro {
+        name: "readiness",
+        ruio: ruio_readiness,
+        tokio: Some(tokio_readiness),
+    },
+    Micro {
+        name: "readiness stream",
+        ruio: ruio_readiness_stream,
+        tokio: None,
+    },
+    Micro {
+        name: "signal",
+        ruio: ruio_signal,
+        tokio: Some(tokio_signal),
     },
     Micro {
         name: "timer",
@@ -864,6 +887,118 @@ fn tokio_sendfile(load: &Load) -> io::Result<f64> {
             .join()
             .map_err(|_| io::Error::other("the thread panicked"))?;
         Ok(rate)
+    })
+}
+
+/// An eventfd, nonblocking, whose count a write adds to and a read takes.
+fn eventfd() -> io::Result<OwnedFd> {
+    // SAFETY: `eventfd` makes a new descriptor, which nothing else owns.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is new, and owned by nobody else.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Adds one to an eventfd's count.
+fn signal_eventfd(fd: RawFd) {
+    let one: u64 = 1;
+    // SAFETY: eight bytes of a `u64`, which an eventfd write takes.
+    let written = unsafe { libc::write(fd, (&raw const one).cast(), 8) };
+    assert_eq!(written, 8, "the eventfd takes the write");
+}
+
+/// Takes an eventfd's count, which resets it.
+fn drain_eventfd(fd: RawFd) {
+    let mut count: u64 = 0;
+    // SAFETY: eight bytes of room, which an eventfd read fills.
+    let read = unsafe { libc::read(fd, (&raw mut count).cast(), 8) };
+    assert_eq!(read, 8, "the eventfd has a count");
+}
+
+/// Writes to an eventfd, waits for it to be readable, with one poll request,
+/// and reads it.
+fn ruio_readiness(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let event = ruio::io::AsyncFd::new(eventfd()?);
+    ruio_runtime()?.block_on(async move {
+        let fd = event.as_raw_fd();
+        Ok(rate(measure, async || {
+            signal_eventfd(fd);
+            event.readable().await.expect("the eventfd is polled");
+            drain_eventfd(fd);
+        })
+        .await)
+    })
+}
+
+/// The same, the waits on one multishot poll kept armed.
+fn ruio_readiness_stream(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let event = ruio::io::AsyncFd::new(eventfd()?);
+    ruio_runtime()?.block_on(async move {
+        let fd = event.as_raw_fd();
+        let mut readiness = event.readiness(libc::POLLIN as u32);
+        Ok(rate(measure, async || {
+            signal_eventfd(fd);
+            readiness.next().await.expect("the eventfd is polled");
+            drain_eventfd(fd);
+        })
+        .await)
+    })
+}
+
+fn tokio_readiness(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let event = eventfd()?;
+    tokio_runtime()?.block_on(async move {
+        let fd = event.as_raw_fd();
+        let event = tokio::io::unix::AsyncFd::new(event)?;
+        Ok(rate(measure, async || {
+            signal_eventfd(fd);
+            let mut guard = event.readable().await.expect("the eventfd is polled");
+            drain_eventfd(fd);
+            // As a driver that read until `WouldBlock` would leave it, so
+            // that the next wait is a wait.
+            guard.clear_ready();
+        })
+        .await)
+    })
+}
+
+/// Sends the process `signum`.
+fn raise(signum: libc::c_int) {
+    // SAFETY: `raise` of a signal the runtime has a handler for.
+    let raised = unsafe { libc::raise(signum) };
+    assert_eq!(raised, 0, "the signal is sent");
+}
+
+/// Sends the process `SIGUSR1` and waits for a listener to receive it.
+fn ruio_signal(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let mut listener = ruio::signal::signal(ruio::signal::SignalKind::user_defined1())?;
+        Ok(rate(measure, async || {
+            raise(libc::SIGUSR1);
+            listener.recv().await.expect("the listener is open");
+        })
+        .await)
+    })
+}
+
+/// Sends the process `SIGUSR2` and waits for tokio's listener to receive it.
+fn tokio_signal(load: &Load) -> io::Result<f64> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let mut listener = signal(SignalKind::user_defined2())?;
+        Ok(rate(measure, async || {
+            raise(libc::SIGUSR2);
+            listener.recv().await.expect("the listener is open");
+        })
+        .await)
     })
 }
 

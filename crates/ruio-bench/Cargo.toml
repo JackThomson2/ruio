@@ -15,7 +15,7 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 libc.workspace = true
 ruio.workspace = true
 ruio-compat = { workspace = true, features = ["tokio"] }
-tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "sync"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "signal", "sync"] }
 # For `CancellationToken`, which ruio's is measured against.
 tokio-util = { version = "0.7.19", default-features = false }
 
