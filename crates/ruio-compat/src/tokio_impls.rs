@@ -6,9 +6,9 @@ use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{Compat, StreamSocket};
+use crate::{Adaptable, Compat};
 
-impl<S: StreamSocket> AsyncRead for Compat<S> {
+impl<S: Adaptable> AsyncRead for Compat<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -23,7 +23,7 @@ impl<S: StreamSocket> AsyncRead for Compat<S> {
     }
 }
 
-impl<S: StreamSocket> AsyncBufRead for Compat<S> {
+impl<S: Adaptable> AsyncBufRead for Compat<S> {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         self.get_mut().poll_fill_buf(cx)
     }
@@ -33,7 +33,7 @@ impl<S: StreamSocket> AsyncBufRead for Compat<S> {
     }
 }
 
-impl<S: StreamSocket> AsyncWrite for Compat<S> {
+impl<S: Adaptable> AsyncWrite for Compat<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -63,8 +63,9 @@ impl<S: StreamSocket> AsyncWrite for Compat<S> {
     }
 
     /// Waits for the write in flight, then shuts down the writing half of
-    /// the connection, after which writes fail with
-    /// [`io::ErrorKind::BrokenPipe`].
+    /// a connection, after which writes fail with
+    /// [`io::ErrorKind::BrokenPipe`]; a file or a descriptor has no half to
+    /// shut, and stays open for more.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.get_mut().poll_close(cx)
     }
