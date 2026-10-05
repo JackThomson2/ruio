@@ -69,6 +69,14 @@
 //! [`TcpStream::send_to`], for a task spawned there with
 //! [`Handle::spawn_with`](crate::Handle::spawn_with) to receive.
 //!
+//! [`TcpStream::connect`] takes this module's [`ToSocketAddrs`]: an
+//! address, or a string that parses as one, resolves at once, with no
+//! allocation and no runtime, and a host name resolves with
+//! `getaddrinfo(3)` on the blocking pool, so that the thread's tasks run
+//! meanwhile; [`lookup_host`] resolves one so for anything else. The binds
+//! take the standard library's trait, and resolve a host name on the
+//! thread, as a program binds its listeners as it starts.
+//!
 //! Like the ring their I/O runs on, sockets belong to their thread: they are
 //! neither `Send` nor `Sync`.
 //!
@@ -77,12 +85,14 @@
 //! assert_send::<ruio::net::TcpStream>();
 //! ```
 
+mod addr;
 mod behind;
 mod socket;
 mod tcp;
 mod udp;
 mod unix;
 
+pub use addr::{ToSocketAddrs, lookup_host};
 pub use behind::{Flush, WriteBehind};
 pub(crate) use socket::{Desc, Plain, Sock, ThreadBound};
 pub use socket::{ReadExact, RecvStream, SendZc, SocketOp, WriteAll, WriteAllVectored};

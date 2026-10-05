@@ -5,7 +5,7 @@ use std::fmt;
 use std::future::poll_fn;
 use std::io;
 use std::marker::PhantomData;
-use std::net::{self, Shutdown, SocketAddr, ToSocketAddrs};
+use std::net::{self, Shutdown, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::task::{Context, Poll, ready};
@@ -14,6 +14,7 @@ use ruio_driver::buf::{BufPool, IoBuf, IoBufMut, IoBufs};
 use ruio_driver::ops::{self, Accept, AcceptMulti, AcceptStream, Connect, Recv, Send, Socket};
 use ruio_driver::{Descriptor, Driver, Fd};
 
+use super::addr::{ToSocketAddrs, resolve};
 use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
     Desc, Plain, ReadExact, RecvStream, SendZc, Sent, Sock, SocketOp, ThreadBound, WriteAll,
@@ -53,31 +54,34 @@ impl TcpListener {
     /// A listener bound to `addr`, or to the first address it resolves to
     /// that works, with `SO_REUSEADDR` and a backlog of 1024 connections.
     ///
-    /// Resolving a host name blocks the thread, as it does in the standard
-    /// library.
+    /// A host name is resolved on the thread, as the standard library
+    /// resolves it: a program binds its listeners as it starts, where
+    /// blocking holds nothing up. A bind that must not block resolves the
+    /// name with [`lookup_host`](super::lookup_host), on the blocking pool,
+    /// and binds the addresses.
     ///
     /// # Errors
     ///
     /// What binding and listening report, or `InvalidInput` if `addr`
     /// resolves to no address.
-    pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
+    pub fn bind(addr: impl net::ToSocketAddrs) -> io::Result<Self> {
         let socket = net::TcpListener::bind(addr)?;
         listen(socket.as_raw_fd())?;
         Ok(Self::from_std(socket))
     }
 
     /// A listener bound to `addr` as [`bind`](TcpListener::bind) binds one,
-    /// but with `SO_REUSEPORT` too: listeners that all have it can bind one
-    /// address, and the kernel spreads the connections among them by a hash
-    /// of each one's addresses and ports. A listener on each core, all bound
-    /// to one address, so share the connections out, and no core has to hand
-    /// any on.
+    /// a host name resolved on the thread included, but with `SO_REUSEPORT`
+    /// too: listeners that all have it can bind one address, and the kernel
+    /// spreads the connections among them by a hash of each one's addresses
+    /// and ports. A listener on each core, all bound to one address, so
+    /// share the connections out, and no core has to hand any on.
     ///
     /// # Errors
     ///
     /// As for [`bind`](TcpListener::bind): `AddrInUse` if a socket without
     /// `SO_REUSEPORT`, or another user's, has the address.
-    pub fn bind_reuseport(addr: impl ToSocketAddrs) -> io::Result<Self> {
+    pub fn bind_reuseport(addr: impl net::ToSocketAddrs) -> io::Result<Self> {
         let socket = net::TcpListener::from(bind_reuseport(addr, libc::SOCK_STREAM)?);
         listen(socket.as_raw_fd())?;
         Ok(Self::from_std(socket))
@@ -257,16 +261,17 @@ impl TcpStream {
     /// Connects to `addr`, or to the first address it resolves to that
     /// accepts the connection.
     ///
-    /// Resolving a host name blocks the thread, as it does in the standard
-    /// library.
+    /// A host name is resolved on the blocking pool, so the thread's other
+    /// tasks run meanwhile; an address, or a string that parses as one,
+    /// costs no lookup, no allocation and no thread. See [`ToSocketAddrs`].
     ///
     /// # Errors
     ///
-    /// The error of the last address tried, or `InvalidInput` if `addr`
-    /// resolves to no address.
+    /// What resolving `addr` reports, the error of the last address tried,
+    /// or `InvalidInput` if `addr` resolves to no address.
     pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
         let mut last = None;
-        for addr in addr.to_socket_addrs()? {
+        for addr in resolve(&addr).await? {
             match Self::connect_to(addr).await {
                 Ok(stream) => return Ok(stream),
                 Err(err) => last = Some(err),

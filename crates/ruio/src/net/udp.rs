@@ -3,7 +3,7 @@
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
-use std::net::{self, SocketAddr, ToSocketAddrs};
+use std::net::{self, SocketAddr};
 
 use ruio_driver::buf::{BufPool, BufResult, IoBuf, IoBufMut};
 use ruio_driver::ops::{self, Recv, RecvFrom, Send, SendTo};
@@ -25,23 +25,30 @@ impl UdpSocket {
     /// A socket bound to `addr`, or to the first address it resolves to
     /// that works.
     ///
+    /// A host name is resolved on the thread, as the standard library
+    /// resolves it: a program binds its sockets as it starts, where blocking
+    /// holds nothing up. A bind that must not block resolves the name with
+    /// [`lookup_host`](super::lookup_host), on the blocking pool, and binds
+    /// the addresses.
+    ///
     /// # Errors
     ///
     /// As for [`std::net::UdpSocket::bind`].
-    pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
+    pub fn bind(addr: impl net::ToSocketAddrs) -> io::Result<Self> {
         net::UdpSocket::bind(addr).map(Self::from_std)
     }
 
-    /// A socket bound to `addr` as [`bind`](UdpSocket::bind) binds one, but
-    /// with `SO_REUSEPORT` too: sockets that all have it can bind one address,
-    /// and the kernel spreads the datagrams among them by a hash of each one's
-    /// addresses and ports, so that a sender's datagrams all reach one socket.
+    /// A socket bound to `addr` as [`bind`](UdpSocket::bind) binds one, a
+    /// host name resolved on the thread included, but with `SO_REUSEPORT`
+    /// too: sockets that all have it can bind one address, and the kernel
+    /// spreads the datagrams among them by a hash of each one's addresses and
+    /// ports, so that a sender's datagrams all reach one socket.
     ///
     /// # Errors
     ///
     /// As for [`bind`](UdpSocket::bind): `AddrInUse` if a socket without
     /// `SO_REUSEPORT`, or another user's, has the address.
-    pub fn bind_reuseport(addr: impl ToSocketAddrs) -> io::Result<Self> {
+    pub fn bind_reuseport(addr: impl net::ToSocketAddrs) -> io::Result<Self> {
         let socket = bind_reuseport(addr, libc::SOCK_DGRAM)?;
         Ok(Self::from_std(net::UdpSocket::from(socket)))
     }
@@ -81,12 +88,15 @@ impl UdpSocket {
 
     /// Connects the socket to `addr`, which [`send`](UdpSocket::send) then
     /// sends to, and [`recv`](UdpSocket::recv) only receives from. Nothing
-    /// goes over the network, so this does not wait.
+    /// goes over the network, so this does not wait, except to resolve a
+    /// host name, which it does on the thread as the standard library does;
+    /// [`lookup_host`](super::lookup_host) resolves one on the blocking pool
+    /// first for a connect that must not block.
     ///
     /// # Errors
     ///
     /// As for [`std::net::UdpSocket::connect`].
-    pub fn connect(&self, addr: impl ToSocketAddrs) -> io::Result<()> {
+    pub fn connect(&self, addr: impl net::ToSocketAddrs) -> io::Result<()> {
         self.socket().connect(addr)
     }
 
