@@ -2,17 +2,19 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::io;
-use std::mem::offset_of;
+use std::mem::{self, offset_of};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use ruio_driver::Descriptor;
 use ruio_driver::ops::{OpenAt, Statx};
+use ruio_executor::blocking::BlockingHandle;
 
 use super::{FileType, METADATA, Metadata};
 use crate::net::Plain;
@@ -34,14 +36,17 @@ pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<ReadDir> {
         Descriptor::Plain(fd) => fd,
         Descriptor::Direct(_) => unreachable!("an open makes a plain descriptor unless asked"),
     };
+    let dir = Arc::new(Dir {
+        fd: Plain::new(std::fs::File::from(fd)),
+        path: path.to_owned(),
+    });
+    let next = Some(read_batch(&dir, Vec::with_capacity(BATCH)));
     Ok(ReadDir {
-        dir: Arc::new(Dir {
-            fd: Plain::new(std::fs::File::from(fd)),
-            path: path.to_owned(),
-        }),
+        dir,
         buf: Vec::with_capacity(BATCH),
         pos: 0,
-        state: State::Unread,
+        next,
+        yielded: true,
     })
 }
 
@@ -56,10 +61,12 @@ struct Dir {
 /// system keeps them. Made by [`read_dir`].
 ///
 /// io_uring has no operation that reads a directory, so the reader reads
-/// its entries with `getdents64(2)`, 32 KiB of them at a time, on the
-/// thread: that blocks the thread while the kernel reads the directory,
-/// which is quick once it is cached, as resolving a host name blocks it.
-/// Between batches the reader lets the thread's other tasks run.
+/// its entries with `getdents64(2)`, 32 KiB of them at a time, on a thread
+/// of the blocking pool ([`spawn_blocking`](crate::spawn_blocking)), and
+/// reads ahead: while a task takes the entries of one batch, the pool reads
+/// the next into a second buffer, so a task that takes them as fast as they
+/// come waits for the pool once, for the first batch. Between batches the
+/// reader lets the thread's other tasks run.
 ///
 /// ```no_run
 /// # ruio::Runtime::new().unwrap().block_on(async {
@@ -75,19 +82,47 @@ pub struct ReadDir {
     /// The entries read and not yet taken: `buf[pos..]`.
     buf: Vec<u8>,
     pos: usize,
-    state: State,
+    /// The batch after `buf`, being read on the blocking pool into the other
+    /// buffer; `None` once the directory has ended, or a read has failed.
+    /// One read at a time, so that the entries come in the directory's
+    /// order.
+    next: Option<BlockingHandle<io::Result<Vec<u8>>>>,
+    /// Whether the reader has let the other tasks run since `buf` ran out.
+    yielded: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
-    /// Nothing read yet.
-    Unread,
-    /// A batch was read, and the reader has not yielded since.
-    Read,
-    /// The reader yielded, and reads the next batch at its next poll.
-    Yielded,
-    /// The directory has no more entries.
-    Ended,
+/// Reads the next batch of the directory's entries into `buf`, on the
+/// blocking pool; the buffer comes back with the bytes the kernel wrote,
+/// none once the directory has ended.
+fn read_batch(dir: &Arc<Dir>, buf: Vec<u8>) -> BlockingHandle<io::Result<Vec<u8>>> {
+    let dir = Arc::clone(dir);
+    ruio_executor::spawn_blocking(move || fill(dir.fd.as_raw_fd(), buf))
+}
+
+/// Reads a batch of entries of the directory `fd` into `buf`, as many as
+/// fit, with `getdents64(2)`.
+fn fill(fd: libc::c_int, mut buf: Vec<u8>) -> io::Result<Vec<u8>> {
+    buf.clear();
+    loop {
+        // SAFETY: getdents64 writes at most `capacity` bytes of entries into
+        // the buffer, which has room for them, and nothing else.
+        let read =
+            unsafe { libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr(), buf.capacity()) };
+        match usize::try_from(read) {
+            Ok(read) => {
+                // SAFETY: the kernel wrote the first `read` bytes, which are
+                // within the capacity it was given.
+                unsafe { buf.set_len(read) };
+                return Ok(buf);
+            }
+            Err(_) => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
 }
 
 impl ReadDir {
@@ -100,9 +135,10 @@ impl ReadDir {
         poll_fn(|cx| self.poll_next_entry(cx)).await
     }
 
-    /// The next entry, or `None` once there are no more. Before it reads
-    /// another batch it wakes the task and returns `Pending` once, so that
-    /// the thread's other tasks run.
+    /// The next entry, or `None` once there are no more. Before it takes the
+    /// next batch it wakes the task and returns `Pending` once, so that the
+    /// thread's other tasks run; and a batch the pool has not read yet is
+    /// waited for.
     ///
     /// # Errors
     ///
@@ -112,15 +148,25 @@ impl ReadDir {
             if let Some(entry) = self.take()? {
                 return Poll::Ready(Ok(Some(entry)));
             }
-            match self.state {
-                State::Ended => return Poll::Ready(Ok(None)),
-                State::Read => {
-                    self.state = State::Yielded;
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                State::Unread | State::Yielded => self.fill()?,
+            let Some(next) = &mut self.next else {
+                return Poll::Ready(Ok(None));
+            };
+            if !self.yielded {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
+            let batch = ready!(Pin::new(next).poll(cx));
+            self.next = None;
+            let buf = batch.map_err(io::Error::other)??;
+            if buf.is_empty() {
+                return Poll::Ready(Ok(None));
+            }
+            // The spent buffer takes the next batch while this one is read.
+            let spare = mem::replace(&mut self.buf, buf);
+            self.pos = 0;
+            self.next = Some(read_batch(&self.dir, spare));
+            self.yielded = false;
         }
     }
 
@@ -158,40 +204,6 @@ impl ReadDir {
             }));
         }
         Ok(None)
-    }
-
-    /// Reads the next batch of entries.
-    fn fill(&mut self) -> io::Result<()> {
-        let fd = self.dir.fd.as_raw_fd();
-        self.buf.clear();
-        self.pos = 0;
-        let read = loop {
-            // SAFETY: getdents64 writes at most `capacity` bytes of entries
-            // into the buffer, which has room for them, and nothing else.
-            let read = unsafe {
-                libc::syscall(
-                    libc::SYS_getdents64,
-                    fd,
-                    self.buf.as_mut_ptr(),
-                    self.buf.capacity(),
-                )
-            };
-            match usize::try_from(read) {
-                Ok(read) => break read,
-                Err(_) => {
-                    let err = io::Error::last_os_error();
-                    if err.kind() != io::ErrorKind::Interrupted {
-                        self.state = State::Ended;
-                        return Err(err);
-                    }
-                }
-            }
-        };
-        // SAFETY: the kernel wrote the first `read` bytes, which are within
-        // the capacity it was given.
-        unsafe { self.buf.set_len(read) };
-        self.state = if read == 0 { State::Ended } else { State::Read };
-        Ok(())
     }
 }
 

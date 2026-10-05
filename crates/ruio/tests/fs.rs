@@ -566,11 +566,14 @@ async fn read_dir_reads_a_large_directory_in_batches() -> io::Result<()> {
     }
     let mut entries = within(fs::read_dir(&scratch.0)).await?;
     let listed = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut names = vec![within(entries.next_entry()).await?.unwrap().file_name()];
+    listed.set(names.len());
+    // Spawned with the first batch in: it runs when the reader yields
+    // between batches, before the reader is done.
     let bystander = ruio::spawn({
         let listed = listed.clone();
         async move { listed.get() }
     });
-    let mut names = Vec::new();
     while let Some(entry) = within(entries.next_entry()).await? {
         names.push(entry.file_name());
         listed.set(names.len());
@@ -582,6 +585,73 @@ async fn read_dir_reads_a_large_directory_in_batches() -> io::Result<()> {
         .map(|index| std::ffi::OsString::from(format!("entry-{index:05}")))
         .collect();
     assert_eq!(names, expected);
+    Ok(())
+}
+
+/// The thread is not held up by a read: a task spawned beside the reader
+/// runs while the pool reads the first batch of a directory that is not
+/// cached, or at the latest when the reader yields between batches.
+#[ruio::test]
+async fn read_dir_does_not_hold_up_the_thread() -> io::Result<()> {
+    const COUNT: usize = 3000;
+    let scratch = Scratch::new("read-dir-thread");
+    for index in 0..COUNT {
+        std::fs::File::create(scratch.path(&format!("entry-{index:05}")))?;
+    }
+    let mut entries = within(fs::read_dir(&scratch.0)).await?;
+    let listed = std::rc::Rc::new(std::cell::Cell::new(0));
+    let bystander = ruio::spawn({
+        let listed = listed.clone();
+        async move { listed.get() }
+    });
+    let mut count = 0;
+    while within(entries.next_entry()).await?.is_some() {
+        count += 1;
+        listed.set(count);
+    }
+    assert_eq!(count, COUNT);
+    let seen = bystander.await.unwrap();
+    assert!(seen < COUNT, "the bystander saw {seen} entries");
+    Ok(())
+}
+
+#[ruio::test]
+async fn read_dir_of_an_empty_directory_ends_at_once() -> io::Result<()> {
+    let scratch = Scratch::new("read-dir-empty");
+    std::fs::create_dir(scratch.path("empty"))?;
+    let mut entries = within(fs::read_dir(scratch.path("empty"))).await?;
+    assert!(within(entries.next_entry()).await?.is_none());
+    assert!(
+        within(entries.next_entry()).await?.is_none(),
+        "it stays ended"
+    );
+    Ok(())
+}
+
+/// A reader dropped with a batch being read on the pool leaves the read to
+/// finish on its own; the directory stays open for the entries taken.
+#[ruio::test]
+async fn a_reader_dropped_mid_way_leaves_its_read_to_finish() -> io::Result<()> {
+    const COUNT: usize = 3000;
+    let scratch = Scratch::new("read-dir-dropped");
+    for index in 0..COUNT {
+        std::fs::write(scratch.path(&format!("entry-{index:05}")), b"xy")?;
+    }
+    let mut entries = within(fs::read_dir(&scratch.0)).await?;
+    let entry = within(entries.next_entry()).await?.unwrap();
+    drop(entries);
+    assert_eq!(entry.metadata().await?.len(), 2);
+    // Readers made and dropped with reads in flight, again and again.
+    for _ in 0..50 {
+        let mut entries = within(fs::read_dir(&scratch.0)).await?;
+        within(entries.next_entry()).await?.unwrap();
+    }
+    let mut entries = within(fs::read_dir(&scratch.0)).await?;
+    let mut count = 0;
+    while within(entries.next_entry()).await?.is_some() {
+        count += 1;
+    }
+    assert_eq!(count, COUNT);
     Ok(())
 }
 
