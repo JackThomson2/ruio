@@ -8,6 +8,10 @@
 //! whether it waits now, until the next wake finds it not waiting; the
 //! receiver, as it takes a value, wakes every one that waits, as one
 //! woken alone could have been dropped, and waste the wake.
+//!
+//! [`unbounded_channel`] makes a channel with no bound, whose senders never
+//! wait: its values wait in a deque that grows as they are sent, and its
+//! halves hand out the same errors as this one's.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -21,6 +25,10 @@ use std::task::{Context, Poll, Waker, ready};
 
 use super::WakerCell;
 use crate::coop;
+
+mod unbounded;
+
+pub use unbounded::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// A channel that holds up to `capacity` values: sending waits while it is
 /// full. Room for all of them is allocated at once.

@@ -8,6 +8,11 @@
 //! the head, takes the value and stamps the slot free for the next turn.
 //! Neither takes a lock: only a sender that finds the channel full does,
 //! to wait in a list for room.
+//!
+//! [`unbounded_channel`] makes a channel with no bound, whose senders never
+//! wait: its values go into a list of blocks of slots, which grows as they
+//! are sent and is filled again as they are taken, and its halves hand out
+//! the same errors as this one's.
 
 use std::cell::UnsafeCell;
 use std::error::Error;
@@ -22,6 +27,10 @@ use std::task::{Context, Poll, Waker, ready};
 use super::lock;
 use super::waker_slot::WakerSlot;
 use crate::coop;
+
+mod unbounded;
+
+pub use unbounded::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// A channel that holds up to `capacity` values: sending waits while it is
 /// full. Room for all of them is allocated at once.
