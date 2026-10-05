@@ -16,7 +16,7 @@ use std::path::Path;
 use ruio_sys as sys;
 
 use super::Install;
-use crate::{Completion, Descriptor, Driver, Fd, Operation};
+use crate::{Completion, Descriptor, Driver, Fd, Operation, PolledFd};
 
 /// A path as the kernel reads it, ending in a nul byte.
 fn c_path(path: &Path) -> io::Result<CString> {
@@ -588,6 +588,57 @@ mod tests {
         assert_eq!((sqe.opcode, sqe.op_flags), (sys::IORING_OP_FSYNC, 0));
         let sqe = entry(&mut Fsync::new(3).data_only());
         assert_eq!(sqe.op_flags, sys::IORING_FSYNC_DATASYNC);
+    }
+}
+
+/// Puts a plain descriptor into a free slot of the polled ring's file table
+/// (`IORING_OP_FILES_UPDATE` with `IORING_FILE_INDEX_ALLOC`): what
+/// [`Driver::install_polled`] runs. The output is the slot, as a
+/// [`PolledFd`].
+#[derive(Debug)]
+pub struct InstallPolled {
+    /// The ID of the driver whose polled ring takes the file.
+    ring: u64,
+    /// Boxed: the kernel reads the descriptor from it as it takes the
+    /// entry, and writes the slot it chose back as it completes.
+    fds: Box<[i32; 1]>,
+}
+
+impl InstallPolled {
+    /// Installs the file open as `fd` into the polled ring of the driver
+    /// with ID `ring`.
+    pub(crate) fn new(ring: u64, fd: RawFd) -> Self {
+        Self {
+            ring,
+            fds: Box::new([fd]),
+        }
+    }
+}
+
+// SAFETY: the entry points to the boxed array, which the operation owns and
+// which stays put when it moves; the kernel writes it before completing. An
+// update posts one completion.
+unsafe impl Operation for InstallPolled {
+    type Output = io::Result<PolledFd>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_FILES_UPDATE;
+        sqe.addr = (&raw mut *self.fds).expose_provenance() as u64;
+        sqe.len = 1;
+        sqe.off = u64::from(sys::IORING_FILE_INDEX_ALLOC);
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        completion.result()?;
+        // The kernel wrote the slot where the descriptor was.
+        let slot = u32::try_from(self.fds[0])
+            .map_err(|_| io::Error::other("the kernel reported no slot for the file"))?;
+        Ok(PolledFd::new(self.ring, slot))
+    }
+
+    #[inline]
+    fn polled(&self) -> bool {
+        true
     }
 }
 

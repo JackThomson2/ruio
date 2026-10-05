@@ -60,7 +60,7 @@ mod unpark;
 mod waker;
 
 pub use driver::{Builder, Driver, Stats, monotonic_now};
-pub use fd::{Descriptor, DirectFd, Fd};
+pub use fd::{Descriptor, DirectFd, Fd, PolledFd};
 pub use link::{Chain, Link};
 pub use op::{Completion, Op, Operation};
 pub use probe::{BaselineError, Probe};

@@ -178,6 +178,78 @@ impl fmt::Debug for DirectFd {
     }
 }
 
+/// A direct descriptor of the polled ring: a file in a slot of the file
+/// table of the ring that [polled](crate::Operation::polled) operations run
+/// on, which they name as [`Fd::Direct`]; made by
+/// [`Driver::install_polled`]. The slot holds a reference to the file of
+/// its own, beside the plain descriptor the file was installed from, which
+/// the main ring's operations keep using.
+///
+/// Dropping it empties the slot, with an update that reaches the kernel
+/// after the operations queued on the polled ring before it. Like a
+/// [`DirectFd`], it names its ring rather than holding on to it, and
+/// belongs to the ring's thread:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ruio_driver::PolledFd>();
+/// ```
+pub struct PolledFd {
+    slot: u32,
+    /// The ID of the driver whose polled ring the slot belongs to.
+    ring: u64,
+    /// Makes the descriptor `!Send` and `!Sync`, as its ring is.
+    _ring_thread: PhantomData<*const ()>,
+}
+
+impl PolledFd {
+    /// Takes ownership of the file in `slot` of the polled ring's table of
+    /// the driver with ID `ring`.
+    pub(crate) fn new(ring: u64, slot: u32) -> Self {
+        Self {
+            slot,
+            ring,
+            _ring_thread: PhantomData,
+        }
+    }
+
+    /// The slot the file is in.
+    #[inline]
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    /// The descriptor, for polled operations on its ring.
+    #[inline]
+    pub fn fd(&self) -> Fd {
+        Fd::Direct(self.slot)
+    }
+
+    /// Whether the descriptor belongs to `driver`'s polled ring.
+    #[inline]
+    pub fn belongs_to(&self, driver: &Driver) -> bool {
+        driver.id() == self.ring
+    }
+}
+
+impl Drop for PolledFd {
+    fn drop(&mut self) {
+        // A ring that is gone took its file table with it.
+        if let Some(driver) = Driver::find(self.ring) {
+            driver.release_polled(self.slot);
+        }
+    }
+}
+
+impl fmt::Debug for PolledFd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PolledFd")
+            .field("slot", &self.slot)
+            .field("ring", &self.ring)
+            .finish()
+    }
+}
+
 /// A file an operation made: a plain file descriptor or a direct descriptor.
 /// Dropping it closes the file.
 #[derive(Debug)]

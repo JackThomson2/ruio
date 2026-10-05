@@ -11,9 +11,10 @@ use ruio_sys as sys;
 use crate::mem::Mapping;
 
 /// Setup flags [`Ring`] cannot work with: they change the memory layout, who
-/// consumes the submission queue, or how the ring is entered.
-const UNSUPPORTED_FLAGS: u32 = sys::IORING_SETUP_IOPOLL
-    | sys::IORING_SETUP_SQPOLL
+/// consumes the submission queue, or how the ring is entered. A ring that
+/// polls its devices for completions (`IORING_SETUP_IOPOLL`) is entered as
+/// any other, and polls as it is entered; see [`Ring::enter`].
+const UNSUPPORTED_FLAGS: u32 = sys::IORING_SETUP_SQPOLL
     | sys::IORING_SETUP_SQE128
     | sys::IORING_SETUP_CQE32
     | sys::IORING_SETUP_NO_MMAP
@@ -328,6 +329,13 @@ impl Ring {
     ///
     /// Always passes `IORING_ENTER_GETEVENTS`: a ring set up with
     /// `IORING_SETUP_DEFER_TASKRUN` only posts completions when asked to.
+    ///
+    /// A ring set up with `IORING_SETUP_IOPOLL` polls its devices instead of
+    /// waiting: with `min_complete` 0 it makes one pass over its requests
+    /// and completes those the devices have finished, and with more it
+    /// polls until that many have completed, the scheduler wants the CPU or
+    /// a signal arrives, which can leave it short. The kernel reads
+    /// `timeout` for such a ring but does not apply it.
     ///
     /// # Safety
     ///

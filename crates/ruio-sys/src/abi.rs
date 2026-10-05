@@ -301,6 +301,28 @@ pub struct io_uring_buf_reg {
     pub resv: [u32; 5],
 }
 
+/// Registered buffers to share with another ring, for
+/// [`IORING_REGISTER_CLONE_BUFFERS`]: the ring the call is made on gets
+/// references to the buffers of `src_fd`, which stay registered with both
+/// until each unregisters them.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct io_uring_clone_buffers {
+    /// The ring whose buffers are shared: its descriptor, or its registered
+    /// index with [`IORING_REGISTER_SRC_REGISTERED`].
+    pub src_fd: u32,
+    /// `IORING_REGISTER_*` flags for cloning.
+    pub flags: u32,
+    /// The first buffer of the source to share.
+    pub src_off: u32,
+    /// The index the first shared buffer gets in this ring's table.
+    pub dst_off: u32,
+    /// How many buffers to share; 0 shares them all.
+    pub nr: u32,
+    /// Reserved; must be zero.
+    pub pad: [u32; 3],
+}
+
 /// The kernel's 64-bit `timespec`, from `linux/time_types.h`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -322,6 +344,7 @@ const _: () = {
     assert!(size_of::<io_uring_getevents_arg>() == 24);
     assert!(size_of::<io_uring_rsrc_register>() == 32);
     assert!(size_of::<io_uring_rsrc_update>() == 16);
+    assert!(size_of::<io_uring_clone_buffers>() == 32);
     assert!(size_of::<io_uring_buf>() == 16);
     assert!(size_of::<io_uring_buf_ring>() == 16);
     assert!(size_of::<io_uring_buf_reg>() == 40);
@@ -769,6 +792,18 @@ consts! {
     pub const RSRC_REGISTER_FLAGS: [u32] = [
         /// Create the table with every slot empty; `data` must be 0.
         IORING_RSRC_REGISTER_SPARSE = 1 << 0,
+    ];
+}
+
+consts! {
+    /// Every flag for cloning registered buffers, for
+    /// [`io_uring_clone_buffers::flags`].
+    pub const CLONE_BUFFERS_FLAGS: [u32] = [
+        /// `src_fd` is a registered ring index rather than a descriptor.
+        IORING_REGISTER_SRC_REGISTERED = 1 << 0,
+        /// Replace buffers this ring has registered rather than fail with
+        /// `EBUSY`.
+        IORING_REGISTER_DST_REPLACE = 1 << 1,
     ];
 }
 

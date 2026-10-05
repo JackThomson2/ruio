@@ -47,6 +47,10 @@ pub(crate) mod private {
         /// The operation's linked timeout, if it has one.
         fn timeout(&self) -> Option<Duration>;
 
+        /// Whether the operation asks for the polled ring, which takes no
+        /// chain; see `Operation::polled`.
+        fn polled(&self) -> bool;
+
         /// Fills in the operation's entry; see `Operation::prepare`.
         fn prepare(&mut self, sqe: &mut sys::io_uring_sqe);
 

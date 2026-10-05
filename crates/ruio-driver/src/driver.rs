@@ -1,5 +1,6 @@
 //! The driver: a ring, the operations in flight on it, and the loop that
-//! submits them and delivers their completions.
+//! submits them and delivers their completions; and a second ring, which
+//! polls its devices for completions, for the operations that ask for it.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -21,6 +22,7 @@ use ruio_sys as sys;
 use crate::Probe;
 use crate::link::private::{Linkable, Member};
 use crate::op::{Completion, Op, Operation, Orphan};
+use crate::ops::InstallPolled;
 use crate::orphan::Payload;
 use crate::remote::{Remote, RemoteRing};
 use crate::ring::Ring;
@@ -68,6 +70,10 @@ const FORBIDDEN_SQE_FLAGS: u8 =
 /// The most slots a registered file table gets unless asked for more.
 const DEFAULT_FILES: u32 = 4096;
 
+/// What a file table update installs to empty a slot; see
+/// [`Inner::queue_release_polled`].
+static NO_FILE: i32 = -1;
+
 /// The ID the next driver gets. IDs are never reused.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -84,17 +90,21 @@ pub struct Builder {
     shutdown_timeout: Duration,
     /// The size of the registered file table, if set.
     files: Option<u32>,
+    /// Whether the polled ring is created with the driver.
+    polled: bool,
 }
 
 impl Builder {
     /// A builder with the default configuration: 256 submission queue
-    /// entries, a one-second shutdown timeout, and a registered file table
-    /// of the default size.
+    /// entries, a one-second shutdown timeout, a registered file table of
+    /// the default size, and no polled ring until an operation asks for
+    /// one.
     pub fn new() -> Self {
         Self {
             entries: 256,
             shutdown_timeout: Duration::from_secs(1),
             files: None,
+            polled: false,
         }
     }
 
@@ -135,6 +145,14 @@ impl Builder {
         self
     }
 
+    /// Creates the polled ring with the driver, as
+    /// [`Driver::enable_polling`] would, rather than at the first polled
+    /// operation.
+    pub fn polled(mut self, polled: bool) -> Self {
+        self.polled = polled;
+        self
+    }
+
     /// Creates the driver.
     ///
     /// # Errors
@@ -142,7 +160,8 @@ impl Builder {
     /// Fails with [`io::ErrorKind::Unsupported`] if the kernel is below ruio's
     /// baseline (see [`Probe::check_baseline`]), or with the system's error if
     /// the ring, or a file table of the size set by [`Builder::files`],
-    /// cannot be created.
+    /// cannot be created; and as for [`Driver::enable_polling`] with
+    /// [`Builder::polled`].
     pub fn build(&self) -> io::Result<Driver> {
         let probe = Probe::current()?;
         probe
@@ -165,6 +184,11 @@ impl Builder {
                 }
             }
         };
+        let polled = if self.polled {
+            Some(Polled::new(&ring, entries, cq_entries, files, false)?)
+        } else {
+            None
+        };
         let notify = Arc::new(Notify::new()?);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let remote = Remote::new(id, ring.raw_fd(), Unparker::new(Arc::clone(&notify)));
@@ -172,6 +196,10 @@ impl Builder {
             id,
             table: Table::with_capacity(cq_entries as usize),
             ring,
+            polled,
+            entries,
+            cq_entries,
+            buffers: false,
             files,
             remote,
             wake_armed: false,
@@ -243,9 +271,11 @@ impl Default for Builder {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Stats {
-    /// Operations queued for submission.
+    /// Operations queued for submission, on either ring.
     pub operations: u64,
-    /// Calls to `io_uring_enter(2)`.
+    /// Operations queued on the polled ring, counted in `operations` too.
+    pub polled: u64,
+    /// Calls to `io_uring_enter(2)`, on either ring.
     pub enters: u64,
     /// Completions processed, including those of internal requests.
     pub completions: u64,
@@ -257,6 +287,11 @@ pub struct Stats {
 /// future queues the operation; [`Driver::submit`] and [`Driver::park`] hand
 /// everything queued to the kernel in one system call, then deliver the
 /// completions that are ready and wake the tasks waiting for them.
+///
+/// Operations that ask to be [polled](Operation::polled), direct reads and
+/// writes of files on devices with poll queues, go on a second ring, which
+/// polls the devices for their completions rather than wait for interrupts;
+/// see [`Driver::enable_polling`].
 ///
 /// A driver belongs to the thread that created it, and clones are handles to
 /// the same ring. The ring is closed once every handle and every [`Op`] is
@@ -311,6 +346,15 @@ struct Inner {
     /// The driver's ID, unique in the process.
     id: u64,
     ring: Ring,
+    /// The ring that polled operations run on, once one has asked for it;
+    /// see [`Driver::enable_polling`].
+    polled: Option<Polled>,
+    /// The size of the main ring's queues, which the polled ring takes too.
+    entries: u32,
+    cq_entries: u32,
+    /// Whether the main ring has buffers registered, for the polled ring to
+    /// share.
+    buffers: bool,
     /// The number of slots in the registered file table.
     files: u32,
     /// Every operation the kernel may still own.
@@ -338,9 +382,94 @@ struct Inner {
     /// [`Driver::completions_last_turn`].
     last_turn: usize,
     /// Counts of the driver's work, but for its entries into the kernel,
-    /// which the ring counts.
+    /// which the rings count.
     stats: Stats,
     shutdown_timeout: Duration,
+}
+
+/// The ring that polled operations run on, set up with
+/// `IORING_SETUP_IOPOLL`: the kernel completes its requests only as the
+/// ring is entered, by polling the devices they went to, so the driver
+/// enters it on every turn while it has operations in flight, and a turn
+/// that waits with any in flight waits by polling; see [`Inner::enter`].
+///
+/// The kernel takes only reads, writes, passthrough commands, no-ops and
+/// file table updates on such a ring, so the main ring keeps the timer, the
+/// unparkers' poll, the cancellations and everything else; completions are
+/// routed by `user_data` through the one table, as the main ring's are. The
+/// ring has a file table of its own, as large as the main ring's, which
+/// [`Driver::install_polled`] puts files into.
+struct Polled {
+    ring: Ring,
+    /// Entries queued or submitted whose completions have not been reaped.
+    /// Every entry on the ring posts one completion: none is linked,
+    /// multishot or marked to skip its completion.
+    pending: u32,
+}
+
+impl Polled {
+    /// Creates the polled ring, with queues as large as `main`'s and a file
+    /// table of `files` slots, sharing `main`'s registered buffers if
+    /// `buffers` says it has any.
+    fn new(
+        main: &Ring,
+        entries: u32,
+        cq_entries: u32,
+        files: u32,
+        buffers: bool,
+    ) -> io::Result<Self> {
+        if !Probe::current()?.supports_setup_flags(sys::IORING_SETUP_IOPOLL) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the kernel's io_uring has no polled rings",
+            ));
+        }
+        let ring = Ring::new(entries, cq_entries, SETUP_FLAGS | sys::IORING_SETUP_IOPOLL)?;
+        if files > 0 {
+            register_files(&ring, files)?;
+        }
+        if buffers {
+            clone_buffers(main, &ring)?;
+        }
+        Ok(Self { ring, pending: 0 })
+    }
+}
+
+/// Shares the registered buffers of `from` with `to`
+/// (`IORING_REGISTER_CLONE_BUFFERS`, Linux 6.12): `to` gets a reference to
+/// each, at the same index, and the memory stays registered until both have
+/// let go of it.
+fn clone_buffers(from: &Ring, to: &Ring) -> io::Result<()> {
+    let mut clone = sys::io_uring_clone_buffers {
+        src_fd: from.raw_fd().cast_unsigned(),
+        ..Default::default()
+    };
+    // SAFETY: `clone` is one valid argument for the kernel to read, and
+    // cloning takes no memory of ours.
+    let cloned = unsafe {
+        to.register(
+            sys::IORING_REGISTER_CLONE_BUFFERS,
+            ptr::from_mut(&mut clone).cast(),
+            1,
+        )
+    };
+    match cloned {
+        Ok(_) => Ok(()),
+        // An older kernel refuses the opcode.
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the kernel cannot share registered buffers with a polled ring",
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+/// What a turn that waits brings [`Inner::enter`] from outside the state,
+/// for waiting with polled operations in flight: the unparkers'
+/// notification, and whether the wake timer is armed.
+struct Park<'a> {
+    notify: &'a Notify,
+    timer_armed: bool,
 }
 
 impl Driver {
@@ -431,6 +560,7 @@ impl Driver {
         let inner = self.inner.state.borrow();
         inner.ring.sq_flags() & pending != 0
             || inner.ring.cq_ready()
+            || inner.polled_cq_ready()
             || self.inner.notify.is_notified()
     }
 
@@ -439,7 +569,10 @@ impl Driver {
     /// completions.
     ///
     /// If an unpark arrived since the last park, this returns without
-    /// waiting.
+    /// waiting. With polled operations in flight the wait polls their
+    /// devices rather than sleep, and, when nothing but a polled operation
+    /// can complete, polls inside the kernel until one does, which holds an
+    /// unpark back until then; see DESIGN.md.
     ///
     /// # Errors
     ///
@@ -525,9 +658,70 @@ impl Driver {
     #[inline]
     pub fn stats(&self) -> Stats {
         let inner = self.inner.state.borrow();
+        let polled = inner
+            .polled
+            .as_ref()
+            .map_or(0, |polled| polled.ring.enters());
         Stats {
-            enters: inner.ring.enters(),
+            enters: inner.ring.enters() + polled,
             ..inner.stats
+        }
+    }
+
+    /// Creates the ring that [polled](Operation::polled) operations run on,
+    /// unless the driver has one. The first polled operation creates it
+    /// otherwise, and fails with the error if it cannot be created.
+    ///
+    /// The ring is set up with `IORING_SETUP_IOPOLL`, with queues as large as
+    /// the main ring's, and shares the main ring's registered buffers
+    /// (`IORING_REGISTER_CLONE_BUFFERS`, Linux 6.12), those registered later
+    /// included, so a [`ReadFixed`](crate::ops::ReadFixed) can be polled. It
+    /// has a file table of its own, as large as the main ring's (see
+    /// [`Builder::files`]), which a polled operation's
+    /// [`Fd::Direct`](crate::Fd::Direct) names a slot of:
+    /// [`Driver::install_polled`] puts a file there.
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` if the kernel's io_uring has no polled rings, or cannot
+    /// share registered buffers with one; `EBUSY` from code running inside
+    /// the driver; or what creating the ring, or its file table, reports.
+    pub fn enable_polling(&self) -> io::Result<()> {
+        let mut inner = self
+            .inner
+            .state
+            .try_borrow_mut()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
+        inner.polled_ring().map(drop)
+    }
+
+    /// Puts the file open as `fd`, a plain descriptor, into a free slot of
+    /// the polled ring's file table, with an `IORING_OP_FILES_UPDATE` on
+    /// that ring, which the first poll of the future queues; the output is
+    /// a [`PolledFd`](crate::PolledFd), which polled operations on the file
+    /// name as their [`Fd`](crate::Fd). The slot holds a reference to the
+    /// file of its own, so `fd` may close once the kernel has the entry, as
+    /// for any operation. The ring is created if the driver has none yet,
+    /// as by [`enable_polling`](Driver::enable_polling), whose errors the
+    /// operation then completes with.
+    ///
+    /// The operation fails with `ENFILE` if the table is full, and `ENXIO`
+    /// if the ring has none ([`Builder::files`] set to 0).
+    pub fn install_polled(&self, fd: RawFd) -> Op<InstallPolled> {
+        self.op(InstallPolled::new(self.id(), fd))
+    }
+
+    /// Empties slot `slot` of the polled ring's file table, which
+    /// [`install_polled`](Driver::install_polled) filled, with an update
+    /// queued on that ring now, so that it reaches the kernel after the
+    /// operations queued before it, which may name the slot.
+    ///
+    /// If the driver is busy, as it is when code it runs drops a
+    /// [`PolledFd`](crate::PolledFd), or has no room for the update even
+    /// after submitting, the slot stays taken until the ring is closed.
+    pub(crate) fn release_polled(&self, slot: u32) {
+        if let Ok(mut inner) = self.inner.state.try_borrow_mut() {
+            let _ = inner.queue_release_polled(slot);
         }
     }
 
@@ -622,11 +816,14 @@ impl Driver {
     }
 
     /// Registers resources with the ring, or queries or configures it.
+    /// Buffers registered or unregistered this way are shared with the
+    /// polled ring, if there is one.
     ///
     /// # Errors
     ///
     /// `EBUSY` if called from code running inside the driver, or what the
-    /// kernel reports.
+    /// kernel reports; buffers the polled ring cannot share are unregistered
+    /// again, and the error is the sharing's.
     ///
     /// # Safety
     ///
@@ -637,13 +834,15 @@ impl Driver {
         arg: *mut c_void,
         nr_args: u32,
     ) -> io::Result<u32> {
-        let inner = self
+        let mut inner = self
             .inner
             .state
-            .try_borrow()
+            .try_borrow_mut()
             .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
         // SAFETY: the caller upholds the contract of `io_uring_register`.
-        unsafe { inner.ring.register(opcode, arg, nr_args) }
+        let registered = unsafe { inner.ring.register(opcode, arg, nr_args) }?;
+        inner.share_buffers(opcode)?;
+        Ok(registered)
     }
 
     /// Turns the ring: submits what is queued, and enters the kernel to wait
@@ -654,7 +853,6 @@ impl Driver {
     /// wake, orphans to finish or streams to hand over to, which run code
     /// that may use the driver, and so run once it is released.
     fn turn(&self, min_complete: u32, timeout: Option<Duration>, parks: bool) -> io::Result<()> {
-        let timeout = timeout.map(timespec);
         let shared = &*self.inner;
         let mut inner = shared.state.borrow_mut();
         let before = inner.stats.completions;
@@ -664,7 +862,11 @@ impl Driver {
             Ok(())
         };
         if result.is_ok() {
-            result = inner.enter(min_complete, timeout.as_ref());
+            let park = Park {
+                notify: &shared.notify,
+                timer_armed: shared.timer.armed.get().is_some(),
+            };
+            result = inner.enter(min_complete, timeout, Some(&park));
         }
         loop {
             inner.reap(&shared.timer);
@@ -675,10 +877,10 @@ impl Driver {
             }
             // Completions that did not fit in the queue wait in the kernel,
             // which moves them in when entered again, now that there is room.
-            if inner.ring.sq_flags() & sys::IORING_SQ_CQ_OVERFLOW == 0 {
+            if !inner.overflowed() {
                 break;
             }
-            inner.enter(0, None)?;
+            inner.enter(0, None, None)?;
         }
         inner.last_turn = usize::try_from(inner.stats.completions - before).unwrap_or(usize::MAX);
         result
@@ -760,11 +962,13 @@ impl Driver {
         timeout: Option<Duration>,
         waker: &Waker,
     ) -> io::Result<u64> {
+        let polled = operation.polled();
         self.inner
             .state
             .borrow_mut()
             .queue_entry(
                 operation,
+                polled,
                 |operation, sqe| operation.prepare(sqe),
                 timeout,
                 |table, _| table.insert(Some(waker)),
@@ -781,11 +985,13 @@ impl Driver {
         operation: T,
         timeout: Option<Duration>,
     ) -> Result<(), (io::Error, T)> {
+        let polled = operation.polled();
         self.inner
             .state
             .borrow_mut()
             .queue_entry(
                 operation,
+                polled,
                 |operation, sqe| operation.prepare(sqe),
                 timeout,
                 |table, operation| table.insert_orphan(Payload::operation(operation)),
@@ -817,6 +1023,7 @@ impl Driver {
             .borrow_mut()
             .queue_entry(
                 request,
+                false,
                 |request, sqe| request.prepare(sqe),
                 None,
                 |table, _| table.insert_stream(Some(waker)),
@@ -894,7 +1101,10 @@ impl Driver {
     }
 
     /// Takes over the operation of an `Op` dropped while in flight, and
-    /// cancels it unless `cancel` is false, when it runs to completion.
+    /// cancels it unless `cancel` is false, when it runs to completion. A
+    /// polled operation runs to completion in any case: the kernel takes no
+    /// cancellation on the polled ring, and the device finishes the
+    /// operation regardless.
     pub(crate) fn orphan<T: Operation>(&self, user_data: u64, operation: T, cancel: bool) {
         let Ok(mut inner) = self.inner.state.try_borrow_mut() else {
             // Dropped by code running inside the driver, such as a waker's
@@ -909,6 +1119,7 @@ impl Driver {
                 drop(operation.complete(completion));
             }
             None => {
+                let cancel = cancel && !operation.polled();
                 let waker = inner.table.orphan(user_data, Payload::operation(operation));
                 if cancel {
                     inner.cancels.push(user_data);
@@ -951,23 +1162,51 @@ impl Inner {
     /// the entry completed first (`IOSQE_CQE_SKIP_SUCCESS`), and any it does
     /// post is ignored: the entry's own completion tells whether it timed
     /// out.
+    ///
+    /// A `polled` entry goes on the polled ring, created if the driver has
+    /// none yet, where the kernel takes no linked timeout: such an entry
+    /// with a timeout is refused with `EOPNOTSUPP`.
     fn queue_entry<C>(
         &mut self,
         mut carried: C,
+        polled: bool,
         prepare: impl FnOnce(&mut C, &mut sys::io_uring_sqe),
         timeout: Option<Duration>,
         occupy: impl FnOnce(&mut Table<Payload>, C) -> u64,
     ) -> Result<u64, (io::Error, C)> {
         // An entry and its linked timeout reach the kernel together.
         let needed = if timeout.is_some() { 2 } else { 1 };
-        if self.ring.sq_space() < needed
-            && let Err(err) = self.submit_queued(needed)
+        if polled {
+            if timeout.is_some() {
+                return Err((io::Error::from_raw_os_error(libc::EOPNOTSUPP), carried));
+            }
+            if let Err(err) = self.polled_ring() {
+                return Err((err, carried));
+            }
+        }
+        if self.ring_of(polled).sq_space() < needed
+            && let Err(err) = self.submit_queued(needed, polled)
         {
             return Err((err, carried));
         }
-        let Some(sqe) = self.ring.next_sqe() else {
+        let Inner {
+            ring,
+            polled: polled_ring,
+            table,
+            stats,
+            ..
+        } = self;
+        let mut unpolled = 0;
+        let (ring, pending) = match polled_ring.as_mut() {
+            Some(polled_ring) if polled => (&mut polled_ring.ring, &mut polled_ring.pending),
+            _ => (ring, &mut unpolled),
+        };
+        let Some(sqe) = ring.next_sqe() else {
             return Err((io::Error::from_raw_os_error(libc::EBUSY), carried));
         };
+        // Counted before it is prepared: an entry whose preparation panics
+        // reaches the kernel as a no-op, which posts a completion too.
+        *pending += 1;
         let mut entry = Entry {
             sqe,
             prepared: false,
@@ -979,22 +1218,142 @@ impl Inner {
             entry.sqe.flags |= sys::IOSQE_IO_LINK;
         }
         let opcode = entry.sqe.opcode;
-        let user_data = occupy(&mut self.table, carried);
+        let user_data = occupy(table, carried);
         entry.sqe.user_data = user_data;
         entry.prepared = true;
         drop(entry);
         if let Some(timeout) = timeout {
             // The room was made above, and nothing has taken it since.
-            let link = self
-                .ring
+            let link = ring
                 .next_link_timeout(timespec(timeout))
                 .expect("no room for a linked timeout");
             link.flags = sys::IOSQE_CQE_SKIP_SUCCESS;
             link.user_data = IGNORED;
         }
-        self.ring.note_queued(opcode);
-        self.stats.operations += 1;
+        ring.note_queued(opcode);
+        stats.operations += 1;
+        stats.polled += u64::from(polled);
         Ok(user_data)
+    }
+
+    /// The ring entries go on: the polled ring if `polled`, which must exist
+    /// by then, and the main ring otherwise.
+    #[inline]
+    fn ring_of(&mut self, polled: bool) -> &mut Ring {
+        match &mut self.polled {
+            Some(polled_ring) if polled => &mut polled_ring.ring,
+            _ => &mut self.ring,
+        }
+    }
+
+    /// The polled ring, created if the driver has none yet; see
+    /// [`Driver::enable_polling`].
+    fn polled_ring(&mut self) -> io::Result<&mut Polled> {
+        if self.polled.is_none() {
+            let polled = Polled::new(
+                &self.ring,
+                self.entries,
+                self.cq_entries,
+                self.files,
+                self.buffers,
+            )?;
+            self.polled = Some(polled);
+        }
+        Ok(self.polled.as_mut().expect("made above"))
+    }
+
+    /// Queues, on the polled ring, the update that empties slot `slot` of
+    /// its file table; see [`Driver::release_polled`]. The entry's
+    /// completion, which nothing waits for, is counted as every polled
+    /// entry's is.
+    fn queue_release_polled(&mut self, slot: u32) -> io::Result<()> {
+        if self.polled.is_none() {
+            return Err(io::Error::from_raw_os_error(libc::ENXIO));
+        }
+        if self.ring_of(true).sq_space() == 0 {
+            self.submit_queued(1, true)?;
+        }
+        let polled = self.polled.as_mut().expect("checked above");
+        let sqe = polled
+            .ring
+            .next_sqe()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))?;
+        polled.pending += 1;
+        sqe.opcode = sys::IORING_OP_FILES_UPDATE;
+        // The kernel reads the descriptor to install as it takes the entry,
+        // from memory that lives as long as the program.
+        sqe.addr = ptr::from_ref(&NO_FILE).expose_provenance() as u64;
+        sqe.len = 1;
+        sqe.off = u64::from(slot);
+        sqe.user_data = IGNORED;
+        Ok(())
+    }
+
+    /// Whether the polled ring has operations in flight, whose completions
+    /// only polling finds.
+    #[inline]
+    fn polling(&self) -> bool {
+        self.polled
+            .as_ref()
+            .is_some_and(|polled| polled.pending > 0)
+    }
+
+    /// Whether the polled ring has posted completions that have not been
+    /// reaped.
+    #[inline]
+    fn polled_cq_ready(&self) -> bool {
+        self.polled
+            .as_ref()
+            .is_some_and(|polled| polled.ring.cq_ready())
+    }
+
+    /// Whether either ring has completions that did not fit in its queue
+    /// waiting in the kernel.
+    #[inline]
+    fn overflowed(&self) -> bool {
+        let overflow = |ring: &Ring| ring.sq_flags() & sys::IORING_SQ_CQ_OVERFLOW != 0;
+        overflow(&self.ring)
+            || self
+                .polled
+                .as_ref()
+                .is_some_and(|polled| overflow(&polled.ring))
+    }
+
+    /// Keeps the polled ring's registered buffers the main ring's, after a
+    /// registration with `opcode` on the main ring: buffers registered are
+    /// shared with it, and buffers unregistered are unregistered there too.
+    /// Buffers the polled ring cannot share are unregistered from the main
+    /// ring again, with the sharing's error.
+    fn share_buffers(&mut self, opcode: u32) -> io::Result<()> {
+        match opcode {
+            sys::IORING_REGISTER_BUFFERS | sys::IORING_REGISTER_BUFFERS2 => {
+                self.buffers = true;
+                if let Some(polled) = &self.polled
+                    && let Err(err) = clone_buffers(&self.ring, &polled.ring)
+                {
+                    self.buffers = false;
+                    // SAFETY: unregistering takes no memory.
+                    let _ = unsafe {
+                        self.ring
+                            .register(sys::IORING_UNREGISTER_BUFFERS, ptr::null_mut(), 0)
+                    };
+                    return Err(err);
+                }
+            }
+            sys::IORING_UNREGISTER_BUFFERS => {
+                self.buffers = false;
+                if let Some(polled) = &self.polled {
+                    // SAFETY: unregistering takes no memory.
+                    let _ = unsafe {
+                        polled
+                            .ring
+                            .register(sys::IORING_UNREGISTER_BUFFERS, ptr::null_mut(), 0)
+                    };
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Queues a chain's operations, each followed by its linked timeout if
@@ -1007,12 +1366,21 @@ impl Inner {
     /// that a panic in an operation's `prepare`, or a waker's `clone`,
     /// leaves nothing queued that points to memory the panic frees.
     fn queue_chain(&mut self, members: &mut [&mut dyn Member], waiter: Waiter<'_>) {
+        // The kernel links nothing to a polled operation's entry: the
+        // polled ring takes no timeout, and a chain cannot span rings.
+        if members.iter().any(|member| member.polled()) {
+            let err = io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+            for member in members {
+                member.refused(&err);
+            }
+            return;
+        }
         let needed = members
             .iter()
             .map(|member| if member.timeout().is_some() { 2 } else { 1 })
             .sum();
         if self.ring.sq_space() < needed
-            && let Err(err) = self.submit_queued(needed)
+            && let Err(err) = self.submit_queued(needed, false)
         {
             for member in members {
                 member.refused(&err);
@@ -1068,23 +1436,97 @@ impl Inner {
         }
     }
 
-    /// Queues cancellations for dropped operations, then enters the kernel,
-    /// unless there is nothing to submit, no completion work pending and no
-    /// need to wait.
+    /// Queues cancellations for dropped operations, then enters the kernel:
+    /// the main ring, unless there is nothing to submit, no completion work
+    /// pending and no need to wait; and the polled ring, if it has
+    /// operations in flight, whose completions only polling finds.
+    ///
+    /// A turn that waits with polled operations in flight waits by polling,
+    /// without blocking on the main ring; see [`Inner::poll_for`].
     fn enter(
         &mut self,
         min_complete: u32,
-        timeout: Option<&sys::__kernel_timespec>,
+        timeout: Option<Duration>,
+        park: Option<&Park<'_>>,
     ) -> io::Result<()> {
         self.queue_cancels()?;
         // Descriptors sent here, which other threads dropped unclaimed.
         for slot in self.remote.take_closes() {
             self.queue_close(slot)?;
         }
+        if !self.polling() {
+            return self.enter_main(min_complete, timeout);
+        }
+        // The main ring is entered for what it has to submit or run, without
+        // waiting; the polled ring submits what it has and makes one pass.
+        self.enter_main(0, None)?;
+        self.enter_polled(0)?;
+        if min_complete == 0 || self.has_completions(park) {
+            return Ok(());
+        }
+        self.poll_for(timeout, park)
+    }
+
+    /// Waits, with polled operations in flight, for a completion on either
+    /// ring, an unpark or `timeout`, by polling.
+    ///
+    /// When nothing but a polled operation can complete, every operation in
+    /// flight being one, the wake timer not armed and there being no
+    /// timeout, the polled ring is entered to wait for a completion, which
+    /// polls the devices inside the kernel until one comes, the scheduler
+    /// wants the CPU or a signal arrives: one entry into the kernel however
+    /// long the device takes. An unpark that arrives meanwhile waits until
+    /// then. Otherwise the polled ring makes a pass at a time, an entry
+    /// into the kernel each, and between passes the main ring is looked at
+    /// without entering it: for completion work the kernel has pending
+    /// (`IORING_SQ_TASKRUN`), which a timer's firing or an unparker's write
+    /// leaves, for completions posted, and for the unparkers' flag.
+    fn poll_for(&mut self, timeout: Option<Duration>, park: Option<&Park<'_>>) -> io::Result<()> {
+        let polled_pending = self.polled.as_ref().map_or(0, |polled| polled.pending);
+        let only_polled = timeout.is_none()
+            && park.is_some_and(|park| !park.timer_armed)
+            && self.table.in_flight() == polled_pending as usize;
+        if only_polled {
+            self.enter_polled(1)?;
+        } else {
+            let deadline = timeout.map(|timeout| Instant::now() + timeout);
+            loop {
+                self.enter_polled(0)?;
+                if self.has_completions(park)
+                    || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    break;
+                }
+            }
+        }
+        // Completion work the main ring has pending runs as it is entered.
+        let pending = sys::IORING_SQ_TASKRUN | sys::IORING_SQ_CQ_OVERFLOW;
+        if self.ring.sq_flags() & pending != 0 {
+            self.enter_main(0, None)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a turn that waits has something to deliver: completions
+    /// posted on either ring, completion work pending on the main ring, or
+    /// an unpark, if the turn `park`s.
+    #[inline]
+    fn has_completions(&self, park: Option<&Park<'_>>) -> bool {
+        let pending = sys::IORING_SQ_TASKRUN | sys::IORING_SQ_CQ_OVERFLOW;
+        self.polled_cq_ready()
+            || self.ring.cq_ready()
+            || self.ring.sq_flags() & pending != 0
+            || park.is_some_and(|park| park.notify.is_notified())
+    }
+
+    /// Enters the main ring, unless there is nothing to submit, no
+    /// completion work pending and no need to wait.
+    fn enter_main(&mut self, min_complete: u32, timeout: Option<Duration>) -> io::Result<()> {
         let pending = sys::IORING_SQ_TASKRUN | sys::IORING_SQ_CQ_OVERFLOW;
         if min_complete == 0 && self.ring.queued() == 0 && self.ring.sq_flags() & pending == 0 {
             return Ok(());
         }
+        let timeout = timeout.map(timespec);
         // SAFETY: every queued entry was prepared by an `Operation`, whose
         // contract keeps the memory it points to valid while the operation
         // exists, and the table keeps the operation until its completion; or
@@ -1093,7 +1535,7 @@ impl Inner {
         // consumes the entry and the ring keeps until then; or the wake
         // timer's, whose deadline the kernel copies likewise, from memory the
         // driver keeps.
-        let entered = unsafe { self.ring.enter(min_complete, timeout) };
+        let entered = unsafe { self.ring.enter(min_complete, timeout.as_ref()) };
         match entered {
             Ok(_) => Ok(()),
             // Timed out, interrupted by a signal, or completions held back
@@ -1110,17 +1552,38 @@ impl Inner {
         }
     }
 
-    /// Submits the queued entries, without waiting, to make room for
-    /// `needed` more in the submission queue.
-    fn submit_queued(&mut self, needed: u32) -> io::Result<()> {
-        // SAFETY: as in `Inner::enter`.
-        let entered = unsafe { self.ring.enter(0, None) };
+    /// Enters the polled ring, if there is one: submits what is queued on
+    /// it, and polls its devices, once if `min_complete` is 0 and until
+    /// that many completions otherwise; see [`Ring::enter`].
+    fn enter_polled(&mut self, min_complete: u32) -> io::Result<()> {
+        let Some(polled) = &mut self.polled else {
+            return Ok(());
+        };
+        // SAFETY: every queued entry was prepared by an `Operation`, as in
+        // `Inner::enter_main`, or is a no-op; the ring has no timeouts.
+        let entered = unsafe { polled.ring.enter(min_complete, None) };
+        match entered {
+            Ok(_) => Ok(()),
+            // Interrupted by a signal, or completions held back until the
+            // queue has room: the caller delivers what is ready.
+            Err(err) if matches!(err.raw_os_error(), Some(libc::EINTR | libc::EBUSY)) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Submits the queued entries of the main ring, or of the polled ring if
+    /// `polled`, without waiting, to make room for `needed` more in its
+    /// submission queue.
+    fn submit_queued(&mut self, needed: u32, polled: bool) -> io::Result<()> {
+        let ring = self.ring_of(polled);
+        // SAFETY: as in `Inner::enter_main`.
+        let entered = unsafe { ring.enter(0, None) };
         if let Err(err) = entered
             && !matches!(err.raw_os_error(), Some(libc::EINTR | libc::EBUSY))
         {
             return Err(err);
         }
-        if self.ring.sq_space() < needed {
+        if ring.sq_space() < needed {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         Ok(())
@@ -1129,7 +1592,7 @@ impl Inner {
     fn queue_cancels(&mut self) -> io::Result<()> {
         while let Some(&user_data) = self.cancels.last() {
             let Some(sqe) = self.ring.next_sqe() else {
-                self.submit_queued(1)?;
+                self.submit_queued(1, false)?;
                 continue;
             };
             sqe.opcode = sys::IORING_OP_ASYNC_CANCEL;
@@ -1153,7 +1616,7 @@ impl Inner {
         let sqe = loop {
             match self.ring.next_sqe() {
                 Some(sqe) => break sqe,
-                None => self.submit_queued(1)?,
+                None => self.submit_queued(1, false)?,
             }
         };
         if moving {
@@ -1185,7 +1648,7 @@ impl Inner {
             return Ok(());
         }
         if self.ring.sq_space() == 0 {
-            self.submit_queued(1)?;
+            self.submit_queued(1, false)?;
         }
         let sqe = self
             .ring
@@ -1204,7 +1667,7 @@ impl Inner {
     /// slot.
     fn queue_close(&mut self, slot: u32) -> io::Result<()> {
         if self.ring.sq_space() == 0 {
-            self.submit_queued(1)?;
+            self.submit_queued(1, false)?;
         }
         let sqe = self
             .ring
@@ -1221,7 +1684,7 @@ impl Inner {
     /// Queues a close of the plain descriptor `fd`; see
     /// [`Driver::close_in_order`]. Hands it back if there is no room.
     fn queue_close_fd(&mut self, fd: OwnedFd) -> Result<(), OwnedFd> {
-        if self.ring.sq_space() == 0 && self.submit_queued(1).is_err() {
+        if self.ring.sq_space() == 0 && self.submit_queued(1, false).is_err() {
             return Err(fd);
         }
         let Some(sqe) = self.ring.next_sqe() else {
@@ -1239,7 +1702,7 @@ impl Inner {
     fn queue_cancel_all(&mut self) -> io::Result<()> {
         self.cancels.clear();
         if self.ring.sq_space() == 0 {
-            self.submit_queued(1)?;
+            self.submit_queued(1, false)?;
         }
         let sqe = self
             .ring
@@ -1252,9 +1715,10 @@ impl Inner {
         Ok(())
     }
 
-    /// Cancels everything in flight and waits, until the shutdown timeout,
-    /// for the kernel to finish with it, finishing each orphaned operation as
-    /// its completion arrives.
+    /// Cancels everything in flight on the main ring, and waits, until the
+    /// shutdown timeout, for the kernel to finish with it and with the
+    /// polled ring's operations, which their devices finish, finishing each
+    /// orphaned operation as its completion arrives.
     fn drain(&mut self) {
         let deadline = Instant::now() + self.shutdown_timeout;
         if self.queue_cancel_all().is_err() {
@@ -1270,10 +1734,7 @@ impl Inner {
             let remaining = deadline.saturating_duration_since(Instant::now());
             // Once the time is up, one last pass collects what is ready.
             let min_complete = u32::from(!remaining.is_zero());
-            if self
-                .enter(min_complete, Some(&timespec(remaining)))
-                .is_err()
-            {
+            if self.enter(min_complete, Some(remaining), None).is_err() {
                 break;
             }
             self.reap(&timer);
@@ -1323,11 +1784,11 @@ impl Inner {
         !(self.wakers.is_empty() && self.released.is_empty() && self.deliveries.is_empty())
     }
 
-    /// Moves the posted completions into the table, all that the queue held
-    /// as the reap began: wakes the executor's tasks that wait for them,
-    /// and collects the other wakers to wake, the orphaned payloads to
-    /// finish and the orphaned streams to deliver to. The wake timer's
-    /// completion goes to `timer`.
+    /// Moves the posted completions into the table, all that each ring's
+    /// queue held as the reap began: wakes the executor's tasks that wait
+    /// for them, and collects the other wakers to wake, the orphaned
+    /// payloads to finish and the orphaned streams to deliver to. The wake
+    /// timer's completion goes to `timer`.
     fn reap(&mut self, timer: &Timer) {
         let mut completions = self.ring.completions();
         self.stats.completions += u64::from(completions.len());
@@ -1349,14 +1810,52 @@ impl Inner {
                 }
                 continue;
             }
-            let completion = Completion::new(cqe.res, cqe.flags);
-            match self.table.complete(cqe.user_data, completion) {
-                Outcome::Wake(Some(waker)) => self.wakers.push(waker),
-                Outcome::Wake(None) | Outcome::Ignore => {}
-                Outcome::Release(payload) => self.released.push((payload, completion)),
-                Outcome::Deliver(user_data) => self.deliveries.push(user_data),
+            route(
+                &mut self.table,
+                &mut self.wakers,
+                &mut self.released,
+                &mut self.deliveries,
+                cqe,
+            );
+        }
+        drop(completions);
+        // The polled ring carries operations only, every one of which posts
+        // one completion.
+        if let Some(polled) = &mut self.polled {
+            let mut completions = polled.ring.completions();
+            let count = completions.len();
+            self.stats.completions += u64::from(count);
+            polled.pending = polled.pending.saturating_sub(count);
+            for cqe in &mut completions {
+                route(
+                    &mut self.table,
+                    &mut self.wakers,
+                    &mut self.released,
+                    &mut self.deliveries,
+                    cqe,
+                );
             }
         }
+    }
+}
+
+/// Records an operation's completion in the table: wakes the executor's
+/// task that waits for it, or collects its waker, its orphaned payload or
+/// the orphaned stream to deliver to, which run once the driver is released.
+#[inline]
+fn route(
+    table: &mut Table<Payload>,
+    wakers: &mut Vec<Waker>,
+    released: &mut Vec<(Payload, Completion)>,
+    deliveries: &mut Vec<u64>,
+    cqe: sys::io_uring_cqe,
+) {
+    let completion = Completion::new(cqe.res, cqe.flags);
+    match table.complete(cqe.user_data, completion) {
+        Outcome::Wake(Some(waker)) => wakers.push(waker),
+        Outcome::Wake(None) | Outcome::Ignore => {}
+        Outcome::Release(payload) => released.push((payload, completion)),
+        Outcome::Deliver(user_data) => deliveries.push(user_data),
     }
 }
 

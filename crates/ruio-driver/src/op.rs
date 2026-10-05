@@ -91,6 +91,22 @@ pub unsafe trait Operation: 'static {
     /// completion arrives and the output is dropped, so an output that owns
     /// a resource, such as a new file descriptor, releases it.
     fn complete(self, completion: Completion) -> Self::Output;
+
+    /// Whether the operation goes on the driver's polled ring, which polls
+    /// its devices for completions rather than wait for their interrupts
+    /// (`IORING_SETUP_IOPOLL`); see [`Driver::enable_polling`]. The kernel
+    /// takes only reads, writes, passthrough commands and no-ops on such a
+    /// ring, and only of files opened for direct I/O on devices that can be
+    /// polled: anything else fails with `EOPNOTSUPP`. A polled operation
+    /// can have no [`timeout`](Op::timeout), cannot be linked into a chain,
+    /// and is not cancelled when its `Op` is dropped, as the device finishes
+    /// it in any case.
+    ///
+    /// Nothing is polled unless an operation says so.
+    #[inline]
+    fn polled(&self) -> bool {
+        false
+    }
 }
 
 /// The payload of a request whose future was dropped before the kernel
@@ -249,6 +265,11 @@ unsafe impl<T: Operation> Operation for Seen<T> {
     fn complete(self, completion: Completion) -> T::Output {
         self.operation.complete(seen(completion, self.timed))
     }
+
+    #[inline]
+    fn polled(&self) -> bool {
+        self.operation.polled()
+    }
 }
 
 /// The completion as the operation sees it. For an operation with a linked
@@ -350,6 +371,13 @@ impl<T: Operation> Linkable for Op<T> {
 impl<T: Operation> Member for Op<T> {
     fn timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    fn polled(&self) -> bool {
+        match &self.state {
+            State::Unsubmitted(operation) => operation.polled(),
+            _ => unreachable!("a chain holds only unsubmitted operations"),
+        }
     }
 
     fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {

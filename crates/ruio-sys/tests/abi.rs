@@ -197,6 +197,14 @@ const LAYOUTS: &[Layout] = &[
         flags => flags,
         min_left => min_left,
     }),
+    layout!(io_uring_clone_buffers, in_header: true, {
+        src_fd => src_fd,
+        flags => flags,
+        src_off => src_off,
+        dst_off => dst_off,
+        nr => nr,
+        pad => pad,
+    }),
     layout!(__kernel_timespec, in_header: false, {
         tv_sec => tv_sec,
         tv_nsec => tv_nsec,
@@ -231,6 +239,7 @@ fn tables() -> Vec<(&'static str, Vec<(&'static str, u64)>)> {
         MMAP_OFFSETS,
         REGISTER_OPS,
         RSRC_REGISTER_FLAGS,
+        CLONE_BUFFERS_FLAGS,
         FSYNC_FLAGS,
         TIMEOUT_FLAGS,
         POLL_FLAGS,

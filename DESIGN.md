@@ -146,6 +146,11 @@ submission queue entries, room for an operation and its linked timeout.
 `DEFER_TASKRUN` and `TASKRUN_FLAG` together with `SQPOLL`, so that mode uses
 its own flag set.
 
+A driver gets a second ring, with the same flags plus `IOPOLL`, once an
+operation asks to be polled, or at once with `Builder::polled`; see
+[Kernel features](#kernel-features) for what it is for and how parking
+works with it.
+
 ### Submission and completion
 
 - Operations write SQEs straight into the mapped submission queue; queueing
@@ -379,6 +384,92 @@ its own flag set.
   zero-copy starts to pay; the size threshold for choosing it automatically
   waits for a benchmark across two machines.
 - Registered buffers for file I/O (`READ_FIXED`, `WRITE_FIXED`).
+- Polled I/O (`IORING_SETUP_IOPOLL`), on a second ring: a read or a write
+  of a file opened for direct I/O on a block device with poll queues can
+  ask for it (`Operation::polled`, `Read::polled` and the three others),
+  and the kernel then polls the device's completion queue for it rather
+  than wait for an interrupt, as fio's `hipri` does; what that gains is
+  measured under [Random reads with direct I/O](#random-reads-with-direct-io).
+  The kernel's constraints, from Linux 7.0's `io_uring/io_uring.c`,
+  `io_uring/rw.c`, `io_uring/opdef.c` and `block/blk-mq.c`, shape the
+  design:
+  - A ring set up with `IOPOLL` takes only opcodes marked `.iopoll` in
+    `opdef.c`: reads and writes, plain, fixed and vectored, passthrough
+    commands, no-ops, `MSG_RING`, and the buffer and file table updates;
+    anything else, a socket operation, a timeout, `POLL_ADD`,
+    `ASYNC_CANCEL`, a `LINK_TIMEOUT`, `CLOSE`, fails at submission with
+    `EINVAL`. So it cannot be the
+    runtime's one ring: the driver keeps its main ring for everything
+    else, the wake timer and the unparkers' poll included, and polled
+    operations go on the second, created on the first such operation or
+    by the builder. Both rings share the operation table, so completions
+    route by `user_data` as before, `Driver::in_flight` counts both, and
+    `Stats` counts the polled operations and both rings' entries. Each
+    ring counts the entries that plug the block layer for itself, so the
+    polled ring submits reads in batches of 32 as the main ring does.
+  - Its requests complete only as the ring is entered with `GETEVENTS`,
+    which polls (`io_iopoll_check`): `min_complete` 0 makes one pass over
+    the requests in flight (`io_do_iopoll`, `BLK_POLL_ONESHOT`), and
+    `min_complete` n polls until n have completed, `need_resched()` says
+    the CPU is wanted or a signal is pending, which can leave it short; an
+    entry with completions still unread in the queue polls nothing at all,
+    so the queue is drained before every entry. A timeout in the extended
+    argument is validated but not applied (`io_validate_ext_arg`): there is
+    no timed wait on such a ring. So every turn with polled operations in
+    flight enters the polled ring for a pass, and reaps its completions
+    through the same path as the main ring's.
+  - A park with polled operations in flight must not block on the main
+    ring, which would leave the polled completions unfound, and must not
+    only poll, which would leave sockets, timers and unparks unseen. When
+    nothing but a polled operation can complete, every operation in flight
+    being polled, the wake timer not armed and the park without a
+    timeout, the park enters the polled ring to wait for one completion,
+    which polls inside the kernel until it comes: one entry however long
+    the device takes, and the device's latency is the most an unpark can
+    be held back by, as with any polling reader. Otherwise the park polls
+    a pass at a time, an entry each, and between passes looks at the main
+    ring without entering it: at `IORING_SQ_TASKRUN`, which the kernel sets
+    when a completion of the main ring is ready to run, as a timer's
+    firing or an unparker's write to the eventfd leaves one; at its
+    completion queue; and at the unparkers' flag; then enters the main
+    ring once, without waiting, to run that work. The second policy costs
+    a system call per pass where the first costs one per completion, which
+    a device that completes faster than the pass takes, as the null block
+    device does, never shows.
+  - A polled read or write needs `O_DIRECT` and a file whose operations
+    can poll (`f_op->iopoll`), or it fails with `EOPNOTSUPP`
+    (`io_rw_init_file`); and since 6.11 a polled request to a device whose
+    queue has no poll queues (`/sys/block/DEV/queue/io_poll` 0) fails with
+    `EOPNOTSUPP` too (`blk_mq_submit_bio`, `BLK_STS_NOTSUPP`), where
+    earlier kernels fell back to an interrupt. The null block device puts a
+    polled request on its poll queue's list and completes it only in
+    `null_poll`, so nothing but polling finishes it.
+  - The polled ring has a file table of its own, as large as the main
+    ring's, since a direct descriptor means something only to its own
+    ring's table: `Driver::install_polled` puts a plain descriptor's file
+    into a slot of it, with an `IORING_OP_FILES_UPDATE` on the polled ring
+    that allocates the slot (`IORING_FILE_INDEX_ALLOC`), and polled
+    operations name the slot as a `PolledFd`, beside the plain descriptor
+    that the main ring's operations keep using. Dropping the `PolledFd`
+    queues the update that empties the slot on the same ring, so it
+    reaches the kernel after the operations queued before it, as a
+    `DirectFd`'s close does on the main ring. The lookup a plain descriptor
+    costs the kernel on every operation is worth having the table for: with
+    plain descriptors instead, the non-polled reader of the random-read
+    benchmark lost 2% at depth 1 and 4% to 5% at depth 32 and 128 (medians
+    of three runs of 2 s). The ring shares the main ring's registered
+    buffers: those registered before it exists are cloned into it as it is
+    created and those registered later as they are registered
+    (`IORING_REGISTER_CLONE_BUFFERS`, 6.12, which gives the second ring
+    references to the first's buffers), and unregistering on the main
+    ring unregisters on both. A polled operation can have no linked
+    timeout and join no chain, which the driver refuses with `EOPNOTSUPP`
+    before the kernel sees them; dropping its `Op` orphans it without a
+    cancellation, the kernel taking none on that ring and the device
+    finishing the request regardless, and the driver's drop waits for it
+    as for any orphan. A kernel without `IOPOLL`, or without cloning while
+    buffers are registered, makes creating the polled ring fail with
+    `Unsupported`.
 - `MSG_RING` to move direct descriptors from one ring's file table to
   another's (`DirectFd::send_to`). The other ring posts no completion
   (`IORING_MSG_RING_CQE_SKIP`): the sender's says which slot the file went

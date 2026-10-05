@@ -30,7 +30,9 @@ mod fs;
 mod net;
 
 pub(crate) use fs::CloseSlot;
-pub use fs::{Close, Fallocate, Fsync, Ftruncate, MkdirAt, OpenAt, RenameAt, Statx, UnlinkAt};
+pub use fs::{
+    Close, Fallocate, Fsync, Ftruncate, InstallPolled, MkdirAt, OpenAt, RenameAt, Statx, UnlinkAt,
+};
 pub use net::{
     Accept, AcceptMulti, AcceptStream, Connect, Recv, RecvFrom, Send, SendTo, SendVectored, SendZc,
     Shutdown, Socket,
@@ -175,6 +177,7 @@ pub struct Read<B> {
     fd: Fd,
     buf: B,
     offset: u64,
+    polled: bool,
 }
 
 impl<B: IoBufMut> Read<B> {
@@ -189,7 +192,19 @@ impl<B: IoBufMut> Read<B> {
             fd: fd.into(),
             buf,
             offset,
+            polled: false,
         }
+    }
+
+    /// Runs the read on the driver's polled ring, which polls the device for
+    /// its completion; see [`Operation::polled`]. The file must be open for
+    /// direct I/O on a block device with poll queues, as a plain descriptor
+    /// or as a direct descriptor of the polled ring, a
+    /// [`PolledFd`](crate::PolledFd): a slot of the main ring's table means
+    /// nothing there.
+    pub fn polled(mut self, polled: bool) -> Self {
+        self.polled = polled;
+        self
     }
 }
 
@@ -212,6 +227,11 @@ unsafe impl<B: IoBufMut> Operation for Read<B> {
 
     fn complete(self, completion: Completion) -> Self::Output {
         complete_read(self.buf, completion)
+    }
+
+    #[inline]
+    fn polled(&self) -> bool {
+        self.polled
     }
 }
 
@@ -257,6 +277,7 @@ pub struct Write<B> {
     fd: Fd,
     buf: B,
     offset: u64,
+    polled: bool,
 }
 
 impl<B: IoBuf> Write<B> {
@@ -271,7 +292,14 @@ impl<B: IoBuf> Write<B> {
             fd: fd.into(),
             buf,
             offset,
+            polled: false,
         }
+    }
+
+    /// Runs the write on the driver's polled ring; see [`Read::polled`].
+    pub fn polled(mut self, polled: bool) -> Self {
+        self.polled = polled;
+        self
     }
 }
 
@@ -292,6 +320,11 @@ unsafe impl<B: IoBuf> Operation for Write<B> {
             self.buf,
         )
     }
+
+    #[inline]
+    fn polled(&self) -> bool {
+        self.polled
+    }
 }
 
 /// Reads into a registered buffer, like [`Read`], without the kernel mapping
@@ -301,6 +334,7 @@ pub struct ReadFixed<B> {
     fd: Fd,
     buf: B,
     offset: u64,
+    polled: bool,
 }
 
 impl<B: IoBufMut + FixedIoBuf> ReadFixed<B> {
@@ -315,7 +349,15 @@ impl<B: IoBufMut + FixedIoBuf> ReadFixed<B> {
             fd: fd.into(),
             buf,
             offset,
+            polled: false,
         }
+    }
+
+    /// Runs the read on the driver's polled ring, which shares the ring's
+    /// registered buffers; see [`Read::polled`].
+    pub fn polled(mut self, polled: bool) -> Self {
+        self.polled = polled;
+        self
     }
 }
 
@@ -339,6 +381,11 @@ unsafe impl<B: IoBufMut + FixedIoBuf> Operation for ReadFixed<B> {
     fn complete(self, completion: Completion) -> Self::Output {
         complete_read(self.buf, completion)
     }
+
+    #[inline]
+    fn polled(&self) -> bool {
+        self.polled
+    }
 }
 
 /// Writes from a registered buffer, like [`Write`], without the kernel
@@ -348,6 +395,7 @@ pub struct WriteFixed<B> {
     fd: Fd,
     buf: B,
     offset: u64,
+    polled: bool,
 }
 
 impl<B: IoBuf + FixedIoBuf> WriteFixed<B> {
@@ -362,7 +410,15 @@ impl<B: IoBuf + FixedIoBuf> WriteFixed<B> {
             fd: fd.into(),
             buf,
             offset,
+            polled: false,
         }
+    }
+
+    /// Runs the write on the driver's polled ring, which shares the ring's
+    /// registered buffers; see [`Read::polled`].
+    pub fn polled(mut self, polled: bool) -> Self {
+        self.polled = polled;
+        self
     }
 }
 
@@ -388,6 +444,11 @@ unsafe impl<B: IoBuf + FixedIoBuf> Operation for WriteFixed<B> {
             completion.result().map(|written| written as usize),
             self.buf,
         )
+    }
+
+    #[inline]
+    fn polled(&self) -> bool {
+        self.polled
     }
 }
 
