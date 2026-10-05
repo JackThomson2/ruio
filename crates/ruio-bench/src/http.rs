@@ -1,8 +1,9 @@
-//! The HTTP/1.1 benchmark's servers: hyper answering every request with a
-//! short plaintext response, on one thread, on ruio through its adapters,
-//! which have hyper's own traits, and on tokio's current-thread runtime
-//! through hyper-util's `TokioIo`; and what the load generator sends and
-//! checks.
+//! The HTTP benchmarks' servers: hyper answering every request with a short
+//! plaintext response, over HTTP/1.1 or HTTP/2, on one thread, on ruio
+//! through its adapters, which have hyper's own traits, with ruio's executor
+//! for HTTP/2's streams, and on tokio's current-thread runtime through
+//! hyper-util's `TokioIo` and `TokioExecutor`; and what the HTTP/1.1 load
+//! generator sends and checks.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -14,12 +15,12 @@ use std::str::FromStr;
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{CONTENT_TYPE, HeaderValue};
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use ruio::buf::BufPool;
-use ruio_compat::Compat;
+use ruio_compat::{Compat, Executor};
 
 use crate::sys;
 
@@ -31,6 +32,16 @@ pub(crate) const REQUEST: &[u8] = b"GET /plaintext HTTP/1.1\r\nHost: ruio-bench\
 
 /// The size of the buffers of ruio's pool, which hold a request each.
 const BUFFER_SIZE: u32 = 4096;
+
+/// Which HTTP a server speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Protocol {
+    /// HTTP/1.1: a request at a time on a connection.
+    Http1,
+    /// HTTP/2, from the start of the connection: many streams at once, each
+    /// a task of the executor.
+    Http2,
+}
 
 /// An HTTP server implementation: hyper, on one thread, on a runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,17 +92,22 @@ async fn hello(_: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible
     Ok(response)
 }
 
-/// Runs `server` on `addr` until the process is killed. `buffers` sizes
-/// ruio's pool.
-pub(crate) fn run(server: HttpServer, addr: SocketAddr, buffers: u16) -> io::Result<()> {
+/// Runs `server` on `addr`, speaking `protocol`, until the process is
+/// killed. `buffers` sizes ruio's pool.
+pub(crate) fn run(
+    server: HttpServer,
+    protocol: Protocol,
+    addr: SocketAddr,
+    buffers: u16,
+) -> io::Result<()> {
     match server {
-        HttpServer::Ruio => ruio(addr, None),
-        HttpServer::RuioPool => ruio(addr, Some(buffers)),
-        HttpServer::Tokio => tokio(addr),
+        HttpServer::Ruio => ruio(protocol, addr, None),
+        HttpServer::RuioPool => ruio(protocol, addr, Some(buffers)),
+        HttpServer::Tokio => tokio(protocol, addr),
     }
 }
 
-fn ruio(addr: SocketAddr, buffers: Option<u16>) -> io::Result<()> {
+fn ruio(protocol: Protocol, addr: SocketAddr, buffers: Option<u16>) -> io::Result<()> {
     ruio::Runtime::builder()
         .entries(4096)
         .build()?
@@ -114,17 +130,28 @@ fn ruio(addr: SocketAddr, buffers: Option<u16>) -> io::Result<()> {
                     Some(pool) => Compat::with_pool(pool, stream),
                     None => Compat::new(stream),
                 };
-                let _detached = ruio::spawn(async move {
-                    let _ = http1::Builder::new()
-                        .serve_connection(io, service_fn(hello))
-                        .await;
-                });
+                match protocol {
+                    Protocol::Http1 => {
+                        let connection =
+                            http1::Builder::new().serve_connection(io, service_fn(hello));
+                        drop(ruio::spawn(async move {
+                            let _ = connection.await;
+                        }));
+                    }
+                    Protocol::Http2 => {
+                        let connection = http2::Builder::new(Executor::new())
+                            .serve_connection(io, service_fn(hello));
+                        drop(ruio::spawn(async move {
+                            let _ = connection.await;
+                        }));
+                    }
+                }
             }
             Ok(())
         })
 }
 
-fn tokio(addr: SocketAddr) -> io::Result<()> {
+fn tokio(protocol: Protocol, addr: SocketAddr) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()?;
@@ -140,11 +167,21 @@ fn tokio(addr: SocketAddr) -> io::Result<()> {
                 }
             };
             let io = TokioIo::new(stream);
-            tokio::spawn(async move {
-                let _ = http1::Builder::new()
-                    .serve_connection(io, service_fn(hello))
-                    .await;
-            });
+            match protocol {
+                Protocol::Http1 => {
+                    let connection = http1::Builder::new().serve_connection(io, service_fn(hello));
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                }
+                Protocol::Http2 => {
+                    let connection = http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, service_fn(hello));
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                }
+            }
         }
     })
 }

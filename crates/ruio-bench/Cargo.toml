@@ -10,7 +10,7 @@ publish.workspace = true
 # measured against.
 [dependencies]
 http-body-util = "0.1.5"
-hyper = { version = "1.11.1", features = ["http1", "server"] }
+hyper = { version = "1.11.1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 libc.workspace = true
 ruio.workspace = true

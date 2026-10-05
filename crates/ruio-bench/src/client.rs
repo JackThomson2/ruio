@@ -1,5 +1,7 @@
 //! The load generator: connections that each send a message and wait for
-//! its echo, or a request and wait for its response, again and again.
+//! its echo, or a request and wait for its response, again and again; and,
+//! for HTTP/2, connections that each keep several streams going, each a
+//! request and its response again and again.
 //!
 //! It is the same for every server, and runs on tokio's multi-threaded
 //! runtime, on CPUs of its own, with enough threads that the server, on
@@ -10,6 +12,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Bytes;
+use hyper::client::conn::http2;
+use hyper::{Method, Request, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
@@ -111,6 +118,114 @@ pub(crate) fn run(addr: SocketAddr, load: Load) -> io::Result<Measurement> {
             latencies,
         })
     })
+}
+
+/// Connects `load.connections` HTTP/2 connections of hyper's client to
+/// `addr`, each with `streams` streams going at once, and measures their
+/// round trips: a request each, and its response.
+pub(crate) fn run_http2(addr: SocketAddr, load: Load, streams: usize) -> io::Result<Measurement> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(load.threads)
+        .enable_io()
+        .build()?;
+    runtime.block_on(async move {
+        let permits = Arc::new(Semaphore::new(100));
+        let connects: Vec<_> = (0..load.connections)
+            .map(|_| {
+                let permits = Arc::clone(&permits);
+                tokio::spawn(async move {
+                    let _permit = permits.acquire_owned().await.map_err(io::Error::other)?;
+                    let stream = TcpStream::connect(addr).await?;
+                    stream.set_nodelay(true)?;
+                    let (sender, connection) = http2::handshake::<_, _, Empty<Bytes>>(
+                        TokioExecutor::new(),
+                        TokioIo::new(stream),
+                    )
+                    .await
+                    .map_err(io::Error::other)?;
+                    tokio::spawn(connection);
+                    io::Result::Ok(sender)
+                })
+            })
+            .collect();
+        let mut senders = Vec::with_capacity(load.connections);
+        for connect in connects {
+            senders.push(connect.await.map_err(io::Error::other)??);
+        }
+
+        let from = Instant::now() + load.warmup;
+        let until = from + load.measure;
+        let tasks: Vec<_> = senders
+            .iter()
+            .flat_map(|sender| {
+                (0..streams).map(|_| tokio::spawn(http2_round_trips(sender.clone(), from, until)))
+            })
+            .collect();
+        let mut total = 0;
+        let mut latencies = Vec::new();
+        for task in tasks {
+            let (count, mut times) = task.await.map_err(io::Error::other)??;
+            total += count;
+            latencies.append(&mut times);
+        }
+        latencies.sort_unstable();
+        Ok(Measurement {
+            round_trips: total,
+            seconds: load.measure.as_secs_f64(),
+            latencies,
+        })
+    })
+}
+
+/// Makes HTTP/2 requests on one stream after another of `sender`'s
+/// connection until `until`, counting and timing those that start from
+/// `from`, and checking every response.
+async fn http2_round_trips(
+    mut sender: http2::SendRequest<Empty<Bytes>>,
+    from: Instant,
+    until: Instant,
+) -> io::Result<(u64, Vec<u32>)> {
+    let mut count = 0;
+    let mut latencies = Vec::new();
+    loop {
+        let sent = Instant::now();
+        if sent >= until {
+            break;
+        }
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/plaintext")
+            .body(Empty::new())
+            .map_err(io::Error::other)?;
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(io::Error::other)?;
+        if response.status() != StatusCode::OK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a response with status {}", response.status()),
+            ));
+        }
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(io::Error::other)?
+            .to_bytes();
+        if body != http::BODY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a response with the wrong body",
+            ));
+        }
+        let took = sent.elapsed();
+        if sent >= from {
+            count += 1;
+            latencies.push(u32::try_from(took.as_nanos()).unwrap_or(u32::MAX));
+        }
+    }
+    Ok((count, latencies))
 }
 
 /// Makes exchanges until `until`, counting and timing those that start from
