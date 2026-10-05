@@ -305,13 +305,29 @@ its own flag set.
   buffers before it knows how much is waiting, as many as the entry's `len`
   asks for: one buffer unless asked for more, so a message of several
   buffers' worth that has arrived whole takes two calls into the socket, one
-  for the first buffer and one for the rest. A stream whose messages run to
-  several buffers can ask for that many (`RecvStream::buffers`), and such a
-  message then takes one call: 3% more round trips with one connection and
-  64 KiB messages. But every receive then walks that many ring entries,
-  which costs messages that fit one buffer 1% to 1.5%, in the echo rows
-  with 16 and 256 connections and in hyper's requests alike, so the ask is
-  not the default.
+  for the first buffer and one for the rest. Asking for the whole message
+  instead gains nothing measurable: the second call costs little next to
+  the copies. But a receive that fills its whole ask is capped
+  (`IORING_RECV_MSHOT_CAP`): the kernel posts it as it is and queues the
+  request again for the rest, which comes in a turn of its own. So a
+  receive stream learns how many buffers its messages take, and while its
+  thread waits on one peer at a time, which the ring's turns delivering one
+  completion each tell, asks for a buffer less: the kernel hands over all
+  but the last buffer of a message as soon as it has them, and the task
+  answering the message echoes that part while the kernel still copies the
+  rest, as tokio's echo, which reads and writes a buffer at a time, does by
+  nature. Under load the split would cost each message a completion and a
+  send, 10% at 16 connections, so the ask is then the kernel's own. A
+  stream changes its ask by restarting its request: a cancellation,
+  whose own completion ends the request, after which it is submitted
+  again; the completions posted before are yielded as usual, and what the
+  receive had not taken waits in the socket. A capped receive is issued
+  only once the socket polls readable (`IORING_RECVSEND_POLL_FIRST`):
+  issued at submission while data waited, with a peer still writing, the
+  kernel's receive was seen to fall silent for good after a capped
+  completion, and from poll it never did. `RecvStream::buffers` sets how
+  many buffers the messages take from the start, for a stream known to
+  carry large ones.
   `ReadStream` keeps a multishot read into a pool armed the same way, one
   buffer to a read, for files the kernel can poll: pipes, FIFOs and
   character devices; it refuses others with `EBADFD`. A file that does
@@ -476,15 +492,31 @@ baseline are used only when probed.
   sleeps cost one. A pass reads the clock and fires timers only once that
   timer has fired; before the wheel's next deadline, firing does nothing,
   not even move the wheel's time on, and a timer queued meanwhile goes on a
-  higher level and moves down as time comes to it.
+  higher level and moves down as time comes to it. The wheel holds a task
+  of the thread's runtime by a local reference, as a task holds the one
+  awaiting its handle, so arming and firing a timer take no atomic
+  operation; and a sleep polled inside the runtime takes the clock as the
+  pass read it, which the scheduler reads at most once a pass, so one that
+  arms many timers reads it once. A deadline that passed during the pass
+  is armed, and fires at the next tick, rather than ending at once; none
+  ends early.
 - A sleep is `Send` and `Sync`, so that a future given to `spawn_on`, or a
   sleep hyper asks of a timer, can hold one. Its timer is in the wheel of
-  the runtime that polls it, which it names by the runtime's shared part.
-  On that runtime's thread, inside it, it reaches the wheel through the
-  thread's current runtime, with no lock. Polled by another
-  runtime, it arms its timer there; dropped, or moved away, where its wheel
-  cannot be reached, it queues the timer's key beside the wakes from other
-  threads, and the runtime's next turn removes it.
+  the runtime that polls it, which it names by the address of the runtime's
+  shared part and the runtime's id rather than holding it, so that arming
+  takes no atomic operation. On that runtime's thread, inside it, it
+  reaches the wheel through the thread's current runtime, with no lock, the
+  id telling the runtime from a later one at the same address. Polled by
+  another runtime, it arms its timer there; dropped, or moved away, where
+  its wheel cannot be reached, it finds the runtime by its id in a registry
+  of the runtimes alive, queues the timer's key beside the wakes from other
+  threads, and the runtime's next turn removes it; a runtime that has gone
+  has no wheel left to remove it from.
+- A task's memory comes from its scheduler's cache of the tasks freed on
+  its thread, kept by layout, the first four layouts and up to 64 blocks
+  of each, and goes back there; a task's layout is its future's, so a
+  program has few, and a spawn and its free take no call into the
+  allocator. A task freed on another thread goes to the allocator.
 - A wake from another thread goes to the runtime's mutex-protected queue,
   sets a flag so that a pass takes the lock only when the queue may hold
   tasks, and unparks its ring. Unparking writes to an eventfd that a parked
@@ -504,7 +536,15 @@ baseline are used only when probed.
   from running. `#[ruio::main(cores = "all")]`, or `cores = N`, runs `main`
   so, and returns `()` or the first core's error. The channels of `sync`,
   `oneshot` and a bounded `mpsc`, carry values between cores, and wake a
-  task wherever it runs, with no lock on the path of a value. An `mpsc`
+  task wherever it runs, with no lock on the path of a value. A send still
+  takes two locked instructions, to claim its slot and to see whether the
+  receiver waits, which no cross-thread channel can do without: a store
+  and a load that another thread may reorder need a barrier between them,
+  which costs what a locked instruction does. So `sync::local` has the
+  same channels for the tasks of one thread, built on `Rc` and cells,
+  whose halves are not `Send` and whose values need not be: a value moves
+  through a plain cell, the receiver's waker stays registered and is woken
+  by reference, and a round trip takes no atomic operation. An `mpsc`
   keeps its values in a ring of slots, each stamped with the turn round
   the ring at which it is free to fill, or was filled, as in Vyukov's
   bounded queue: a sender claims a slot with one compare-and-exchange on
@@ -828,18 +868,18 @@ loopback:
 
 | Connections | Message | tokio | ruio | p99 tokio (µs) | p99 ruio (µs) |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 64 B | 47k | 48k (1.01×) | 28 | 27 |
-| 1 | 1 KiB | 45k | 44k (0.98×) | 28 | 29 |
-| 1 | 16 KiB | 31k | 32k (1.04×) | 40 | 39 |
-| 1 | 64 KiB | 17k | 16k (0.96×) | 78 | 66 |
-| 16 | 64 B | 211k | 204k (0.97×) | 95 | 101 |
-| 16 | 1 KiB | 200k | 193k (0.97×) | 102 | 107 |
-| 16 | 16 KiB | 116k | 120k (1.04×) | 188 | 179 |
-| 16 | 64 KiB | 42k | 46k (1.12×) | 571 | 467 |
-| 256 | 64 B | 205k | 203k (0.99×) | 1313 | 1387 |
-| 256 | 1 KiB | 194k | 197k (1.02×) | 1399 | 1412 |
-| 256 | 16 KiB | 141k | 156k (1.11×) | 2086 | 1856 |
-| 256 | 64 KiB | 48k | 50k (1.04×) | 5592 | 5460 |
+| 1 | 64 B | 47k | 48k (1.02×) | 28 | 28 |
+| 1 | 1 KiB | 45k | 45k (1.01×) | 28 | 28 |
+| 1 | 16 KiB | 30k | 31k (1.01×) | 42 | 41 |
+| 1 | 64 KiB | 17k | 20k (1.17×) | 76 | 57 |
+| 16 | 64 B | 210k | 207k (0.98×) | 95 | 100 |
+| 16 | 1 KiB | 200k | 195k (0.98×) | 102 | 106 |
+| 16 | 16 KiB | 116k | 121k (1.04×) | 187 | 178 |
+| 16 | 64 KiB | 42k | 46k (1.10×) | 559 | 468 |
+| 256 | 64 B | 204k | 207k (1.02×) | 1320 | 1336 |
+| 256 | 1 KiB | 194k | 199k (1.03×) | 1393 | 1396 |
+| 256 | 16 KiB | 154k | 163k (1.06×) | 1818 | 1748 |
+| 256 | 64 KiB | 49k | 49k (1.02×) | 5570 | 6192 |
 | 1,024 | 64 B | 221k | 218k (0.99×) | 4792 | 5116 |
 | 1,024 | 1 KiB | 222k | 231k (1.04×) | 4823 | 4668 |
 | 1,024 | 16 KiB | 106k | 119k (1.13×) | 11932 | 12894 |
@@ -849,12 +889,17 @@ loopback:
 | 10,000 | 16 KiB | 91k | 88k (0.97×) | 112809 | 117267 |
 | 10,000 | 64 KiB | 32k | 35k (1.07×) | 314124 | 293676 |
 
-ruio is ahead of tokio from 256 connections on, by up to 13%, bar 256 and
-1,024 connections with 64 B messages (0.99×) and 10,000 with 16 KiB (0.97×),
-and level at 1 and 16 connections, bar one connection with 64 KiB messages
-(0.96×) and 16 connections with messages of a kilobyte or less (0.97×). Its
-99th percentile is within 7% of tokio's or better, bar 1,024 connections with
-64 B and 16 KiB messages. Direct descriptors change nothing measurable. Runs
+ruio is ahead of tokio from 256 connections on, by up to 13%, bar 1,024
+connections with 64 B messages (0.99×) and 10,000 with 16 KiB (0.97×), and
+level at 1 and 16 connections, bar 16 connections with messages of a
+kilobyte or less (0.98×) and the rows with 64 KiB messages, where it is
+ahead by 10% to 17%. Its 99th percentile is within 7% of tokio's or better,
+bar 1,024 connections with 64 B and 16 KiB messages and 256 with 64 KiB. The
+rows up to 256 connections are from after the fifth performance pass,
+medians of five runs; those from 1,024 on are from before the second, and
+the passes since have not been on their path, bar the receive that the
+64 KiB rows gained from, which the load there keeps the kernel's own.
+Direct descriptors change nothing measurable. Runs
 of the same load differ by up to a few percent on this host, which is
 shared, and more while it is busy: in the run of the table the 10,000
 connection rows came in such a spell, 64 B messages measuring 0.77× with the
@@ -921,11 +966,6 @@ What got ruio here, in order of effect:
 
 What is left:
 
-- With one connection and 64 KiB messages the kernel still copies the whole
-  message into ruio's buffers before the server sees any of it, where tokio
-  has echoed the first 16 KiB by then; and the client's copy of the last
-  segment, 32 KiB, comes after the server's last send, where tokio's is
-  16 KiB.
 - With 10,000 connections and large messages, tokio's 16 KiB stays in the
   first-level cache between read and write, where ruio's 64 KiB, received
   up to forty receives earlier, comes back from the last-level cache, and
@@ -975,7 +1015,22 @@ neither the microbenchmark's turns nor the echo rows. And asking the kernel
 to map four buffers for every receive, so that a 64 KiB message takes one
 call into the socket rather than two, gained 3% with one connection and
 64 KiB messages and cost 1% to 1.5% with messages that fit one buffer, so it
-is an option (`RecvStream::buffers`) rather than the default.
+was an option rather than the default; measured again in the fifth pass it
+gained 0.4% to 1.6% and cost 0.6% to 1.3%, within the host's noise. What
+did pay there was the opposite: a receive asked for a buffer less than
+its messages take, so that the kernel hands over all but the last buffer
+as soon as it has them, and the server echoes them while the kernel
+copies the rest, as tokio's echo does (see [Networking](#networking)).
+With one connection and 64 KiB messages that took ruio from 0.95x of
+tokio to 1.12x, 16412 to 20258 round trips a second against tokio's
+18156, medians of seven runs in turns with the server on one CPU and the
+client on fourteen, the 99th percentile 57 us against 65 before and
+tokio's 72, and every run ahead; a fixed ask of three buffers measured
+the same, 20682, and of two 17180, so the gain is the one-buffer tail. The
+split is gated on the thread waiting on one peer at a time: a fixed ask of
+three cost 10% at 16 connections with 64 KiB messages, 42708 against
+47391, where the gated ask, which stays the kernel's own under load, left
+that row and the rows with small messages within 0.5%.
 
 Across two machines the server no longer does the client's receive
 processing, which leaves the runtime a larger share of its time. How
@@ -1183,10 +1238,12 @@ has the same thing, on its current-thread runtime, the runtimes taking turns.
 queue, enter the kernel and wait, deliver, wake, run. `nop 64` is 64 such
 tasks, so that a turn delivers a batch. `spawn` spawns a task that does
 nothing and awaits it; `yield` yields to the scheduler; `channel` sends a
-value to another task through a bounded channel and gets one back; `remote`
-sends one to a thread of its own, which sends one back through the
-runtime's channel, so the task is woken from outside and the ring parked
-and unparked; `timer` arms a timer by polling a sleep once and drops it;
+value to another task through a bounded channel and gets one back, and
+`local channel` does the same through the channels for one thread;
+`remote` sends one to a thread of its own, which sends one back through
+the runtime's channel, so the task is woken from outside and the ring
+parked and unparked; `timer` arms a timer by polling a sleep once and drops
+it;
 `sleep` is a thousand tasks each sleeping a millisecond at a time, bound by
 the millisecond; `mutex` locks and unlocks an uncontended async mutex.
 Steps per second, medians of three runs, before and after the second
@@ -1395,6 +1452,66 @@ Measured and not adopted:
   larger and the smaller both read 3% fewer `nop 1` steps a second than
   slots of this size.
 
+The fifth pass took up the timers, the spawn's allocation, and channels
+for one thread, and the echo benchmark's one connection with 64 KiB
+messages (see [TCP echo](#tcp-echo)). Before and after it, medians of
+five runs taken in turns, on a quiet host, with tokio's current-thread
+runtime for reference:
+
+| Step | tokio | ruio before | ruio after |
+|---|---:|---:|---:|
+| nop 1 | | 4.40M | 4.40M (1.00×) |
+| nop 64 | | 20.5M | 20.6M (1.00×) |
+| spawn | 2.2M | 17.6M | 19.2M (1.09×) |
+| yield | 3.8M | 63.2M | 61.2M (0.97×) |
+| channel | 2.0M | 10.8M | 10.7M (1.00×) |
+| local channel | | | 18.6M |
+| remote | 189k | 188k | 195k (1.04×) |
+| timer | 3.1M | 11.0M | 16.5M (1.50×) |
+| sleep | 456k | 500k | 500k (1.00×) |
+| mutex | 25.0M | 53.0M | 53.0M (1.00×) |
+
+- **Timers without atomic operations.** Arming a sleep and dropping it
+  took four atomic operations and two readings of the clock: the wheel
+  cloned the task's waker and dropped it, the sleep cloned the `Arc` of
+  its runtime's shared part and dropped it, and each poll read the clock
+  after the sleep had read it to set its deadline. The wheel holds a task
+  by a local reference, the sleep names its runtime by address and id and
+  finds it again through a registry of live runtimes only when dropped
+  away from its thread, and a poll takes the clock as the pass read it:
+  `timer` 1.50×, of which the local references give 1.03×.
+- **A task's memory kept.** malloc and free were a sixteenth of a spawn
+  and its join in the profile, and the traffic they cause more; the
+  scheduler keeps the memory of the tasks freed on its thread, by layout,
+  for its spawns: `spawn` 1.09×. In the scheduler itself the cache's 200
+  bytes moved the fields every pass reads across cache lines and cost the
+  no-op loops 7%, so it is boxed.
+- **Channels for one thread.** The cross-thread channels' send takes two
+  locked instructions, to claim its slot and to see whether the receiver
+  waits, and that is the floor: between a store and a load that another
+  thread may reorder stands a barrier, which costs what a locked
+  instruction does, so a send that skipped the compare-and-exchange when
+  nobody waits would need a fence in its place. `sync::local` has the
+  same channels for the tasks of one thread, on `Rc` and cells, with the
+  receiver's waker kept registered and woken by reference: `local
+  channel` makes 1.69× the round trips of `channel`, and 9.2× tokio's
+  channel's.
+- **A large message's last buffer.** A receive asked for a buffer less
+  than its messages take gets the kernel to hand over all but the last
+  as soon as they have arrived, so the server echoes them while the
+  kernel copies the rest: one connection with 64 KiB messages 1.17× tokio,
+  from 0.96×, its 99th percentile 57 µs from 66, and the rows with small
+  messages within a point of what they were.
+
+Two things were looked at and left. Waking rings with `MSG_RING` rather
+than the eventfd had been measured in the second pass and lost across
+physical cores (see [Kernel features](#kernel-features)); and asking for
+the whole of a large message per receive, which the second pass had made
+an option, measured within the host's noise either way and gave way to
+the ask of a buffer less. `yield` reads 3% fewer steps a second after the
+pass with the same instructions per step, as the no-op loops did after the
+fourth: where the code was placed, which this pass did not pursue.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -1498,6 +1615,17 @@ Since M7:
   completions held back so that an entry into the kernel runs more of
   their work, and table slots smaller or larger than an orphaned write
   behind needs.
+- A fifth performance pass (see
+  [The runtime itself](#the-runtime-itself)): the wheel holds tasks by
+  local reference and a sleep names its runtime rather than holding it,
+  so arming and dropping a timer take no atomic operation, and a pass
+  reads the clock once for the timers polled in it; a scheduler keeps the
+  memory of its freed tasks for its spawns; `sync::local` has channels for
+  the tasks of one thread, which take no atomic operation; and a receive
+  stream whose thread waits on one peer asks for a buffer less than its
+  messages take, so that the server answers a large message while the
+  kernel still copies its last buffer, which took one connection with
+  64 KiB messages from 0.95x of tokio to 1.12x.
 
 ## Open questions
 

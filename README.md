@@ -88,9 +88,10 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
 [Benchmarks](DESIGN.md#benchmarks) for the loads and the full tables):
 
 - **TCP echo**, one core: ahead of tokio from 256 connections on, by up to
-  13%, and level with fewer; with one connection, a runtime that spins
-  before it parks (`Builder::spin`) makes twice tokio's round trips, with
-  half the tail latency.
+  13%, and level with fewer, bar 64 KiB messages, where it is 10% to 17%
+  ahead at every connection count; with one connection, a runtime that
+  spins before it parks (`Builder::spin`) makes twice tokio's round trips,
+  with half the tail latency.
 - **4 KiB `O_DIRECT` random reads**: 13% to 16% ahead of fio's io_uring
   engine at every queue depth. It was within 5% of fio when first compared;
   the runtime's own paths, and submitting reads 32 to an entry into the
@@ -101,10 +102,12 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   pool: level with hyper on tokio with one connection, 1% to 8% ahead from
   256 connections on, and 3% behind at 16.
 - **The runtime itself** (`ruio-bench micro`): a task's turn of the loop, a
-  spawn and its join, and a wake on the task's own thread cost no locked
-  instruction. Against tokio's current-thread runtime, spawning and joining
-  a task runs 7.8 times as fast, a yield 16 times, a channel round trip 6.4
-  times and an uncontended async mutex 2.2 times.
+  spawn and its join, a timer armed and dropped, and a wake on the task's
+  own thread cost no locked instruction. Against tokio's current-thread
+  runtime, spawning and joining a task runs 8.8 times as fast, a yield 16
+  times, arming and dropping a timer 5.3 times, a channel round trip 5.4
+  times, 9.2 through the channels for one thread, and an uncontended async
+  mutex 2.1 times.
 
 ## Development
 
