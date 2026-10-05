@@ -35,6 +35,15 @@
 //!   read on the blocking pool, and the entries taken from them.
 //! - `resolve`: resolve `("127.0.0.1", 80)`, which parses, so costs no
 //!   lookup and no pool.
+//! - `copy`: 64 KiB chunks written into one connection as fast as it takes
+//!   them, relayed into another by a task running `io::copy`, and read out
+//!   of it a chunk at a time: the relay's reads and writes, the bytes twice
+//!   through user space.
+//! - `splice`: the same, the relay running `io::splice`: the bytes move
+//!   through a pipe in the kernel and never reach user space.
+//! - `sendfile`: a cached 1 MiB file spliced into a connection that a
+//!   thread on another CPU drains, as a server sends a file; tokio copies
+//!   it from its `File` with `io::copy`.
 //! - `timer`: arm a timer by polling a sleep once, then drop it.
 //! - `sleep`: 1000 tasks each sleeping a millisecond at a time: timers that
 //!   fire.
@@ -44,7 +53,7 @@
 //! - `cancel`: arm a wait for a token's cancellation by polling it once,
 //!   then drop it.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -194,6 +203,21 @@ pub(crate) const ALL: &[Micro] = &[
         name: "resolve",
         ruio: ruio_resolve,
         tokio: Some(tokio_resolve),
+    },
+    Micro {
+        name: "copy",
+        ruio: ruio_copy,
+        tokio: Some(tokio_copy),
+    },
+    Micro {
+        name: "splice",
+        ruio: ruio_splice,
+        tokio: None,
+    },
+    Micro {
+        name: "sendfile",
+        ruio: ruio_sendfile,
+        tokio: Some(tokio_sendfile),
     },
     Micro {
         name: "timer",
@@ -630,6 +654,216 @@ fn tokio_resolve(load: &Load) -> io::Result<f64> {
             assert!(addrs.next().is_some());
         })
         .await)
+    })
+}
+
+/// How many bytes a `copy` or `splice` step relays.
+const RELAY_CHUNK: usize = 64 << 10;
+
+/// How large the file `sendfile` sends is.
+const SENT_FILE: usize = 1 << 20;
+
+/// A connected pair of ruio TCP streams on the loopback interface.
+async fn ruio_pair() -> io::Result<(ruio::net::TcpStream, ruio::net::TcpStream)> {
+    let listener = ruio::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let client = ruio::spawn(ruio::net::TcpStream::connect(addr));
+    let (server, _) = listener.accept().await?;
+    Ok((client.await.map_err(io::Error::other)??, server))
+}
+
+/// A connected pair of tokio TCP streams on the loopback interface.
+async fn tokio_pair() -> io::Result<(tokio::net::TcpStream, tokio::net::TcpStream)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let client = tokio::spawn(tokio::net::TcpStream::connect(addr));
+    let (server, _) = listener.accept().await?;
+    Ok((client.await.map_err(io::Error::other)??, server))
+}
+
+/// Chunks written into one connection as fast as it takes them, relayed
+/// into another by `relay`, and read out of it: a step is a chunk out.
+fn ruio_relay<F>(load: &Load, relay: F) -> io::Result<f64>
+where
+    F: FnOnce(ruio::net::TcpStream, ruio::net::TcpStream) -> ruio::JoinHandle<io::Result<u64>>,
+{
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (feeder, relay_in) = ruio_pair().await?;
+        let (relay_out, sink) = ruio_pair().await?;
+        let relay = relay(relay_in, relay_out);
+        let stop = Rc::new(Cell::new(false));
+        let feed = ruio::spawn({
+            let stop = stop.clone();
+            async move {
+                let mut chunk = vec![7; RELAY_CHUNK];
+                while !stop.get() {
+                    let (written, buf) = feeder.write_all(chunk).await;
+                    chunk = buf;
+                    if written.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let back = RefCell::new(Some(Vec::with_capacity(RELAY_CHUNK)));
+        let rate = rate(measure, async || {
+            let mut buf = back.borrow_mut().take().expect("the buffer is back");
+            buf.clear();
+            let (read, buf) = sink.read_exact(buf).await;
+            read.expect("the relay hands chunks on");
+            *back.borrow_mut() = Some(buf);
+        })
+        .await;
+        // The feeder stops after the chunk it is on, which the sink takes,
+        // and the relay ends with the feeder's connection.
+        stop.set(true);
+        let mut buf = back.into_inner().expect("the buffer is back");
+        loop {
+            buf.clear();
+            let (read, taken) = sink.read(buf).await;
+            buf = taken;
+            if read? == 0 {
+                break;
+            }
+        }
+        feed.await.map_err(io::Error::other)?;
+        relay.await.map_err(io::Error::other)??;
+        Ok(rate)
+    })
+}
+
+/// Chunks relayed from one connection to another through `io::copy`.
+fn ruio_copy(load: &Load) -> io::Result<f64> {
+    ruio_relay(load, |relay_in, relay_out| {
+        ruio::spawn(async move { ruio::io::copy(&relay_in, &relay_out).await })
+    })
+}
+
+/// Chunks relayed from one connection to another through `io::splice`.
+fn ruio_splice(load: &Load) -> io::Result<f64> {
+    ruio_relay(load, |relay_in, relay_out| {
+        ruio::spawn(async move { ruio::io::splice(&relay_in, &relay_out).await })
+    })
+}
+
+fn tokio_copy(load: &Load) -> io::Result<f64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let (mut feeder, mut relay_in) = tokio_pair().await?;
+        let (mut relay_out, mut sink) = tokio_pair().await?;
+        let relay =
+            tokio::spawn(async move { tokio::io::copy(&mut relay_in, &mut relay_out).await });
+        let stop = Arc::new(AtomicBool::new(false));
+        let feed = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                let chunk = vec![7; RELAY_CHUNK];
+                while !stop.load(Ordering::Relaxed) && feeder.write_all(&chunk).await.is_ok() {}
+            }
+        });
+        let mut back = vec![0; RELAY_CHUNK];
+        let rate = rate(measure, async || {
+            sink.read_exact(&mut back)
+                .await
+                .expect("the relay hands chunks on");
+        })
+        .await;
+        stop.store(true, Ordering::Relaxed);
+        while sink.read(&mut back).await? > 0 {}
+        feed.await.map_err(io::Error::other)?;
+        relay.await.map_err(io::Error::other)??;
+        Ok(rate)
+    })
+}
+
+/// A file of [`SENT_FILE`] bytes, removed when dropped.
+struct Served(std::path::PathBuf);
+
+impl Served {
+    fn new() -> io::Result<Self> {
+        let path = std::env::temp_dir().join(format!("ruio-bench-sendfile-{}", std::process::id()));
+        std::fs::write(&path, vec![9; SENT_FILE])?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A thread on another CPU that reads everything `sink` has, until it
+/// closes; what a client of the file server would do elsewhere.
+fn drain_on_thread(sink: std::net::TcpStream, cpu: usize) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        use std::io::Read;
+
+        let _ = sys::pin(&[cpu]);
+        let mut sink = sink;
+        let mut buf = vec![0; SENT_FILE];
+        while sink.read(&mut buf).map(|read| read > 0).unwrap_or(false) {}
+    })
+}
+
+/// A cached file spliced into a connection, whole, as a server sends it.
+fn ruio_sendfile(load: &Load) -> io::Result<f64> {
+    let (measure, cpu) = (load.measure, remote_cpu(load));
+    let served = Served::new()?;
+    ruio_runtime()?.block_on(async move {
+        let file = ruio::fs::File::open(&served.0).await?;
+        let listener = ruio::net::TcpListener::bind("127.0.0.1:0")?;
+        let sink = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (sender, _) = listener.accept().await?;
+        let drain = drain_on_thread(sink, cpu);
+        let rate = rate(measure, async || {
+            let sent = ruio::io::splice(&file, &sender)
+                .offset_in(0)
+                .limit(SENT_FILE as u64)
+                .await
+                .expect("the file splices");
+            assert_eq!(sent, SENT_FILE as u64);
+        })
+        .await;
+        // The socket closes through the ring, which runs only while this
+        // task waits; the shutdown's end-of-file lets the thread go first.
+        sender.shutdown(std::net::Shutdown::Write).await?;
+        drain
+            .join()
+            .map_err(|_| io::Error::other("the thread panicked"))?;
+        Ok(rate)
+    })
+}
+
+fn tokio_sendfile(load: &Load) -> io::Result<f64> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let (measure, cpu) = (load.measure, remote_cpu(load));
+    let served = Served::new()?;
+    tokio_runtime()?.block_on(async move {
+        let mut file = tokio::fs::File::open(&served.0).await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let sink = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (mut sender, _) = listener.accept().await?;
+        let drain = drain_on_thread(sink, cpu);
+        let rate = rate(measure, async || {
+            file.seek(io::SeekFrom::Start(0))
+                .await
+                .expect("the file seeks");
+            let sent = tokio::io::copy(&mut (&mut file).take(SENT_FILE as u64), &mut sender)
+                .await
+                .expect("the file copies");
+            assert_eq!(sent, SENT_FILE as u64);
+        })
+        .await;
+        drop(sender);
+        drain
+            .join()
+            .map_err(|_| io::Error::other("the thread panicked"))?;
+        Ok(rate)
     })
 }
 
