@@ -6,11 +6,50 @@ use std::io::{self, ErrorKind};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ruio::buf::{AlignedBuf, FixedBuffers};
 use ruio::fs::{self, File, OpenOptions};
 
 use support::within;
+
+/// The null block device's path, block size and the alignment direct I/O
+/// on it needs, where the polled tests run.
+const NULLB: &str = "/dev/nullb0";
+const BLOCK: usize = 4096;
+
+/// Opens the null block device for polled I/O, or says why the test has
+/// nothing to run against: the kernel's io_uring has no polled rings, or
+/// the device is missing or has no poll queues.
+async fn polled_nullb() -> Option<File> {
+    if !ruio::uring::Probe::current()
+        .unwrap()
+        .supports_setup_flags(ruio::uring::sys::IORING_SETUP_IOPOLL)
+    {
+        eprintln!("skipped: the kernel's io_uring has no polled rings");
+        return None;
+    }
+    let polls = std::fs::read_to_string("/sys/block/nullb0/queue/io_poll")
+        .map(|polls| polls.trim() == "1")
+        .unwrap_or(false);
+    if !polls {
+        eprintln!("skipped: no {NULLB} with poll queues");
+        return None;
+    }
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .polled(true)
+        .open(NULLB)
+        .await;
+    match opened {
+        Ok(file) => Some(file),
+        Err(err) => {
+            eprintln!("skipped: {NULLB} cannot be opened for polled I/O: {err}");
+            None
+        }
+    }
+}
 
 /// A directory of the test's own, removed when dropped.
 struct Scratch(PathBuf);
@@ -249,6 +288,123 @@ async fn direct_io_reads_and_writes_aligned_buffers() -> io::Result<()> {
     let (read, buf) = within(file.read_fixed_at(buf, 3 * block as u64)).await;
     assert_eq!(read?, block);
     assert_eq!(&*buf, &data[3 * block..]);
+    Ok(())
+}
+
+/// A polled file's reads, plain, exact and into registered buffers, go
+/// through the driver's polled ring.
+#[ruio::test]
+async fn polled_reads_go_through_the_polled_ring() -> io::Result<()> {
+    let Some(file) = polled_nullb().await else {
+        return Ok(());
+    };
+    assert!(file.is_polled() && !file.is_direct());
+    let before = ruio::driver().stats().polled;
+    let buf = AlignedBuf::with_capacity(BLOCK, BLOCK);
+    let (read, buf) = within(file.read_at(buf, 0)).await;
+    assert_eq!(read?, BLOCK);
+    assert_eq!(buf.len(), BLOCK);
+
+    let buf = AlignedBuf::with_capacity(2 * BLOCK, BLOCK);
+    let (read, buf) = within(file.read_exact_at(buf, 4 * BLOCK as u64)).await;
+    read?;
+    assert_eq!(buf.len(), 2 * BLOCK);
+
+    let registered = FixedBuffers::new(&ruio::driver(), 1, BLOCK)?;
+    let buf = registered.check_out(0).unwrap();
+    let (read, buf) = within(file.read_fixed_at(buf, BLOCK as u64)).await;
+    assert_eq!(read?, BLOCK);
+    assert_eq!(buf.len(), BLOCK);
+    assert_eq!(ruio::driver().stats().polled - before, 3);
+
+    let err = within(
+        file.read_at(AlignedBuf::with_capacity(BLOCK, BLOCK), 0)
+            .timeout(Duration::from_secs(1)),
+    )
+    .await
+    .0
+    .unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP));
+    assert!(within(file.metadata()).await?.file_type().is_block_device());
+    within(file.close()).await
+}
+
+/// Polled reads keep completing while a sleep is in flight, and the sleep
+/// ends on time: the runtime polls the device and watches its timer.
+#[ruio::test]
+async fn polled_reads_run_beside_a_sleep() -> io::Result<()> {
+    let Some(file) = polled_nullb().await else {
+        return Ok(());
+    };
+    let file = std::rc::Rc::new(file);
+    let reads = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+    let stop = std::rc::Rc::new(std::cell::Cell::new(false));
+    let reader = ruio::spawn({
+        let (file, reads, stop) = (file.clone(), reads.clone(), stop.clone());
+        async move {
+            let mut buf = AlignedBuf::with_capacity(BLOCK, BLOCK);
+            while !stop.get() {
+                let offset = (reads.get() % 1024) * BLOCK as u64;
+                let (read, back) = file.read_at(buf, offset).await;
+                buf = back;
+                read?;
+                reads.set(reads.get() + 1);
+            }
+            io::Result::Ok(())
+        }
+    });
+    let start = Instant::now();
+    within(ruio::time::sleep(Duration::from_millis(50))).await;
+    let slept = start.elapsed();
+    stop.set(true);
+    within(reader).await.unwrap()?;
+    assert!(slept >= Duration::from_millis(50), "{slept:?}");
+    assert!(slept < Duration::from_secs(2), "{slept:?}");
+    assert!(reads.get() > 100, "{} reads during the sleep", reads.get());
+    Ok(())
+}
+
+/// Two polled files read at once, each from a task of its own.
+#[ruio::test]
+async fn two_polled_files_read_at_once() -> io::Result<()> {
+    let Some(first) = polled_nullb().await else {
+        return Ok(());
+    };
+    let second = polled_nullb().await.unwrap();
+    let read_blocks = |file: File, from: u64| {
+        ruio::spawn(async move {
+            let mut buf = AlignedBuf::with_capacity(BLOCK, BLOCK);
+            for block in 0..200 {
+                let (read, back) = file.read_at(buf, (from + block) * BLOCK as u64).await;
+                buf = back;
+                assert_eq!(read?, BLOCK);
+            }
+            io::Result::Ok(())
+        })
+    };
+    let before = ruio::driver().stats().polled;
+    let (first, second) = (read_blocks(first, 0), read_blocks(second, 100_000));
+    within(first).await.unwrap()?;
+    within(second).await.unwrap()?;
+    assert_eq!(ruio::driver().stats().polled - before, 400);
+    assert_eq!(ruio::driver().in_flight(), 0);
+    Ok(())
+}
+
+/// A file for polled I/O must be opened for direct I/O, and as a plain
+/// descriptor.
+#[ruio::test]
+async fn polled_files_take_direct_io_and_plain_descriptors_only() -> io::Result<()> {
+    let buffered = OpenOptions::new().read(true).polled(true).open(NULLB).await;
+    assert_eq!(buffered.unwrap_err().kind(), ErrorKind::InvalidInput);
+    let direct = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .direct_descriptor(true)
+        .polled(true)
+        .open(NULLB)
+        .await;
+    assert_eq!(direct.unwrap_err().kind(), ErrorKind::InvalidInput);
     Ok(())
 }
 

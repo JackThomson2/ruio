@@ -802,6 +802,19 @@ baseline are used only when probed.
   `Metadata::dio_alignment` says (`STATX_DIOALIGN`): an `AlignedBuf`, or a
   registered buffer whose size is a multiple of the page size. The kernel
   refuses anything else with `EINVAL`.
+- `OpenOptions::polled` opens a file for polled I/O: its reads and writes,
+  plain, exact and fixed, go on the driver's polled ring (see
+  [Kernel features](#kernel-features)), which the open creates if the
+  thread has none yet, so a kernel without `IOPOLL` fails the open with
+  `Unsupported`. The file must be opened `O_DIRECT`, and is a plain
+  descriptor, which the open also installs into the polled ring's own file
+  table (`Driver::install_polled`), so that its reads and writes name a
+  slot there and skip the kernel's lookup of the file, as a direct
+  descriptor's do; asking for a direct descriptor of the main ring as well
+  fails with `InvalidInput`, as does leaving out `O_DIRECT`. Its reads and
+  writes take no timeout and join no chain, both `EOPNOTSUPP`; everything
+  else on the file, syncing, its status and closing, runs on the main ring
+  through the plain descriptor as for any file.
 - The kernel always runs statx, fsync, fallocate, ftruncate and the
   operations on names in an io-wq worker, and an open whose lookup is not
   cached; so buffered reads and writes that miss the page cache. A direct

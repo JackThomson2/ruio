@@ -27,6 +27,10 @@
 //! [`Metadata::dio_alignment`] says: an
 //! [`AlignedBuf`](crate::buf::AlignedBuf), or a registered buffer for
 //! [`File::read_fixed_at`], which also skips mapping the memory on each read.
+//! A file on a block device with poll queues can be opened for polled I/O
+//! as well ([`OpenOptions::polled`]): the kernel then polls the device for
+//! each read's and write's completion instead of waiting for an interrupt,
+//! on a second ring of the thread's driver.
 //!
 //! [`read_dir`] reads a directory's entries, which io_uring has no
 //! operation for: with `getdents64(2)`, a batch at a time, on the thread.
@@ -53,7 +57,7 @@ use ruio_driver::ops::{
     self, Fsync, Ftruncate, MkdirAt, OpenAt, Read, ReadFixed, RenameAt, Statx, UnlinkAt, Write,
     WriteFixed,
 };
-use ruio_driver::{Chain, Driver, Fd, Link, Op, Operation};
+use ruio_driver::{Chain, Driver, Fd, Link, Op, Operation, PolledFd};
 
 use crate::net::{Desc, Sock, ThreadBound};
 
@@ -80,6 +84,9 @@ const METADATA: u32 = libc::STATX_BASIC_STATS | libc::STATX_BTIME | libc::STATX_
 /// ```
 pub struct File {
     sock: Sock<std::fs::File>,
+    /// The file's slot in the polled ring's table, if its reads and writes
+    /// are polled; see [`OpenOptions::polled`].
+    polled: Option<PolledFd>,
     _thread: ThreadBound,
 }
 
@@ -117,6 +124,7 @@ impl File {
     pub fn from_std(file: std::fs::File) -> Self {
         Self {
             sock: Sock::from_std(file),
+            polled: None,
             _thread: PhantomData,
         }
     }
@@ -124,6 +132,12 @@ impl File {
     /// Whether the file is a direct descriptor.
     pub fn is_direct(&self) -> bool {
         self.sock.is_direct()
+    }
+
+    /// Whether the file's reads and writes are polled; see
+    /// [`OpenOptions::polled`].
+    pub fn is_polled(&self) -> bool {
+        self.polled.is_some()
     }
 
     /// The descriptor, for operations on the thread's ring.
@@ -148,23 +162,44 @@ impl File {
         }
     }
 
+    /// The ring a read or a write runs on, the descriptor to give it, and
+    /// whether it is polled: the polled ring's slot for a polled file, and
+    /// what [`Sock::target`] says otherwise.
+    fn io_target(&self) -> (Driver, Fd, bool) {
+        let (driver, fd) = self.sock.target();
+        match &self.polled {
+            Some(polled) => (driver, polled.fd(), true),
+            None => (driver, fd, false),
+        }
+    }
+
+    /// Runs the read or write `make` makes for the file's descriptor, polled
+    /// if the file is.
+    fn io_op<T: Operation>(&self, make: impl FnOnce(Fd, bool) -> T) -> FileOp<'_, T> {
+        let (driver, fd, polled) = self.io_target();
+        FileOp {
+            op: driver.op(make(fd, polled)),
+            _file: PhantomData,
+        }
+    }
+
     /// Reads into `buf`, up to its capacity, from `offset` on. Fewer bytes
     /// come back only at the end of the file, where none do.
     pub fn read_at<B: IoBufMut>(&self, buf: B, offset: u64) -> FileOp<'_, Read<B>> {
-        self.op(|fd| Read::at(fd, buf, offset))
+        self.io_op(|fd, polled| Read::at(fd, buf, offset).polled(polled))
     }
 
     /// Writes `buf`'s initialized bytes, from `offset` on, or as many as the
     /// file takes.
     pub fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> FileOp<'_, Write<B>> {
-        self.op(|fd| Write::at(fd, buf, offset))
+        self.io_op(|fd, polled| Write::at(fd, buf, offset).polled(polled))
     }
 
     /// Fills `buf` to its capacity from `offset` on; see [`ReadExactAt`].
     pub fn read_exact_at<B: IoBufMut>(&self, buf: B, offset: u64) -> ReadExactAt<'_, B> {
-        let (driver, fd) = self.sock.target();
+        let (driver, fd, polled) = self.io_target();
         ReadExactAt {
-            transfer: Transfer::new(driver, fd, offset, buf),
+            transfer: Transfer::new(driver, fd, offset, buf, polled),
             _file: PhantomData,
         }
     }
@@ -172,9 +207,9 @@ impl File {
     /// Writes all of `buf`'s initialized bytes from `offset` on; see
     /// [`WriteAllAt`].
     pub fn write_all_at<B: IoBuf>(&self, buf: B, offset: u64) -> WriteAllAt<'_, B> {
-        let (driver, fd) = self.sock.target();
+        let (driver, fd, polled) = self.io_target();
         WriteAllAt {
-            transfer: Transfer::new(driver, fd, offset, buf),
+            transfer: Transfer::new(driver, fd, offset, buf, polled),
             _file: PhantomData,
         }
     }
@@ -187,7 +222,7 @@ impl File {
         buf: B,
         offset: u64,
     ) -> FileOp<'_, ReadFixed<B>> {
-        self.op(|fd| ReadFixed::at(fd, buf, offset))
+        self.io_op(|fd, polled| ReadFixed::at(fd, buf, offset).polled(polled))
     }
 
     /// Writes a registered buffer's initialized bytes from `offset` on; see
@@ -197,7 +232,7 @@ impl File {
         buf: B,
         offset: u64,
     ) -> FileOp<'_, WriteFixed<B>> {
-        self.op(|fd| WriteFixed::at(fd, buf, offset))
+        self.io_op(|fd, polled| WriteFixed::at(fd, buf, offset).polled(polled))
     }
 
     /// Reads into `buf` at the file's position, which the read advances.
@@ -205,14 +240,14 @@ impl File {
     /// Nothing orders reads and writes at the position that run at once, so
     /// they must not overlap; ones at offsets may.
     pub fn read<B: IoBufMut>(&self, buf: B) -> FileOp<'_, Read<B>> {
-        self.op(|fd| Read::new(fd, buf))
+        self.io_op(|fd, polled| Read::new(fd, buf).polled(polled))
     }
 
     /// Writes `buf`'s initialized bytes at the file's position, which the
     /// write advances, or at its end if it was opened to append; see
     /// [`read`](File::read).
     pub fn write<B: IoBuf>(&self, buf: B) -> FileOp<'_, Write<B>> {
-        self.op(|fd| Write::new(fd, buf))
+        self.io_op(|fd, polled| Write::new(fd, buf).polled(polled))
     }
 
     /// The data arriving on the file, read into `pool`, which must belong
@@ -372,7 +407,8 @@ impl<'a, T: Operation> FileOp<'a, T> {
     /// Cancels the operation if the kernel has not completed it `duration`
     /// after it is submitted, with a linked timeout; see [`Op::timeout`].
     /// The kernel cannot stop every operation part of the way, such as a
-    /// buffered read an io-wq worker has begun.
+    /// buffered read an io-wq worker has begun. A read or a write of a
+    /// polled file takes no timeout, and fails with `EOPNOTSUPP` given one.
     pub fn timeout(self, duration: Duration) -> Self {
         Self {
             op: self.op.timeout(duration),
@@ -382,7 +418,8 @@ impl<'a, T: Operation> FileOp<'a, T> {
 
     /// Links `next` after this operation into a chain, which the kernel
     /// runs in order, each operation once the one before has succeeded;
-    /// see [`FileChain`].
+    /// see [`FileChain`]. A chain with a read or a write of a polled file in
+    /// it fails with `EOPNOTSUPP`.
     ///
     /// # Panics
     ///
@@ -479,6 +516,8 @@ struct Transfer<T: Operation, B> {
     driver: Driver,
     fd: Fd,
     offset: u64,
+    /// Whether the operations go on the polled ring.
+    polled: bool,
     state: TransferState<T, B>,
 }
 
@@ -493,11 +532,12 @@ enum TransferState<T: Operation, B> {
 }
 
 impl<T: Operation, B> Transfer<T, B> {
-    fn new(driver: Driver, fd: Fd, offset: u64, buf: B) -> Self {
+    fn new(driver: Driver, fd: Fd, offset: u64, buf: B, polled: bool) -> Self {
         Self {
             driver,
             fd,
             offset,
+            polled,
             state: TransferState::Start(buf),
         }
     }
@@ -527,9 +567,10 @@ impl<B: IoBufMut> Future for ReadExactAt<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let transfer = &mut self.get_mut().transfer;
+        let polled = transfer.polled;
         let read = |fd, buf: B, offset| {
             let done = buf.bytes_init();
-            Read::at(fd, buf.slice(done..), offset)
+            Read::at(fd, buf.slice(done..), offset).polled(polled)
         };
         loop {
             match mem::replace(&mut transfer.state, TransferState::Finished) {
@@ -586,6 +627,7 @@ impl<B: IoBuf> Future for WriteAllAt<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let transfer = &mut self.get_mut().transfer;
+        let polled = transfer.polled;
         loop {
             match mem::replace(&mut transfer.state, TransferState::Finished) {
                 TransferState::Start(buf) if buf.bytes_init() == 0 => {
@@ -593,7 +635,7 @@ impl<B: IoBuf> Future for WriteAllAt<'_, B> {
                 }
                 TransferState::Start(buf) => {
                     transfer.start(buf, 0, |fd, buf, offset| {
-                        Write::at(fd, buf.slice(..), offset)
+                        Write::at(fd, buf.slice(..), offset).polled(polled)
                     });
                 }
                 TransferState::Moving { mut op, done } => {
@@ -611,7 +653,7 @@ impl<B: IoBuf> Future for WriteAllAt<'_, B> {
                         return Poll::Ready((Ok(()), buf));
                     }
                     transfer.start(buf, done, |fd, buf, offset| {
-                        Write::at(fd, buf.slice(done..), offset)
+                        Write::at(fd, buf.slice(done..), offset).polled(polled)
                     });
                 }
                 TransferState::Finished => panic!("`WriteAllAt` polled after it completed"),
@@ -631,7 +673,7 @@ impl<B: IoBuf> fmt::Debug for WriteAllAt<'_, B> {
 
 /// Options for opening a file, as the standard library's
 /// [`OpenOptions`](std::fs::OpenOptions) has them, and whether to open it as
-/// a direct descriptor.
+/// a direct descriptor, or for polled I/O.
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     read: bool,
@@ -643,6 +685,7 @@ pub struct OpenOptions {
     mode: u32,
     custom_flags: i32,
     direct_descriptor: bool,
+    polled: bool,
 }
 
 impl Default for OpenOptions {
@@ -665,6 +708,7 @@ impl OpenOptions {
             mode: 0o666,
             custom_flags: 0,
             direct_descriptor: false,
+            polled: false,
         }
     }
 
@@ -729,6 +773,33 @@ impl OpenOptions {
         self
     }
 
+    /// Opens the file for polled I/O: its reads and writes go on a second
+    /// ring of the thread's driver, which polls the device for their
+    /// completions rather than wait for its interrupts
+    /// (`IORING_SETUP_IOPOLL`); see
+    /// [`Driver::enable_polling`](crate::uring::Driver::enable_polling).
+    /// The thread polls while a read or a write is outstanding and nothing
+    /// else is ready, instead of sleeping, so a read completes as soon as
+    /// the device has it, at the cost of the CPU meanwhile.
+    ///
+    /// Polled I/O needs direct I/O: [`custom_flags`](OpenOptions::custom_flags)
+    /// must include `O_DIRECT`, with buffers, offsets and lengths aligned as
+    /// for any direct I/O, and the file must be on a block device with poll
+    /// queues, which `/sys/block/DEV/queue/io_poll` reports as 1; a read or
+    /// a write of a device without them fails with `EOPNOTSUPP`. The file
+    /// is a plain descriptor, which the polled ring also has in its own
+    /// file table, so that its reads and writes skip the kernel's lookup
+    /// of the file as a direct descriptor's do; it cannot be a
+    /// [`direct_descriptor`](OpenOptions::direct_descriptor) of the main
+    /// ring. Its reads and writes take no [`timeout`](FileOp::timeout) and
+    /// join no chain, and one whose future is dropped completes unseen
+    /// rather than being cancelled. Everything else on the file, syncing
+    /// it, its metadata and closing it, works as for any file.
+    pub fn polled(&mut self, polled: bool) -> &mut Self {
+        self.polled = polled;
+        self
+    }
+
     /// The access mode flags, as the standard library works them out.
     fn access_mode(&self) -> io::Result<i32> {
         match (self.read, self.write, self.append) {
@@ -769,18 +840,41 @@ impl OpenOptions {
     /// # Errors
     ///
     /// What `openat2(2)` reports, and `InvalidInput` if the options make no
-    /// sense, as for the standard library, or the path contains a nul byte.
+    /// sense, as for the standard library, or the path contains a nul byte:
+    /// a file for [polled](OpenOptions::polled) I/O that is not opened for
+    /// direct I/O, or is to be a direct descriptor, makes no sense. Opening
+    /// one fails with `Unsupported` if the kernel's io_uring has no polled
+    /// rings, and with `ENFILE` if the polled ring's file table is full.
     pub async fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
         let flags =
             self.access_mode()? | self.creation_mode()? | (self.custom_flags & !libc::O_ACCMODE);
         let driver = crate::driver();
+        if self.polled {
+            if flags & libc::O_DIRECT == 0 {
+                return Err(invalid(
+                    "a file for polled I/O must be opened for direct I/O",
+                ));
+            }
+            if self.direct_descriptor {
+                return Err(invalid("a file for polled I/O is a plain descriptor"));
+            }
+            driver.enable_polling()?;
+        }
         let mut open = OpenAt::new(path)?.flags(flags).mode(self.mode);
         if self.direct_descriptor {
             open = open.direct(&driver);
         }
         let descriptor = driver.op(open).await?;
+        let polled = match (&descriptor, self.polled) {
+            (ruio_driver::Descriptor::Plain(fd), true) => {
+                use std::os::fd::AsRawFd as _;
+                Some(driver.install_polled(fd.as_raw_fd()).await?)
+            }
+            _ => None,
+        };
         Ok(File {
             sock: Sock::new(descriptor),
+            polled,
             _thread: PhantomData,
         })
     }
