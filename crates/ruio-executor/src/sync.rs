@@ -48,6 +48,6 @@ pub use semaphore::{Acquire, AcquireOwned, OwnedSemaphorePermit, Semaphore, Sema
 /// Locks `mutex`, whose data no panic can leave half-changed: every critical
 /// section here only moves values in and out.
 #[inline]
-fn lock<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

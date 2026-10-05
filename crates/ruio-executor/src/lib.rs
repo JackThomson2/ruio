@@ -13,6 +13,9 @@
 //!
 //! Wakers are `Send + Sync`: a task woken on another thread goes to its
 //! runtime's queue of remote wakes, and the runtime's ring is unparked.
+//! [`spawn_blocking`] runs a closure that would block, a name lookup or
+//! long work, on a thread of a pool ([`blocking`]), and hands its output
+//! back so.
 //!
 //! Timers ([`time`]), sleeps, timeouts and intervals, live in a timing wheel
 //! in user space; the kernel sees a single timeout, until the next deadline.
@@ -39,6 +42,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+pub mod blocking;
 mod context;
 mod coop;
 mod cores;
@@ -55,6 +59,7 @@ use std::future::{self, Future};
 use std::sync::Arc;
 use std::task::Poll;
 
+pub use blocking::spawn_blocking;
 pub use cores::{Core, Cores, core, core_count, handle_of, spawn_on};
 pub use handle::{Handle, RemoteJoinHandle};
 pub use join_set::JoinSet;

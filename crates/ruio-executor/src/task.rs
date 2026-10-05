@@ -1152,7 +1152,7 @@ impl JoinError {
         }
     }
 
-    fn panicked(payload: Box<dyn Any + Send>) -> Self {
+    pub(crate) fn panicked(payload: Box<dyn Any + Send>) -> Self {
         Self {
             repr: Repr::Panicked(Payload(payload)),
         }

@@ -58,9 +58,10 @@
 
 pub use ruio_executor::{
     AbortHandle, Builder, Core, Cores, Handle, JoinError, JoinHandle, JoinSet, RemoteJoinHandle,
-    Runtime, core, core_count, driver, handle, handle_of, spawn, spawn_on, yield_now,
+    Runtime, core, core_count, driver, handle, handle_of, spawn, spawn_blocking, spawn_on,
+    yield_now,
 };
-pub use ruio_executor::{sync, time};
+pub use ruio_executor::{blocking, sync, time};
 pub use ruio_macros::{main, test};
 
 pub use ruio_driver::buf;
