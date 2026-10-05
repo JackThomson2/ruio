@@ -1,12 +1,13 @@
 //! The scheduler of one thread: the tasks it owns, the queue of those ready to
 //! run, and the loop that runs them and turns the ring.
 
+use std::alloc::{self, Layout};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::hint;
 use std::io;
 use std::mem;
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -24,6 +25,52 @@ const BUDGET: usize = 64;
 /// How many tasks in a row may come from the LIFO slot before the queue gets
 /// a turn, so that tasks waking each other cannot starve the rest.
 const LIFO_LIMIT: u32 = 3;
+
+/// How many freed tasks' allocations a scheduler keeps for spawns to reuse,
+/// of each of the layouts it keeps them for.
+const CACHED_TASKS: usize = 64;
+
+/// How many layouts of task a scheduler keeps freed allocations of: the
+/// first that many whose tasks are freed on its thread.
+const CACHED_LAYOUTS: usize = 4;
+
+/// The allocations of tasks freed on the scheduler's thread, kept for spawns
+/// of tasks of the same layout, which then take no call into the allocator,
+/// as the frees did not. A task's layout is its future's, so a program has
+/// few.
+#[derive(Default)]
+struct TaskCache {
+    buckets: [Bucket; CACHED_LAYOUTS],
+}
+
+/// The kept blocks of one layout.
+#[derive(Default)]
+struct Bucket {
+    /// The layout the blocks have, once a task of it has been freed.
+    layout: Option<Layout>,
+    blocks: Vec<NonNull<u8>>,
+}
+
+impl TaskCache {
+    /// The bucket of `layout`, if a task of it has been freed.
+    #[inline]
+    fn bucket(&mut self, layout: Layout) -> Option<&mut Bucket> {
+        self.buckets
+            .iter_mut()
+            .find(|bucket| bucket.layout == Some(layout))
+    }
+
+    /// The bucket of `layout`, or an empty one claimed for it, if any is.
+    #[inline]
+    fn bucket_for(&mut self, layout: Layout) -> Option<&mut Bucket> {
+        let bucket = self
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.layout.is_none_or(|kept| kept == layout))?;
+        bucket.layout = Some(layout);
+        Some(bucket)
+    }
+}
 
 /// The part of a scheduler that other threads reach: the tasks woken there,
 /// the timers dropped there, and the unparker of the scheduler's ring.
@@ -267,8 +314,11 @@ pub(crate) struct Scheduler {
     /// pass share one reading, so a task arming many reads it once. Cleared
     /// as the pass ends, after its wait; see [`Scheduler::now`].
     now: Cell<Option<Instant>>,
+    /// Freed tasks' allocations, for spawns to reuse; boxed, so that the
+    /// scheduler's own fields keep their places in the cache lines a pass
+    /// reads.
+    tasks_freed: Box<RefCell<TaskCache>>,
 }
-
 impl Scheduler {
     pub(crate) fn new(driver: Driver, spin: Duration) -> Self {
         let id = driver.id();
@@ -310,7 +360,45 @@ impl Scheduler {
             spin,
             last_wait: Cell::new(Duration::ZERO),
             now: Cell::new(None),
+            tasks_freed: Box::new(RefCell::new(TaskCache::default())),
         }
+    }
+
+    /// Memory for a task of `layout`: a freed task's, if one of that layout
+    /// is kept, and otherwise the allocator's.
+    #[inline]
+    pub(crate) fn alloc_task(&self, layout: Layout) -> NonNull<u8> {
+        if let Some(block) = self
+            .tasks_freed
+            .borrow_mut()
+            .bucket(layout)
+            .and_then(|bucket| bucket.blocks.pop())
+        {
+            return block;
+        }
+        // SAFETY: a task has a size, its header's at the least.
+        let block = unsafe { alloc::alloc(layout) };
+        NonNull::new(block).unwrap_or_else(|| alloc::handle_alloc_error(layout))
+    }
+
+    /// Takes back the memory of a task freed on this thread, to keep for the
+    /// next spawn of its layout if there is room for it, and otherwise to
+    /// give back to the allocator.
+    ///
+    /// # Safety
+    ///
+    /// `block` must be memory of `layout` that the allocator gave, with
+    /// nothing in it any more.
+    #[inline]
+    pub(crate) unsafe fn free_task(&self, block: NonNull<u8>, layout: Layout) {
+        if let Some(bucket) = self.tasks_freed.borrow_mut().bucket_for(layout)
+            && bucket.blocks.len() < CACHED_TASKS
+        {
+            bucket.blocks.push(block);
+            return;
+        }
+        // SAFETY: the caller's contract.
+        unsafe { alloc::dealloc(block.as_ptr(), layout) };
     }
 
     /// The time, as the pass first read it: never later than now, and
@@ -575,6 +663,17 @@ impl Scheduler {
 
 impl Drop for Scheduler {
     fn drop(&mut self) {
+        for bucket in &mut self.tasks_freed.get_mut().buckets {
+            let Some(layout) = bucket.layout else {
+                continue;
+            };
+            for block in bucket.blocks.drain(..) {
+                // SAFETY: the blocks are the allocator's, of `layout`, with
+                // nothing in them: the tasks they held were dropped as they
+                // were freed.
+                unsafe { alloc::dealloc(block.as_ptr(), layout) };
+            }
+        }
         // The wheel goes with the scheduler: nothing is left to find the
         // runtime for.
         let id = self.shared.id;
@@ -593,6 +692,45 @@ impl Drop for Scheduler {
 mod tests {
     use super::*;
     use crate::Runtime;
+
+    /// Freed blocks come back for the next task of their layout, each
+    /// layout apart, up to the kept count; the rest go to the allocator.
+    #[test]
+    fn freed_tasks_are_kept_for_their_layout() {
+        let runtime = Runtime::new().unwrap();
+        runtime.block_on(async {
+            crate::context::with_current(|scheduler| {
+                let small = Layout::from_size_align(64, 8).unwrap();
+                let large = Layout::from_size_align(256, 16).unwrap();
+                let first = scheduler.alloc_task(small);
+                let second = scheduler.alloc_task(large);
+                // SAFETY: the blocks are the allocator's, of these layouts,
+                // and nothing was put in them.
+                unsafe { scheduler.free_task(first, small) };
+                // SAFETY: as above.
+                unsafe { scheduler.free_task(second, large) };
+                assert_eq!(scheduler.alloc_task(small), first);
+                assert_eq!(scheduler.alloc_task(large), second);
+                let blocks: Vec<_> = (0..CACHED_TASKS + 1)
+                    .map(|_| scheduler.alloc_task(small))
+                    .collect();
+                for &block in &blocks {
+                    // SAFETY: as above.
+                    unsafe { scheduler.free_task(block, small) };
+                }
+                let kept = scheduler.tasks_freed.borrow().buckets[0].blocks.len();
+                assert_eq!(kept, CACHED_TASKS);
+                // The two in use go back too: the small one to the allocator,
+                // its bucket being full, and the large one to its bucket. The
+                // scheduler frees what it kept as it is dropped.
+                // SAFETY: as above.
+                unsafe { scheduler.free_task(first, small) };
+                // SAFETY: as above.
+                unsafe { scheduler.free_task(second, large) };
+            })
+            .unwrap();
+        });
+    }
 
     #[test]
     fn a_runtime_is_found_by_its_id_while_it_lives() {

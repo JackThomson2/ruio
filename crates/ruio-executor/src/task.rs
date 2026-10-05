@@ -17,6 +17,7 @@
 //! the runtime's thread, which costs no atomic operation, unless it may be
 //! freed on another thread: then it holds an atomic reference of its own.
 
+use std::alloc::{self, Layout};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::error::Error;
@@ -767,7 +768,8 @@ where
 
     /// Creates a task, queued to run, for `scheduler` to own.
     pub(crate) fn spawn(future: F, scheduler: &Scheduler) -> JoinHandle<F::Output> {
-        let task = Box::new(Self {
+        let block = scheduler.alloc_task(Layout::new::<Self>()).cast::<Self>();
+        let task = Self {
             header: Header {
                 vtable: &Self::VTABLE,
                 shared: hold_owner(scheduler),
@@ -782,8 +784,12 @@ where
             join_waker: Cell::new(HeldWaker::None),
             detached: Cell::new(false),
             aborted: Cell::new(false),
-        });
-        let header: *const Header = &raw const Box::leak(task).header;
+        };
+        // SAFETY: the block has the task's layout, and nothing else uses it.
+        unsafe { block.write(task) };
+        // The header is the first field of the `#[repr(C)]` task, so its
+        // address is the task's.
+        let header: *const Header = block.as_ptr().cast_const().cast();
         // SAFETY: the new task counts one local reference, taken here, and
         // one atomic one, its share.
         let task = unsafe { LocalRef::from_raw(header) };
@@ -902,8 +908,9 @@ where
 
     unsafe fn dealloc(header: *const Header) {
         // SAFETY: the vtable's contract, and the header is the first field
-        // of the `#[repr(C)]` task the box held.
-        let task = unsafe { Box::from_raw(header.cast_mut().cast::<Self>()) };
+        // of the `#[repr(C)]` task, so its address is the task's.
+        let task = unsafe { Self::get(header) };
+        let owner = task.header.owner();
         // A task finishes, and wakes its awaiter, before its last reference
         // can go. Were one still held, it is a reference of the awaiter's
         // thread, which this may not be: leaking it is safe.
@@ -911,7 +918,23 @@ where
             debug_assert!(false, "a task is freed with its awaiter still held");
             mem::forget(awaiter);
         }
-        drop(task);
+        let block = NonNull::from(task).cast::<u8>();
+        // SAFETY: nothing reaches the task again, and `get`'s reference is
+        // not used after this.
+        unsafe { ptr::drop_in_place(block.cast::<Self>().as_ptr()) };
+        // The memory goes back to the scheduler on the runtime's thread,
+        // which the owner it was spawned by names, and to the allocator
+        // anywhere else.
+        let layout = Layout::new::<Self>();
+        // SAFETY: the block is the allocator's, of `layout`, and the task
+        // in it is dropped.
+        let kept = context::with_owner(owner, |scheduler| unsafe {
+            scheduler.free_task(block, layout)
+        });
+        if kept.is_none() {
+            // SAFETY: as above.
+            unsafe { alloc::dealloc(block.as_ptr(), layout) };
+        }
     }
 
     unsafe fn poll_join(
