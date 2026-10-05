@@ -40,8 +40,9 @@
 //!
 //! With the `hyper` feature, on by default, an adapter has hyper's own I/O
 //! traits, `hyper::rt::Read` and `Write`, so hyper serves it, or connects
-//! through it, as it is, with nothing between them; and [`Timer`] gives
-//! hyper ruio's timers, which its timeouts need: that for reading a
+//! through it, as it is, with nothing between them; [`Executor`] spawns
+//! the tasks hyper's HTTP/2 needs on the thread's runtime; and [`Timer`]
+//! gives hyper ruio's timers, which its timeouts need: that for reading a
 //! request's head, say.
 //!
 //! ```no_run
@@ -81,6 +82,8 @@ use ruio::net::{TcpStream, UnixStream};
 use ruio::uring::ops::{self, Read, Recv, Send, Write};
 use ruio::uring::{Driver, Fd, Op, Operation};
 
+#[cfg(feature = "hyper")]
+mod executor;
 #[cfg(feature = "futures-io")]
 mod futures_impls;
 #[cfg(feature = "hyper")]
@@ -90,6 +93,8 @@ mod timer;
 #[cfg(feature = "tokio")]
 mod tokio_impls;
 
+#[cfg(feature = "hyper")]
+pub use executor::Executor;
 #[cfg(feature = "hyper")]
 pub use timer::Timer;
 

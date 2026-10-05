@@ -10,8 +10,9 @@ publish.workspace = true
 default = ["futures-io", "hyper", "tokio"]
 # `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of futures-io.
 futures-io = ["dep:futures-io"]
-# `Timer`, which gives hyper ruio's timers for its timeouts. It needs none of
-# hyper's own features.
+# `Executor`, which spawns the tasks hyper's HTTP/2 needs, `Timer`, which
+# gives hyper ruio's timers for its timeouts, and hyper's own I/O traits for
+# the adapters. It needs none of hyper's own features.
 hyper = ["dep:hyper"]
 # `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io`, which need
 # none of tokio's runtime.
@@ -27,7 +28,7 @@ tokio = { version = "1.53.1", default-features = false, optional = true }
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["io"] }
 http-body-util = "0.1.5"
-hyper = { version = "1.11.1", features = ["client", "http1", "server"] }
+hyper = { version = "1.11.1", features = ["client", "http1", "http2", "server"] }
 # For `TokioIo`, which gives hyper's traits to types with tokio's.
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 rcgen = "0.14.10"
@@ -43,6 +44,10 @@ required-features = ["hyper", "tokio"]
 [[example]]
 name = "rustls"
 required-features = ["hyper", "tokio"]
+
+[[example]]
+name = "http2"
+required-features = ["hyper"]
 
 [lints]
 workspace = true
