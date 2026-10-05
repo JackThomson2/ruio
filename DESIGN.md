@@ -919,6 +919,43 @@ baseline are used only when probed.
   `splice`, 5.5 GB/s, against 60k with `copy` and 43k with tokio's, and
   sends a cached megabyte file into a connection 13k times a second, 13.6
   GB/s, against tokio's 1k (see [The runtime itself](#the-runtime-itself)).
+- `io::AsyncFd` wraps a descriptor of any other kind, a timerfd, an inotify
+  instance, a device, a socket another library owns and drives with calls
+  of its own, so that a task can wait for it on the ring. `readable`,
+  `writable` and `ready(events)` each wait once with one poll request
+  (`IORING_OP_POLL_ADD`), after which the owner makes its own call, which
+  a wait is to be repeated for if it would block, as with `poll(2)`;
+  `readiness(events)` reports the descriptor's readiness again and again
+  on one multishot poll kept armed (`IORING_POLL_ADD_MULTI`, the driver's
+  `PollMulti` behind `PollStream`), so a task that waits for ever submits
+  nothing for a wait; and `AsyncRead` and `AsyncWrite` read and write the
+  descriptor through the ring's own read and write, which wait for it
+  themselves. An operation borrows the wrapper, so the descriptor stays
+  open until the kernel has it. In `ruio-bench micro` a write to an
+  eventfd, a wait for it and a read run 1.59M times a second, 1.3× tokio's
+  `AsyncFd`, and 1.68M on the multishot poll; each is three system calls on
+  either runtime, so both are near the floor, and the ring's completion
+  path is what ruio gains by (see [The runtime itself](#the-runtime-itself)).
+- `signal` delivers signals to tasks: `signal(kind)` gives a `Signal` whose
+  `recv` completes each time the signal arrives, and `ctrl_c` waits for
+  `SIGINT`. A process-wide handler is installed for each kind once, the
+  first time a task asks, and the handler it replaces is called after it,
+  so a library's coexists with it. The handler sets the kind's bit in one
+  atomic word and writes to an eventfd the process has for its signals,
+  whose count cannot fill as a pipe can, so the write never blocks and
+  never drops; both are safe in a handler. Each runtime with a listener
+  keeps one read of the eventfd on its ring, a dispatcher task keyed to the
+  driver's identity, which costs nothing until a signal comes; the kernel
+  gives the count to one runtime's read, which swaps the word for zero, so
+  each arrival is handed on once, and gives each kind in it to the kind's
+  `watch` channel, whose receivers everywhere are the listeners. A signal
+  costs its handler an atomic operation and a system call, the ring one
+  completion, and each listener one wake, wherever it runs; arrivals of one
+  kind coalesce into one receive, as the channel's change does. A `signalfd`
+  would have needed the signal blocked in every thread of the process,
+  which threads other libraries make would not have. In `ruio-bench micro`
+  a signal raised and received runs 420k times a second, 1.3× tokio's, the
+  raise's own calls being most of either.
 - Still to come: socket options for direct descriptors through
   `URING_CMD`.
 
@@ -1998,6 +2035,25 @@ sent without any copy on the sending side: the kernel moves the file's
 cached pages into the pipe and the pipe's into the socket, and the one copy
 left, the sink's, is on its own core.
 
+`readiness`, `readiness stream` and `signal`, added with `AsyncFd` and the
+signal module, measure the paths onto the ring for what is not ruio's own.
+`readiness` writes to an eventfd, waits for it to be readable through
+`AsyncFd::readable`, one poll request a wait, and reads it, against tokio's
+`AsyncFd`, whose guard's readiness is cleared after each read, as a driver
+that read until `WouldBlock` would leave it, so that each of its waits is a
+wait too; `readiness stream` does the same with the waits on one multishot
+poll kept armed; `signal` raises a signal and waits for a listener to
+receive it, ruio listening for `SIGUSR1` and tokio for `SIGUSR2`, so that
+neither pays the other's handler. Medians of five runs taken in turns:
+`readiness` 1.59M a second against 1.23M, `readiness stream` 1.68M, and
+`signal` 420k against 314k. Each readiness step is three system calls on
+either runtime, the write, the wait and the read, so both are near the
+floor, and the ring's completion path is what ruio gains by; the stream
+saves the request's preparation and the kernel's arming of a poll a wait,
+some five per cent. A signal's round trip is the raise's own calls, its
+signal frame and return, the handler's write and the wait, on either
+runtime, and ruio's dispatch, one swap and one send, is a small part of it.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -2176,6 +2232,14 @@ Since M7:
   moves 1.4× as many chunks with `splice` as with `copy`, and twice
   tokio's; a cached file goes into a socket at 13.6 GB/s, 14× tokio's (see
   [Networking](#networking) and [The runtime itself](#the-runtime-itself)).
+- `io::AsyncFd` waits for any descriptor's readiness, once with one poll or
+  for ever on one multishot poll, and reads and writes it through the ring;
+  `signal` delivers signals to tasks on every runtime through one handler,
+  an atomic word, an eventfd and a `watch` channel a kind, chaining the
+  handler it replaces; the driver gained `PollMulti` and `PollStream`. A
+  readiness wait runs 1.3× tokio's `AsyncFd` and a signal 1.3× tokio's,
+  both near the floor of their system calls (see [Networking](#networking)
+  and [The runtime itself](#the-runtime-itself)).
 
 ## Open questions
 

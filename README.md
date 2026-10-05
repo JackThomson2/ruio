@@ -47,7 +47,7 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 
 | Crate | What it has |
 |---|---|
-| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, and `io`, the owned-buffer traits they share, with `copy` and `splice` |
+| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, and `signal` |
 | [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, for hyper, rustls and the rest of the ecosystem; and `Timer`, which gives hyper ruio's timers for its timeouts |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
@@ -125,7 +125,10 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   connections moves 1.4 times as many 64 KiB chunks with `io::splice`,
   which keeps the bytes in the kernel, as with `io::copy`, itself 1.4 times
   tokio's, and a cached file goes into a connection at 13.6 GB/s, 14 times
-  as fast as tokio copies it from its `File`.
+  as fast as tokio copies it from its `File`. A wait for a foreign
+  descriptor's readiness through `AsyncFd` runs 1.3 times as fast as
+  tokio's, and a signal raised and received 1.3 times, each near the floor
+  of its system calls.
 
 ## Development
 

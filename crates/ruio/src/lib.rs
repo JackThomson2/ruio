@@ -24,12 +24,14 @@
 //! [`net`] has sockets, which read and write with owned buffers and can
 //! receive into a pool of buffers that the kernel picks from, and [`fs`]
 //! has files, which read and write the same way; [`io`] has the traits
-//! both implement, and `copy` over them. Their operations, like all
-//! others, run on the thread's ring, which [`driver`] returns; [`uring`]
-//! has the operations and the types for writing new ones. Libraries that
-//! take their I/O through the poll-based traits of `tokio::io` or
-//! futures-io, such as hyper and rustls, run over ruio's streams through
-//! the adapters of the `ruio-compat` crate.
+//! both implement, `copy` and `splice` over them, and `AsyncFd`, which
+//! brings a descriptor of any other kind onto the ring; [`signal`]
+//! delivers signals to tasks. Their operations, like all others, run on
+//! the thread's ring, which [`driver`] returns; [`uring`] has the
+//! operations and the types for writing new ones. Libraries that take
+//! their I/O through the poll-based traits of `tokio::io` or futures-io,
+//! such as hyper and rustls, run over ruio's streams through the adapters
+//! of the `ruio-compat` crate.
 //!
 //! Thread per core: [`Cores`] runs a runtime on each of several CPUs, on a
 //! thread pinned to it, as `#[ruio::main(cores = "all")]` runs `main`.
