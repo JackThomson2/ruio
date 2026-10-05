@@ -4,12 +4,13 @@ mod support;
 
 use std::env;
 use std::fs::{self, File};
+use std::future::poll_fn;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ruio_driver::ops::{OpenAt, PollAdd, Splice, Tee};
+use ruio_driver::ops::{OpenAt, PollAdd, PollMulti, PollStream, Splice, Tee};
 use ruio_driver::{Descriptor, Driver};
 
 use support::{block_on, poll_once, settle};
@@ -147,6 +148,55 @@ fn a_poll_on_a_writable_pipe_completes_at_once() {
     let poll = PollAdd::new(writer.as_raw_fd(), libc::POLLOUT as u32);
     let events = block_on(&driver, driver.op(poll)).unwrap();
     assert_ne!(events & libc::POLLOUT as u32, 0);
+}
+
+/// One request reports each write into the pipe, as long as the reader
+/// drains it; the events come with the request still armed.
+#[test]
+fn a_multishot_poll_reports_each_wakeup_on_one_request() {
+    let driver = Driver::new().unwrap();
+    let (mut reader, mut writer) = io::pipe().unwrap();
+
+    let mut events = PollStream::new(
+        &driver,
+        PollMulti::new(reader.as_raw_fd(), libc::POLLIN as u32),
+    );
+    assert!(poll_once(&mut poll_fn(|cx| events.poll_next(cx))).is_pending());
+    driver.submit().unwrap();
+    let before = driver.stats().operations;
+    for round in 0..100u8 {
+        writer.write_all(&[round]).unwrap();
+        let ready = block_on(&driver, poll_fn(|cx| events.poll_next(cx))).unwrap();
+        assert_ne!(ready & libc::POLLIN as u32, 0);
+        let mut byte = [0];
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [round]);
+    }
+    assert_eq!(
+        driver.stats().operations,
+        before,
+        "the hundred events took no further request"
+    );
+    assert!(events.next_ready().is_none());
+    drop(events);
+    settle(&driver);
+}
+
+/// A poll armed on a file that is ready completes at once, so a stream
+/// armed late, or again, misses nothing that is there.
+#[test]
+fn a_multishot_poll_armed_on_a_ready_file_completes_at_once() {
+    let driver = Driver::new().unwrap();
+    let (_reader, mut writer) = io::pipe().unwrap();
+    writer.write_all(b"already").unwrap();
+    let mut events = PollStream::new(
+        &driver,
+        PollMulti::new(_reader.as_raw_fd(), libc::POLLIN as u32),
+    );
+    let ready = block_on(&driver, poll_fn(|cx| events.poll_next(cx))).unwrap();
+    assert_ne!(ready & libc::POLLIN as u32, 0);
+    drop(events);
+    settle(&driver);
 }
 
 /// The splice waits in the kernel, on the poll, until there is something to

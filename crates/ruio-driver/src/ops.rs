@@ -38,7 +38,7 @@ pub use net::{
     Accept, AcceptMulti, AcceptStream, Connect, Recv, RecvFrom, Send, SendTo, SendVectored, SendZc,
     Shutdown, Socket,
 };
-pub use splice::{PollAdd, Splice, Tee};
+pub use splice::{PollAdd, PollMulti, PollStream, Splice, Tee};
 
 /// Where an operation that makes a file puts it.
 #[derive(Clone, Copy, Debug)]
