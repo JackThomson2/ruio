@@ -21,6 +21,7 @@
 
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
 
+pub mod broadcast;
 pub mod local;
 pub mod mpsc;
 mod mutex;
