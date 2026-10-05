@@ -22,6 +22,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
+use crate::blocking::{self, BlockingHandle, Pool};
 use crate::coop;
 use crate::sync::local::WakerCell;
 use crate::task::{AbortHandle, JoinError, JoinHandle};
@@ -315,6 +316,73 @@ impl<T: 'static> JoinSet<T> {
 impl<T: 'static> Default for JoinSet<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+impl<T: Send + 'static> JoinSet<T> {
+    /// Runs `f` on a thread of the process's blocking pool
+    /// ([`spawn_blocking`](crate::spawn_blocking)), as a task of the set: its
+    /// output comes from [`join_next`](JoinSet::join_next) as a task's does,
+    /// and a panic in it as the task's panic. Aborting the task aborts the
+    /// job when the scheduler next reaches the task and drops its future: a
+    /// job no thread has taken by then does not run, and one that has
+    /// started runs to its end, its output dropped; either way the set
+    /// reports the task cancelled.
+    ///
+    /// # Panics
+    ///
+    /// If the thread is not inside [`Runtime::block_on`](crate::Runtime).
+    pub fn spawn_blocking<F>(&mut self, f: F) -> AbortHandle
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.spawn_blocking_on(blocking::global(), f)
+    }
+
+    /// Runs `f` on a thread of `pool`, as a task of the set; see
+    /// [`spawn_blocking`](JoinSet::spawn_blocking).
+    ///
+    /// # Panics
+    ///
+    /// If the thread is not inside [`Runtime::block_on`](crate::Runtime).
+    pub fn spawn_blocking_on<F>(&mut self, pool: &Pool, f: F) -> AbortHandle
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.spawn(Blocking {
+            handle: pool.spawn(f),
+            done: false,
+        })
+    }
+}
+
+/// A blocking job as a task of a set: the job's output, with a panic in the
+/// closure raised again as the task's, so that the set reports it as it
+/// reports a task's. Dropped before the job is done, as the task is aborted,
+/// it aborts the job, which then does not run if no thread has taken it.
+struct Blocking<T> {
+    handle: BlockingHandle<T>,
+    done: bool,
+}
+
+impl<T> Future for Blocking<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        let result = ready!(Pin::new(&mut self.handle).poll(cx));
+        self.done = true;
+        match result {
+            Ok(output) => Poll::Ready(output),
+            Err(err) if err.is_panic() => panic::resume_unwind(err.into_panic()),
+            Err(_) => unreachable!("the job is aborted only as its task is dropped"),
+        }
+    }
+}
+
+impl<T> Drop for Blocking<T> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.handle.abort();
+        }
     }
 }
 

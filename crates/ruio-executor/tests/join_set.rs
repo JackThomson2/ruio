@@ -3,8 +3,12 @@
 use std::cell::Cell;
 use std::future::pending;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::Duration;
 
+use ruio_executor::blocking::Pool;
 use ruio_executor::time::{sleep, timeout};
 use ruio_executor::{JoinSet, Runtime, spawn, yield_now};
 
@@ -293,6 +297,105 @@ fn many_tasks_finishing_on_timers_all_report() {
             sum += output.unwrap();
         }
         assert_eq!(sum, (0..1000u64).sum::<u64>());
+    });
+}
+
+#[test]
+fn blocking_jobs_outputs_come_through_the_set() {
+    run(async {
+        let mut set = JoinSet::new();
+        let here = thread::current().id();
+        for n in 0..8u64 {
+            set.spawn_blocking(move || (thread::current().id(), n));
+        }
+        set.spawn(async { (thread::current().id(), 100) });
+        let mut sum = 0;
+        let mut elsewhere = 0;
+        while let Some(output) = set.join_next().await {
+            let (thread, n) = output.unwrap();
+            sum += n;
+            if thread != here {
+                elsewhere += 1;
+            }
+        }
+        assert_eq!(sum, (0..8).sum::<u64>() + 100);
+        assert_eq!(elsewhere, 8, "the jobs ran on the pool");
+    });
+}
+
+#[test]
+fn a_blocking_jobs_panic_is_the_tasks() {
+    run(async {
+        let mut set = JoinSet::new();
+        set.spawn_blocking(|| -> u32 { panic!("boom") });
+        let err = set.join_next().await.unwrap().unwrap_err();
+        assert!(err.is_panic());
+        assert_eq!(*err.into_panic().downcast::<&str>().unwrap(), "boom");
+        assert!(set.join_next().await.is_none());
+    });
+}
+
+/// A blocking task aborted before a thread takes its job is cancelled, and
+/// the job never runs; one aborted after runs to its end, and is still
+/// reported cancelled. The job is aborted as the scheduler drops the task's
+/// future, so the test yields for that before it lets the pool go on.
+#[test]
+fn aborting_a_blocking_task_aborts_its_job() {
+    run(async {
+        let pool = Pool::builder().threads(1).build();
+        let (release, held) = mpsc::channel::<()>();
+        let (started, wait_started) = mpsc::channel::<()>();
+        let mut set = JoinSet::new();
+        let first = set.spawn_blocking_on(&pool, move || {
+            started.send(()).unwrap();
+            held.recv().unwrap_or(());
+        });
+        let ran = Arc::new(AtomicBool::new(false));
+        let second = {
+            let ran = ran.clone();
+            set.spawn_blocking_on(&pool, move || ran.store(true, Ordering::Relaxed))
+        };
+        wait_started.recv().unwrap();
+        second.abort();
+        first.abort();
+        yield_now().await;
+        release.send(()).unwrap();
+        let mut cancelled = 0;
+        while let Some(result) = set.join_next().await {
+            assert!(result.unwrap_err().is_cancelled());
+            cancelled += 1;
+        }
+        assert_eq!(cancelled, 2);
+        // The first job ran to its end; a thread never took the second.
+        pool.spawn(|| ()).await.unwrap();
+        assert!(!ran.load(Ordering::Relaxed), "an aborted job ran");
+    });
+}
+
+#[test]
+fn dropping_the_set_aborts_the_jobs_not_yet_taken() {
+    run(async {
+        let pool = Pool::builder().threads(1).build();
+        let (release, held) = mpsc::channel::<()>();
+        let (started, wait_started) = mpsc::channel::<()>();
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut set = JoinSet::new();
+        // Holds the one thread until released, so the second job waits.
+        set.spawn_blocking_on(&pool, move || {
+            started.send(()).unwrap();
+            held.recv().unwrap_or(());
+        });
+        set.spawn_blocking_on(&pool, {
+            let ran = ran.clone();
+            move || ran.store(true, Ordering::Relaxed)
+        });
+        wait_started.recv().unwrap();
+        drop(set);
+        // The scheduler drops the tasks' futures, which abort the jobs.
+        yield_now().await;
+        release.send(()).unwrap();
+        pool.spawn(|| ()).await.unwrap();
+        assert!(!ran.load(Ordering::Relaxed), "a job of a dropped set ran");
     });
 }
 
