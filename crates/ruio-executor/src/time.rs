@@ -8,6 +8,8 @@
 //! one runtime, so that it can be part of a future that must be: one given
 //! to [`spawn_on`](crate::spawn_on), say, or one that a library such as
 //! hyper asks of a timer.
+//!
+//! An [`Interval`] ticks at a period, for work that recurs.
 
 use std::cell::{Cell, RefCell};
 use std::error::Error;
@@ -26,6 +28,10 @@ use crate::context;
 use crate::scheduler::{Scheduler, Shared};
 use crate::task::HeldWaker;
 use crate::wheel::{Key, Wheel};
+
+mod interval;
+
+pub use interval::{Interval, MissedTickBehavior, interval, interval_at};
 
 /// A runtime's timers: its wheel, whose ticks are milliseconds since `start`.
 pub(crate) struct Timers {
