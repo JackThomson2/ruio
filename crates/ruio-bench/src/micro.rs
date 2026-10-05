@@ -25,6 +25,12 @@
 //!   each way a send, and a wait for the change.
 //! - `remote`: a value sent to a thread of its own, which sends one back
 //!   through a channel: a wake from another thread, and a park and unpark.
+//! - `blocking`: a closure that does nothing, run on a thread of the
+//!   blocking pool, and its output awaited: a job handed to a thread, and
+//!   the task woken from it.
+//! - `blocking spin`: the same on a pool of one thread that spins for its
+//!   next job, pinned to another core, and a runtime that spins before it
+//!   parks, so that neither side waits for the kernel to wake it.
 //! - `timer`: arm a timer by polling a sleep once, then drop it.
 //! - `sleep`: 1000 tasks each sleeping a millisecond at a time: timers that
 //!   fire.
@@ -164,6 +170,16 @@ pub(crate) const ALL: &[Micro] = &[
         name: "remote",
         ruio: ruio_remote,
         tokio: Some(tokio_remote),
+    },
+    Micro {
+        name: "blocking",
+        ruio: ruio_blocking,
+        tokio: Some(tokio_blocking),
+    },
+    Micro {
+        name: "blocking spin",
+        ruio: ruio_blocking_spin,
+        tokio: None,
     },
     Micro {
         name: "timer",
@@ -463,6 +479,55 @@ fn tokio_remote(load: &Load) -> io::Result<f64> {
         echo.join()
             .map_err(|_| io::Error::other("the thread panicked"))?;
         Ok(rate)
+    })
+}
+
+/// A closure that does nothing, run on a thread of the blocking pool, and
+/// its output awaited.
+fn ruio_blocking(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        Ok(rate(measure, async || {
+            ruio::spawn_blocking(|| {}).await.expect("the job ran");
+        })
+        .await)
+    })
+}
+
+fn tokio_blocking(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        Ok(rate(measure, async || {
+            tokio::task::spawn_blocking(|| {})
+                .await
+                .expect("the job ran");
+        })
+        .await)
+    })
+}
+
+/// The same on a pool of one thread that spins for its next job, pinned to
+/// another core, and a runtime that spins before it parks.
+fn ruio_blocking_spin(load: &Load) -> io::Result<f64> {
+    let (measure, cpu) = (load.measure, remote_cpu(load));
+    let budget = Duration::from_micros(100);
+    let runtime = ruio::Runtime::builder().spin(budget).build()?;
+    runtime.block_on(async move {
+        let pool = ruio::blocking::Pool::builder()
+            .threads(1)
+            .spin(budget)
+            .build();
+        // The one thread, pinned by its first job; not pinned if the host has
+        // no such CPU.
+        pool.spawn(move || {
+            let _ = sys::pin(&[cpu]);
+        })
+        .await
+        .expect("the job ran");
+        Ok(rate(measure, async || {
+            pool.spawn(|| {}).await.expect("the job ran");
+        })
+        .await)
     })
 }
 
