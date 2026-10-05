@@ -31,6 +31,10 @@
 //! - `blocking spin`: the same on a pool of one thread that spins for its
 //!   next job, pinned to another core, and a runtime that spins before it
 //!   parks, so that neither side waits for the kernel to wake it.
+//! - `read dir`: list a directory of 1000 entries: the batches of entries
+//!   read on the blocking pool, and the entries taken from them.
+//! - `resolve`: resolve `("127.0.0.1", 80)`, which parses, so costs no
+//!   lookup and no pool.
 //! - `timer`: arm a timer by polling a sleep once, then drop it.
 //! - `sleep`: 1000 tasks each sleeping a millisecond at a time: timers that
 //!   fire.
@@ -180,6 +184,16 @@ pub(crate) const ALL: &[Micro] = &[
         name: "blocking spin",
         ruio: ruio_blocking_spin,
         tokio: None,
+    },
+    Micro {
+        name: "read dir",
+        ruio: ruio_read_dir,
+        tokio: Some(tokio_read_dir),
+    },
+    Micro {
+        name: "resolve",
+        ruio: ruio_resolve,
+        tokio: Some(tokio_resolve),
     },
     Micro {
         name: "timer",
@@ -526,6 +540,94 @@ fn ruio_blocking_spin(load: &Load) -> io::Result<f64> {
         .expect("the job ran");
         Ok(rate(measure, async || {
             pool.spawn(|| {}).await.expect("the job ran");
+        })
+        .await)
+    })
+}
+
+/// How many entries the directory `read dir` lists has.
+const DIR_ENTRIES: usize = 1000;
+
+/// A directory of [`DIR_ENTRIES`] empty files, removed when dropped.
+struct Listed(std::path::PathBuf);
+
+impl Listed {
+    fn new() -> io::Result<Self> {
+        let dir = std::env::temp_dir().join(format!("ruio-bench-read-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir)?;
+        for index in 0..DIR_ENTRIES {
+            std::fs::File::create(dir.join(format!("entry-{index:05}")))?;
+        }
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Lists a directory of [`DIR_ENTRIES`] entries: opened, read in batches on
+/// the blocking pool, every entry taken.
+fn ruio_read_dir(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let listed = Listed::new()?;
+    ruio_runtime()?.block_on(async move {
+        let dir = &listed.0;
+        Ok(rate(measure, async || {
+            let mut entries = ruio::fs::read_dir(dir).await.expect("the directory opens");
+            let mut count = 0;
+            while let Some(entry) = entries.next_entry().await.expect("the directory reads") {
+                count += entry.file_name().len();
+            }
+            assert!(count > 0, "the directory has entries");
+        })
+        .await)
+    })
+}
+
+fn tokio_read_dir(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let listed = Listed::new()?;
+    tokio_runtime()?.block_on(async move {
+        let dir = &listed.0;
+        Ok(rate(measure, async || {
+            let mut entries = tokio::fs::read_dir(dir).await.expect("the directory opens");
+            let mut count = 0;
+            while let Some(entry) = entries.next_entry().await.expect("the directory reads") {
+                count += entry.file_name().len();
+            }
+            assert!(count > 0, "the directory has entries");
+        })
+        .await)
+    })
+}
+
+/// Resolves a host and port that parse as an address: no lookup, and no
+/// thread but the task's.
+fn ruio_resolve(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        Ok(rate(measure, async || {
+            let mut addrs = ruio::net::lookup_host(("127.0.0.1", 80))
+                .await
+                .expect("a literal resolves");
+            assert!(addrs.next().is_some());
+        })
+        .await)
+    })
+}
+
+fn tokio_resolve(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        Ok(rate(measure, async || {
+            let mut addrs = tokio::net::lookup_host(("127.0.0.1", 80))
+                .await
+                .expect("a literal resolves");
+            assert!(addrs.next().is_some());
         })
         .await)
     })
