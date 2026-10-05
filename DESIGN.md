@@ -882,8 +882,44 @@ baseline are used only when probed.
   it: a plain descriptor as it is, and a direct one with `MSG_RING`. The
   `SentTcpStream` it makes is `Send`, and a task on that core takes it back
   with `receive`.
-- Still to come: a `copy` using `splice`, owned-buffer read and write traits
-  that files can share, and socket options for direct descriptors through
+- `io::AsyncRead` and `io::AsyncWrite` are the owned-buffer traits the
+  sockets and the files share: `read` and `write` take a buffer by value
+  and hand it back with the result, and each gives the type's own future,
+  named by a generic associated type, so that code generic over a reader or
+  a writer compiles to the operations the type's methods make, with no
+  boxing and no dynamic dispatch; a reference, an `Rc` or a `Box` of one is
+  one too. `read_exact`, `read_to_end` and `write_all` come with the traits
+  as futures that run the type's own future again until the buffer is done
+  with, each polled where it lies and dropped there, so a future that is
+  not `Unpin`, as a user's boxed one, is as good as one that is; a method
+  call on a stream still reaches the stream's own `read_exact` and
+  `write_all`, with their linked timeouts and `MSG_WAITALL`. `io::copy`
+  moves everything a reader has to a writer with two buffers of 64 KiB and
+  a read and a write in flight at once, so the reader fills one buffer
+  while the writer takes the other.
+- `io::splice` moves everything one descriptor has to another through a
+  pipe, with `IORING_OP_SPLICE`, by moving the pages that hold the data
+  rather than copying them, so nothing crosses into user space; the sealed
+  `Spliceable` names what can be spliced, the stream sockets and files,
+  with offsets and a limit for a file, as `sendfile` would send a range.
+  The pipe is the thread's, kept from one splice for the next and grown to
+  a megabyte; a splice in and a splice out are in flight at once, with the
+  bytes in the pipe counted so that neither asks for more than the pipe
+  has or has room for. The kernel runs a splice in an io-wq worker and
+  looks its descriptors up there, so each is linked behind a poll of its
+  socket (`IORING_OP_POLL_ADD`), which the ring waits on itself, and a
+  worker runs only when there is something to do: a proxy with many idle
+  connections holds none; a pipe whose slots are full, as it is when the
+  data comes in small pieces, refuses more with `SPLICE_F_NONBLOCK` rather
+  than hold the worker. The splice operation owns a reference to the pipe,
+  so a `Splice` dropped with a splice still queued leaves the pipe open
+  until the kernel is done with it, and no worker can splice into a
+  descriptor closed and reused meanwhile. In `ruio-bench micro` a relay
+  moves 64 KiB chunks from one connection to another at 84k a second with
+  `splice`, 5.5 GB/s, against 60k with `copy` and 43k with tokio's, and
+  sends a cached megabyte file into a connection 13k times a second, 13.6
+  GB/s, against tokio's 1k (see [The runtime itself](#the-runtime-itself)).
+- Still to come: socket options for direct descriptors through
   `URING_CMD`.
 
 ## Files
@@ -957,7 +993,10 @@ baseline are used only when probed.
   the entry in the directory read, wherever the directory has moved; the
   type comes from the directory, or from statx where the file system
   gives none.
-- Still to come: `copy` with `splice`, links and permissions.
+- Files implement `io::AsyncRead` and `io::AsyncWrite` at their position,
+  and are spliced from and to with `io::splice`, from an offset and for a
+  length; see [Networking](#networking). Still to come: links and
+  permissions.
 
 ## Compatibility
 
@@ -1040,10 +1079,11 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-Owned-buffer read and write traits carry the usual helpers (`read_exact`,
-`write_all`, and `copy` using `splice` between descriptors). The sockets
-have `read_exact` and `write_all` of their own so far, and the sketch's
-`send_all(chunk).timeout(d)` is `write_all(chunk).timeout(d)`;
+The owned-buffer read and write traits are `io::AsyncRead` and
+`io::AsyncWrite`, with `read_exact`, `read_to_end` and `write_all`, and
+`io::copy` over them; `copy` between descriptors with `splice` is
+`io::splice`. The sockets' own `read_exact` and `write_all` stay, and the
+sketch's `send_all(chunk).timeout(d)` is `write_all(chunk).timeout(d)`;
 `#[ruio::main(cores = "all")]` and `bind_reuseport` work as sketched.
 
 ## Verification
@@ -1940,6 +1980,24 @@ entries, ten batches, ruio lists in 1.54 ms where the synchronous
 reads a batch while the task takes the entries of the one before, so the
 task's work hides behind the kernel's.
 
+`copy`, `splice` and `sendfile`, added with the io module, relay a stream:
+a task writes 64 KiB chunks into one connection as fast as it takes them, a
+relay task moves them into another, with `io::copy` or with `io::splice`,
+and the sink reads them out a chunk at a time, a step being a chunk out,
+against tokio's `io::copy`; `sendfile` splices a cached megabyte file into
+a connection that a thread on another CPU drains, as a server sends a
+file, against tokio's `io::copy` from its `File`, which reads it on tokio's
+blocking pool. Medians of five runs taken in turns: `copy` 60k chunks a
+second on ruio, 3.9 GB/s, against 43k; `splice` 84k, 5.5 GB/s; `sendfile`
+13k megabytes a second, 13.6 GB/s, against 1k. The relay's own reads and
+writes are what `splice` saves: the feeder's and the sink's copies on the
+same thread, 64 KiB each way per chunk, set a ceiling near 100k, and
+`splice` moves the relay's share of the work into the kernel's workers,
+where `copy` adds two more copies of every byte on the thread. The file is
+sent without any copy on the sending side: the kernel moves the file's
+cached pages into the pipe and the pipe's into the socket, and the one copy
+left, the sink's, is on its own core.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -2109,6 +2167,15 @@ Since M7:
   tokio's reader, and ten thousand faster than the standard library lists
   them synchronously (see [Networking](#networking), [Files](#files) and
   [The runtime itself](#the-runtime-itself)).
+- `io` has the owned-buffer `AsyncRead` and `AsyncWrite` the sockets and
+  files share, with generic associated future types so generic code costs
+  nothing, `copy` with two buffers in flight, and `splice`, which relays
+  between descriptors through a pipe without a byte in user space, each
+  splice behind a linked poll so no io-wq worker waits on an idle socket;
+  the driver gained the `Splice`, `Tee` and `PollAdd` operations. A relay
+  moves 1.4× as many chunks with `splice` as with `copy`, and twice
+  tokio's; a cached file goes into a socket at 13.6 GB/s, 14× tokio's (see
+  [Networking](#networking) and [The runtime itself](#the-runtime-itself)).
 
 ## Open questions
 

@@ -47,7 +47,7 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 
 | Crate | What it has |
 |---|---|
-| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, `time`, `sync`, and `net` and `fs`, whose I/O runs on the thread's ring |
+| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, and `io`, the owned-buffer traits they share, with `copy` and `splice` |
 | [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, for hyper, rustls and the rest of the ecosystem; and `Timer`, which gives hyper ruio's timers for its timeouts |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
@@ -121,7 +121,11 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   thousand entries lists 2.4 times as fast as through `tokio::fs::read_dir`.
   Nothing blocks the runtime's thread: host names resolve and directories
   are read on the blocking pool, directories read ahead so that a task
-  taking the entries waits for the pool once.
+  taking the entries waits for the pool once. A relay between two
+  connections moves 1.4 times as many 64 KiB chunks with `io::splice`,
+  which keeps the bytes in the kernel, as with `io::copy`, itself 1.4 times
+  tokio's, and a cached file goes into a connection at 13.6 GB/s, 14 times
+  as fast as tokio copies it from its `File`.
 
 ## Development
 
