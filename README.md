@@ -48,7 +48,7 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 | Crate | What it has |
 |---|---|
 | [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, and `signal` |
-| [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, for hyper, rustls and the rest of the ecosystem; and `Timer`, which gives hyper ruio's timers for its timeouts |
+| [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; and `Timer`, which gives hyper ruio's timers for its timeouts |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
 | [`ruio-sys`](crates/ruio-sys) | The kernel's io_uring ABI and system calls |
@@ -105,6 +105,9 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   256 connections on, and 3% behind at 16, where the difference is cache
   lines the client's core hands the server's for each wake, not the
   runtime's own work.
+- **hyper, HTTP/2**, one core, each stream a task of ruio's executor: level
+  with hyper on tokio in requests a second with 1, 16 and 256 connections of
+  32 streams, with a 99th percentile 6% to 12% shorter.
 - **The runtime itself** (`ruio-bench micro`): a task's turn of the loop, a
   spawn and its join, a timer armed and dropped, and a wake on the task's
   own thread cost no locked instruction. Against tokio's current-thread

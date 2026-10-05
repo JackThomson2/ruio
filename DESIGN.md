@@ -144,9 +144,11 @@ kernel refuses larger tables. `Builder::files` sets the size, 0 for none; a
 ring whose default table is refused goes without. A ring has at least two
 submission queue entries, room for an operation and its linked timeout.
 
-`SQPOLL` and NAPI busy polling (6.9) are opt-in. The kernel rejects
-`DEFER_TASKRUN` and `TASKRUN_FLAG` together with `SQPOLL`, so that mode uses
-its own flag set.
+`SQPOLL` and NAPI busy polling (6.9) were to be opt-in. Neither is: the
+ring refuses `IORING_SETUP_SQPOLL`, whose kernel thread submits on the
+ring's behalf and so cannot be used with `DEFER_TASKRUN`, which the design
+rests on, and nothing registers NAPI, which wants measurement on a real
+NIC before a default is chosen. Both stay possible additions.
 
 A driver gets a second ring, with the same flags plus `IOPOLL`, once an
 operation asks to be polled, or at once with `Builder::polled`; see
@@ -1040,9 +1042,14 @@ baseline are used only when probed.
 Most of the ecosystem takes its I/O through poll-based traits, tokio's
 `AsyncRead` and `AsyncWrite` or those of futures-io, which lend the
 caller's buffer for one call; the kernel cannot use it once the call
-returns. `ruio_compat::Compat` adapts a `TcpStream` or a `UnixStream` to
-both families, and `AsyncBufRead` besides, with buffers of its own. tokio's
-traits need none of tokio's runtime.
+returns. `ruio_compat::Compat` adapts a `TcpStream` or a `UnixStream`, a
+`File` at its position, or any descriptor in an `io::AsyncFd` to both
+families, and `AsyncBufRead` besides, with buffers of its own; the sealed
+`Adaptable` names the four, and each type's read and write operations, a
+socket's receive and send and a file's read and write, which take the
+descriptor rather than borrow the value, so the adapter is generic over
+them and holds nothing pinned and boxes nothing. tokio's traits need none
+of tokio's runtime.
 
 - A read receives into the adapter's buffer, 16 KiB unless made
   `with_capacity`, and copies out what the caller's takes; the rest waits
@@ -1070,28 +1077,44 @@ traits need none of tokio's runtime.
   reports a failure if one is known, as a socket's flush would. hyper
   flushes every response, and a flush that waited for the kernel would
   cost each another wake of its task (see [HTTP/1.1](#http11)). Closing
-  (tokio's `shutdown`) waits for the send in flight, then shuts the
-  writing half down.
+  (tokio's `shutdown`) waits for the send in flight, then shuts a
+  connection's writing half down; a file or a descriptor has no half to
+  shut, so its close is the wait alone, and it stays open for more.
+- A write the kernel cuts short, as it may a write to a pipe with less room
+  than the write, is carried on with the rest of the buffer, behind as the
+  first was, so the bytes the caller was told were taken all arrive; a
+  socket's send, asked to carry on through short sends, stops short only
+  when the connection breaks.
 - The adapter runs its receives and its shutdown on the thread's ring,
   which it keeps from its first operation, so that a direct descriptor's
   slot always names the stream's file.
 
-hyper-util's `TokioIo` gives hyper's own traits to anything with tokio's,
-so `TokioIo::new(Compat::with_pool(&pool, stream))` is a connection hyper
-serves, or a client's; HTTP/1.1 connections need no executor, and ruio's
-tasks need not be `Send`. tokio-rustls runs TLS over an adapter as it is,
-and its streams have tokio's traits too. The examples of `ruio-compat`
-serve HTTP/1.1 and HTTPS so on every core.
+With the `hyper` feature, on by default, an adapter has hyper's own I/O
+traits, `hyper::rt::Read` and `Write`: a read copies what the adapter has
+received into hyper's buffer cursor through the cursor's own `put_slice`,
+and a write is vectored, so hyper hands a response's head and body over at
+once. So `Compat::with_pool(&pool, stream)` is a connection hyper serves,
+or a client's, with nothing between them, where hyper-util's `TokioIo` was
+in between before, turning hyper's cursor into tokio's `ReadBuf` for each
+read; the HTTP/1.1 benchmark read the same without it, within its noise,
+hyper on ruio spending five sixths of its time in the kernel. tokio-rustls
+runs TLS over an adapter as it is, and its streams have tokio's traits,
+which `TokioIo` still gives hyper's to. `ruio_compat::Executor` is a
+`hyper::rt::Executor` that spawns on the thread's runtime, which hyper's
+HTTP/2 needs to run each stream of a connection as a task: the tasks are
+ruio's, on the core that serves the connection, and need not be `Send`, so
+hyper's HTTP/2 server and client run on one core as its HTTP/1.1 does,
+with nothing shared between cores (see [HTTP/2](#http2)). The examples of
+`ruio-compat` serve HTTP/1.1, HTTP/2 and HTTPS so on every core.
 
 hyper's timeouts, such as the one for reading a request's head, need a
 timer, whose sleeps hyper boxes as `Send` and `Sync`. `ruio_compat::Timer`,
-behind the `hyper` feature, on by default, is one whose sleeps are ruio's:
-hyper polls them in the task serving the connection, so their timers go in
-the wheel of that task's runtime, and a reset moves a sleep's deadline in
-place. Given it, hyper's server cuts off a client that takes longer than
-30 seconds, unless set otherwise, to send a request's head, as the
-examples' servers do. hyper's upgrades need `Send` streams, which ruio's
-are not.
+behind the `hyper` feature, is one whose sleeps are ruio's: hyper polls
+them in the task serving the connection, so their timers go in the wheel of
+that task's runtime, and a reset moves a sleep's deadline in place. Given
+it, hyper's server cuts off a client that takes longer than 30 seconds,
+unless set otherwise, to send a request's head, as the examples' servers
+do. hyper's upgrades need `Send` streams, which ruio's are not.
 
 ## API sketch
 
@@ -1636,6 +1659,38 @@ writes its entry's link into the ready list and little else; the two
 functions that first touch the request, `llist_reverse_order` and
 `io_poll_check_events`, take 580 cycles a request between them. The adapters
 cannot reach that: it is the price of a wake-up through io_uring's poll.
+
+### HTTP/2
+
+`ruio-bench http2` runs hyper serving HTTP/2 on one CPU as the HTTP/1.1
+benchmark does, the connections HTTP/2 from the start: on ruio through
+`Compat`, which has hyper's traits, with `ruio_compat::Executor` running
+each stream as a task of the core, each connection receiving into a buffer
+of its own or into a pool; and on tokio's current-thread runtime through
+hyper-util's `TokioIo` and `TokioExecutor`. The load generator is hyper's
+HTTP/2 client on tokio's multi-threaded runtime, each connection keeping 32
+streams going at once, each a GET and its response again and again, every
+response checked. The pool has a buffer per connection and one more per
+eight of its streams, as a connection receives its streams' requests in
+bursts: with 256 connections, 1024 buffers put the pool's 99th percentile
+at 28 ms where 256, which ran dry under the bursts, put it at 58. Requests
+per second and 99th percentile, medians of three runs of 2 s taken in
+turns, on the host of the other measurements:
+
+| Connections | tokio | ruio | ruio, pool | p99 tokio (µs) | p99 ruio (µs) | p99 ruio, pool (µs) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 86k | 85k (0.99×) | 86k (1.00×) | 528 | 465 | 468 |
+| 16 | 327k | 321k (0.98×) | 324k (0.99×) | 1957 | 1772 | 1837 |
+| 256 | 304k | 300k (0.99×) | 301k (0.99×) | 30635 | 28262 | 28197 |
+
+hyper on ruio is level with hyper on tokio in throughput, within the runs'
+noise, with a tail 6% to 12% shorter. HTTP/2 batches its streams' frames
+into fewer reads and writes than HTTP/1.1 takes for as many requests, so
+the adapters' copies and the ring's requests are spread over more requests
+each, and what is left is h2's framing and HPACK, the same under both
+runtimes, and the kernel's work on the sockets: the runtime's share is
+small, and the executor's, a spawn and a join a stream, smaller. The pool
+buys nothing here, as a read already brings a batch of frames in.
 
 ### The runtime itself
 
@@ -2240,6 +2295,15 @@ Since M7:
   readiness wait runs 1.3× tokio's `AsyncFd` and a signal 1.3× tokio's,
   both near the floor of their system calls (see [Networking](#networking)
   and [The runtime itself](#the-runtime-itself)).
+- `Compat` adapts a `File` and any descriptor in an `AsyncFd` beside the
+  stream sockets, through the sealed `Adaptable`, which names each type's
+  own operations so the adapter stays generic with nothing boxed, and has
+  hyper's own I/O traits, so hyper serves it with nothing between them;
+  `Executor` runs hyper's HTTP/2, a stream a task of the core. hyper on ruio
+  serves HTTP/2 level with hyper on tokio, with a tail 6% to 12% shorter
+  (see [Compatibility](#compatibility) and [HTTP/2](#http2)). The ring
+  setup's account of `SQPOLL` and NAPI now says what the code does: the
+  first is refused, the second not registered.
 
 ## Open questions
 
