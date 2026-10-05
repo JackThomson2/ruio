@@ -5,6 +5,8 @@
 //! task wherever it runs: a task on another core is woken through its
 //! runtime's queue of remote wakes. [`oneshot`] carries one value;
 //! [`mpsc`] carries many, from any number of senders, with a bound.
+//! [`local`] has the same two channels for halves that stay on one
+//! thread, which take no atomic operation.
 //!
 //! [`Mutex`] and [`RwLock`] lock a value for tasks that may hold it
 //! across awaits, [`Semaphore`] counts out permits, and [`Notify`] wakes
@@ -19,6 +21,7 @@
 
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
 
+pub mod local;
 pub mod mpsc;
 mod mutex;
 mod notify;

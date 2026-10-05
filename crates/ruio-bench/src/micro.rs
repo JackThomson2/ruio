@@ -11,6 +11,8 @@
 //! - `yield`: yield to the scheduler, which runs the task again.
 //! - `channel`: a value sent to another task through a channel, and one
 //!   back: two wakes and two runs.
+//! - `local channel`: the same through the channels of one thread, which
+//!   take no atomic operation.
 //! - `remote`: a value sent to a thread of its own, which sends one back
 //!   through a channel: a wake from another thread, and a park and unpark.
 //! - `timer`: arm a timer by polling a sleep once, then drop it.
@@ -113,6 +115,11 @@ pub(crate) const ALL: &[Micro] = &[
         name: "channel",
         ruio: ruio_channel,
         tokio: Some(tokio_channel),
+    },
+    Micro {
+        name: "local channel",
+        ruio: ruio_local_channel,
+        tokio: None,
     },
     Micro {
         name: "remote",
@@ -247,6 +254,33 @@ fn tokio_yield(load: &Load) -> io::Result<f64> {
 /// A value to a second task and one back, through bounded channels.
 fn ruio_channel(load: &Load) -> io::Result<f64> {
     use ruio::sync::mpsc;
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (to_echo, mut echo_rx) = mpsc::channel::<u32>(1);
+        let (to_main, mut main_rx) = mpsc::channel::<u32>(1);
+        let echo = ruio::spawn(async move {
+            while let Some(value) = echo_rx.recv().await {
+                if to_main.send(value).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let rate = rate(measure, async || {
+            to_echo.send(1).await.expect("the echo task runs");
+            main_rx.recv().await.expect("the echo task answers");
+        })
+        .await;
+        drop(to_echo);
+        echo.await.map_err(io::Error::other)?;
+        Ok(rate)
+    })
+}
+
+/// A value to a second task and one back, through the bounded channels of
+/// one thread.
+fn ruio_local_channel(load: &Load) -> io::Result<f64> {
+    use ruio::sync::local::mpsc;
 
     let measure = load.measure;
     ruio_runtime()?.block_on(async move {
