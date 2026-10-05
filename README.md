@@ -110,8 +110,11 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   own thread cost no locked instruction. Against tokio's current-thread
   runtime, spawning and joining a task runs 8.8 times as fast, a yield 16
   times, arming and dropping a timer 5.3 times, a channel round trip 5.4
-  times, 9.2 through the channels for one thread, and an uncontended async
-  mutex 2.1 times.
+  times, 9.2 through the channels for one thread, an uncontended async
+  mutex 2.1 times, a round trip through unbounded channels 4.7 times,
+  through broadcast channels 3.1 and through watch channels 4.0, two tasks
+  meet at a barrier 6.3 times as often, and arming a wait for a
+  cancellation token and dropping it runs 2.3 times as fast as tokio-util's.
 
 ## Development
 

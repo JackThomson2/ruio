@@ -13,8 +13,8 @@
 //! Wakers are `Send + Sync`: a task woken on another thread goes to its
 //! runtime's queue of remote wakes, and the runtime's ring is unparked.
 //!
-//! Timers ([`time`]) live in a timing wheel in user space; the kernel sees a
-//! single timeout, until the next deadline.
+//! Timers ([`time`]), sleeps, timeouts and intervals, live in a timing wheel
+//! in user space; the kernel sees a single timeout, until the next deadline.
 //!
 //! Each poll of a task has a budget: the channels of [`sync`] and
 //! [`JoinHandle`]s, which can be ready every time they are polled, spend a

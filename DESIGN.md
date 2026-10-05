@@ -599,6 +599,12 @@ baseline are used only when probed.
   arms many timers reads it once. A deadline that passed during the pass
   is armed, and fires at the next tick, rather than ending at once; none
   ends early.
+  An `Interval` (`time::interval`) ticks at a period: it keeps one
+  `Sleep`, which it resets to the next tick's deadline as each ends, so a
+  tick costs the wheel one removal and one arm, reads the clock once and
+  allocates nothing. A tick the task is late for by more than a period is
+  made up at once, waited for a period from now, or skipped to the
+  cadence, as its `MissedTickBehavior` says.
 - A sleep is `Send` and `Sync`, so that a future given to `spawn_on`, or a
   sleep hyper asks of a timer, can hold one. Its timer is in the wheel of
   the runtime that polls it, which it names by the address of the runtime's
@@ -654,6 +660,21 @@ baseline are used only when probed.
   `oneshot` is one atomic state, in which the sender finishes, by sending
   or going, and the receiver registers its waker and goes, each with one
   read-modify-write.
+  An unbounded `mpsc` (`mpsc::unbounded_channel`), whose send never
+  waits, keeps its values in a list of blocks of 32 slots: a sender claims
+  a position with one atomic add, so that senders sending at once each
+  get a slot of their own and nobody retries, finds the block from the
+  channel's tail block, writes the value and publishes it by setting the
+  slot's bit in the block's ready word, which the receiver reads with one
+  load. A block the receiver has emptied goes back to the end of the list
+  for the senders to fill again, once no sender can reach it: the sender
+  that moves the tail block on past a full block leaves in it the tail as
+  it was then, and the receiver puts the block back once it has taken
+  every value before that position. So a channel in a steady state
+  allocates nothing, and the receiver closing the channel sets a flag in
+  the tail, so that every claim falls before the close, and is taken, or
+  after it, and hands its value back. `sync::local` has the unbounded
+  channel for one thread too, on a deque.
 - `sync` also has a `Semaphore`, and on it a `Mutex` and an `RwLock` whose
   guards may be held across awaits, and `Notify`. They keep their waiters
   behind a standard mutex, wake outside it, and work across cores, as the
@@ -669,6 +690,41 @@ baseline are used only when probed.
   starved by readers. A waiter dropped after its permits were set aside
   gives them back, and a `Notified` dropped after `notify_one` chose it
   passes the notification on, so cancelling a wait loses nothing.
+- `sync::broadcast` carries every value to every receiver, keeping the
+  last `capacity` of them, rounded up to a power of two, in a ring of
+  slots. Each receiver keeps its own position and reads the slot at it,
+  cloning the value under the slot's read lock, or taking it as the last
+  of the receivers counted to read it, so a value goes as soon as every
+  receiver has it; one that has fallen more than `capacity` behind finds
+  the slot filled again since, is told how many values it missed, and
+  goes on from the oldest kept. Sends take their turns under the tail's
+  lock, which holds the receiver count and the wakers of the receivers
+  waiting, so that each slot is stamped with the receivers that will read
+  it; a receive that finds its value takes no lock but the slot's.
+- `sync::watch` holds one value, behind a standard reader-writer lock,
+  with a version beside it whose low bit says every sender is gone. A
+  send changes the value under the write lock, bumps the version, and
+  wakes the receivers waiting for a change only if the flag beside their
+  list says any do; a receiver's `changed` compares the version with the
+  one it last saw, one load when a change waits, and `borrow` takes the
+  read lock, so a `Ref` must not be held across an await.
+- A `Barrier` lets `n` tasks through together. The count arrived and the
+  waiters' wakers, by ticket, are behind a lock, and the generation in an
+  atomic beside it, which the last to arrive moves on before it wakes the
+  rest outside the lock, so a waiter let through sees it with one load and
+  no lock. A wait dropped before its generation is let through takes its
+  arrival back, so a cancelled wait does not let the others through one
+  short.
+- A `CancellationToken` is one word of state that its clones share:
+  `is_cancelled` is one load, and `cancel` one read-modify-write unless
+  something has waited on the token or it has children, which bits of the
+  state say, when it also wakes the waiters and cancels the children, down
+  the tree with a list of what is left rather than by recursion. The
+  waiters' wakers are in a slab behind a lock, each in a slot whose index
+  is its ticket, so a wait dropped takes exactly its own waker out, and a
+  task that waits on the token and gives up with every turn of a loop, as
+  one selecting between the token and its work does, allocates nothing
+  after the first. Children are held weakly, and pruned as one is added.
 
 ### Keeping work stealing possible
 
@@ -1719,6 +1775,58 @@ the ask of a buffer less. `yield` reads 3% fewer steps a second after the
 pass with the same instructions per step, as the no-op loops did after the
 fourth: where the code was placed, which this pass did not pursue.
 
+The primitives that `sync` and `time` gained after the sixth pass, an
+unbounded channel, across cores and for one thread, broadcast and watch
+channels, a barrier and a cancellation token (see [Executor](#executor)),
+were measured as they came, on the same host, medians of five runs taken
+in turns, with tokio's current-thread runtime for reference and
+tokio-util's token for `cancel`, and `channel` and `local channel` as
+they read in the same runs. `unbounded channel` and `local unbounded
+channel` are `channel` and `local channel` through the unbounded ones;
+`broadcast` is a value to another task and one back through broadcast
+channels with one receiver each, and `watch` through watch channels, each
+way a send and a wait for the change; `barrier` is two tasks meeting at a
+barrier again and again; and `cancel` arms a wait for a token's
+cancellation by polling it once and drops it, as a loop selecting between
+a token and its work does with every turn:
+
+| Step | tokio | ruio |
+|---|---:|---:|
+| channel | 2.06M | 10.9M (5.29×) |
+| local channel | | 17.6M |
+| unbounded channel | 2.33M | 11.0M (4.71×) |
+| local unbounded channel | | 23.3M |
+| broadcast | 1.90M | 5.80M (3.05×) |
+| watch | 1.29M | 5.16M (3.99×) |
+| barrier | 2.15M | 13.5M (6.28×) |
+| cancel | 11.1M | 25.1M (2.27×) |
+
+- **The unbounded channel** makes the round trips of the bounded one: a
+  send claims its position with one atomic add and publishes its value
+  with one more, where the bounded send claims a slot with a
+  compare-and-exchange, and the receiver reads a value with one load in
+  either; the list of blocks, recycled, allocates nothing in a steady
+  state, as the ring does not. The one for one thread makes 1.33× the
+  round trips of the bounded local channel, having no room to check and
+  no senders to wake for it.
+- **Broadcast and watch** pay for what they carry. A broadcast round trip
+  takes the tail's lock for each send and the slot's lock twice, for the
+  write and the read, where the bounded channel takes none, and makes
+  half its round trips; a watch round trip takes the value's write lock
+  for each send and its read lock for each look, and the wait for the
+  change costs one load. Both still make three to four times tokio's.
+- **The barrier** costs each round the leader's lock and the other
+  task's one load, and a wake and a run each way: 6.28× tokio's, whose
+  barrier waits on a watch channel behind a mutex.
+- **The token's wait** clones the waker, takes the waiters' lock to
+  register and again to leave, and allocates nothing after the first:
+  25.1M arms and drops a second, from 14.8M with the wakers in a
+  `BTreeMap`, whose one node was allocated and freed each time, and the
+  waiters' bit of the state set as the first registered and cleared as
+  the last left, two atomic operations a wait that the bit, set once and
+  left set, spares, at the price of one lock for the one cancellation of
+  a token that has been waited on.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -1853,6 +1961,20 @@ Since M7:
   stays 10% to 18% ahead of fio's polled engine (see
   [Random reads with direct I/O](#random-reads-with-direct-io)).
   `IORING_SETUP_HYBRID_IOPOLL` measured far slower and was not adopted.
+- `time::interval` ticks at a period, and `sync` has unbounded channels,
+  across cores and for one thread, broadcast and watch channels, a
+  `Barrier` and a `CancellationToken` (see [Executor](#executor)), each
+  built as the primitives before them: hot paths without a lock, a flag
+  that says whether anyone waits, wakers woken outside every lock, and a
+  step of the task's budget for each that is ready at once. In
+  `ruio-bench micro` a round trip through the unbounded channels makes
+  4.7× the round trips of tokio's and through the unbounded channels for
+  one thread 23.3M a second, through broadcast channels 3.1× tokio's and
+  through watch channels 4.0×, two tasks meet at a barrier 6.3× as often,
+  and arming a wait for a token's cancellation and dropping it runs 2.3×
+  as fast as tokio-util's, which a slab for the waiters' wakers, in place
+  of a map that allocated a node for each, took from 1.3× (see [The
+  runtime itself](#the-runtime-itself)).
 
 ## Open questions
 

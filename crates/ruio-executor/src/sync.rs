@@ -4,14 +4,18 @@
 //! Both halves of a channel are `Send` when their values are, and wake a
 //! task wherever it runs: a task on another core is woken through its
 //! runtime's queue of remote wakes. [`oneshot`] carries one value;
-//! [`mpsc`] carries many, from any number of senders, with a bound.
-//! [`local`] has the same two channels for halves that stay on one
-//! thread, which take no atomic operation.
+//! [`mpsc`] carries many, from any number of senders, with a bound or
+//! without one; [`broadcast`] carries every value to every receiver, and
+//! [`watch`] the latest of them. [`local`] has the one-shot and the mpsc
+//! channels for halves that stay on one thread, which take no atomic
+//! operation.
 //!
 //! [`Mutex`] and [`RwLock`] lock a value for tasks that may hold it
-//! across awaits, [`Semaphore`] counts out permits, and [`Notify`] wakes
-//! tasks waiting for something to happen. Each serves its waiters in the
-//! order they came, and works across cores as the channels do.
+//! across awaits, [`Semaphore`] counts out permits, [`Notify`] wakes
+//! tasks waiting for something to happen, a [`Barrier`] lets a number of
+//! tasks through together, and a [`CancellationToken`] tells tasks to
+//! stop. Each works across cores as the channels do, and the locks and
+//! the semaphore serve their waiters in the order they came.
 //!
 //! These can be ready again and again, as the ring's operations never
 //! are, so each that completes at once spends a step of the task's budget
