@@ -20,6 +20,31 @@ fn the_builder_sizes_the_file_table() {
     assert_eq!(runtime.driver().files(), 0);
 }
 
+/// The shutdown timeout reaches the driver's builder, and a runtime built
+/// with a short one still drains cleanly: its drop cancels what is in
+/// flight, and the kernel finishes with it well within the bound.
+#[test]
+fn the_builder_sets_the_shutdown_timeout() {
+    let builder = Runtime::builder().shutdown_timeout(Duration::from_millis(10));
+    assert!(format!("{builder:?}").contains("shutdown_timeout: 10ms"));
+    let runtime = builder.build().unwrap();
+    runtime.block_on(async {
+        // Left in flight for the drop to cancel.
+        drop(spawn(async {
+            let timeout = Timeout::new(Duration::from_secs(60));
+            ruio_executor::driver().op(timeout).await.unwrap();
+        }));
+        yield_now().await;
+    });
+    let start = Instant::now();
+    drop(runtime);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
 /// Sets its flag when dropped.
 struct DropFlag(Rc<Cell<bool>>);
 

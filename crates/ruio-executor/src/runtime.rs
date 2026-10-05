@@ -43,6 +43,17 @@ impl Builder {
         self
     }
 
+    /// Sets how long dropping the runtime waits for the kernel to finish
+    /// with the operations of its tasks, which the drop cancels, before it
+    /// leaks what the kernel still holds and closes the ring; see
+    /// [`ruio_driver::Builder::shutdown_timeout`]. The default is one
+    /// second. Through [`Cores::builder`](crate::Cores::builder) it bounds
+    /// the shutdown of every core's runtime.
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.driver = self.driver.shutdown_timeout(timeout);
+        self
+    }
+
     /// Has the runtime, when it runs out of work, poll the ring for up to
     /// `budget` before it parks, as long as its waits are that short.
     ///
