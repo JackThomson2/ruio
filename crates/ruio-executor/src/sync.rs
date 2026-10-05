@@ -30,6 +30,7 @@ pub mod oneshot;
 mod rwlock;
 mod semaphore;
 mod waker_slot;
+pub mod watch;
 
 pub use mutex::{Mutex, MutexGuard};
 pub use notify::{Notified, Notify};
