@@ -20,6 +20,7 @@ tokio = ["dep:tokio"]
 [dependencies]
 futures-io = { version = "0.3.34", optional = true }
 hyper = { version = "1.11.1", default-features = false, optional = true }
+libc.workspace = true
 ruio.workspace = true
 tokio = { version = "1.53.1", default-features = false, optional = true }
 

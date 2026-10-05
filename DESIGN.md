@@ -739,14 +739,18 @@ traits need none of tokio's runtime.
   as soon as it has been read out. A connection then holds buffers only
   while data waits, but as many as that data fills: a pool shared by
   connections suits readers that read what arrives promptly, as hyper does.
-- A write copies up to 256 KiB of the caller's bytes and writes them behind
-  the stream: done, as far as the caller can tell, once the send is on its
-  way. The next write waits for it, and a failure fails the writes, flushes
-  and closes after it, as for the stream's own writes behind. The buffer
-  comes back to the adapter once the send is done with it, for the next
-  write to fill, unless it has grown past 16 KiB, so a connection's writes
-  allocate nothing once it is going, and an idle one holds little. A dropped
-  adapter leaves its send to finish, and the stream closes after it.
+- A write copies up to 256 KiB of the caller's bytes and sends them with an
+  operation of the adapter's own: done, as far as the caller can tell, once
+  the send is on its way. The send is submitted with a waker that wakes
+  nothing, so its completion costs the task no wake-up, and its result waits
+  in its slot of the driver's table until the next write, flush or close
+  takes it; a write that finds the send before it still in flight leaves the
+  task's own waker with it. The next write waits for it, and a failure fails
+  the writes, flushes and closes after it, as for the stream's own writes
+  behind. The buffer comes back with the result, for the next write to fill,
+  unless it has grown past 16 KiB, so a connection's writes allocate nothing
+  once it is going, and an idle one holds little. A dropped adapter leaves
+  its send to finish, and the stream closes after it.
 - A flush has nothing to wait for, since the adapter holds nothing back: it
   reports a failure if one is known, as a socket's flush would. hyper
   flushes every response, and a flush that waited for the kernel would
@@ -1175,24 +1179,24 @@ runtimes: on ruio through `Compat` and hyper-util's `TokioIo`, each
 connection receiving into a buffer of its own, or into a pool of a buffer
 per connection; and on tokio's current-thread runtime, through `TokioIo`.
 Neither gives hyper a timer, so neither has hyper's timeouts. Requests per
-second, medians of three runs taken in turns, on the Xeon Platinum 8488C
-with Linux 7.0, over loopback:
+second, medians of runs taken in turns, on the Xeon Platinum 8488C with
+Linux 7.0, over loopback: five runs up to 256 connections, three with 1,024
+and five with 10,000, where a run of this host's gives either runtime a fifth
+more or less from one run to the next, and three runs in a noisier spell had
+put the pool at 0.93×:
 
 | Connections | tokio | ruio | ruio, pool | p99 tokio (µs) | p99 ruio (µs) | p99 ruio, pool (µs) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 45k | 44k (0.99×) | 44k (0.99×) | 28 | 28 | 29 |
-| 16 | 187k | 173k (0.93×) | 182k (0.97×) | 105 | 124 | 118 |
-| 256 | 176k | 170k (0.97×) | 178k (1.01×) | 1550 | 1670 | 1598 |
+| 1 | 46k | 45k (0.98×) | 46k (1.01×) | 27 | 28 | 27 |
+| 16 | 191k | 177k (0.93×) | 187k (0.98×) | 103 | 120 | 115 |
+| 256 | 178k | 175k (0.98×) | 186k (1.04×) | 1536 | 1573 | 1494 |
 | 1,024 | 184k | 183k (0.99×) | 191k (1.04×) | 5926 | 6068 | 5633 |
 | 10,000 | 156k | 163k (1.05×) | 168k (1.08×) | 82736 | 83222 | 67270 |
 
 Receiving into a pool, hyper on ruio is level with hyper on tokio with one
-connection, and from 256 connections on 1% to 8% ahead, with a 99th
-percentile as short or shorter; at 16 connections it is 3% behind. The row
-with 10,000 connections is the median of five runs rather than three: with
-that many connections a run of this host's gives either runtime a fifth more
-or less from one run to the next, and three runs of that row in a noisier
-spell had put the pool at 0.93×. Loaded,
+connection, and from 256 connections on 4% to 8% ahead, with a 99th
+percentile as short or shorter; at 16 connections it is 2% to 3% behind.
+Loaded,
 both spend about 83% of their CPU in the kernel, 13% in hyper and the
 runtime, and 4% in the C library; the adapters' copies, of a request out
 of the pool's buffers and of a response into a buffer for the kernel, add
@@ -1200,7 +1204,7 @@ little to that. The kernel does the same for each request under both: one
 receive, one send, one segment each way and one wake-up of the client,
 counted with probes.
 
-Three things got the adapters there:
+Four things got the adapters there:
 
 - **A flush that does not wait.** hyper flushes every response. Waiting for
   the kernel to finish the send woke the task again for each, as a write
@@ -1216,15 +1220,39 @@ Three things got the adapters there:
   once the send is done, so a response allocates nothing where it allocated
   twice, and is copied into memory still in the cache: a percent or so,
   with the C library's allocator a third of what it was in the profile.
+- **Less bookkeeping a request.** The adapter's send is an operation of its
+  own, submitted with a waker that wakes nothing, whose result waits in its
+  slot of the driver's table until the next write takes it, and the buffer
+  with it. Written behind the stream, as before, the send was detached, and
+  the driver copied the operation, 168 bytes with its slot's vtable, into
+  the slot, out again when it completed and once more to finish it: a tenth
+  of the C library's copying in the profile, more than the response itself.
+  The pool's reader keeps the lease it reads from and the bundle's own
+  iterator rather than a deque of leases, and a bundle of one buffer is made
+  without collecting an empty vector. Together they take 330 instructions
+  and some 200 cycles off the 8,450 instructions and 3,050 cycles a request
+  took in user space, a percent of the request; seven runs of each binary in
+  turns put the pool at 187k against 186k before, and the connections with
+  buffers of their own at 177k against 176k, within the rows' noise.
 
-What is left: at 16 connections ruio's CPU goes where tokio's does, bar
-io_uring's own share, the deferred work that runs a receive when its socket
-wakes and the poll bookkeeping around it, which stands where epoll's
-readiness list and the system calls stand under tokio and comes to slightly
-more. The kernel's receive path takes twice its share under tokio, as it
-does in the echo benchmark, where the two are level: under tokio `epoll_wait`
-polls the socket first and takes the cache misses that `recvmsg` takes under
-ruio, which the profiles show in different places.
+What is left: at 16 connections a turn of the ring delivers 16 completions,
+as `epoll_wait` returns 14 events, so what a turn costs is spread as thin
+under both, and the kernel does the same for each request bar how the server
+learns of it. ruio's CPU goes where tokio's does except for io_uring's own
+share, some 900 cycles a request: the deferred work that runs a receive when
+its socket wakes, and the poll bookkeeping around it, against epoll's
+readiness list and the system calls' entry and exit, which come to more
+under tokio. Yet the kernel takes 500 cycles a request more under ruio, in
+fewer instructions, and the processor's counters put the difference in
+cache lines taken from another core's cache: 49 a request under ruio to 45
+under tokio, each worth a couple of hundred cycles on this host. The
+multishot receive's request holds the deferred work's list node, the poll's
+reference count and its stashed result, which the client's CPU writes when
+the socket wakes and the server's CPU then reads, where epoll's callback
+writes its entry's link into the ready list and little else; the two
+functions that first touch the request, `llist_reverse_order` and
+`io_poll_check_events`, take 580 cycles a request between them. The adapters
+cannot reach that: it is the price of a wake-up through io_uring's poll.
 
 ### The runtime itself
 

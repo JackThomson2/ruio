@@ -20,12 +20,12 @@
 //!   buffers of a pool instead, with one multishot receive that stays
 //!   armed, as [`TcpStream::recv_stream`] does, so that its reads cost the
 //!   ring no request each.
-//! - A write copies the caller's bytes and writes them behind the stream,
-//!   as [`TcpStream::write_behind`] does: it is done, as far as the caller
-//!   can tell, once the send is on its way, and the next write waits for it
-//!   to finish. How the send went comes out later: a failure fails the
-//!   writes, flushes and closes after it. Dropping the adapter leaves the
-//!   send to finish, and the stream closes after it.
+//! - A write copies the caller's bytes and sends them, as
+//!   [`TcpStream::write_behind`] does: it is done, as far as the caller can
+//!   tell, once the send is on its way, and the next write waits for it to
+//!   finish. How the send went comes out later: a failure fails the writes,
+//!   flushes and closes after it. Dropping the adapter leaves the send to
+//!   finish, and the stream closes after it.
 //! - A flush has nothing to wait for, since the adapter holds nothing back:
 //!   it reports a failure if one is known, as a socket's flush would. Were
 //!   it to wait for the send to finish, each flush would cost its task
@@ -61,20 +61,17 @@
 //! family's, or call through the trait, as in
 //! `futures_util::AsyncWriteExt::write_all(&mut stream, data)`.
 
-use std::cell::Cell;
-use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::io::{self, IoSlice};
 use std::mem;
 use std::net::Shutdown;
 use std::pin::Pin;
-use std::rc::Rc;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll, Waker, ready};
 
-use ruio::buf::{BufLease, BufPool, IoBuf, IoBufs};
-use ruio::net::{Flush, TcpStream, UnixStream, WriteBehind};
-use ruio::uring::ops::{self, Recv};
+use ruio::buf::{BufBundle, BufLease, BufPool};
+use ruio::net::{TcpStream, UnixStream};
+use ruio::uring::ops::{self, Recv, Send};
 use ruio::uring::{Driver, Fd, Op};
 
 #[cfg(feature = "futures-io")]
@@ -100,6 +97,10 @@ const MAX_WRITE: usize = 256 << 10;
 /// may hold.
 const KEPT_WRITE: usize = 16 << 10;
 
+/// The flags of the adapter's sends: the kernel sends on through a short
+/// send, so one stops short only when the connection breaks.
+const SEND_FLAGS: i32 = libc::MSG_WAITALL;
+
 /// A stream socket of ruio's that a [`Compat`] adapts: a [`TcpStream`] or a
 /// [`UnixStream`].
 pub trait StreamSocket: sealed::Sealed {}
@@ -110,50 +111,21 @@ impl StreamSocket for UnixStream {}
 mod sealed {
     use super::*;
 
-    /// What an adapter needs of its stream.
+    /// What an adapter needs of its stream: the descriptor its operations
+    /// run on.
     pub trait Sealed {
         fn fd(&self) -> Fd;
-
-        fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V>;
-
-        fn flush(&self) -> Flush<'_>;
-
-        fn try_flush(&self) -> Option<io::Result<()>>;
     }
 
     impl Sealed for TcpStream {
         fn fd(&self) -> Fd {
             TcpStream::fd(self)
         }
-
-        fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V> {
-            TcpStream::write_behind(self, bufs)
-        }
-
-        fn flush(&self) -> Flush<'_> {
-            TcpStream::flush(self)
-        }
-
-        fn try_flush(&self) -> Option<io::Result<()>> {
-            TcpStream::try_flush(self)
-        }
     }
 
     impl Sealed for UnixStream {
         fn fd(&self) -> Fd {
             UnixStream::fd(self)
-        }
-
-        fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V> {
-            UnixStream::write_behind(self, bufs)
-        }
-
-        fn flush(&self) -> Flush<'_> {
-            UnixStream::flush(self)
-        }
-
-        fn try_flush(&self) -> Option<io::Result<()>> {
-            UnixStream::try_flush(self)
         }
     }
 }
@@ -166,16 +138,15 @@ mod sealed {
 /// [`with_capacity`](Compat::with_capacity), which a receive fills with
 /// whatever has arrived, or through the buffers of a pool, made
 /// [`with_pool`](Compat::with_pool). Writes copy up to 256 KiB at a time,
-/// and are written behind the stream.
+/// and send them without waiting for the kernel.
 pub struct Compat<S> {
-    // Fields drop in order: the operations, which cancel, then the stream,
+    // Fields drop in order: the operations, of which the receive and the
+    // shutdown cancel and the send is left to finish, then the stream,
     // which closes after them.
     reader: Reader,
+    writer: Writer,
     /// The shutdown in flight.
     shutdown: Option<Op<ops::Shutdown>>,
-    /// The buffer of the last write, once its send is done with it, for
-    /// the next write to fill: a write then allocates nothing.
-    spare: Rc<Cell<Option<Vec<u8>>>>,
     /// Whether the writing half of the connection has been shut down.
     closed: bool,
     /// The ring the adapter's own operations run on: the thread's, taken at
@@ -203,10 +174,13 @@ enum Reader {
         /// The receive, from the first read on.
         recv: Option<ops::RecvStream>,
         pool: BufPool,
-        /// What was received and not yet taken: the first lease's data from
-        /// `pos`, then the others'.
-        leases: VecDeque<BufLease>,
+        /// The buffer being read: what was received and not yet taken is
+        /// its data from `pos`, then that of the buffers after it in
+        /// `rest`. Each goes back to the pool as soon as it is read out.
+        lease: Option<BufLease>,
         pos: usize,
+        /// The rest of the bundle the lease came from, in order.
+        rest: Option<<BufBundle as IntoIterator>::IntoIter>,
         /// What the receive failed with, when a read found it after taking
         /// data, which it reported first.
         error: Option<io::Error>,
@@ -248,11 +222,12 @@ impl Reader {
             Reader::Pool {
                 recv,
                 pool,
-                leases,
+                lease,
                 pos,
+                rest,
                 error,
             } => {
-                if !leases.is_empty() {
+                if lease.is_some() {
                     return Poll::Ready(Ok(()));
                 }
                 if let Some(err) = error.take() {
@@ -267,8 +242,7 @@ impl Reader {
                 // yields nothing more: the end of the stream, from then on.
                 match ready!(stream.poll_next(cx)) {
                     Some(Ok(bundle)) => {
-                        leases.extend(bundle);
-                        *pos = 0;
+                        take_in(bundle, lease, pos, rest);
                         Poll::Ready(Ok(()))
                     }
                     Some(Err(err)) => Poll::Ready(Err(err)),
@@ -283,22 +257,20 @@ impl Reader {
     fn fill_ready(&mut self) {
         let Reader::Pool {
             recv: Some(recv),
-            leases,
+            lease,
             pos,
+            rest,
             error,
             ..
         } = self
         else {
             return;
         };
-        if !leases.is_empty() || error.is_some() {
+        if lease.is_some() || error.is_some() {
             return;
         }
         match recv.next_ready() {
-            Some(Ok(bundle)) => {
-                leases.extend(bundle);
-                *pos = 0;
-            }
+            Some(Ok(bundle)) => take_in(bundle, lease, pos, rest),
             Some(Err(err)) => *error = Some(err),
             None => {}
         }
@@ -309,7 +281,7 @@ impl Reader {
     fn buffered(&self) -> &[u8] {
         match self {
             Reader::Buffer { buf, pos, .. } => &buf[*pos..],
-            Reader::Pool { leases, pos, .. } => leases.front().map_or(&[], |lease| &lease[*pos..]),
+            Reader::Pool { lease, pos, .. } => lease.as_deref().map_or(&[], |lease| &lease[*pos..]),
         }
     }
 
@@ -317,19 +289,39 @@ impl Reader {
     fn consume(&mut self, amount: usize) {
         match self {
             Reader::Buffer { buf, pos, .. } => *pos = (*pos + amount).min(buf.len()),
-            Reader::Pool { leases, pos, .. } => {
-                let Some(lease) = leases.front() else {
+            Reader::Pool {
+                lease, pos, rest, ..
+            } => {
+                let Some(current) = lease else {
                     return;
                 };
-                *pos = (*pos + amount).min(lease.len());
-                if *pos == lease.len() {
+                *pos = (*pos + amount).min(current.len());
+                if *pos == current.len() {
                     // Back to the pool at once, for the kernel to fill again.
-                    leases.pop_front();
+                    *lease = rest.as_mut().and_then(Iterator::next);
                     *pos = 0;
+                    if lease.is_none() {
+                        *rest = None;
+                    }
                 }
             }
         }
     }
+}
+
+/// Takes in a bundle a pool's receive brought, for reading from its first
+/// buffer on.
+#[inline]
+fn take_in(
+    bundle: BufBundle,
+    lease: &mut Option<BufLease>,
+    pos: &mut usize,
+    rest: &mut Option<<BufBundle as IntoIterator>::IntoIter>,
+) {
+    let mut leases = bundle.into_iter();
+    *lease = leases.next();
+    *pos = 0;
+    *rest = Some(leases);
 }
 
 impl<S: StreamSocket> Compat<S> {
@@ -373,8 +365,9 @@ impl<S: StreamSocket> Compat<S> {
             Reader::Pool {
                 recv: None,
                 pool: pool.clone(),
-                leases: VecDeque::new(),
+                lease: None,
                 pos: 0,
+                rest: None,
                 error: None,
             },
             stream,
@@ -384,8 +377,8 @@ impl<S: StreamSocket> Compat<S> {
     fn with_reader(reader: Reader, stream: S) -> Self {
         Self {
             reader,
+            writer: Writer::default(),
             shutdown: None,
-            spare: Rc::default(),
             closed: false,
             driver: None,
             stream,
@@ -489,34 +482,26 @@ impl<S: StreamSocket> Compat<S> {
         if self.closed {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
-        ready!(self.poll_behind(cx))?;
+        ready!(self.writer.poll_done(cx))?;
         let len = total.min(MAX_WRITE);
         // The last write's buffer is back by now, as its send has finished.
-        let mut data = self.spare.take().unwrap_or_default();
+        let mut data = mem::take(&mut self.writer.spare);
         data.reserve(len);
         for buf in bufs {
             let take = buf.len().min(len - data.len());
             data.extend_from_slice(&buf[..take]);
         }
-        let buf = WriteBuf {
-            data,
-            spare: Rc::clone(&self.spare),
-        };
-        // Nothing is in flight now, so the write goes ahead at once.
-        ready!(Pin::new(&mut self.stream.write_behind([buf])).poll(cx))?;
+        let (driver, fd) = self.target();
+        self.writer.send(&driver, fd, data);
         Poll::Ready(Ok(len))
-    }
-
-    /// Waits for the write in flight, and reports how the writes went.
-    fn poll_behind(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream.flush()).poll(cx)
     }
 
     /// Reports how the writes went, as far as is known, without waiting for
     /// the write in flight, whose failure the next write, flush or close
     /// reports.
     fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(self.stream.try_flush().unwrap_or(Ok(())))
+        self.writer.take_ready();
+        Poll::Ready(self.writer.outcome())
     }
 
     /// Waits for the write in flight, then shuts down the writing half of
@@ -526,7 +511,7 @@ impl<S: StreamSocket> Compat<S> {
             return Poll::Ready(Ok(()));
         }
         if self.shutdown.is_none() {
-            ready!(self.poll_behind(cx))?;
+            ready!(self.writer.poll_done(cx))?;
             let (driver, fd) = self.target();
             self.shutdown = Some(driver.op(ops::Shutdown::new(fd, Shutdown::Write)));
         }
@@ -545,38 +530,113 @@ fn target<S: StreamSocket>(driver: &mut Option<Driver>, stream: &S) -> (Driver, 
     (driver, stream.fd())
 }
 
-/// The copy of a write's bytes that its send holds, which goes back to the
-/// adapter, emptied, once the send is done with it, unless it has grown
-/// past what an idle connection should hold.
-struct WriteBuf {
-    data: Vec<u8>,
-    spare: Rc<Cell<Option<Vec<u8>>>>,
+/// Where an adapter's writes go: one send at a time, which the adapter
+/// keeps, in flight or finished, until the next write, flush or close takes
+/// its result and its buffer.
+///
+/// The send is submitted with a waker that wakes nothing, so its completion
+/// wakes no task: a task that waits for it, as a write does while the one
+/// before is still in flight, leaves its own waker with the send instead.
+/// Its result waits in the send's slot of the driver's table meanwhile,
+/// where a detached operation's would have the driver copy the operation
+/// into the slot and out again to finish it there.
+#[derive(Default)]
+struct Writer {
+    /// The send of the last write, until its result is taken.
+    send: Option<Op<Send<Vec<u8>>>>,
+    /// How many bytes the send was given.
+    len: usize,
+    /// Whether a task waits for the send, having left its waker with it,
+    /// which a poll with no waker must not replace.
+    waited: bool,
+    /// The buffer of the last write, emptied, once its send is done with
+    /// it, for the next write to fill: a write then allocates nothing.
+    spare: Vec<u8>,
+    /// What a send failed with, as an errno: the writes, flushes and closes
+    /// after it report it as the kernel would have. A send that failed, or
+    /// was cut short, leaves a gap in the stream, so every write after it
+    /// fails, as a stream's writes do once it has broken.
+    error: Option<i32>,
 }
 
-// SAFETY: the bytes lie on the heap, where the vector keeps them in place,
-// and nothing touches them while the send holds the buffer.
-unsafe impl IoBuf for WriteBuf {
-    fn stable_ptr(&self) -> *const u8 {
-        self.data.as_ptr()
+impl Writer {
+    /// Sends `data` on `fd`, with nobody waiting for it.
+    fn send(&mut self, driver: &Driver, fd: Fd, data: Vec<u8>) {
+        self.len = data.len();
+        let mut send = driver.op(Send::new(fd, data).flags(SEND_FLAGS));
+        match Pin::new(&mut send).poll(&mut Context::from_waker(Waker::noop())) {
+            // Refused by the ring: it fails at once.
+            Poll::Ready((sent, data)) => self.finish(sent, data),
+            Poll::Pending => self.send = Some(send),
+        }
     }
 
-    fn bytes_init(&self) -> usize {
-        self.data.len()
+    /// Ready once no send is in flight, having taken the result of the last
+    /// one: `Ok`, unless a send failed.
+    fn poll_done(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(send) = &mut self.send {
+            let Poll::Ready((sent, data)) = Pin::new(send).poll(cx) else {
+                self.waited = true;
+                return Poll::Pending;
+            };
+            self.send = None;
+            self.waited = false;
+            self.finish(sent, data);
+        }
+        Poll::Ready(self.outcome())
     }
 
-    fn bytes_total(&self) -> usize {
-        self.data.capacity()
-    }
-}
-
-impl Drop for WriteBuf {
-    fn drop(&mut self) {
-        if self.data.capacity() > KEPT_WRITE {
+    /// Takes the result of the last send if it has finished, without
+    /// waiting, unless a task waits for it, whose waker the send keeps.
+    fn take_ready(&mut self) {
+        if self.waited {
             return;
         }
-        let mut data = mem::take(&mut self.data);
-        data.clear();
-        self.spare.set(Some(data));
+        if let Some(send) = &mut self.send
+            && let Poll::Ready((sent, data)) =
+                Pin::new(send).poll(&mut Context::from_waker(Waker::noop()))
+        {
+            self.send = None;
+            self.finish(sent, data);
+        }
+    }
+
+    /// Records how the last send went, and keeps its buffer for the next
+    /// write unless it has grown past what an idle connection should hold.
+    fn finish(&mut self, sent: io::Result<usize>, mut data: Vec<u8>) {
+        // Asked to carry on through short sends, the kernel stops short only
+        // when the connection breaks, and reports the bytes sent rather than
+        // why.
+        let error = match sent {
+            Ok(sent) if sent == self.len => None,
+            Ok(_) => Some(libc::EPIPE),
+            Err(err) => Some(err.raw_os_error().unwrap_or(libc::EIO)),
+        };
+        if self.error.is_none() {
+            self.error = error;
+        }
+        if data.capacity() <= KEPT_WRITE {
+            data.clear();
+            self.spare = data;
+        }
+    }
+
+    /// `Ok`, unless a send failed.
+    fn outcome(&self) -> io::Result<()> {
+        match self.error {
+            None => Ok(()),
+            Some(code) => Err(io::Error::from_raw_os_error(code)),
+        }
+    }
+}
+
+impl Drop for Writer {
+    /// The send in flight is left to finish, rather than cancelled as a
+    /// dropped operation is.
+    fn drop(&mut self) {
+        if let Some(send) = self.send.take() {
+            send.detach();
+        }
     }
 }
 

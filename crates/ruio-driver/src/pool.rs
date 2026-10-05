@@ -318,10 +318,13 @@ impl BufPool {
             pool.lease_taken(bid, len)
         };
         let first = lease(0);
-        Some(BufBundle {
-            first,
-            rest: (1..count).map(lease).collect(),
-        })
+        // Most messages fit one buffer, whose bundle allocates nothing.
+        let rest = if count > 1 {
+            (1..count).map(lease).collect()
+        } else {
+            Vec::new()
+        };
+        Some(BufBundle { first, rest })
     }
 }
 
