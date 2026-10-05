@@ -47,7 +47,7 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 
 | Crate | What it has |
 |---|---|
-| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `JoinSet`, `time`, `sync`, and `net` and `fs`, whose I/O runs on the thread's ring |
+| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, `time`, `sync`, and `net` and `fs`, whose I/O runs on the thread's ring |
 | [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, for hyper, rustls and the rest of the ecosystem; and `Timer`, which gives hyper ruio's timers for its timeouts |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
@@ -113,9 +113,11 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   times, a channel round trip 5.4 times, 9.2 through the channels for one
   thread, an uncontended async mutex 2.1 times, a round trip through
   unbounded channels 4.7 times, through broadcast channels 3.1 and through
-  watch channels 4.0, two tasks meet at a barrier 6.3 times as often, and
+  watch channels 4.0, two tasks meet at a barrier 6.3 times as often,
   arming a wait for a cancellation token and dropping it runs 2.3 times as
-  fast as tokio-util's.
+  fast as tokio-util's, and a closure sent to the blocking pool and its
+  output awaited make 2.9 times the round trips of tokio's `spawn_blocking`,
+  858k a second with the pool and the runtime spinning.
 
 ## Development
 

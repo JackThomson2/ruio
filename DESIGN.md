@@ -652,6 +652,31 @@ baseline are used only when probed.
   ring has a multishot poll on, which works from any thread, and costs no
   system call unless the ring is parked. Spawns from other threads go the
   same way, and their thread makes them tasks outside the queue's lock.
+- `spawn_blocking` runs a closure that would block the thread, a name
+  lookup or long work, on a thread of a pool the process shares, and gives a
+  `BlockingHandle` that awaits the output from any thread, inside a runtime
+  or not; `blocking::Pool` is a pool of a program's own, with a limit on its
+  threads, 512 unless set, a keep-alive after which an idle thread goes, ten
+  seconds unless set, and a spin budget. A job is one allocation, the
+  closure, its output and the awaiting task's waker behind one word of
+  state, handed over as a `oneshot`'s value is: the worker claims the job
+  with one read-modify-write, which tells it of an abort that came first,
+  and completes it with one more, which finds the waker; the handle
+  registers and takes with one each. The queue holds a thin pointer and the
+  function that runs the job, behind a mutex a job takes once to go in and
+  a worker once to come out; a worker with nothing to do waits on a
+  condition variable, and a job wakes one, counting it out of the idle
+  threads as tokio's pool does, or makes a thread if none is idle or
+  spinning and the limit allows, so that no job waits for a thread that is
+  not coming and none is made for a job a thread is coming for. Workers
+  may spin for a budget before they wait, looking at the count of queued
+  jobs without the lock, so that a job that comes within it is taken
+  without a system call; off unless set, as a spinning thread takes its
+  core from a runtime pinned there. In `ruio-bench micro` a job that does
+  nothing goes to a thread and its output comes back 409k times a second,
+  2.9× tokio's `spawn_blocking`, each a wake through the kernel both ways,
+  and 858k times with the pool and the runtime spinning, no system call on
+  the path (see [The runtime itself](#the-runtime-itself)).
 - `Cores` runs a runtime on each of several CPUs, thread per core: every
   CPU the process may run on (its main thread's, as `taskset` or a cgroup's
   cpuset limit them, whichever thread asks), the first few, or a list.
@@ -1859,6 +1884,23 @@ ruio and 2.24M on tokio, `join set` 16.9M and 1.65M. The set costs ruio
 the wake, and the pop and the slab's bookkeeping as the output is taken,
 and tokio 26% of its; ruio's set runs 10.2× tokio's.
 
+`blocking`, added with the blocking pool, runs a closure that does nothing
+through `spawn_blocking` and awaits it: a job handed to a thread of the
+pool, and the task woken from it, each a wake through the kernel when the
+other side waits; `blocking spin` runs the same on a pool of one thread
+that spins for its next job, pinned to another core, and a runtime that
+spins before it parks. Medians of five runs taken in turns: `blocking` 409k
+round trips a second on ruio and 141k on tokio, 2.9×, and `blocking spin`
+858k, a round trip of 1.2 µs with no system call on the path; `remote`,
+which sends a value to a thread through a standard channel and gets one
+back through the runtime's, read 196k in the same runs. tokio's round trip
+hands the job to its pool through a mutex and a condition variable as
+ruio's does, and pays a task cell of its own for each job, and its
+wake-ups for the completion go through its atomically counted waker and
+the runtime's driver, where ruio's job is one allocation handed over
+through one word, and the completion wakes the task through the remote
+queue and the eventfd, as any wake from another thread.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -2012,6 +2054,13 @@ Since M7:
   tokio's set, and the runtime's builder sets the shutdown timeout, which
   only the driver's did (see [Executor](#executor) and [The runtime
   itself](#the-runtime-itself)).
+- `spawn_blocking` runs a closure that would block on a thread of a pool
+  the process shares, or of a `blocking::Pool` of the program's own, a job
+  being one allocation handed over through one word of state; a round trip
+  makes 2.9× tokio's, and 858k a second with the pool and the runtime
+  spinning (see [Executor](#executor) and [The runtime
+  itself](#the-runtime-itself)). Name lookups and `read_dir` still run on
+  the thread; moving them onto the pool is to come.
 
 ## Open questions
 
