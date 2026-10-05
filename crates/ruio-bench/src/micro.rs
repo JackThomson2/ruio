@@ -8,6 +8,8 @@
 //!   loop: queue, enter the kernel and wait, deliver, wake, run.
 //! - `nop 64`: 64 tasks awaiting no-ops, so that a turn delivers a batch.
 //! - `spawn`: spawn a task that does nothing, and await it.
+//! - `join set`: spawn a task that does nothing into a join set, and take
+//!   its output from the set.
 //! - `yield`: yield to the scheduler, which runs the task again.
 //! - `channel`: a value sent to another task through a channel, and one
 //!   back: two wakes and two runs.
@@ -117,6 +119,11 @@ pub(crate) const ALL: &[Micro] = &[
         name: "spawn",
         ruio: ruio_spawn,
         tokio: Some(tokio_spawn),
+    },
+    Micro {
+        name: "join set",
+        ruio: ruio_join_set,
+        tokio: Some(tokio_join_set),
     },
     Micro {
         name: "yield",
@@ -278,6 +285,37 @@ fn tokio_spawn(load: &Load) -> io::Result<f64> {
     tokio_runtime()?.block_on(async move {
         Ok(rate(measure, async || {
             tokio::spawn(async {}).await.expect("the task ran");
+        })
+        .await)
+    })
+}
+
+/// A task that does nothing, spawned into a join set and taken out of it.
+fn ruio_join_set(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let mut set = ruio::JoinSet::new();
+        Ok(rate(measure, async || {
+            set.spawn(async {});
+            set.join_next()
+                .await
+                .expect("a task is in the set")
+                .expect("the task ran");
+        })
+        .await)
+    })
+}
+
+fn tokio_join_set(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let mut set = tokio::task::JoinSet::new();
+        Ok(rate(measure, async || {
+            set.spawn(async {});
+            set.join_next()
+                .await
+                .expect("a task is in the set")
+                .expect("the task ran");
         })
         .await)
     })
