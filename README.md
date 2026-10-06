@@ -137,7 +137,11 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   tokio's, and a signal raised and received 1.3 times, each near the floor
   of its system calls. With the `futures` feature, a channel's values driven
   through `StreamExt` come at the same rate as through the channel's own
-  `recv`, a round trip 4.9 times as fast as tokio's through tokio-stream.
+  `recv`, a round trip 4.9 times as fast as tokio's through tokio-stream. A
+  socket option on a plain stream is the system call it always was, level
+  with tokio's; on a direct descriptor, which only the ring can reach, it is
+  a round trip of the ring, and one submitted beside a write costs about
+  what the system call does.
 
 ## Development
 

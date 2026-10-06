@@ -34,7 +34,7 @@ an API that still reads like ordinary async Rust.
 | Interop | `futures-io` and `tokio::io` adapters in `ruio-compat`, which hyper and rustls run over. | Ecosystem access matters, but must not shape the core API. |
 | Toolchain | Newest stable Rust (1.97.1), edition 2024, pinned in `rust-toolchain.toml`. Nightly only for sanitizers. | No minimum supported Rust version is required. |
 | Dependencies | `libc` only, in the core crates. | Small audit surface. |
-| Direct descriptors | Supported throughout the driver; `ruio::net` accepts them on request (`set_direct`), plain descriptors by default. | A direct socket cannot report its addresses (`getsockname` through `URING_CMD` is 6.19) and can change options only with `URING_CMD` requests, and a full file table makes the kernel close the connection it accepted. The echo benchmark measures the file lookups they save at about 1%. |
+| Direct descriptors | Supported throughout the driver; `ruio::net` accepts them on request (`set_direct`), plain descriptors by default. | A direct socket's options go through `URING_CMD` requests (6.7), its addresses through a descriptor installed for the call (`FIXED_FD_INSTALL`, 6.8), and a full file table makes the kernel close the connection it accepted. The echo benchmark measures the file lookups they save at about 1%. |
 
 ## Architecture
 
@@ -853,11 +853,39 @@ baseline are used only when probed.
   `TimedOut`, and the buffer still comes back.
 - Listeners bind with a backlog of 1024, as tokio's do, instead of the
   standard library's 128, which a burst of clients overflows. On request
-  (`set_direct`) they accept direct descriptors, which cannot report their
-  local address or change socket options, and know the peer's address only
-  from `accept`. When the file table is full the kernel closes the
-  connection it could not install and fails the accept with `ENFILE`;
-  `Incoming` yields that and carries on with plain descriptors.
+  (`set_direct`) they accept direct descriptors, whose options and
+  addresses cost a little more to reach, as the next item says. When the
+  file table is full the kernel closes the connection it could not install
+  and fails the accept with `ENFILE`; `Incoming` yields that and carries on
+  with plain descriptors.
+- A stream's options, `TCP_NODELAY`, `IP_TTL`, `SO_LINGER` and `SO_ERROR`,
+  and its addresses are reached by the cheapest path there is for its
+  descriptor, behind one async method each. A plain descriptor's options
+  are system calls, at once, as the standard library's are: a bare
+  `setsockopt(2)` is a third of a request through the ring awaited alone,
+  and still ahead of one submitted beside other requests, so nothing is
+  gained by routing it there. A direct descriptor has no file descriptor
+  for the call, so its options go through the ring: set at any level with
+  `SetSockOpt`, a `URING_CMD` the kernel completes as it is submitted, and
+  read through the ring for an option of `SOL_SOCKET`, which is all the
+  kernel reads there; an option of another level, `TCP_NODELAY` or
+  `IP_TTL`, and the addresses, which only `getsockname(2)` gives, are read
+  on a descriptor installed for the call with `InstallFd`
+  (`FIXED_FD_INSTALL`) and closed after it, which leaves the slot's file
+  open, as both refer to the one file; `peer_addr` answers from the address
+  `connect` or `accept` learnt where it can. `into_plain` gives a direct
+  stream asked often, or handed to a library, a plain descriptor for good,
+  the file installed and the slot freed, once the writes behind the stream
+  have finished: a chain of them is issued one send after another on the
+  slot, each finding its file as it is issued, and a send not yet issued
+  would find the slot gone. The driver's `UnreadBytes` and `UnsentBytes`
+  are the two `ioctl`s of the same family. In `ruio-bench micro` an option
+  on a plain stream runs at 5.85M a second against tokio's 5.96M, two
+  system calls alike, and one on a direct descriptor at 2.53M, a round
+  trip of the ring; set beside a write, so that one submission carries
+  both, the direct option costs 0.29 µs over the write and read alone,
+  where awaited by itself it costs 0.48 and tokio's system call 0.21 (see
+  [The runtime itself](#the-runtime-itself)).
 - `TcpStream::connect` and `net::lookup_host` take `net::ToSocketAddrs`,
   a sealed trait over everything the standard library's is implemented
   for. A literal costs nothing: an address resolves to itself through a
@@ -958,8 +986,6 @@ baseline are used only when probed.
   which threads other libraries make would not have. In `ruio-bench micro`
   a signal raised and received runs 420k times a second, 1.3× tokio's, the
   raise's own calls being most of either.
-- Still to come: socket options for direct descriptors through
-  `URING_CMD`.
 
 ## Files
 
@@ -2142,6 +2168,33 @@ some five per cent. A signal's round trip is the raise's own calls, its
 signal frame and return, the handler's write and the wait, on either
 runtime, and ruio's dispatch, one swap and one send, is a small part of it.
 
+`sockopt`, `sockopt direct`, `write read`, `sockopt direct in turn` and
+`sockopt direct batched`, added with the options through the ring, measure
+what an option costs by each path. `sockopt` sets `TCP_NODELAY` on a plain
+stream, on and off in turn, a `setsockopt(2)` on either runtime; `sockopt
+direct` sets it on a direct descriptor, which only the ring can set an
+option on. `write read` writes a byte to the peer and reads it back, on a
+direct pair on ruio and a plain one on tokio, as the baseline the last two
+add their option to: `sockopt direct in turn` sets the option, writes the
+byte and reads it, each awaited before the next, and `sockopt direct
+batched` polls the option and the write together, so that one submission
+takes both to the kernel, as a loaded runtime's turn submits every task's
+requests together; tokio's stream is plain, and its option a system call,
+in both rows. Medians of five runs taken in turns: `sockopt` 5.85M a second
+against 5.96M, `sockopt direct` 2.53M, `write read` 280k against 316k, 3.57
+against 3.16 µs for a byte each way on one task, `sockopt direct in turn`
+247k and `sockopt direct batched` 259k against 297k. Over the baseline, the
+direct option costs 0.48 µs awaited alone and 0.29 batched, where tokio's
+system call costs 0.21: batching saves the request its `io_uring_enter`,
+and leaves the kernel's work on the option and the ring's bookkeeping of
+the request. The measurement is why a plain descriptor's option stays a
+system call: a system call is the cheaper path either way, and the ring is
+for the descriptor that has no other. The byte's round trip on one task is
+where ruio trails, at 0.88×: each of its two operations is queued, yielded
+on, submitted and woken for, where tokio's two system calls return with
+their result, a cost that a loaded runtime spreads over every task's
+operations in a turn and a single task pays in full.
+
 `stream next`, `drain` and `stream fold`, added with the `futures` feature,
 measure the `Stream` implementations against the methods they forward to.
 `stream next` is the `unbounded channel` round trip with both receivers
@@ -2363,6 +2416,15 @@ Since M7:
   `WatchStream`; a channel round trip and a fold of a thousand values read
   the same through the trait as through the method (see
   [Compatibility](#compatibility) and [The runtime
+  itself](#the-runtime-itself)).
+- A direct stream's options and addresses are reached: options through
+  `URING_CMD` requests on the ring, which the driver has as `SetSockOpt`,
+  `GetSockOpt`, `UnreadBytes` and `UnsentBytes`, and addresses and the
+  options the kernel does not read there through a descriptor installed
+  for the call with `InstallFd`; `into_plain` makes a direct stream a plain
+  one for good. A plain stream's options stay system calls, which the
+  measurement found cheaper than the ring even batched, and every option
+  method is async for both (see [Networking](#networking) and [The runtime
   itself](#the-runtime-itself)).
 
 ## Open questions
