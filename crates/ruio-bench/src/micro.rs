@@ -57,6 +57,19 @@
 //!   parks, so that neither side waits for the kernel to wake it.
 //! - `read dir`: list a directory of 1000 entries: the batches of entries
 //!   read on the blocking pool, and the entries taken from them.
+//! - `metadata`: the status of a file by path: statx through the ring,
+//!   which the kernel runs in an io-wq worker; tokio's `stat` on its
+//!   blocking pool.
+//! - `symlink`: a symbolic link made and removed: two operations through
+//!   the ring, each in an io-wq worker; tokio's two calls on its blocking
+//!   pool.
+//! - `hard link`: a hard link made and removed, likewise.
+//! - `read link`: where a symbolic link points: `readlink` on the blocking
+//!   pool of either runtime, as io_uring has no operation for it.
+//! - `fallocate`: 4 KiB of a file allocated and the hole punched back: two
+//!   operations through the ring, in io-wq workers; tokio has no fallocate.
+//! - `advise`: `POSIX_FADV_SEQUENTIAL` for a file, which sets a mode and so
+//!   completes on the ring without a worker; tokio has no fadvise.
 //! - `resolve`: resolve `("127.0.0.1", 80)`, which parses, so costs no
 //!   lookup and no pool.
 //! - `copy`: 64 KiB chunks written into one connection as fast as it takes
@@ -270,6 +283,36 @@ pub(crate) const ALL: &[Micro] = &[
         name: "read dir",
         ruio: ruio_read_dir,
         tokio: Some(tokio_read_dir),
+    },
+    Micro {
+        name: "metadata",
+        ruio: ruio_metadata,
+        tokio: Some(tokio_metadata),
+    },
+    Micro {
+        name: "symlink",
+        ruio: ruio_symlink,
+        tokio: Some(tokio_symlink),
+    },
+    Micro {
+        name: "hard link",
+        ruio: ruio_hard_link,
+        tokio: Some(tokio_hard_link),
+    },
+    Micro {
+        name: "read link",
+        ruio: ruio_read_link,
+        tokio: Some(tokio_read_link),
+    },
+    Micro {
+        name: "fallocate",
+        ruio: ruio_fallocate,
+        tokio: None,
+    },
+    Micro {
+        name: "advise",
+        ruio: ruio_advise,
+        tokio: None,
     },
     Micro {
         name: "resolve",
@@ -711,6 +754,198 @@ fn tokio_read_dir(load: &Load) -> io::Result<f64> {
                 count += entry.file_name().len();
             }
             assert!(count > 0, "the directory has entries");
+        })
+        .await)
+    })
+}
+
+/// A directory of a file-system benchmark's own, with a five-byte file and
+/// a symbolic link to it in it, removed when dropped.
+struct Named {
+    dir: std::path::PathBuf,
+    file: std::path::PathBuf,
+    link: std::path::PathBuf,
+}
+
+impl Named {
+    fn new(name: &str) -> io::Result<Self> {
+        let dir = std::env::temp_dir().join(format!("ruio-bench-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir)?;
+        let file = dir.join("file");
+        std::fs::write(&file, b"named")?;
+        let link = dir.join("link");
+        std::os::unix::fs::symlink("file", &link)?;
+        Ok(Self { dir, file, link })
+    }
+}
+
+impl Drop for Named {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The status of a file by path: statx through the ring, which the kernel
+/// runs in an io-wq worker.
+fn ruio_metadata(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("metadata")?;
+    ruio_runtime()?.block_on(async move {
+        let path = &named.file;
+        Ok(rate(measure, async || {
+            let found = ruio::fs::metadata(path).await.expect("the file is there");
+            assert_eq!(found.len(), 5);
+        })
+        .await)
+    })
+}
+
+fn tokio_metadata(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("metadata")?;
+    tokio_runtime()?.block_on(async move {
+        let path = &named.file;
+        Ok(rate(measure, async || {
+            let found = tokio::fs::metadata(path).await.expect("the file is there");
+            assert_eq!(found.len(), 5);
+        })
+        .await)
+    })
+}
+
+/// A symbolic link made and removed: two operations through the ring, each
+/// in an io-wq worker.
+fn ruio_symlink(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("symlink")?;
+    ruio_runtime()?.block_on(async move {
+        let link = named.dir.join("made");
+        Ok(rate(measure, async || {
+            ruio::fs::symlink("file", &link)
+                .await
+                .expect("the link is made");
+            ruio::fs::remove_file(&link)
+                .await
+                .expect("the link is removed");
+        })
+        .await)
+    })
+}
+
+fn tokio_symlink(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("symlink")?;
+    tokio_runtime()?.block_on(async move {
+        let link = named.dir.join("made");
+        Ok(rate(measure, async || {
+            tokio::fs::symlink("file", &link)
+                .await
+                .expect("the link is made");
+            tokio::fs::remove_file(&link)
+                .await
+                .expect("the link is removed");
+        })
+        .await)
+    })
+}
+
+/// A hard link made and removed, as [`ruio_symlink`] makes a symbolic one.
+fn ruio_hard_link(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("hard-link")?;
+    ruio_runtime()?.block_on(async move {
+        let link = named.dir.join("made");
+        Ok(rate(measure, async || {
+            ruio::fs::hard_link(&named.file, &link)
+                .await
+                .expect("the link is made");
+            ruio::fs::remove_file(&link)
+                .await
+                .expect("the link is removed");
+        })
+        .await)
+    })
+}
+
+fn tokio_hard_link(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("hard-link")?;
+    tokio_runtime()?.block_on(async move {
+        let link = named.dir.join("made");
+        Ok(rate(measure, async || {
+            tokio::fs::hard_link(&named.file, &link)
+                .await
+                .expect("the link is made");
+            tokio::fs::remove_file(&link)
+                .await
+                .expect("the link is removed");
+        })
+        .await)
+    })
+}
+
+/// Where a symbolic link points: `readlink` on the blocking pool, as
+/// io_uring has no operation for it.
+fn ruio_read_link(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("read-link")?;
+    ruio_runtime()?.block_on(async move {
+        let link = &named.link;
+        Ok(rate(measure, async || {
+            let target = ruio::fs::read_link(link).await.expect("the link reads");
+            assert_eq!(target.as_os_str().len(), 4);
+        })
+        .await)
+    })
+}
+
+fn tokio_read_link(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("read-link")?;
+    tokio_runtime()?.block_on(async move {
+        let link = &named.link;
+        Ok(rate(measure, async || {
+            let target = tokio::fs::read_link(link).await.expect("the link reads");
+            assert_eq!(target.as_os_str().len(), 4);
+        })
+        .await)
+    })
+}
+
+/// 4 KiB of a file allocated and the hole punched back: two operations
+/// through the ring, each in an io-wq worker.
+fn ruio_fallocate(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("fallocate")?;
+    ruio_runtime()?.block_on(async move {
+        let file = ruio::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&named.file)
+            .await?;
+        let hole = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        Ok(rate(measure, async || {
+            file.allocate(0, 4096).await.expect("the range allocates");
+            file.fallocate(0, 4096, hole)
+                .await
+                .expect("the hole is punched");
+        })
+        .await)
+    })
+}
+
+/// Advice that sets a mode on the file, which completes on the ring without
+/// a worker: a round trip of the ring and nothing else.
+fn ruio_advise(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("advise")?;
+    ruio_runtime()?.block_on(async move {
+        let file = ruio::fs::File::open(&named.file).await?;
+        Ok(rate(measure, async || {
+            file.advise(0, 0, ruio::fs::Advice::Sequential)
+                .await
+                .expect("the advice is taken");
         })
         .await)
     })
