@@ -989,10 +989,13 @@ baseline are used only when probed.
 
 ## Files
 
-`ruio::fs` has `File`, `OpenOptions` and `Metadata`, and the functions
-`metadata`, `symlink_metadata`, `read`, `read_to_string`, `write`,
-`create_dir`, `create_dir_all`, `remove_file`, `remove_dir`, `rename` and
-`read_dir`, running on the ring of the thread's runtime.
+`ruio::fs` has `File`, `OpenOptions`, `Metadata` and `Advice`, and the
+functions `metadata`, `symlink_metadata`, `try_exists`, `read`,
+`read_to_string`, `write`, `create_dir`, `create_dir_all`, `remove_file`,
+`remove_dir`, `rename`, `symlink`, `hard_link` and `read_dir`, running on
+the ring of the thread's runtime, and `read_link`, `canonicalize`,
+`set_permissions`, `copy` and `remove_dir_all`, running on the blocking
+pool, which io_uring has no operation for.
 
 - Reads and writes take owned buffers and hand them back with the result, at
   an offset, so any number can run at once. `read_exact_at` and
@@ -1012,10 +1015,15 @@ baseline are used only when probed.
   it cannot report.
 - `OpenOptions` mean what the standard library's do, and take custom flags,
   such as `O_DIRECT`, and `direct_descriptor`, which opens the file into the
-  ring's table: its operations skip the file lookup, but it has no status to
-  ask for, as statx takes plain descriptors only. Opening goes through
-  `openat2`, which refuses a mode unless the open creates the file; the
-  driver passes one only then, as `openat` ignores it otherwise.
+  ring's table: its operations skip the file lookup. Statx takes plain
+  descriptors only, so `metadata` on a direct file installs a plain
+  descriptor for the call with `InstallFd` and closes it after, as the
+  sockets do for what only a file descriptor can do; `into_plain` makes a
+  direct file a plain one for good, and `into_std` the standard library's,
+  the slot freed either way. `as_std` alone stays `Unsupported` for a direct
+  file, as it cannot lend a descriptor the file does not keep. Opening goes
+  through `openat2`, which refuses a mode unless the open creates the file;
+  the driver passes one only then, as `openat` ignores it otherwise.
 - Direct I/O needs memory, offsets and lengths aligned as
   `Metadata::dio_alignment` says (`STATX_DIOALIGN`): an `AlignedBuf`, or a
   registered buffer whose size is a multiple of the page size. The kernel
@@ -1033,10 +1041,37 @@ baseline are used only when probed.
   writes take no timeout and join no chain, both `EOPNOTSUPP`; everything
   else on the file, syncing, its status and closing, runs on the main ring
   through the plain descriptor as for any file.
-- The kernel always runs statx, fsync, fallocate, ftruncate and the
-  operations on names in an io-wq worker, and an open whose lookup is not
-  cached; so buffered reads and writes that miss the page cache. A direct
-  read goes to the device from the ring.
+- The kernel always runs statx, fsync, fallocate, ftruncate,
+  sync_file_range and the operations on names, links included, in an io-wq
+  worker, and an open whose lookup is not cached; so buffered reads and
+  writes that miss the page cache. A direct read goes to the device from the
+  ring. Of fadvise, `WillNeed`, `DontNeed` and `NoReuse` act on the range's
+  pages in a worker, where `Normal`, `Sequential` and `Random` set a mode on
+  the file and complete on the ring.
+- `File::allocate` and `File::fallocate` expose the driver's `Fallocate`,
+  the second with the `FALLOC_FL` modes for punching holes and zeroing
+  ranges; `File::sync_range` writes back a range's dirty pages and waits,
+  and `File::start_sync_range` starts the write-back and returns, for
+  pacing a bulk write so that the page cache does not fill with dirty pages
+  for the kernel to write back whenever it chooses; `File::advise` gives
+  `posix_fadvise` advice. All are `FileOp`s, so a range's sync can be
+  linked behind the write it covers. The kernel takes `sync_file_range`'s
+  length in 32 bits, and the method does too, rather than widen the field
+  and truncate.
+- `read_link`, `canonicalize`, `set_permissions`, `copy` and
+  `remove_dir_all` are the standard library's call in a job of the blocking
+  pool each, as io_uring has no operation for any of them, so that they
+  hold a thread of the pool and not the runtime's. A tree could be removed
+  through the ring an entry at a time, with statx and unlink, but each of
+  those runs in an io-wq worker, and handing an entry to one costs more
+  than the system call it stands for; one pool thread walking the tree with
+  system calls is the cheaper way, and the standard library's walk is the
+  careful one, which a symbolic link swapped in under it cannot lead out of
+  the tree. `copy` is `copy_file_range`, which lets the file system share
+  or move blocks. `File::set_permissions` gives its job a descriptor of its
+  own, a duplicate of a plain one or an installed one for a direct one, so
+  that a future dropped mid-way cannot leave `fchmod` aimed at a number the
+  file closed and another reused.
 - io_uring has no operation that reads a directory, so `read_dir` opens
   one through the ring, whose open takes the cached path without a worker
   thread, and `ReadDir` reads its entries with `getdents64(2)`, 32 KiB at
@@ -1060,8 +1095,7 @@ baseline are used only when probed.
   gives none.
 - Files implement `io::AsyncRead` and `io::AsyncWrite` at their position,
   and are spliced from and to with `io::splice`, from an offset and for a
-  length; see [Networking](#networking). Still to come: links and
-  permissions.
+  length; see [Networking](#networking).
 
 ## Compatibility
 
@@ -2215,6 +2249,29 @@ the loop a program would write. ruio takes a value out of its unbounded
 channel at twice tokio's rate, with or without the trait, and makes the
 round trip at 4.9 times it.
 
+`metadata`, `symlink`, `hard link`, `read link`, `fallocate` and `advise`,
+added with the links and the file advice, measure the file system's
+operations on names and status by the path each takes. `metadata` stats a
+file by path, statx through the ring in an io-wq worker against tokio's
+`stat` on its pool; `symlink` and `hard link` each make a link and remove
+it, two operations a step, against tokio's two pool calls; `read link`
+reads where a link points, on the pool of either runtime, as io_uring has
+no operation for it; `fallocate` allocates 4 KiB of a file and punches the
+hole back, two operations in io-wq workers, which tokio has no call for;
+`advise` gives `POSIX_FADV_SEQUENTIAL`, which sets a mode on the file and
+completes on the ring with no worker, so it shows the ring's bare round
+trip beside the others. The files are on ext4, so the links and the
+allocation do real journaled work. Medians of five runs taken in turns:
+`metadata` 463k a second against 188k, 2.5×; `symlink` 95k pairs against
+56k, 1.7×; `hard link` 133k against 78k, 1.7×; `read link` 283k against
+193k, 1.5×; `fallocate` 128k pairs; `advise` 3.97M. A statx system call on
+the thread would beat the ring for a cached inode, but blocks the thread
+for a cold one, which the runtime must never do; the ring's hand-off to an
+io-wq worker keeps the thread free and still makes 2.5 times the round
+trips of tokio's hand-off to its pool. Where both runtimes use their pool,
+`read link` runs at the pools' own ratio less the `readlink` call, which
+is the same on both.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -2426,6 +2483,18 @@ Since M7:
   measurement found cheaper than the ring even batched, and every option
   method is async for both (see [Networking](#networking) and [The runtime
   itself](#the-runtime-itself)).
+- The file system is complete against the standard library's: `symlink`
+  and `hard_link` through the ring, which the driver has as `SymlinkAt` and
+  `LinkAt`; `File::allocate`, `fallocate`, `sync_range`, `start_sync_range`
+  and `advise` through `Fallocate`, `SyncFileRange` and `Fadvise`;
+  `try_exists` on statx; and `read_link`, `canonicalize`,
+  `set_permissions`, `copy` and `remove_dir_all` as one job of the blocking
+  pool each, as io_uring has no operation for them. A direct file has its
+  metadata through a descriptor installed for the call, and `into_plain`
+  and `into_std` make it a plain one or the standard library's. Statx
+  through the ring makes 2.5 times the round trips of tokio's pool, the
+  links 1.7 and `readlink` on the pool 1.5 (see [Files](#files) and [The
+  runtime itself](#the-runtime-itself)).
 
 ## Open questions
 
