@@ -51,7 +51,7 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         Sender {
             chan: Rc::clone(&chan),
         },
-        Receiver { chan },
+        Receiver { chan, ended: false },
     )
 }
 
@@ -283,6 +283,9 @@ impl<T> fmt::Debug for Sending<'_, T> {
 /// Receives the channel's values, in the order they were sent.
 pub struct Receiver<T> {
     chan: Rc<Chan<T>>,
+    /// Whether a receive has found the channel ended: every sender gone and
+    /// every value taken, so that receives give `None` from now on.
+    ended: bool,
 }
 
 impl<T> Receiver<T> {
@@ -329,9 +332,21 @@ impl<T> Receiver<T> {
             }
         }
         if self.chan.senders.get() == 0 {
-            return Err(TryRecvError::Closed);
+            return Err(self.end());
         }
         Err(TryRecvError::Empty)
+    }
+
+    /// Notes that the channel has ended, which it stays.
+    fn end(&mut self) -> TryRecvError {
+        self.ended = true;
+        TryRecvError::Closed
+    }
+
+    /// Whether a receive has found the channel ended.
+    #[cfg(feature = "futures")]
+    pub(crate) fn is_ended(&self) -> bool {
+        self.ended
     }
 }
 
@@ -352,7 +367,9 @@ impl<T> Drop for Receiver<T> {
 
 impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Receiver").finish_non_exhaustive()
+        f.debug_struct("Receiver")
+            .field("ended", &self.ended)
+            .finish_non_exhaustive()
     }
 }
 

@@ -41,11 +41,19 @@
 //! assert_eq!(answer, 42);
 //! # Ok::<(), std::io::Error>(())
 //! ```
+//!
+//! With the `futures` feature, the channels' receivers and intervals
+//! implement the `Stream` and `FusedStream` of futures-core, each as one
+//! call to its own `poll_recv` or `poll_tick`, and a watch channel's values
+//! stream through [`sync::watch::WatchStream`], so they compose with
+//! futures-util's combinators.
 
 pub mod blocking;
 mod context;
 mod coop;
 mod cores;
+#[cfg(feature = "futures")]
+mod futures_impls;
 mod handle;
 mod join_set;
 mod runtime;

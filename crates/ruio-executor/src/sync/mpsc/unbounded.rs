@@ -90,7 +90,7 @@ pub fn unbounded_channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
         UnboundedSender {
             chan: Arc::clone(&chan),
         },
-        UnboundedReceiver { chan },
+        UnboundedReceiver { chan, ended: false },
     )
 }
 
@@ -486,6 +486,10 @@ impl<T> fmt::Debug for UnboundedSender<T> {
 /// Receives the channel's values, in the order they were sent.
 pub struct UnboundedReceiver<T> {
     chan: Arc<Chan<T>>,
+    /// Whether a receive has found the channel ended: every sender gone, or
+    /// the channel closed, and every value taken, so that receives give
+    /// `None` from now on.
+    ended: bool,
 }
 
 impl<T> UnboundedReceiver<T> {
@@ -559,16 +563,28 @@ impl<T> UnboundedReceiver<T> {
         }
         // Acquire: with no sender left, every value sent is seen.
         if self.chan.senders.load(Ordering::Acquire) == 0 {
-            return self.pop().ok_or(TryRecvError::Closed);
+            return self.pop().ok_or_else(|| self.end());
         }
         // Closed, the channel ends once every position claimed before the
         // close has been taken; a sender still filling one wakes the
         // receiver as it is done.
         let head = self.head();
         if head.end == Some(head.index) {
-            return Err(TryRecvError::Closed);
+            return Err(self.end());
         }
         Err(TryRecvError::Empty)
+    }
+
+    /// Notes that the channel has ended, which it stays.
+    fn end(&mut self) -> TryRecvError {
+        self.ended = true;
+        TryRecvError::Closed
+    }
+
+    /// Whether a receive has found the channel ended.
+    #[cfg(feature = "futures")]
+    pub(crate) fn is_ended(&self) -> bool {
+        self.ended
     }
 
     /// Takes the value at the head, if it is there, and puts back the
@@ -602,6 +618,8 @@ impl<T> Drop for UnboundedReceiver<T> {
 
 impl<T> fmt::Debug for UnboundedReceiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UnboundedReceiver").finish_non_exhaustive()
+        f.debug_struct("UnboundedReceiver")
+            .field("ended", &self.ended)
+            .finish_non_exhaustive()
     }
 }

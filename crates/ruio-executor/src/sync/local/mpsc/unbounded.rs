@@ -52,7 +52,7 @@ pub fn unbounded_channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
         UnboundedSender {
             chan: Rc::clone(&chan),
         },
-        UnboundedReceiver { chan },
+        UnboundedReceiver { chan, ended: false },
     )
 }
 
@@ -135,6 +135,10 @@ impl<T> fmt::Debug for UnboundedSender<T> {
 /// Receives the channel's values, in the order they were sent.
 pub struct UnboundedReceiver<T> {
     chan: Rc<Chan<T>>,
+    /// Whether a receive has found the channel ended: every sender gone, or
+    /// the channel closed, and every value taken, so that receives give
+    /// `None` from now on.
+    ended: bool,
 }
 
 impl<T> UnboundedReceiver<T> {
@@ -190,9 +194,21 @@ impl<T> UnboundedReceiver<T> {
             }
         }
         if self.chan.senders.get() == 0 || self.chan.closed.get() {
-            return Err(TryRecvError::Closed);
+            return Err(self.end());
         }
         Err(TryRecvError::Empty)
+    }
+
+    /// Notes that the channel has ended, which it stays.
+    fn end(&mut self) -> TryRecvError {
+        self.ended = true;
+        TryRecvError::Closed
+    }
+
+    /// Whether a receive has found the channel ended.
+    #[cfg(feature = "futures")]
+    pub(crate) fn is_ended(&self) -> bool {
+        self.ended
     }
 }
 
@@ -207,6 +223,8 @@ impl<T> Drop for UnboundedReceiver<T> {
 
 impl<T> fmt::Debug for UnboundedReceiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UnboundedReceiver").finish_non_exhaustive()
+        f.debug_struct("UnboundedReceiver")
+            .field("ended", &self.ended)
+            .finish_non_exhaustive()
     }
 }

@@ -519,6 +519,93 @@ impl<T> fmt::Debug for Receiver<T> {
     }
 }
 
+/// The values of a channel as a stream, with the `futures` feature: each
+/// item is a clone of the latest value, once a value the receiver has not
+/// seen is there, however many were sent meanwhile; the stream ends once
+/// every sender is gone and nothing is left unseen. Made by
+/// [`WatchStream::new`], which yields the value as it is first, or
+/// [`WatchStream::from_changes`], which yields only the values sent from
+/// then on.
+///
+/// ```
+/// use futures_util::StreamExt;
+/// use ruio_executor::sync::watch::{self, WatchStream};
+///
+/// # ruio_executor::Runtime::new()?.block_on(async {
+/// let (tx, rx) = watch::channel(1);
+/// let mut values = WatchStream::new(rx);
+/// assert_eq!(values.next().await, Some(1));
+/// tx.send(2).unwrap();
+/// tx.send(3).unwrap();
+/// assert_eq!(values.next().await, Some(3), "the latest");
+/// drop(tx);
+/// assert_eq!(values.next().await, None);
+/// # });
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[cfg(feature = "futures")]
+#[must_use = "a stream does nothing until polled"]
+pub struct WatchStream<T> {
+    receiver: Receiver<T>,
+}
+
+#[cfg(feature = "futures")]
+impl<T> WatchStream<T> {
+    /// A stream of `receiver`'s channel whose first item is the value as it
+    /// is now, seen or not.
+    pub fn new(mut receiver: Receiver<T>) -> Self {
+        receiver.mark_changed();
+        Self { receiver }
+    }
+
+    /// A stream of `receiver`'s channel whose items are the values sent
+    /// from now on: the value as it is now comes only if the receiver has
+    /// not seen it.
+    pub fn from_changes(receiver: Receiver<T>) -> Self {
+        Self { receiver }
+    }
+
+    /// The receiver.
+    pub fn get_ref(&self) -> &Receiver<T> {
+        &self.receiver
+    }
+
+    /// The receiver back, having seen what the stream has yielded.
+    pub fn into_inner(self) -> Receiver<T> {
+        self.receiver
+    }
+}
+
+#[cfg(feature = "futures")]
+impl<T: Clone> futures_core::stream::Stream for WatchStream<T> {
+    type Item = T;
+
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let receiver = &mut self.get_mut().receiver;
+        Poll::Ready(match ready!(receiver.poll_changed(cx)) {
+            Ok(()) => Some(T::clone(&receiver.borrow())),
+            Err(RecvError(())) => None,
+        })
+    }
+}
+
+/// Terminated once every sender is gone and nothing is left unseen.
+#[cfg(feature = "futures")]
+impl<T: Clone> futures_core::stream::FusedStream for WatchStream<T> {
+    fn is_terminated(&self) -> bool {
+        self.receiver.has_changed().is_err()
+    }
+}
+
+#[cfg(feature = "futures")]
+impl<T> fmt::Debug for WatchStream<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WatchStream")
+            .field("receiver", &self.receiver)
+            .finish()
+    }
+}
+
 /// A borrow of the channel's value, made by [`Sender::borrow`],
 /// [`Receiver::borrow`] and [`Receiver::borrow_and_update`].
 ///
