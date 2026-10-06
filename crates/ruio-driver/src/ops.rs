@@ -805,6 +805,15 @@ impl RecvStream {
     pub fn next_ready(&mut self) -> Option<io::Result<BufBundle>> {
         self.inner.next_ready()
     }
+
+    /// Whether the stream has ended: the peer has shut down, or an error has
+    /// been yielded. [`next_ready`](RecvStream::next_ready) gives `None` both
+    /// when nothing has arrived yet and when the stream has ended; this tells
+    /// which.
+    #[inline]
+    pub fn is_ended(&self) -> bool {
+        self.inner.finished
+    }
 }
 
 /// Reads from a file that can be polled, such as a pipe, a FIFO or a
@@ -917,6 +926,13 @@ impl ReadStream {
     #[inline]
     pub fn next_ready(&mut self) -> Option<io::Result<BufLease>> {
         self.inner.next_ready()
+    }
+
+    /// Whether the stream has ended: the file has ended, or an error has
+    /// been yielded; see [`RecvStream::is_ended`].
+    #[inline]
+    pub fn is_ended(&self) -> bool {
+        self.inner.finished
     }
 }
 

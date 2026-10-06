@@ -19,6 +19,10 @@
 //! [`Probe`] reports what the running kernel supports and checks it against
 //! ruio's baseline, the capabilities of Linux 6.10.
 //!
+//! With the `futures` feature, the streams of multishot requests implement
+//! the `Stream` and `FusedStream` of futures-core, each as one call to its
+//! own `poll_next`, so they compose with futures-util's combinators.
+//!
 //! ```
 //! use std::pin::Pin;
 //! use std::task::{Context, Poll, Waker};
@@ -44,6 +48,8 @@ pub mod buf;
 mod driver;
 mod fd;
 mod fixed;
+#[cfg(feature = "futures")]
+mod futures_impls;
 mod link;
 mod mem;
 mod op;

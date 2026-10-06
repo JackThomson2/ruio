@@ -205,6 +205,12 @@ impl<T: Multishot> MultiOp<T> {
         matches!(self.state, State::Armed { .. })
     }
 
+    /// Whether the request has ended, so that [`poll_next`](MultiOp::poll_next)
+    /// gives `None` until [`rearm`](MultiOp::rearm) submits it again.
+    pub fn is_ended(&self) -> bool {
+        matches!(self.state, State::Ended(_))
+    }
+
     /// The request, unless it is armed, when the kernel may be using it.
     pub fn get_mut(&mut self) -> Option<&mut T> {
         match &mut self.state {

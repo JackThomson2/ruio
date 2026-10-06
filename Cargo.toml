@@ -9,6 +9,7 @@ rust-version = "1.97"
 publish = false
 
 [workspace.dependencies]
+futures-core = { version = "0.3.34", default-features = false }
 libc = "0.2.189"
 ruio = { path = "crates/ruio", version = "0.0.0" }
 ruio-compat = { path = "crates/ruio-compat", version = "0.0.0" }

@@ -543,6 +543,8 @@ dependencies = [
 name = "ruio-driver"
 version = "0.0.0"
 dependencies = [
+ "futures-core",
+ "futures-util",
  "libc",
  "ruio-sys",
 ]
