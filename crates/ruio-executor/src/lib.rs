@@ -69,11 +69,11 @@ use std::task::Poll;
 
 pub use blocking::spawn_blocking;
 pub use cores::{Core, Cores, core, core_count, handle_of, spawn_on};
-pub use handle::{Handle, RemoteJoinHandle};
+pub use handle::Handle;
 pub use join_set::JoinSet;
 pub use ruio_driver::Driver;
 pub use runtime::{Builder, Runtime};
-pub use task::{AbortHandle, JoinError, JoinHandle};
+pub use task::{AbortHandle, JoinError, JoinHandle, RemoteJoinHandle};
 
 /// A handle that spawns tasks onto the thread's runtime from any thread;
 /// see [`Handle`].

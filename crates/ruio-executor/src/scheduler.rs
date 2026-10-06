@@ -108,12 +108,11 @@ unsafe impl Sync for Holds {}
 /// thread of the wheel its timer is in; see [`Shared::find`].
 static RUNTIMES: Mutex<Vec<(u64, Weak<Shared>)>> = Mutex::new(Vec::new());
 
-/// A spawn from another thread, which makes a task on the runtime's own.
-pub(crate) type RemoteSpawn = Box<dyn FnOnce() + Send>;
-
 struct Remote {
+    /// The tasks woken on other threads.
     tasks: Vec<RemoteRef>,
-    spawns: Vec<RemoteSpawn>,
+    /// The tasks spawned on other threads, for the scheduler to take in.
+    spawns: Vec<RemoteRef>,
     /// Timers of the scheduler's wheel to remove, whose sleeps were dropped
     /// or moved where the wheel cannot be reached.
     timers: Vec<Key>,
@@ -145,26 +144,24 @@ impl Shared {
         }
     }
 
-    /// Queues a spawn from another thread, which the scheduler runs on its
-    /// own at its next turn, and wakes the scheduler. A runtime that has shut
-    /// down drops it.
-    pub(crate) fn spawn_remote(&self, spawn: RemoteSpawn) {
-        let refused = {
+    /// Queues a task spawned on another thread, for the scheduler to take in
+    /// at its next turn, and wakes the scheduler.
+    ///
+    /// # Errors
+    ///
+    /// The task back, if the runtime has shut down: the scheduler never
+    /// takes it in.
+    pub(crate) fn spawn_remote(&self, task: RemoteRef) -> Result<(), RemoteRef> {
+        {
             let mut remote = self.lock();
             if remote.closed {
-                Some(spawn)
-            } else {
-                remote.spawns.push(spawn);
-                None
+                return Err(task);
             }
-        };
-        match refused {
-            Some(spawn) => drop(spawn),
-            None => {
-                self.pending.store(true, Ordering::Release);
-                self.unparker.unpark();
-            }
+            remote.spawns.push(task);
         }
+        self.pending.store(true, Ordering::Release);
+        self.unparker.unpark();
+        Ok(())
     }
 
     /// Has the scheduler remove a timer from its wheel at its next turn,
@@ -596,9 +593,8 @@ impl Scheduler {
         }
     }
 
-    /// Moves the tasks woken on other threads into the run queue, removes
-    /// the timers let go of there, and makes the tasks spawned from other
-    /// threads.
+    /// Moves the tasks woken on other threads into the run queue, takes in
+    /// the tasks spawned there, and removes the timers let go of there.
     #[inline]
     fn take_remote(&self) {
         // Anything queued after the check sets the flag again, and unparks
@@ -612,7 +608,7 @@ impl Scheduler {
     /// something may have been queued.
     fn take_pending(&self) {
         self.shared.pending.store(false, Ordering::Relaxed);
-        let (timers, spawns) = {
+        let timers = {
             let mut remote = self.shared.lock();
             if !remote.tasks.is_empty() {
                 // A task woken here meanwhile is in the queue already.
@@ -623,28 +619,34 @@ impl Scheduler {
                     .map(LocalRef::adopt);
                 self.queue.borrow_mut().extend(claimed);
             }
-            (mem::take(&mut remote.timers), mem::take(&mut remote.spawns))
+            // Taking a task in runs no code but the scheduler's own.
+            for spawned in remote.spawns.drain(..) {
+                task::adopt_spawned(spawned, self);
+            }
+            mem::take(&mut remote.timers)
         };
-        // Outside the lock: dropping a waker can drop a task, and a spawn
-        // runs code, either of which can reach this runtime or another.
+        // Outside the lock: dropping a waker can drop a task, which can reach
+        // this runtime or another.
         for key in timers {
             drop(self.timers.remove(key));
-        }
-        for spawn in spawns {
-            spawn();
         }
     }
 
     /// Drops the future of every unfinished task, on this thread.
     pub(crate) fn shutdown(&self) {
-        let (woken, spawns) = {
+        let (woken, spawned) = {
             let mut remote = self.shared.lock();
             remote.closed = true;
             // The wheel goes with the scheduler, timers and all.
             remote.timers.clear();
             (mem::take(&mut remote.tasks), mem::take(&mut remote.spawns))
         };
-        drop((woken, spawns));
+        drop(woken);
+        // The tasks never taken in are cancelled here, which their handles
+        // report.
+        for task in spawned {
+            task::cancel_spawned(task);
+        }
         // Dropping a future can spawn more tasks, so repeat until none is left.
         loop {
             let tasks = self.tasks.borrow_mut().take_all();

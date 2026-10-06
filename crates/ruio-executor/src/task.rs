@@ -16,6 +16,9 @@
 //! other threads reach, for as long as it lives. It holds it by the count of
 //! the runtime's thread, which costs no atomic operation, unless it may be
 //! freed on another thread: then it holds an atomic reference of its own.
+//!
+//! A task spawned from another thread is made there, and taken in by its
+//! scheduler as one atomic reference; see [`remote`].
 
 use std::alloc::{self, Layout};
 use std::any::Any;
@@ -36,6 +39,11 @@ use ruio_driver::LocalWaker;
 
 use crate::scheduler::{Scheduler, Shared};
 use crate::{context, coop};
+
+mod remote;
+
+pub use remote::RemoteJoinHandle;
+pub(crate) use remote::{RemoteTask, adopt_spawned, cancel_spawned};
 
 /// A spawned future and, once it finishes, its output. The header comes
 /// first, so that a pointer to the task is a pointer to its header, through
@@ -119,6 +127,10 @@ enum Hold {
 /// scheduler's list of tasks; see [`Main`].
 const MAIN: usize = usize::MAX;
 
+/// The index of a task spawned from another thread until its scheduler takes
+/// it in, which gives it its place in the list; see [`remote`].
+const UNADOPTED: usize = usize::MAX - 1;
+
 impl Header {
     /// Marks the task queued to run, unless it is already: whether the caller
     /// is to queue it. Only on the task's thread.
@@ -127,12 +139,14 @@ impl Header {
         !self.queued.replace(true)
     }
 
-    /// Whether this is the header of the future given to `block_on`, which
-    /// its loop polls once it is marked queued, rather than a run of the
-    /// scheduler's. Only on the task's thread.
+    /// Whether the scheduler runs the task from its queue once it is marked
+    /// queued: neither the future given to `block_on`, which its loop polls
+    /// then, nor a task spawned from another thread that the scheduler has
+    /// yet to take in, which it queues as it does. Only on the task's
+    /// thread.
     #[inline]
-    fn is_main(&self) -> bool {
-        self.index.get() == MAIN
+    fn is_runnable(&self) -> bool {
+        self.index.get() < UNADOPTED
     }
 
     /// The shared part of the scheduler that owns the task, which stays
@@ -243,7 +257,7 @@ impl LocalRef {
         let mut task = Some(self);
         context::with_owner(owner, |scheduler| {
             let task = task.take().expect("the reference is still held");
-            if task.header().claim() && !task.header().is_main() {
+            if task.header().claim() && task.header().is_runnable() {
                 scheduler.schedule(task);
             }
         });
@@ -323,7 +337,9 @@ pub(crate) struct RemoteRef {
 // freed on whichever thread lets go of the last atomic reference, by which
 // time its future and output are gone, so nothing that is not `Send` goes
 // with it, and it holds its owner by an atomic reference, unless that is
-// the runtime's thread.
+// the runtime's thread. What a task spawned from another thread has beyond
+// the header, its handle reaches from any thread by a protocol of its own;
+// see `remote`.
 unsafe impl Send for RemoteRef {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for RemoteRef {}
@@ -362,6 +378,12 @@ impl RemoteRef {
         unsafe { self.header.as_ref() }
     }
 
+    /// The task's header, as wakers and the scheduler name the task.
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *const Header {
+        self.header.as_ptr()
+    }
+
     /// Marks the task queued to run, unless it is already: whether the caller
     /// is to queue it. Only on the task's thread, as the scheduler takes its
     /// remote queue.
@@ -381,7 +403,7 @@ impl RemoteRef {
         let mut remote = Some(self);
         let on_owner = context::with_owner(owner, |scheduler| {
             let remote = remote.take().expect("the reference is still held");
-            if remote.claim() && !remote.header().is_main() {
+            if remote.claim() && remote.header().is_runnable() {
                 scheduler.schedule(LocalRef::adopt(remote));
             }
         });
@@ -523,7 +545,7 @@ unsafe fn wake_by_ref(header: *const Header) {
     // SAFETY: the task is alive.
     let task = unsafe { &*header };
     let on_owner = context::with_owner(task.owner(), |scheduler| {
-        if task.claim() && !task.is_main() {
+        if task.claim() && task.is_runnable() {
             // SAFETY: the task is alive, and this is its thread.
             scheduler.schedule(unsafe { LocalRef::retain(header) });
         }

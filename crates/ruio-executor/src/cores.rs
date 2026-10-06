@@ -10,8 +10,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
 use std::thread;
 
-use crate::handle::{Handle, RemoteJoinHandle};
+use crate::handle::Handle;
 use crate::runtime::Builder;
+use crate::task::RemoteJoinHandle;
 
 /// A core of a [`Cores`] run: its index among the run's cores, and the CPU
 /// its thread is pinned to.
