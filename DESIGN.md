@@ -1107,6 +1107,39 @@ hyper's HTTP/2 server and client run on one core as its HTTP/1.1 does,
 with nothing shared between cores (see [HTTP/2](#http2)). The examples of
 `ruio-compat` serve HTTP/1.1, HTTP/2 and HTTPS so on every core.
 
+The other traits the ecosystem builds on are `Stream` and `FusedStream` of
+futures-core, which futures-util's combinators and everything else that
+takes a stream of items want. With the `futures` feature of `ruio`, which
+turns on the same feature of `ruio-executor` and `ruio-driver`, every
+stream of the three crates implements them: `Incoming`, `RecvStream`,
+`ReadStream`, `ReadDir`, `Readiness` and `Signal`; the receivers of the
+bounded and unbounded channels, across cores and for one thread, the
+broadcast receiver and `Interval`; and `MultiOp`, `AcceptStream`,
+`RecvStream`, `ReadStream` and `PollStream` of the driver. A watch
+channel's values stream through `sync::watch::WatchStream`, each item a
+clone of the latest value once one the receiver has not seen is there, as
+tokio-stream's does. Each `poll_next` is one call to the type's own
+`poll_next`, `poll_recv` or `poll_tick`, which the compiler inlines, so the
+trait costs nothing over the method, and no pin projection is needed, as
+the streams are `Unpin`: nothing the kernel uses is inside them. A stream
+that never ends, of connections, readiness, signals or ticks, says it is
+never terminated, so `select` takes it without a fuse; one that ends says
+so once it has, through `is_ended` on the driver's and the crate's streams,
+which also tells apart `next_ready`'s two `None`s, and through one `bool` a
+receiver sets where its take finds the channel closed, as futures-channel's
+receivers do, since telling from the state alone whether an unbounded
+channel is drained takes the walk of its blocks that a pop takes. The
+broadcast receiver yields a lag as an error and ends, rather than yielding
+`Closed`, as tokio-stream's wrapper does; `ReadDir`'s items are its entries
+with the reader's `Option` and `Result` turned about. In `ruio-bench micro`
+the `unbounded channel` round trip driven through `StreamExt::next` reads
+as the one through `recv` does, 11.1M a second against 10.9M, and a
+thousand values folded through `take(1000).fold` as the loop over `recv`
+does, 32k thousands a second against 31k (see [The runtime
+itself](#the-runtime-itself)). The feature is off unless asked for, so a
+program that wants none of it pulls in neither futures-core nor the
+implementations; the CI check runs with every feature on.
+
 hyper's timeouts, such as the one for reading a request's head, need a
 timer, whose sleeps hyper boxes as `Send` and `Sync`. `ruio_compat::Timer`,
 behind the `hyper` feature, is one whose sleeps are ruio's: hyper polls
@@ -2109,6 +2142,26 @@ some five per cent. A signal's round trip is the raise's own calls, its
 signal frame and return, the handler's write and the wait, on either
 runtime, and ruio's dispatch, one swap and one send, is a small part of it.
 
+`stream next`, `drain` and `stream fold`, added with the `futures` feature,
+measure the `Stream` implementations against the methods they forward to.
+`stream next` is the `unbounded channel` round trip with both receivers
+driven through futures-util's `StreamExt::next` rather than their own
+`recv`, on ruio through the trait the feature gives its receivers and on
+tokio through tokio-stream's `UnboundedReceiverStream`; `drain` sends a
+thousand values into an unbounded channel and takes them out with `recv`
+one after another, a step being the thousand; `stream fold` takes the same
+thousand out through `take(1000).fold`, the combinators over the trait
+against the loop over the method. Medians of five runs taken in turns:
+`stream next` 11.10M round trips a second on ruio against `unbounded
+channel`'s 10.86M, and 2.27M against 2.27M on tokio; `stream fold` 32k
+thousands a second on ruio against `drain`'s 31k, 32M values a second, and
+18k against 16k on tokio. The trait reads as the method does on both
+runtimes, within the runs' noise: each implementation is one call the
+compiler inlines, and the combinators add a counter and an accumulator to
+the loop a program would write. ruio takes a value out of its unbounded
+channel at twice tokio's rate, with or without the trait, and makes the
+round trip at 4.9 times it.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -2304,6 +2357,13 @@ Since M7:
   (see [Compatibility](#compatibility) and [HTTP/2](#http2)). The ring
   setup's account of `SQPOLL` and NAPI now says what the code does: the
   first is refused, the second not registered.
+- With the `futures` feature, every stream of the three crates implements
+  the `Stream` and `FusedStream` of futures-core, each `poll_next` one call
+  to the type's own, and a watch channel's values stream through
+  `WatchStream`; a channel round trip and a fold of a thousand values read
+  the same through the trait as through the method (see
+  [Compatibility](#compatibility) and [The runtime
+  itself](#the-runtime-itself)).
 
 ## Open questions
 

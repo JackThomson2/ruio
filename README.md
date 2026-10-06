@@ -47,7 +47,7 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 
 | Crate | What it has |
 |---|---|
-| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, and `signal` |
+| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, and `signal`; with the `futures` feature, every stream implements futures-core's `Stream` |
 | [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; and `Timer`, which gives hyper ruio's timers for its timeouts |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
@@ -57,26 +57,30 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 
 ## hyper, rustls and the rest
 
-`ruio-compat` adapts a `TcpStream` or a `UnixStream` to the poll-based
-traits that most of the ecosystem takes its I/O through; tokio's traits
-need none of tokio's runtime. hyper-util's `TokioIo` then makes it a
-connection hyper serves, and tokio-rustls runs TLS over it. `Timer` gives
+`ruio-compat` adapts a `TcpStream` or a `UnixStream`, a `File` or an
+`AsyncFd` to the poll-based traits that most of the ecosystem takes its I/O
+through; tokio's traits need none of tokio's runtime. The adapter has
+hyper's own traits too, so hyper serves it as it is, `Executor` runs hyper's
+HTTP/2 on ruio's tasks, and tokio-rustls runs TLS over it. `Timer` gives
 hyper ruio's timers, with which it times out a client that is slow to send
 a request's head:
 
 ```rust
-let io = TokioIo::new(Compat::with_pool(&pool, stream));
+let io = Compat::with_pool(&pool, stream);
 hyper::server::conn::http1::Builder::new()
     .timer(Timer::new())
     .serve_connection(io, service_fn(serve))
     .await?;
 ```
 
-Two examples serve HTTP/1.1 and HTTPS on every core:
+Three examples serve HTTP/1.1, HTTP/2 and HTTPS on every core:
 
 ```text
 cargo run --release -p ruio-compat --example hyper
 curl http://127.0.0.1:3000/
+
+cargo run --release -p ruio-compat --example http2
+curl --http2-prior-knowledge http://127.0.0.1:3000/
 
 cargo run --release -p ruio-compat --example rustls
 curl --insecure https://127.0.0.1:3443/
@@ -131,7 +135,9 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   as fast as tokio copies it from its `File`. A wait for a foreign
   descriptor's readiness through `AsyncFd` runs 1.3 times as fast as
   tokio's, and a signal raised and received 1.3 times, each near the floor
-  of its system calls.
+  of its system calls. With the `futures` feature, a channel's values driven
+  through `StreamExt` come at the same rate as through the channel's own
+  `recv`, a round trip 4.9 times as fast as tokio's through tokio-stream.
 
 ## Development
 
