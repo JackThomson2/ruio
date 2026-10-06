@@ -251,6 +251,7 @@ fn tables() -> Vec<(&'static str, Vec<(&'static str, u64)>)> {
         MSG_RING_FLAGS,
         NOP_FLAGS,
         URING_CMD_FLAGS,
+        SOCKET_URING_OPS,
         PROBE_OP_FLAGS,
         MISC_CONSTANTS,
     ]

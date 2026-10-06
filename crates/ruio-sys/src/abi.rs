@@ -960,6 +960,20 @@ consts! {
 }
 
 consts! {
+    /// Every socket command for [`IORING_OP_URING_CMD`], for `cmd_op`.
+    pub const SOCKET_URING_OPS: [u32] = [
+        /// `SIOCINQ`: how many bytes wait in the socket to be read.
+        SOCKET_URING_OP_SIOCINQ = 0,
+        /// `SIOCOUTQ`: how many bytes wait in the socket to be sent.
+        SOCKET_URING_OP_SIOCOUTQ = 1,
+        /// `getsockopt(2)`, with `level`, `optname`, `optval` and `optlen`.
+        SOCKET_URING_OP_GETSOCKOPT = 2,
+        /// `setsockopt(2)`, with `level`, `optname`, `optval` and `optlen`.
+        SOCKET_URING_OP_SETSOCKOPT = 3,
+    ];
+}
+
+consts! {
     /// Every [`io_uring_probe_op`] flag.
     pub const PROBE_OP_FLAGS: [u16] = [
         /// The kernel supports the opcode.
