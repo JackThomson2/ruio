@@ -59,6 +59,13 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! With the `futures` feature, the streams here, of connections, of data,
+//! of directory entries, of readiness and of signals, and the channels'
+//! receivers and intervals of the executor, implement the `Stream` and
+//! `FusedStream` of futures-core, each as one call to its own `poll_next`,
+//! so they compose with futures-util's combinators: a server's connections
+//! merge with its shutdown signal through `select`.
 
 pub use ruio_executor::{
     AbortHandle, Builder, Core, Cores, Handle, JoinError, JoinHandle, JoinSet, RemoteJoinHandle,
@@ -71,6 +78,8 @@ pub use ruio_macros::{main, test};
 pub use ruio_driver::buf;
 
 pub mod fs;
+#[cfg(feature = "futures")]
+mod futures_impls;
 pub mod io;
 pub mod net;
 pub mod signal;

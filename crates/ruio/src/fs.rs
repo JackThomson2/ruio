@@ -393,6 +393,12 @@ impl ReadStream<'_> {
     pub fn next_ready(&mut self) -> Option<io::Result<BufLease>> {
         self.stream.next_ready()
     }
+
+    /// Whether the stream has ended: the file has ended, or an error has
+    /// been yielded; see [`ops::ReadStream::is_ended`].
+    pub fn is_ended(&self) -> bool {
+        self.stream.is_ended()
+    }
 }
 
 /// An operation on a file. Made by [`File`]'s methods; its output is the

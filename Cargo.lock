@@ -501,6 +501,8 @@ dependencies = [
 name = "ruio"
 version = "0.0.0"
 dependencies = [
+ "futures-core",
+ "futures-util",
  "libc",
  "ruio-driver",
  "ruio-executor",

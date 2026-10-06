@@ -170,6 +170,13 @@ impl ReadDir {
         }
     }
 
+    /// Whether the reader has ended: no batch is being read, and every entry
+    /// read has been taken.
+    #[cfg(feature = "futures")]
+    pub(crate) fn is_ended(&self) -> bool {
+        self.next.is_none() && self.pos >= self.buf.len()
+    }
+
     /// Takes the next entry of those read, skipping `.` and `..`.
     fn take(&mut self) -> io::Result<Option<DirEntry>> {
         while self.pos < self.buf.len() {

@@ -895,4 +895,10 @@ impl RecvStream<'_> {
     pub fn next_ready(&mut self) -> Option<io::Result<BufBundle>> {
         self.stream.next_ready()
     }
+
+    /// Whether the stream has ended: the peer has shut down, or an error has
+    /// been yielded; see [`ops::RecvStream::is_ended`].
+    pub fn is_ended(&self) -> bool {
+        self.stream.is_ended()
+    }
 }
