@@ -55,6 +55,17 @@
 //! - `blocking spin`: the same on a pool of one thread that spins for its
 //!   next job, pinned to another core, and a runtime that spins before it
 //!   parks, so that neither side waits for the kernel to wake it.
+//! - `spawn on`: a task that does nothing, spawned onto a second core and
+//!   awaited: the task handed over, the core woken, and the awaiting task
+//!   woken back from it. On tokio, two current-thread runtimes on the two
+//!   cores, the one spawning onto the other through its `Handle`.
+//! - `spawn on spin`: the same with both cores spinning before they park,
+//!   so that neither waits for the kernel to wake it.
+//! - `abort on`: a task that never finishes, spawned onto the second core
+//!   and aborted at once through its abort handle, and the cancellation
+//!   awaited.
+//! - `join set on`: a task that does nothing, spawned onto the second core
+//!   through a join set, and its output taken from the set.
 //! - `read dir`: list a directory of 1000 entries: the batches of entries
 //!   read on the blocking pool, and the entries taken from them.
 //! - `metadata`: the status of a file by path: statx through the ring,
@@ -278,6 +289,26 @@ pub(crate) const ALL: &[Micro] = &[
         name: "blocking spin",
         ruio: ruio_blocking_spin,
         tokio: None,
+    },
+    Micro {
+        name: "spawn on",
+        ruio: ruio_spawn_on,
+        tokio: Some(tokio_spawn_on),
+    },
+    Micro {
+        name: "spawn on spin",
+        ruio: ruio_spawn_on_spin,
+        tokio: None,
+    },
+    Micro {
+        name: "abort on",
+        ruio: ruio_abort_on,
+        tokio: Some(tokio_abort_on),
+    },
+    Micro {
+        name: "join set on",
+        ruio: ruio_join_set_on,
+        tokio: Some(tokio_join_set_on),
     },
     Micro {
         name: "read dir",
@@ -694,6 +725,189 @@ fn ruio_blocking_spin(load: &Load) -> io::Result<f64> {
         .expect("the job ran");
         Ok(rate(measure, async || {
             pool.spawn(|| {}).await.expect("the job ran");
+        })
+        .await)
+    })
+}
+
+/// Runs `measure` on the first of two cores, the runtime's CPU and the
+/// remote one, the second serving what the first spawns onto it, and
+/// returns the rate it measured. On a host with no such second CPU, both
+/// cores share the runtime's.
+fn on_two_cores<Fut>(
+    load: &Load,
+    builder: ruio::Builder,
+    measure: impl Fn() -> Fut + Sync,
+) -> io::Result<f64>
+where
+    Fut: Future<Output = f64>,
+{
+    let run = |remote: usize| {
+        ruio::Cores::cpus([load.cpu, remote])
+            .builder(builder.clone())
+            .run(|core| {
+                let measure = &measure;
+                async move {
+                    if core.index() == 0 {
+                        measure().await
+                    } else {
+                        0.0
+                    }
+                }
+            })
+    };
+    let rates = match run(remote_cpu(load)) {
+        // A core that cannot be pinned keeps the run from starting, so
+        // nothing has been measured yet.
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => run(load.cpu)?,
+        rates => rates?,
+    };
+    Ok(rates[0])
+}
+
+/// A task that does nothing, spawned onto the second core and awaited.
+fn ruio_spawn_on(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    on_two_cores(load, ruio::Runtime::builder(), || async move {
+        rate(measure, async || {
+            ruio::spawn_on(1, async {}).await.expect("the task ran");
+        })
+        .await
+    })
+}
+
+/// The same with both cores spinning before they park.
+fn ruio_spawn_on_spin(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let builder = ruio::Runtime::builder().spin(Duration::from_micros(100));
+    on_two_cores(load, builder, || async move {
+        rate(measure, async || {
+            ruio::spawn_on(1, async {}).await.expect("the task ran");
+        })
+        .await
+    })
+}
+
+/// A task that never finishes, spawned onto the second core, aborted through
+/// its abort handle, and awaited for the cancellation.
+fn ruio_abort_on(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    on_two_cores(load, ruio::Runtime::builder(), || async move {
+        rate(measure, async || {
+            let task = ruio::spawn_on(1, std::future::pending::<()>());
+            task.abort_handle().abort();
+            let err = task.await.expect_err("the task was aborted");
+            assert!(err.is_cancelled());
+        })
+        .await
+    })
+}
+
+/// A task that does nothing, spawned onto the second core through a join set
+/// and taken out of it.
+fn ruio_join_set_on(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    on_two_cores(load, ruio::Runtime::builder(), || async move {
+        let mut set = ruio::JoinSet::new();
+        rate(measure, async || {
+            set.spawn_on(1, async {});
+            set.join_next()
+                .await
+                .expect("a task is in the set")
+                .expect("the task ran");
+        })
+        .await
+    })
+}
+
+/// A second current-thread runtime of tokio's, on a thread pinned to the
+/// remote CPU, which runs until this is dropped.
+struct TokioRemote {
+    handle: tokio::runtime::Handle,
+    /// Dropped to end the runtime's `block_on`.
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl TokioRemote {
+    fn start(load: &Load) -> io::Result<Self> {
+        let cpu = remote_cpu(load);
+        let (ready, started) = std_mpsc::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let thread = thread::spawn(move || {
+            // Not pinned if the host has no such CPU.
+            let _ = sys::pin(&[cpu]);
+            let runtime = match tokio_runtime() {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let _ = ready.send(Err(err));
+                    return;
+                }
+            };
+            let _ = ready.send(Ok(runtime.handle().clone()));
+            runtime.block_on(async {
+                let _ = stopped.await;
+            });
+        });
+        let handle = started
+            .recv()
+            .map_err(|_| io::Error::other("the remote runtime's thread ended"))??;
+        Ok(Self {
+            handle,
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for TokioRemote {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn tokio_spawn_on(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let remote = TokioRemote::start(load)?;
+    let handle = remote.handle.clone();
+    tokio_runtime()?.block_on(async move {
+        Ok(rate(measure, async || {
+            handle.spawn(async {}).await.expect("the task ran");
+        })
+        .await)
+    })
+}
+
+fn tokio_abort_on(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let remote = TokioRemote::start(load)?;
+    let handle = remote.handle.clone();
+    tokio_runtime()?.block_on(async move {
+        Ok(rate(measure, async || {
+            let task = handle.spawn(std::future::pending::<()>());
+            task.abort_handle().abort();
+            let err = task.await.expect_err("the task was aborted");
+            assert!(err.is_cancelled());
+        })
+        .await)
+    })
+}
+
+fn tokio_join_set_on(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let remote = TokioRemote::start(load)?;
+    let handle = remote.handle.clone();
+    tokio_runtime()?.block_on(async move {
+        let mut set = tokio::task::JoinSet::new();
+        Ok(rate(measure, async || {
+            set.spawn_on(async {}, &handle);
+            set.join_next()
+                .await
+                .expect("a task is in the set")
+                .expect("the task ran");
         })
         .await)
     })
