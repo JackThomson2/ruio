@@ -19,6 +19,15 @@
 //!   never waits.
 //! - `local unbounded channel`: the same through the unbounded channels of
 //!   one thread.
+//! - `stream next`: the `unbounded channel` round trip, both receivers
+//!   driven through futures-util's `StreamExt::next` rather than their own
+//!   `recv`: what the `Stream` trait costs over the method, which is
+//!   nothing if the row reads as `unbounded channel` does.
+//! - `drain`: a thousand values sent into an unbounded channel and taken out
+//!   with `recv`, one after another.
+//! - `stream fold`: the same thousand, taken out through
+//!   `StreamExt::take(1000).fold`: the combinators over the trait against
+//!   the loop over the method.
 //! - `broadcast`: a value to another task and one back through broadcast
 //!   channels with one receiver each.
 //! - `watch`: a value to another task and one back through watch channels:
@@ -176,6 +185,21 @@ pub(crate) const ALL: &[Micro] = &[
         name: "local unbounded channel",
         ruio: ruio_local_unbounded,
         tokio: None,
+    },
+    Micro {
+        name: "stream next",
+        ruio: ruio_stream_next,
+        tokio: Some(tokio_stream_next),
+    },
+    Micro {
+        name: "drain",
+        ruio: ruio_drain,
+        tokio: Some(tokio_drain),
+    },
+    Micro {
+        name: "stream fold",
+        ruio: ruio_stream_fold,
+        tokio: Some(tokio_stream_fold),
     },
     Micro {
         name: "broadcast",
@@ -1184,6 +1208,153 @@ fn tokio_unbounded(load: &Load) -> io::Result<f64> {
         drop(to_echo);
         echo.await.map_err(io::Error::other)?;
         Ok(rate)
+    })
+}
+
+/// The `unbounded channel` round trip, both receivers driven through
+/// `StreamExt::next`.
+fn ruio_stream_next(load: &Load) -> io::Result<f64> {
+    use futures_util::StreamExt;
+    use ruio::sync::mpsc;
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (to_echo, mut echo_rx) = mpsc::unbounded_channel::<u32>();
+        let (to_main, mut main_rx) = mpsc::unbounded_channel::<u32>();
+        let echo = ruio::spawn(async move {
+            while let Some(value) = echo_rx.next().await {
+                if to_main.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let rate = rate(measure, async || {
+            to_echo.send(1).expect("the echo task runs");
+            main_rx.next().await.expect("the echo task answers");
+        })
+        .await;
+        drop(to_echo);
+        echo.await.map_err(io::Error::other)?;
+        Ok(rate)
+    })
+}
+
+fn tokio_stream_next(load: &Load) -> io::Result<f64> {
+    use futures_util::StreamExt;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let (to_echo, echo_rx) = mpsc::unbounded_channel::<u32>();
+        let (to_main, main_rx) = mpsc::unbounded_channel::<u32>();
+        let mut echo_rx = UnboundedReceiverStream::new(echo_rx);
+        let mut main_rx = UnboundedReceiverStream::new(main_rx);
+        let echo = tokio::spawn(async move {
+            while let Some(value) = echo_rx.next().await {
+                if to_main.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let rate = rate(measure, async || {
+            to_echo.send(1).expect("the echo task runs");
+            main_rx.next().await.expect("the echo task answers");
+        })
+        .await;
+        drop(to_echo);
+        echo.await.map_err(io::Error::other)?;
+        Ok(rate)
+    })
+}
+
+/// How many values `drain` and `stream fold` send and take in a step.
+const DRAINED: u32 = 1000;
+
+/// A thousand values sent into an unbounded channel and taken out with
+/// `recv`, one after another.
+fn ruio_drain(load: &Load) -> io::Result<f64> {
+    use ruio::sync::mpsc;
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (tx, mut rx) = mpsc::unbounded_channel::<u32>();
+        Ok(rate(measure, async || {
+            for value in 0..DRAINED {
+                tx.send(value).expect("the receiver is here");
+            }
+            let mut sum = 0;
+            for _ in 0..DRAINED {
+                sum += rx.recv().await.expect("the values are there");
+            }
+            assert_eq!(sum, DRAINED * (DRAINED - 1) / 2);
+        })
+        .await)
+    })
+}
+
+fn tokio_drain(load: &Load) -> io::Result<f64> {
+    use tokio::sync::mpsc;
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let (tx, mut rx) = mpsc::unbounded_channel::<u32>();
+        Ok(rate(measure, async || {
+            for value in 0..DRAINED {
+                tx.send(value).expect("the receiver is here");
+            }
+            let mut sum = 0;
+            for _ in 0..DRAINED {
+                sum += rx.recv().await.expect("the values are there");
+            }
+            assert_eq!(sum, DRAINED * (DRAINED - 1) / 2);
+        })
+        .await)
+    })
+}
+
+/// The same thousand values, taken out through `StreamExt::take(1000).fold`.
+fn ruio_stream_fold(load: &Load) -> io::Result<f64> {
+    use futures_util::StreamExt;
+    use ruio::sync::mpsc;
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (tx, mut rx) = mpsc::unbounded_channel::<u32>();
+        Ok(rate(measure, async || {
+            for value in 0..DRAINED {
+                tx.send(value).expect("the receiver is here");
+            }
+            let sum = (&mut rx)
+                .take(DRAINED as usize)
+                .fold(0, |sum, value| async move { sum + value })
+                .await;
+            assert_eq!(sum, DRAINED * (DRAINED - 1) / 2);
+        })
+        .await)
+    })
+}
+
+fn tokio_stream_fold(load: &Load) -> io::Result<f64> {
+    use futures_util::StreamExt;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let (tx, rx) = mpsc::unbounded_channel::<u32>();
+        let mut rx = UnboundedReceiverStream::new(rx);
+        Ok(rate(measure, async || {
+            for value in 0..DRAINED {
+                tx.send(value).expect("the receiver is here");
+            }
+            let sum = (&mut rx)
+                .take(DRAINED as usize)
+                .fold(0, |sum, value| async move { sum + value })
+                .await;
+            assert_eq!(sum, DRAINED * (DRAINED - 1) / 2);
+        })
+        .await)
     })
 }
 

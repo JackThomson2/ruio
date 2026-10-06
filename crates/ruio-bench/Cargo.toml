@@ -9,13 +9,18 @@ publish.workspace = true
 # The only crate that depends on another runtime: it is what ruio is
 # measured against.
 [dependencies]
+# For `StreamExt`, over ruio's streams and tokio-stream's wrappers.
+futures-util = { version = "0.3.34", default-features = false }
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 libc.workspace = true
-ruio.workspace = true
+ruio = { workspace = true, features = ["futures"] }
 ruio-compat = { workspace = true, features = ["tokio"] }
 tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "signal", "sync"] }
+# For `UnboundedReceiverStream`, which gives tokio's channels the `Stream`
+# ruio's have.
+tokio-stream = { version = "0.1.17", default-features = false }
 # For `CancellationToken`, which ruio's is measured against.
 tokio-util = { version = "0.7.19", default-features = false }
 
