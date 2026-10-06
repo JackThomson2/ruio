@@ -47,7 +47,7 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 
 | Crate | What it has |
 |---|---|
-| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, and `signal`; with the `futures` feature, every stream implements futures-core's `Stream` |
+| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, which holds tasks of other cores too, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, and `signal`; with the `futures` feature, every stream implements futures-core's `Stream` |
 | [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; and `Timer`, which gives hyper ruio's timers for its timeouts |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
@@ -145,7 +145,12 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   ring, comes 2.5 times as often as through tokio's pool, a symbolic or
   hard link is made and removed 1.7 times as often, and a link is read 1.5
   times as often on ruio's pool as on tokio's; advice that sets a mode on a
-  file is a bare round trip of the ring, 4M a second.
+  file is a bare round trip of the ring, 4M a second. A task spawned onto a
+  second core and awaited makes 1.1 times tokio's round trips with both
+  cores parking between steps, where the kernel's wakes set the pace, and
+  some 860k a second with both cores spinning, 1.5 times what the executor
+  made before, with no system call on the path; aborting it from any
+  thread and collecting it through a `JoinSet` cost about the same.
 
 ## Development
 

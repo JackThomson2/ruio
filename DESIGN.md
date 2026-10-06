@@ -506,7 +506,10 @@ baseline are used only when probed.
   futures that need not be `Send`; `spawn_on(core, future)` sends a `Send`
   future to another core, and `Handle::spawn_with` a closure that makes
   the future there, which then need not be `Send`: it can hold a socket of
-  that core's ring across its awaits.
+  that core's ring across its awaits. Either gives a `RemoteJoinHandle`,
+  which awaits the output on any thread, says whether the task has
+  finished, and makes a `RemoteAbortHandle`, which aborts the task from
+  any thread.
 - A task is one allocation holding its future and, once it finishes, its
   output, and is its own waker. It is referred to in two ways. References
   from its own thread, which the scheduler's table, the run queue, the
@@ -530,6 +533,46 @@ baseline are used only when probed.
   of its own only from when it may be freed on another thread: once its
   last local reference goes while a waker of it is held elsewhere. So a
   spawn and its join take no locked instruction on the task's thread.
+- A task spawned from another thread, through a `Handle`, is made whole on
+  the thread that spawns it: the header every task has, an abort flag, a
+  word of state, a slot for the awaiting task's waker, and a stage that
+  holds what makes the future, then the future, then the output. It goes
+  to the runtime's remote queue as one atomic reference, which the
+  scheduler takes in as it takes the queue, into its table and the back of
+  its run queue, and from then on it is a task of the scheduler's own; its
+  first run makes the future, on the task's thread, which is why
+  `spawn_with` needs only the closure to be `Send`, and a panic in the
+  closure is the task's. The output goes back as a `oneshot`'s value does,
+  in the task itself: in the state word the task finishes, and the handle
+  registers its waker and goes, each with one read-modify-write, and
+  whichever comes second does what is left. The `RemoteJoinHandle` is an
+  atomic reference and a function that polls the task for the output's
+  type, so it is `Send` and `Sync`; the `RemoteAbortHandle` is another such
+  reference with abort and `is_finished` alone, which any thread may clone
+  and use. An abort sets the flag and wakes the task, on its own thread
+  through the run queue and elsewhere through the remote queue, which
+  orders the flag before the run that reads it. Until the scheduler takes
+  a task in, its index says so, and a wake treats it as it treats the
+  future of `block_on`, scheduling nothing, in the comparison the wake
+  made already; the task starts with its remote woken flag set, so a wake
+  or an abort before its first run queues nothing, and the run's swap of
+  the flag orders an abort's store before its load. A runtime that shuts
+  down cancels the spawns it never took in, and one that has shut down
+  hands a spawn back to the spawner, which cancels it there. The memory
+  comes from, and goes back to, the cache of whichever runtime runs on the
+  thread that allocates or frees it, so a core that spawns onto another
+  and awaits the handle reuses its own blocks. Before, a spawn boxed its
+  closure, sent the output through a `oneshot` with an `Arc` of its own,
+  aborted through another `Arc` with a mutex round the waker, and made two
+  tasks on the runtime's thread, the one asked for and a relay beside it
+  that awaited it and watched for the abort: five allocations and two
+  tasks a spawn, now one of each. In `ruio-bench micro` a task that does
+  nothing, spawned onto a second core and awaited, makes 184k round trips
+  a second against tokio's 166k when both cores park between steps, each
+  step a wake through the kernel both ways, and some 860k with both cores
+  spinning before they park, no system call on the path, where the
+  executor before made 166k and some 600k (see [The runtime
+  itself](#the-runtime-itself)).
 - Every task's wakers share one vtable, whatever the task's future: the
   header of a task comes first in it, so a pointer to the task is a pointer
   to its header, through which the vtable reaches the rest. So the driver
@@ -606,11 +649,20 @@ baseline are used only when probed.
   moves it between lists behind a mutex as it is woken. The set keeps each
   task's join handle in a slab the reporter's note indexes, for aborting
   the tasks and for the error of one that ended without an output, which
-  it takes from the handle with a budget of its own. In `ruio-bench micro`
-  spawning a task that does nothing into a set and taking its output runs
-  16.9M times a second against 19.3M for a spawn and its join, 13% over
-  it, where tokio's set costs 26% over tokio's spawn; ruio's set makes
-  10.2× the steps of tokio's (see [The runtime itself](#the-runtime-itself)).
+  it takes from the handle with a budget of its own. `spawn_on(core,
+  future)` and `spawn_remote(&handle, future)` put a task on another core
+  in the set: the set's task for it is a reporter of its own, which awaits
+  the `RemoteJoinHandle` and pushes the output, or the error the task
+  ended with there, which `join_next` gives as it is; dropped unreported,
+  as aborting the set's tasks drops it, it aborts the remote task, whose
+  core drops the future at its next turn. Both give the task's
+  `RemoteAbortHandle`. In `ruio-bench micro` spawning a task that does
+  nothing into a set and taking its output runs 16.9M times a second
+  against 19.3M for a spawn and its join, 13% over it, where tokio's set
+  costs 26% over tokio's spawn; ruio's set makes 10.2× the steps of
+  tokio's, and a task spawned onto a second core through a set and taken
+  out makes 176k round trips a second against 155k through tokio's
+  `JoinSet::spawn_on` (see [The runtime itself](#the-runtime-itself)).
 - Timers live in a hierarchical wheel in user space, with millisecond ticks.
   The kernel sees a single timeout, the ring's timer at the wheel's next
   deadline, which moves only for an earlier one: a thousand concurrent
@@ -2272,6 +2324,34 @@ trips of tokio's hand-off to its pool. Where both runtimes use their pool,
 `read link` runs at the pools' own ratio less the `readlink` call, which
 is the same on both.
 
+`spawn on`, `spawn on spin`, `abort on` and `join set on`, added as a spawn
+from another thread became one task, run two cores, the runtime's CPU and
+the one `remote` and `blocking spin` use, the first spawning onto the
+second and the second serving it. `spawn on` spawns a task that does
+nothing onto the second core and awaits it; `spawn on spin` does the same
+with both cores spinning before they park; `abort on` spawns a task that
+never finishes, aborts it through its `RemoteAbortHandle` and awaits the
+cancellation; `join set on` spawns through a `JoinSet` and takes the output
+from the set. tokio runs two current-thread runtimes on threads pinned the
+same way, the one spawning onto the other through its `Handle` and its
+`JoinSet::spawn_on`, and has no spin. Medians of five runs taken in turns:
+`spawn on` 184k round trips a second on ruio and 166k on tokio, 1.11×,
+`abort on` 181k and 167k, `join set on` 176k and 155k, 1.13×, and `spawn
+on spin` between 830k and 940k across sets of runs, a round trip of 1.1 to
+1.2 µs with no system call on the path; `remote` read 189k against 185k in
+the same runs. The same rows built against the executor before the change
+read 166k, 171k and 580k to 625k. With both cores parking, a step is an
+eventfd written and an `io_uring_enter` returned on each side, wakes
+through the kernel that take most of the 5.4 µs of a round trip and that
+no runtime's user space can shorten, so the two runtimes are within 10%
+there, as they are on `remote`; with both spinning, the user-space work of
+a round trip, which is what the task's design changes, went from 1.7 µs to
+1.2. The rows name their two CPUs rather than take them from `Cores::all`,
+which inside the benchmark gives only the CPU its main thread is pinned
+to: a first version did, ran both cores on one CPU without knowing, and
+read 10k a second, the two threads taking the CPU in turns of the spin
+budget.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -2495,6 +2575,16 @@ Since M7:
   through the ring makes 2.5 times the round trips of tokio's pool, the
   links 1.7 and `readlink` on the pool 1.5 (see [Files](#files) and [The
   runtime itself](#the-runtime-itself)).
+- A spawn from another thread is one task, made where it is spawned and
+  taken in through the runtime's remote queue, its output handed back
+  through a word of state in the task, where it was a boxed closure, a
+  `oneshot`, two `Arc`s and a relay task beside the task; `RemoteJoinHandle`
+  says whether its task has finished, `RemoteAbortHandle` aborts a remote
+  task from any thread, and `JoinSet::spawn_on` and `spawn_remote` collect
+  tasks on other cores in a set. A round trip to a second core and back
+  takes 1.2 µs of user-space work, from 1.7, and with both cores parking
+  between steps makes 184k a second against tokio's 166k (see
+  [Executor](#executor) and [The runtime itself](#the-runtime-itself)).
 
 ## Open questions
 
