@@ -11,6 +11,10 @@
 //! set keeps each task's join handle, in a slab whose index the reporter
 //! names its task by, for aborting the tasks and for the error of one that
 //! ended without an output.
+//!
+//! A task spawned onto another core is a task of that core, and the set's
+//! task for it is a reporter on its own, which awaits the remote handle and
+//! pushes what comes: the output, or the error the task ended with there.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -24,8 +28,10 @@ use std::task::{Context, Poll, ready};
 
 use crate::blocking::{self, BlockingHandle, Pool};
 use crate::coop;
+use crate::cores::handle_of;
+use crate::handle::Handle;
 use crate::sync::local::WakerCell;
-use crate::task::{AbortHandle, JoinError, JoinHandle};
+use crate::task::{AbortHandle, JoinError, JoinHandle, RemoteAbortHandle, RemoteJoinHandle};
 
 /// A set of tasks spawned on the thread's runtime, whose outputs come, one
 /// at a time, in the order the tasks finish.
@@ -86,6 +92,9 @@ enum Finished<T> {
     /// The task at the index ended without an output: it was aborted, or
     /// it panicked.
     Ended(usize),
+    /// The task at the index ran on another core, and ended there with
+    /// this error.
+    Failed(usize, JoinError),
 }
 
 impl<T> Inner<T> {
@@ -242,23 +251,25 @@ impl<T: 'static> JoinSet<T> {
 
     /// What the task `finished` reports finished with, its handle leaving
     /// the slab: its output, or, for a task that ended without one, the
-    /// error its handle has.
+    /// error its handle has, or the error it ended with on another core.
     #[inline]
     fn collect(&mut self, finished: Finished<T>) -> Result<T, JoinError> {
         let (index, output) = match finished {
-            Finished::Output(index, output) => (index, Some(output)),
-            Finished::Ended(index) => (index, None),
+            Finished::Output(index, output) => (index, Ok(Some(output))),
+            Finished::Ended(index) => (index, Ok(None)),
+            Finished::Failed(index, err) => (index, Err(err)),
         };
         let mut handle = self.handles[index]
             .take()
             .expect("a task reports once, and its handle stays until it has");
         self.free.push(index);
         match output {
-            Some(output) => Ok(output),
-            None => Err(handle
+            Ok(Some(output)) => Ok(output),
+            Ok(None) => Err(handle
                 .finished_output()
                 .expect("a task that ended without an output has finished")
                 .expect_err("a task that ended without an output did not finish with one")),
+            Err(err) => Err(err),
         }
     }
 
@@ -352,6 +363,89 @@ impl<T: Send + 'static> JoinSet<T> {
             handle: pool.spawn(f),
             done: false,
         })
+    }
+
+    /// Spawns `future` onto core `index` of the thread's run, as a task of
+    /// the set; see [`spawn_remote`](JoinSet::spawn_remote).
+    ///
+    /// # Panics
+    ///
+    /// Outside [`Cores::run`](crate::Cores::run), or if the run has no core
+    /// `index`.
+    pub fn spawn_on<F>(&mut self, index: usize, future: F) -> RemoteAbortHandle
+    where
+        F: Future<Output = T> + Send + 'static,
+    {
+        self.spawn_remote(&handle_of(index), future)
+    }
+
+    /// Spawns `future` onto the runtime `handle` is of, as
+    /// [`Handle::spawn`] does, as a task of the set: its output comes from
+    /// [`join_next`](JoinSet::join_next) as a task's does, and so does the
+    /// error of its panicking or being cancelled there. The handle given
+    /// aborts it from whichever thread, as does aborting the set's tasks,
+    /// which the set then reports cancelled as the other runtime drops the
+    /// future.
+    ///
+    /// # Panics
+    ///
+    /// If the thread is not inside [`Runtime::block_on`](crate::Runtime).
+    pub fn spawn_remote<F>(&mut self, handle: &Handle, future: F) -> RemoteAbortHandle
+    where
+        F: Future<Output = T> + Send + 'static,
+    {
+        let task = handle.spawn(future);
+        let abort = task.abort_handle();
+        let index = self.free.pop().unwrap_or(self.handles.len());
+        let handle = crate::spawn(ReportRemote {
+            task,
+            inner: Rc::clone(&self.inner),
+            index,
+            reported: false,
+        });
+        if index == self.handles.len() {
+            self.handles.push(Some(handle));
+        } else {
+            self.handles[index] = Some(handle);
+        }
+        abort
+    }
+}
+
+/// The set's task for one spawned onto another core: awaits the remote
+/// handle, and reports what it gives, the output or the error the task
+/// ended with there. Dropped before, as the set aborts its tasks, it aborts
+/// the remote task and notes that the task ended.
+struct ReportRemote<T> {
+    task: RemoteJoinHandle<T>,
+    inner: Rc<Inner<T>>,
+    /// The task's index in the set's slab.
+    index: usize,
+    /// Set once the result has been pushed.
+    reported: bool,
+}
+
+impl<T> Future for ReportRemote<T> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let result = ready!(Pin::new(&mut self.task).poll(cx));
+        self.reported = true;
+        let finished = match result {
+            Ok(output) => Finished::Output(self.index, output),
+            Err(err) => Finished::Failed(self.index, err),
+        };
+        self.inner.push(finished);
+        Poll::Ready(())
+    }
+}
+
+impl<T> Drop for ReportRemote<T> {
+    fn drop(&mut self) {
+        if !self.reported {
+            self.task.abort();
+            self.inner.push(Finished::Ended(self.index));
+        }
     }
 }
 

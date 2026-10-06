@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ruio_executor::sync::{mpsc, oneshot};
 use ruio_executor::time::sleep;
-use ruio_executor::{Core, Cores, Runtime, core, core_count, handle_of, spawn, spawn_on};
+use ruio_executor::{Core, Cores, JoinSet, Runtime, core, core_count, handle_of, spawn, spawn_on};
 
 /// A few cores, however many CPUs the machine has: on one with fewer, some
 /// share a CPU.
@@ -91,6 +91,40 @@ fn cores_spawn_onto_each_other() {
     for (next, (there, cpu)) in answers {
         assert_eq!(there.index(), next);
         assert_eq!(cpu, there.cpu());
+    }
+}
+
+/// A set spawns onto every core of the run, and the outputs come as those of
+/// the set's own tasks do.
+#[test]
+fn a_set_spawns_onto_other_cores() {
+    let cores = few();
+    let count = cores.count();
+    let answers = cores
+        .run(|me| async move {
+            let mut set = JoinSet::new();
+            for index in 0..count {
+                set.spawn_on(
+                    index,
+                    async move { (core().unwrap().index(), current_cpu()) },
+                );
+            }
+            set.spawn(async move { (me.index(), current_cpu()) });
+            let mut ran_on = Vec::new();
+            while let Some(output) = set.join_next().await {
+                ran_on.push(output.unwrap());
+            }
+            ran_on.sort_unstable();
+            ran_on
+        })
+        .unwrap();
+    for (me, ran_on) in answers.into_iter().enumerate() {
+        let mut expected: Vec<_> = (0..count)
+            .map(|index| (index, cores.cpu_list()[index]))
+            .collect();
+        expected.push((me, cores.cpu_list()[me]));
+        expected.sort_unstable();
+        assert_eq!(ran_on, expected);
     }
 }
 

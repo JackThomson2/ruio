@@ -6,11 +6,11 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ruio_executor::blocking::Pool;
 use ruio_executor::time::{sleep, timeout};
-use ruio_executor::{JoinSet, Runtime, spawn, yield_now};
+use ruio_executor::{Handle, JoinSet, Runtime, spawn, yield_now};
 
 /// Long enough for any of these to finish; a lost wake runs it out.
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -36,6 +36,50 @@ impl Drop for DropFlag {
 fn drop_flag() -> (DropFlag, Rc<Cell<bool>>) {
     let flag = Rc::new(Cell::new(false));
     (DropFlag(flag.clone()), flag)
+}
+
+/// A runtime on a thread of its own, which serves the tasks spawned through
+/// its handle until it is dropped.
+struct OtherRuntime {
+    handle: Handle,
+    /// Dropped to end the runtime's `block_on`.
+    stop: Option<ruio_executor::sync::oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl OtherRuntime {
+    fn start() -> Self {
+        let (ready, started) = mpsc::channel();
+        let (stop, stopped) = ruio_executor::sync::oneshot::channel::<()>();
+        let thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            ready.send(runtime.handle()).unwrap();
+            runtime.block_on(async {
+                let _ = stopped.await;
+            });
+        });
+        Self {
+            handle: started.recv().unwrap(),
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for OtherRuntime {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+/// Sets its flag when dropped, on whichever thread.
+struct SendDropFlag(Arc<AtomicBool>);
+
+impl Drop for SendDropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 #[test]
@@ -405,6 +449,107 @@ async fn steps_before_the_next_task(steps: Rc<Cell<usize>>) -> usize {
     spawn(async move { steps.get() }).await.unwrap()
 }
 
+/// Tasks spawned onto another runtime through its handle are tasks of the
+/// set: their outputs come as the set's own do, beside them.
+#[test]
+fn a_set_spawns_onto_another_runtime() {
+    let other = OtherRuntime::start();
+    let home = thread::current().id();
+    run(async {
+        let mut set = JoinSet::new();
+        for n in 0..10u32 {
+            set.spawn_remote(&other.handle, async move {
+                yield_now().await;
+                (n, thread::current().id())
+            });
+        }
+        set.spawn(async { (10, thread::current().id()) });
+        assert_eq!(set.len(), 11);
+        let mut outputs = Vec::new();
+        while let Some(output) = set.join_next().await {
+            outputs.push(output.unwrap());
+        }
+        outputs.sort_unstable_by_key(|(n, _)| *n);
+        assert_eq!(
+            outputs.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            (0..=10).collect::<Vec<_>>()
+        );
+        assert!(outputs[..10].iter().all(|(_, thread)| *thread != home));
+        assert_eq!(outputs[10].1, home);
+        assert!(set.is_empty());
+    });
+}
+
+/// A remote task that panics or is aborted, through the handle the set
+/// gives, ends with the error the set reports.
+#[test]
+fn a_remote_tasks_error_comes_through_the_set() {
+    let other = OtherRuntime::start();
+    run(async {
+        let mut set = JoinSet::new();
+        set.spawn_remote(&other.handle, async {
+            if true {
+                panic!("remote boom");
+            }
+            1
+        });
+        let abort = set.spawn_remote(&other.handle, pending::<u32>());
+        abort.abort();
+        let (mut panicked, mut cancelled) = (0, 0);
+        while let Some(result) = set.join_next().await {
+            let err = result.unwrap_err();
+            if err.is_panic() {
+                assert_eq!(*err.into_panic().downcast::<&str>().unwrap(), "remote boom");
+                panicked += 1;
+            } else {
+                assert!(err.is_cancelled());
+                cancelled += 1;
+            }
+        }
+        assert_eq!((panicked, cancelled), (1, 1));
+        assert!(abort.is_finished());
+    });
+}
+
+/// Aborting the set's tasks, or dropping the set, aborts the remote tasks
+/// too: the other runtime drops their futures.
+#[test]
+fn aborting_the_set_aborts_its_remote_tasks() {
+    let other = OtherRuntime::start();
+    let aborted = Arc::new(AtomicBool::new(false));
+    let dropped_with_set = Arc::new(AtomicBool::new(false));
+    run({
+        let (aborted, dropped_with_set) = (aborted.clone(), dropped_with_set.clone());
+        let other = &other;
+        async move {
+            let mut set = JoinSet::new();
+            let flag = SendDropFlag(aborted);
+            set.spawn_remote(&other.handle, async move {
+                let _flag = flag;
+                pending::<()>().await;
+            });
+            set.abort_all();
+            assert!(set.join_next().await.unwrap().unwrap_err().is_cancelled());
+            assert!(set.join_next().await.is_none());
+
+            let flag = SendDropFlag(dropped_with_set);
+            set.spawn_remote(&other.handle, async move {
+                let _flag = flag;
+                pending::<()>().await;
+            });
+            drop(set);
+        }
+    });
+    let start = Instant::now();
+    while !aborted.load(Ordering::Acquire) || !dropped_with_set.load(Ordering::Acquire) {
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the other runtime drops the futures"
+        );
+        thread::yield_now();
+    }
+    drop(other);
+}
 /// A task that always finds a finished task in its set still lets the
 /// others run: what is ready spends the task's budget, and once it is spent
 /// the task yields.
