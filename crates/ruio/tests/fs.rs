@@ -2,6 +2,7 @@
 
 mod support;
 
+use std::fs::Permissions;
 use std::io::{self, ErrorKind};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ruio::buf::{AlignedBuf, FixedBuffers};
-use ruio::fs::{self, File, OpenOptions};
+use ruio::fs::{self, Advice, File, OpenOptions};
 
 use support::within;
 
@@ -216,8 +217,10 @@ async fn metadata_reports_on_files() -> io::Result<()> {
     Ok(())
 }
 
-/// A direct descriptor reads and writes as a plain one does, and has no
-/// metadata to ask for.
+/// A direct descriptor reads and writes as a plain one does; what wants a
+/// file descriptor, such as statx and fchmod, installs one for the call;
+/// and the file becomes a plain one, or the standard library's, with its
+/// slot freed.
 #[ruio::test]
 async fn files_open_as_direct_descriptors() -> io::Result<()> {
     let scratch = Scratch::new("direct");
@@ -234,13 +237,32 @@ async fn files_open_as_direct_descriptors() -> io::Result<()> {
     let (read, data) = within(file.read_exact_at(Vec::with_capacity(6), 0)).await;
     read?;
     assert_eq!(data, b"direct");
+    let found = within(file.metadata()).await?;
     assert_eq!(
-        file.metadata().await.unwrap_err().kind(),
-        ErrorKind::Unsupported
+        (found.len(), found.ino()),
+        (6, std::fs::metadata(&path)?.ino())
     );
-    assert!(file.as_std().is_err());
+    assert_eq!(file.as_std().unwrap_err().kind(), ErrorKind::Unsupported);
+    within(file.allocate(0, 4096)).await?;
+    within(file.sync_range(0, 0)).await?;
+    within(file.advise(0, 0, Advice::Sequential)).await?;
+    within(file.set_permissions(Permissions::from_mode(0o600))).await?;
+    assert_eq!(std::fs::metadata(&path)?.mode() & 0o777, 0o600);
+
+    let plain = within(file.into_plain()).await?;
+    assert!(!plain.is_direct());
+    assert_eq!(plain.as_std()?.metadata()?.len(), 4096);
+    let std_file = within(plain.into_std()).await?;
+    assert_eq!(std_file.metadata()?.len(), 4096);
+    drop(std_file);
+
+    let file = OpenOptions::new()
+        .read(true)
+        .direct_descriptor(true)
+        .open(&path)
+        .await?;
     within(file.close()).await?;
-    assert_eq!(std::fs::read(&path)?, b"direct");
+    assert_eq!(std::fs::read(&path)?[..6], b"direct"[..]);
     Ok(())
 }
 
@@ -443,6 +465,171 @@ async fn names_are_made_changed_and_removed() -> io::Result<()> {
         .await
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidData);
+    Ok(())
+}
+
+/// Links are made through the ring and read back on the pool.
+#[ruio::test]
+async fn names_are_linked() -> io::Result<()> {
+    let scratch = Scratch::new("links");
+    let file = scratch.path("file");
+    fs::write(&file, "linked").await?;
+    let original = std::fs::metadata(&file)?;
+
+    let hard = scratch.path("hard");
+    fs::hard_link(&file, &hard).await?;
+    let linked = fs::metadata(&hard).await?;
+    assert_eq!((linked.ino(), linked.nlink()), (original.ino(), 2));
+    assert_eq!(
+        fs::hard_link(&file, &hard).await.unwrap_err().kind(),
+        ErrorKind::AlreadyExists
+    );
+
+    let soft = scratch.path("soft");
+    fs::symlink("file", &soft).await?;
+    assert_eq!(within(fs::read_link(&soft)).await?, PathBuf::from("file"));
+    assert_eq!(fs::read(&soft).await?, b"linked");
+    assert!(fs::symlink_metadata(&soft).await?.is_symlink());
+    assert_eq!(
+        within(fs::canonicalize(&soft)).await?,
+        std::fs::canonicalize(&file)?
+    );
+    let to_link = scratch.path("to-link");
+    fs::hard_link(&soft, &to_link).await?;
+    assert!(
+        fs::symlink_metadata(&to_link).await?.is_symlink(),
+        "the link itself, as the standard library links it"
+    );
+
+    assert!(fs::try_exists(&file).await?);
+    assert!(!fs::try_exists(scratch.path("missing")).await?);
+    let dangling = scratch.path("dangling");
+    fs::symlink(scratch.path("missing"), &dangling).await?;
+    assert!(fs::symlink_metadata(&dangling).await?.is_symlink());
+    assert!(
+        !fs::try_exists(&dangling).await?,
+        "a dangling link is no file"
+    );
+    assert_eq!(
+        within(fs::read_link(&file)).await.unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        fs::symlink("x", scratch.path("nul\0byte"))
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    Ok(())
+}
+
+/// Space is allocated and freed, ranges are written back, and advice is
+/// taken, on plain descriptors here and on a direct one in
+/// `files_open_as_direct_descriptors`.
+#[ruio::test]
+async fn files_are_allocated_synced_and_advised_on() -> io::Result<()> {
+    let scratch = Scratch::new("allocate");
+    let path = scratch.path("file");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .await?;
+    within(file.allocate(0, 1 << 16)).await?;
+    let found = within(file.metadata()).await?;
+    assert_eq!(found.len(), 1 << 16);
+    assert!(found.blocks() * 512 >= 1 << 16, "{} blocks", found.blocks());
+    within(file.fallocate(1 << 16, 1 << 16, libc::FALLOC_FL_KEEP_SIZE)).await?;
+    assert_eq!(within(file.metadata()).await?.len(), 1 << 16);
+
+    let data = pattern(1 << 16);
+    within(file.write_all_at(data.clone(), 0)).await.0?;
+    let hole = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    within(file.fallocate(0, 4096, hole)).await?;
+    let (read, head) = within(file.read_exact_at(Vec::with_capacity(8192), 0)).await;
+    read?;
+    assert_eq!(&head[..4096], &[0; 4096]);
+    assert_eq!(&head[4096..], &data[4096..8192]);
+
+    within(file.start_sync_range(0, 1 << 15)).await?;
+    within(file.sync_range(0, 0)).await?;
+    for advice in [
+        Advice::Sequential,
+        Advice::Random,
+        Advice::Normal,
+        Advice::WillNeed,
+        Advice::DontNeed,
+        Advice::NoReuse,
+    ] {
+        within(file.advise(0, 0, advice)).await?;
+    }
+    // The sync of a chunk follows its write, in one submission.
+    let write = file.write_at(data.clone(), 1 << 16);
+    let (written, synced) = within(write.link(file.sync_range(1 << 16, 1 << 16))).await;
+    assert_eq!(written.0?, 1 << 16);
+    synced?;
+    assert_eq!(std::fs::read(&path)?[1 << 16..], data[..]);
+    Ok(())
+}
+
+#[ruio::test]
+async fn permissions_are_set() -> io::Result<()> {
+    let scratch = Scratch::new("permissions");
+    let path = scratch.path("file");
+    fs::write(&path, "x").await?;
+    within(fs::set_permissions(&path, Permissions::from_mode(0o600))).await?;
+    assert_eq!(fs::metadata(&path).await?.mode() & 0o777, 0o600);
+    let file = File::open(&path).await?;
+    within(file.set_permissions(Permissions::from_mode(0o640))).await?;
+    assert_eq!(within(file.metadata()).await?.mode() & 0o777, 0o640);
+    let missing = fs::set_permissions(scratch.path("missing"), Permissions::from_mode(0o600));
+    assert_eq!(
+        within(missing).await.unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+    Ok(())
+}
+
+/// A copy brings the permissions along; a removal takes the whole tree and
+/// follows no link out of it.
+#[ruio::test]
+async fn files_are_copied_and_trees_removed() -> io::Result<()> {
+    let scratch = Scratch::new("tree");
+    let big = pattern(300_000);
+    fs::write(scratch.path("big"), big.clone()).await?;
+    within(fs::set_permissions(
+        scratch.path("big"),
+        Permissions::from_mode(0o640),
+    ))
+    .await?;
+    let copied = within(fs::copy(scratch.path("big"), scratch.path("copy"))).await?;
+    assert_eq!(copied, 300_000);
+    assert!(fs::read(scratch.path("copy")).await? == big);
+    assert_eq!(
+        fs::metadata(scratch.path("copy")).await?.mode() & 0o777,
+        0o640
+    );
+    let missing = fs::copy(scratch.path("missing"), scratch.path("x"));
+    assert_eq!(
+        within(missing).await.unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+
+    let tree = scratch.path("tree");
+    fs::create_dir_all(tree.join("a/b/c")).await?;
+    for name in ["a/1", "a/b/2", "a/b/c/3"] {
+        fs::write(tree.join(name), name).await?;
+    }
+    fs::symlink(&scratch.0, tree.join("a/out")).await?;
+    within(fs::remove_dir_all(&tree)).await?;
+    assert!(!tree.exists());
+    assert!(scratch.path("big").exists(), "nothing past the link went");
+    assert_eq!(
+        within(fs::remove_dir_all(&tree)).await.unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
     Ok(())
 }
 

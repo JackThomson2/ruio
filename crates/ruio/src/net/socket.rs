@@ -394,6 +394,26 @@ impl<S: AsRawFd + Into<OwnedFd>> Sock<S> {
         }
     }
 
+    /// The standard library's type, out of the socket: a plain descriptor as
+    /// it is, and a direct one installed as a descriptor of the process
+    /// through the ring and its slot closed, as [`Sock::into_plain`] has it.
+    pub(crate) async fn into_std(self) -> io::Result<S>
+    where
+        S: From<OwnedFd>,
+    {
+        let (driver, fd) = self.target();
+        match self.desc {
+            Desc::Plain(socket) => Ok(socket.into_inner()),
+            Desc::Direct(slot) => {
+                let installed = driver.op(InstallFd::new(fd)).await?;
+                // Closes the slot, on its ring, now that the kernel has
+                // installed its file.
+                drop(slot);
+                Ok(S::from(installed))
+            }
+        }
+    }
+
     /// Sets the option `name` of `level` to `value`: with `setsockopt(2)` on
     /// a plain descriptor, at once, as the standard library sets it, and
     /// through the ring on a direct descriptor, which has no file descriptor

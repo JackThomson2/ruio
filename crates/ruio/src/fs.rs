@@ -32,30 +32,43 @@
 //! each read's and write's completion instead of waiting for an interrupt,
 //! on a second ring of the thread's driver.
 //!
-//! [`read_dir`] reads a directory's entries, which io_uring has no
-//! operation for: with `getdents64(2)`, a batch at a time, on the thread.
+//! What io_uring has no operation for runs on the blocking pool
+//! ([`spawn_blocking`](crate::spawn_blocking)), as the standard library's
+//! call in a job of its own, so that it holds a thread of the pool and not
+//! the runtime's: [`read_dir`] reads a directory's entries with
+//! `getdents64(2)`, a batch at a time and ahead of the task taking them;
+//! [`read_link`], [`canonicalize`], [`set_permissions`], [`copy`] and
+//! [`remove_dir_all`] are one job each. A tree could be removed with the
+//! ring's operations, an entry at a time, but statx and unlink each run in
+//! an io-wq worker, and handing an entry to one costs more than the system
+//! call it stands for; one thread of the pool walking the tree with system
+//! calls is the cheaper way, and the standard library's walk is the careful
+//! one, which a symbolic link swapped in under it cannot lead out of the
+//! tree.
 //!
 //! The kernel does most of what is not a read or a write in an io-wq worker,
 //! as the calls it stands for can block: opening a file whose name is not
-//! cached, statx, fsync, truncating, and changing names. Buffered reads and
-//! writes that miss the page cache go there too, while direct ones go to the
-//! device from the ring.
+//! cached, statx, fsync, truncating, allocating, syncing a range, and
+//! making, changing and linking names. Buffered reads and writes that miss
+//! the page cache go there too, while direct ones go to the device from the
+//! ring.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use ruio_driver::buf::{BufLease, BufPool, BufResult, FixedIoBuf, IoBuf, IoBufMut, Slice};
 use ruio_driver::ops::{
-    self, Fsync, Ftruncate, MkdirAt, OpenAt, Read, ReadFixed, RenameAt, Statx, UnlinkAt, Write,
-    WriteFixed,
+    self, Fadvise, Fallocate, Fsync, Ftruncate, InstallFd, LinkAt, MkdirAt, OpenAt, Read,
+    ReadFixed, RenameAt, Statx, SymlinkAt, SyncFileRange, UnlinkAt, Write, WriteFixed,
 };
 use ruio_driver::{Chain, Driver, Fd, Link, Op, Operation, PolledFd};
 
@@ -145,7 +158,8 @@ impl File {
         self.sock.fd()
     }
 
-    /// The standard library's file, which a direct descriptor has not.
+    /// The standard library's file, which a direct descriptor has not;
+    /// [`into_std`](File::into_std) gives one for either.
     ///
     /// # Errors
     ///
@@ -308,18 +322,117 @@ impl File {
         self.op(|fd| Ftruncate::new(fd, len))
     }
 
-    /// The file's status, as `statx(2)` reports it.
+    /// Allocates space for `len` bytes of the file from `offset`, growing
+    /// it if they reach past its end, as `fallocate(2)` does: a write there
+    /// then finds its blocks, and cannot run out of space.
+    pub fn allocate(&self, offset: u64, len: u64) -> FileOp<'_, Fallocate> {
+        self.op(|fd| Fallocate::new(fd, offset, len))
+    }
+
+    /// Changes the space of `len` bytes of the file from `offset` as `mode`,
+    /// the `FALLOC_FL_*` flags, says: `FALLOC_FL_KEEP_SIZE` allocates past
+    /// the end without growing the file, `FALLOC_FL_PUNCH_HOLE` with it
+    /// frees the range's blocks, which read as zeroes after,
+    /// `FALLOC_FL_ZERO_RANGE` zeroes them, and `FALLOC_FL_COLLAPSE_RANGE` and
+    /// `FALLOC_FL_INSERT_RANGE` cut the range out or make room for it. The
+    /// file system decides which it supports.
+    pub fn fallocate(&self, offset: u64, len: u64, mode: i32) -> FileOp<'_, Fallocate> {
+        self.op(|fd| Fallocate::new(fd, offset, len).mode(mode))
+    }
+
+    /// Writes back the dirty pages of `len` bytes of the file from `offset`,
+    /// or through its end if `len` is 0, and waits for them to reach the
+    /// device, as `sync_file_range(2)` does. It says nothing about the
+    /// file's metadata, so it is no [`sync_data`](File::sync_data), which
+    /// promises the data can be found after a crash; it is for pacing
+    /// writes, so that a file written in bulk does not fill the page cache
+    /// with dirty pages for the kernel to write back whenever it chooses.
+    /// The kernel takes the length in 32 bits, so a longer range takes more
+    /// than one call.
+    pub fn sync_range(&self, offset: u64, len: u32) -> FileOp<'_, SyncFileRange> {
+        self.op(|fd| SyncFileRange::new(fd, offset, len))
+    }
+
+    /// Starts writing back the dirty pages of `len` bytes of the file from
+    /// `offset`, or through its end if `len` is 0, without waiting for them;
+    /// a [`sync_range`](File::sync_range) of the same range later waits for
+    /// what was started. Starting the write-back of each chunk as the next
+    /// is written, and waiting for a chunk only when it is the one before
+    /// last, keeps the device writing while the task does.
+    pub fn start_sync_range(&self, offset: u64, len: u32) -> FileOp<'_, SyncFileRange> {
+        self.op(|fd| SyncFileRange::new(fd, offset, len).flags(libc::SYNC_FILE_RANGE_WRITE))
+    }
+
+    /// Tells the kernel how `len` bytes of the file from `offset`, or
+    /// through its end if `len` is 0, are about to be used, as
+    /// `posix_fadvise(2)` does; see [`Advice`].
+    pub fn advise(&self, offset: u64, len: u64, advice: Advice) -> FileOp<'_, Fadvise> {
+        self.op(|fd| Fadvise::new(fd, offset, len, advice.raw()))
+    }
+
+    /// The file's status, as `statx(2)` reports it: of a plain descriptor
+    /// through the ring, and of a direct one, which the kernel does not take
+    /// for statx, through a plain descriptor installed for the call
+    /// ([`InstallFd`]) and closed after it.
     ///
     /// # Errors
     ///
-    /// What `statx(2)` reports, and `Unsupported` for a direct descriptor,
-    /// which the kernel does not take for statx.
+    /// What `statx(2)` reports, and what installing a descriptor for a direct
+    /// one does: `EMFILE` if the process has no descriptor left.
     pub async fn metadata(&self) -> io::Result<Metadata> {
-        use std::os::fd::AsRawFd as _;
-        let fd = self.sock.plain()?.as_raw_fd();
-        let stat = Statx::fd(fd).mask(METADATA);
-        let stat = crate::driver().op(stat).await?;
-        Ok(Metadata { stat: *stat })
+        match self.sock.desc() {
+            Desc::Plain(file) => metadata_of(file.as_raw_fd()).await,
+            Desc::Direct(_) => {
+                let installed = self.sock.op(InstallFd::new).await?;
+                metadata_of(installed.as_raw_fd()).await
+            }
+        }
+    }
+
+    /// Sets the file's permissions, as `fchmod(2)` does, on the blocking
+    /// pool, which io_uring has no operation for. The job holds a descriptor
+    /// of its own for the file, a duplicate of a plain one or one installed
+    /// for a direct one, so the file may close before it runs.
+    ///
+    /// # Errors
+    ///
+    /// What `fchmod(2)` reports, and what duplicating or installing the
+    /// descriptor does.
+    pub async fn set_permissions(&self, perm: std::fs::Permissions) -> io::Result<()> {
+        let file = match self.sock.desc() {
+            Desc::Plain(file) => file.try_clone()?,
+            Desc::Direct(_) => self.sock.op(InstallFd::new).await?.into(),
+        };
+        on_pool(move || file.set_permissions(perm)).await
+    }
+
+    /// The file as a plain descriptor: a plain file as it is, and a direct
+    /// one with its file installed as a descriptor of the process through
+    /// the ring and its slot freed, for what only a file descriptor can do,
+    /// such as handing the file to a library.
+    ///
+    /// # Errors
+    ///
+    /// What installing the descriptor reports: `EMFILE` if the process has
+    /// no descriptor left.
+    pub async fn into_plain(self) -> io::Result<Self> {
+        Ok(Self {
+            sock: self.sock.into_plain().await?,
+            polled: self.polled,
+            _thread: PhantomData,
+        })
+    }
+
+    /// The standard library's file: a plain descriptor's as it is, and a
+    /// direct one installed as a descriptor of the process, as
+    /// [`into_plain`](File::into_plain) has it. A polled file leaves its
+    /// slot in the polled ring's table.
+    ///
+    /// # Errors
+    ///
+    /// As for [`into_plain`](File::into_plain).
+    pub async fn into_std(self) -> io::Result<std::fs::File> {
+        self.sock.into_std().await
     }
 
     /// Closes the file, reporting what closing it found, such as an error
@@ -344,6 +457,44 @@ impl fmt::Debug for File {
         f.debug_struct("File")
             .field("fd", &self.fd())
             .finish_non_exhaustive()
+    }
+}
+
+/// How a range of a file is about to be used, for [`File::advise`]: the
+/// `POSIX_FADV_*` values.
+///
+/// The first three set how far the kernel reads ahead, on the whole file
+/// rather than the range, and complete on the ring; the others act on the
+/// range's pages, in an io-wq worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Advice {
+    /// No particular pattern: the default read-ahead.
+    Normal,
+    /// Read from start to end: the kernel reads twice as far ahead.
+    Sequential,
+    /// Read at random: the kernel reads nothing ahead.
+    Random,
+    /// Read soon: the kernel starts reading the range into the page cache.
+    WillNeed,
+    /// Not read again soon: the kernel starts writing back the range's
+    /// dirty pages and drops its clean ones from the page cache.
+    DontNeed,
+    /// Read once: the kernel does not keep the range's pages warm in the
+    /// page cache (Linux 6.3; nothing before).
+    NoReuse,
+}
+
+impl Advice {
+    /// The `POSIX_FADV_*` value.
+    fn raw(self) -> i32 {
+        match self {
+            Advice::Normal => libc::POSIX_FADV_NORMAL,
+            Advice::Sequential => libc::POSIX_FADV_SEQUENTIAL,
+            Advice::Random => libc::POSIX_FADV_RANDOM,
+            Advice::WillNeed => libc::POSIX_FADV_WILLNEED,
+            Advice::DontNeed => libc::POSIX_FADV_DONTNEED,
+            Advice::NoReuse => libc::POSIX_FADV_NOREUSE,
+        }
     }
 }
 
@@ -1112,6 +1263,21 @@ impl fmt::Debug for FileType {
     }
 }
 
+/// The status of the file open as `fd`, as `statx(2)` reports it.
+async fn metadata_of(fd: std::os::fd::RawFd) -> io::Result<Metadata> {
+    let stat = Statx::fd(fd).mask(METADATA);
+    let stat = crate::driver().op(stat).await?;
+    Ok(Metadata { stat: *stat })
+}
+
+/// Runs `f` on the blocking pool, as a job of its own, for what io_uring has
+/// no operation for; a job that panics reports an error.
+async fn on_pool<R: Send + 'static>(
+    f: impl FnOnce() -> io::Result<R> + Send + 'static,
+) -> io::Result<R> {
+    crate::spawn_blocking(f).await.map_err(io::Error::other)?
+}
+
 /// The status of the file at `path`, following a final symbolic link.
 ///
 /// # Errors
@@ -1135,6 +1301,58 @@ pub async fn symlink_metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
         .mask(METADATA);
     let stat = crate::driver().op(stat).await?;
     Ok(Metadata { stat: *stat })
+}
+
+/// Whether there is a file at `path`, following a final symbolic link: a
+/// dangling link is no file.
+///
+/// # Errors
+///
+/// As for [`metadata`], except that `NotFound` is `false` rather than an
+/// error: what cannot be told, such as a directory on the way that may not
+/// be searched, is.
+pub async fn try_exists(path: impl AsRef<Path>) -> io::Result<bool> {
+    match metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// Reads where the symbolic link at `path` points, on the blocking pool,
+/// which io_uring has no operation for.
+///
+/// # Errors
+///
+/// What `readlink(2)` reports: `InvalidInput` if the file is no symbolic
+/// link.
+pub async fn read_link(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref().to_owned();
+    on_pool(move || std::fs::read_link(path)).await
+}
+
+/// The absolute path of the file at `path`, with every symbolic link
+/// followed and no `.` or `..` left, on the blocking pool, which io_uring
+/// has no operation for.
+///
+/// # Errors
+///
+/// What `realpath(3)` reports, such as `NotFound`.
+pub async fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref().to_owned();
+    on_pool(move || std::fs::canonicalize(path)).await
+}
+
+/// Sets the permissions of the file at `path`, on the blocking pool, which
+/// io_uring has no operation for; [`File::set_permissions`] sets an open
+/// file's.
+///
+/// # Errors
+///
+/// What `chmod(2)` reports.
+pub async fn set_permissions(path: impl AsRef<Path>, perm: std::fs::Permissions) -> io::Result<()> {
+    let path = path.as_ref().to_owned();
+    on_pool(move || std::fs::set_permissions(path, perm)).await
 }
 
 /// Reads the whole file at `path`.
@@ -1247,4 +1465,57 @@ pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
 /// byte.
 pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
     crate::driver().op(RenameAt::new(from, to)?).await
+}
+
+/// Makes `link` a symbolic link to `original`, which it holds as given and
+/// which need not exist.
+///
+/// # Errors
+///
+/// What `symlinkat(2)` reports, and `InvalidInput` if a path contains a nul
+/// byte.
+pub async fn symlink(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+    crate::driver().op(SymlinkAt::new(original, link)?).await
+}
+
+/// Makes `link` another name for the file at `original`: a hard link. A
+/// symbolic link at `original` is linked itself, not what it points to, as
+/// the standard library links it.
+///
+/// # Errors
+///
+/// What `linkat(2)` reports, and `InvalidInput` if a path contains a nul
+/// byte.
+pub async fn hard_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+    crate::driver().op(LinkAt::new(original, link)?).await
+}
+
+/// Copies the contents and permissions of the file at `from` to `to`,
+/// making or emptying it, on the blocking pool: with `copy_file_range(2)`,
+/// which lets the file system share or move the blocks rather than copy
+/// them, and which io_uring has no operation for. The copy's length comes
+/// back.
+///
+/// # Errors
+///
+/// What opening the files and `copy_file_range(2)` report.
+pub async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
+    let (from, to) = (from.as_ref().to_owned(), to.as_ref().to_owned());
+    on_pool(move || std::fs::copy(from, to)).await
+}
+
+/// Removes the directory at `path` and everything in it, on the blocking
+/// pool, as the standard library does: following no symbolic link, and
+/// opening each directory on the way down by its name in its parent, so
+/// that a link swapped in meanwhile cannot lead the removal out of the
+/// tree. One job walks the whole tree, which is cheaper than an io-wq
+/// hand-off for each of its entries' statx and unlink.
+///
+/// # Errors
+///
+/// What `openat(2)`, `getdents64(2)` and `unlinkat(2)` report, such as
+/// `NotFound`.
+pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref().to_owned();
+    on_pool(move || std::fs::remove_dir_all(path)).await
 }
