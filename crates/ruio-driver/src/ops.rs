@@ -33,7 +33,8 @@ mod splice;
 
 pub(crate) use fs::CloseSlot;
 pub use fs::{
-    Close, Fallocate, Fsync, Ftruncate, InstallPolled, MkdirAt, OpenAt, RenameAt, Statx, UnlinkAt,
+    Close, Fadvise, Fallocate, Fsync, Ftruncate, InstallPolled, LinkAt, MkdirAt, OpenAt, RenameAt,
+    Statx, SymlinkAt, SyncFileRange, UnlinkAt,
 };
 pub use net::{
     Accept, AcceptMulti, AcceptStream, Connect, Recv, RecvFrom, Send, SendTo, SendVectored, SendZc,

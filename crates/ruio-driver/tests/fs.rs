@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 use ruio_driver::buf::{AlignedBuf, IoBuf};
 use ruio_driver::ops::{
-    Close, Fallocate, Fsync, Ftruncate, MkdirAt, OpenAt, Read, RenameAt, Statx, UnlinkAt, Write,
+    Close, Fadvise, Fallocate, Fsync, Ftruncate, LinkAt, MkdirAt, OpenAt, Read, RenameAt, Statx,
+    SymlinkAt, SyncFileRange, UnlinkAt, Write,
 };
 use ruio_driver::{Descriptor, Driver, Fd};
 
@@ -238,6 +239,149 @@ fn names_are_made_moved_and_removed() {
     assert_eq!(err.raw_os_error(), Some(libc::EISDIR));
     block_on(&driver, driver.op(UnlinkAt::new(&dir).unwrap().directory())).unwrap();
     assert!(!dir.exists());
+}
+
+/// A hard link is another name for the same inode; a symbolic link holds
+/// its target as given. Either is made relative to the working directory or
+/// to a directory's descriptor.
+#[test]
+fn names_are_linked() {
+    let driver = Driver::new().unwrap();
+    let scratch = Scratch::new("links");
+    let file = scratch.path("file");
+    fs::write(&file, "linked").unwrap();
+    let original = fs::metadata(&file).unwrap();
+
+    let hard = scratch.path("hard");
+    block_on(&driver, driver.op(LinkAt::new(&file, &hard).unwrap())).unwrap();
+    let linked = fs::metadata(&hard).unwrap();
+    assert_eq!((linked.ino(), linked.nlink()), (original.ino(), 2));
+    assert_eq!(fs::read(&hard).unwrap(), b"linked");
+    let err = block_on(&driver, driver.op(LinkAt::new(&file, &hard).unwrap())).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+
+    let soft = scratch.path("soft");
+    block_on(&driver, driver.op(SymlinkAt::new("file", &soft).unwrap())).unwrap();
+    assert_eq!(fs::read_link(&soft).unwrap(), PathBuf::from("file"));
+    assert_eq!(
+        fs::read(&soft).unwrap(),
+        b"linked",
+        "relative to its directory"
+    );
+    let dangling = scratch.path("dangling");
+    let to_nowhere = SymlinkAt::new(scratch.path("nowhere"), &dangling).unwrap();
+    block_on(&driver, driver.op(to_nowhere)).unwrap();
+    assert!(fs::symlink_metadata(&dangling).unwrap().is_symlink());
+    assert_eq!(
+        fs::metadata(&dangling).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+
+    // A hard link to a symbolic link links the link itself, unless asked to
+    // follow it.
+    let to_link = scratch.path("to-link");
+    block_on(&driver, driver.op(LinkAt::new(&soft, &to_link).unwrap())).unwrap();
+    assert!(fs::symlink_metadata(&to_link).unwrap().is_symlink());
+    let through = scratch.path("through");
+    let follow = LinkAt::new(&soft, &through)
+        .unwrap()
+        .flags(libc::AT_SYMLINK_FOLLOW);
+    block_on(&driver, driver.op(follow)).unwrap();
+    let through = fs::symlink_metadata(&through).unwrap();
+    assert!(through.is_file());
+    assert_eq!((through.ino(), through.nlink()), (original.ino(), 3));
+
+    // Relative to directories' descriptors.
+    let dir = scratch.path("dir");
+    fs::create_dir(&dir).unwrap();
+    let top = fs::File::open(&scratch.0).unwrap();
+    let inside = fs::File::open(&dir).unwrap();
+    let across = LinkAt::at(top.as_raw_fd(), "file", inside.as_raw_fd(), "hard").unwrap();
+    block_on(&driver, driver.op(across)).unwrap();
+    assert_eq!(
+        fs::metadata(dir.join("hard")).unwrap().ino(),
+        original.ino()
+    );
+    let soft = SymlinkAt::at("../file", inside.as_raw_fd(), "soft").unwrap();
+    block_on(&driver, driver.op(soft)).unwrap();
+    assert_eq!(fs::read(dir.join("soft")).unwrap(), b"linked");
+
+    for (path, kind) in [
+        (
+            LinkAt::new("nul\0byte", "x").err(),
+            "a hard link's original",
+        ),
+        (LinkAt::new("x", "nul\0byte").err(), "a hard link's name"),
+        (
+            SymlinkAt::new("nul\0byte", "x").err(),
+            "a symbolic link's target",
+        ),
+        (
+            SymlinkAt::new("x", "nul\0byte").err(),
+            "a symbolic link's name",
+        ),
+    ] {
+        assert_eq!(
+            path.map(|err| err.kind()),
+            Some(std::io::ErrorKind::InvalidInput),
+            "{kind}"
+        );
+    }
+}
+
+/// What a range sync writes back and what advice does to the page cache are
+/// invisible to a test; the kernel accepts them, and refuses what is not a
+/// file or not advice.
+#[test]
+fn ranges_are_synced_and_advised_on() {
+    let driver = Driver::new().unwrap();
+    let scratch = Scratch::new("advise");
+    let path = scratch.path("file");
+    let file = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    let fd = file.as_raw_fd();
+    let write = Write::at(fd, vec![2; 16384], 0);
+    assert_eq!(block_on(&driver, driver.op(write)).0.unwrap(), 16384);
+
+    block_on(&driver, driver.op(SyncFileRange::new(fd, 0, 8192))).unwrap();
+    let rest = SyncFileRange::new(fd, 8192, 0).flags(libc::SYNC_FILE_RANGE_WRITE);
+    block_on(&driver, driver.op(rest)).unwrap();
+    let wait = SyncFileRange::new(fd, 0, 0).flags(libc::SYNC_FILE_RANGE_WAIT_AFTER);
+    block_on(&driver, driver.op(wait)).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), vec![2; 16384]);
+
+    for advice in [
+        libc::POSIX_FADV_SEQUENTIAL,
+        libc::POSIX_FADV_RANDOM,
+        libc::POSIX_FADV_NORMAL,
+        libc::POSIX_FADV_WILLNEED,
+        libc::POSIX_FADV_DONTNEED,
+        libc::POSIX_FADV_NOREUSE,
+    ] {
+        let advise = Fadvise::new(fd, 0, 8192, advice);
+        block_on(&driver, driver.op(advise)).unwrap_or_else(|err| panic!("{advice}: {err}"));
+    }
+    let whole = Fadvise::new(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
+    block_on(&driver, driver.op(whole)).unwrap();
+    let err = block_on(&driver, driver.op(Fadvise::new(fd, 0, 0, 1 << 20))).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "not advice");
+
+    let (reader, _writer) = std::io::pipe().unwrap();
+    let sync = SyncFileRange::new(reader.as_raw_fd(), 0, 0);
+    let err = block_on(&driver, driver.op(sync)).unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ESPIPE),
+        "a pipe has no ranges"
+    );
+    let advise = Fadvise::new(reader.as_raw_fd(), 0, 0, libc::POSIX_FADV_NORMAL);
+    let err = block_on(&driver, driver.op(advise)).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ESPIPE));
 }
 
 /// Direct I/O moves data between the device and memory past the page cache,

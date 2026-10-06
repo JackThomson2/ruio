@@ -3,8 +3,10 @@
 //! The kernel copies a path when it takes the entry, and resolves paths
 //! against plain descriptors only: none of these take a direct descriptor
 //! for a directory. Most run in an io-wq worker, since the calls they stand
-//! for can block: open when a lookup needs I/O, and statx, fsync, fallocate,
-//! ftruncate, unlink, rename and mkdir always.
+//! for can block: open when a lookup needs I/O; statx, fsync, fallocate,
+//! ftruncate, unlink, rename, mkdir, link, symlink and sync_file_range
+//! always; and fadvise when the advice is about the pages of a range, which
+//! it reads or drops there, rather than about how the file will be read.
 
 use std::ffi::CString;
 use std::io;
@@ -526,6 +528,236 @@ unsafe impl Operation for RenameAt {
     }
 }
 
+/// Makes another name for a file, like `linkat(2)`: a hard link.
+#[derive(Debug)]
+pub struct LinkAt {
+    old_dir: RawFd,
+    old: CString,
+    new_dir: RawFd,
+    new: CString,
+    flags: i32,
+}
+
+impl LinkAt {
+    /// Makes `link` a name for the file at `original`, each relative to the
+    /// working directory if it is relative. A symbolic link at `original`
+    /// is linked itself, not followed, unless [`flags`](LinkAt::flags) say
+    /// so.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if a path contains a nul byte.
+    pub fn new(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<Self> {
+        Self::at(libc::AT_FDCWD, original, libc::AT_FDCWD, link)
+    }
+
+    /// Makes `link`, relative to the directory open as `new_dir`, a name for
+    /// the file at `original`, relative to `old_dir`, where they are
+    /// relative.
+    ///
+    /// # Errors
+    ///
+    /// As for [`LinkAt::new`].
+    pub fn at(
+        old_dir: RawFd,
+        original: impl AsRef<Path>,
+        new_dir: RawFd,
+        link: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            old_dir,
+            old: c_path(original.as_ref())?,
+            new_dir,
+            new: c_path(link.as_ref())?,
+            flags: 0,
+        })
+    }
+
+    /// Sets the `AT_*` flags: `AT_SYMLINK_FOLLOW` links what a symbolic link
+    /// at `original` points to.
+    pub fn flags(mut self, flags: i32) -> Self {
+        self.flags = flags;
+        self
+    }
+}
+
+// SAFETY: the entry points to the two paths, which the operation owns. A
+// link posts one completion.
+unsafe impl Operation for LinkAt {
+    type Output = io::Result<()>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_LINKAT;
+        sqe.fd = self.old_dir;
+        sqe.addr = path_addr(&self.old);
+        sqe.off = path_addr(&self.new);
+        sqe.len = self.new_dir.cast_unsigned();
+        sqe.op_flags = self.flags.cast_unsigned();
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        completion.result().map(drop)
+    }
+}
+
+/// Makes a symbolic link, like `symlinkat(2)`.
+#[derive(Debug)]
+pub struct SymlinkAt {
+    dir: RawFd,
+    target: CString,
+    link: CString,
+}
+
+impl SymlinkAt {
+    /// Makes `link` a symbolic link to `target`, relative to the working
+    /// directory if `link` is relative. The link holds `target` as given,
+    /// which need not exist.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if a path contains a nul byte.
+    pub fn new(target: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<Self> {
+        Self::at(target, libc::AT_FDCWD, link)
+    }
+
+    /// Makes `link`, relative to the directory open as `dir` if it is
+    /// relative, a symbolic link to `target`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`SymlinkAt::new`].
+    pub fn at(target: impl AsRef<Path>, dir: RawFd, link: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(Self {
+            dir,
+            target: c_path(target.as_ref())?,
+            link: c_path(link.as_ref())?,
+        })
+    }
+}
+
+// SAFETY: the entry points to the two paths, which the operation owns. A
+// symlink posts one completion.
+unsafe impl Operation for SymlinkAt {
+    type Output = io::Result<()>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_SYMLINKAT;
+        sqe.fd = self.dir;
+        sqe.addr = path_addr(&self.target);
+        sqe.off = path_addr(&self.link);
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        completion.result().map(drop)
+    }
+}
+
+/// Writes back the dirty pages of a range of a file, like
+/// `sync_file_range(2)`: the data alone, with nothing said about the file's
+/// metadata, so it does not promise the data can be found after a crash as
+/// [`Fsync`] does. It is for pacing writes: a file written in bulk fills
+/// the page cache until the kernel writes back whatever it chooses, and
+/// syncing each range as it is written keeps the dirty pages few.
+///
+/// It waits for write-back of the range already in flight, starts
+/// write-back of its dirty pages, and waits for that to finish, unless
+/// [`flags`](SyncFileRange::flags) pick fewer of the three.
+#[derive(Debug)]
+pub struct SyncFileRange {
+    fd: Fd,
+    offset: u64,
+    len: u32,
+    flags: u32,
+}
+
+impl SyncFileRange {
+    /// Writes back `len` bytes of the file open as `fd` from `offset`, or
+    /// through the end of the file if `len` is 0. The kernel takes the
+    /// length in 32 bits; a longer range takes more than one operation.
+    pub fn new(fd: impl Into<Fd>, offset: u64, len: u32) -> Self {
+        Self {
+            fd: fd.into(),
+            offset,
+            len,
+            flags: libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                | libc::SYNC_FILE_RANGE_WRITE
+                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+        }
+    }
+
+    /// Sets the `SYNC_FILE_RANGE_*` flags: `WAIT_BEFORE`, `WRITE` and
+    /// `WAIT_AFTER`, in any combination. `WRITE` alone starts write-back
+    /// without waiting for it.
+    pub fn flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+}
+
+// SAFETY: the entry points to no memory, and a sync posts one completion.
+unsafe impl Operation for SyncFileRange {
+    type Output = io::Result<()>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_SYNC_FILE_RANGE;
+        self.fd.apply(sqe);
+        sqe.off = self.offset;
+        sqe.len = self.len;
+        sqe.op_flags = self.flags;
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        completion.result().map(drop)
+    }
+}
+
+/// Tells the kernel how a range of a file will be used, like
+/// `posix_fadvise(2)`: read in order or at random, soon, or not again.
+///
+/// `POSIX_FADV_WILLNEED` starts reading the range into the page cache, and
+/// `POSIX_FADV_DONTNEED` drops its clean pages from the cache; those two
+/// run in an io-wq worker. `NORMAL`, `SEQUENTIAL` and `RANDOM` set how far
+/// the kernel reads ahead, on the file rather than the range, and
+/// complete on the ring.
+#[derive(Debug)]
+pub struct Fadvise {
+    fd: Fd,
+    offset: u64,
+    len: u64,
+    advice: i32,
+}
+
+impl Fadvise {
+    /// Gives `advice`, a `POSIX_FADV_*` value, about `len` bytes of the
+    /// file open as `fd` from `offset`, or through the end of the file if
+    /// `len` is 0.
+    pub fn new(fd: impl Into<Fd>, offset: u64, len: u64, advice: i32) -> Self {
+        Self {
+            fd: fd.into(),
+            offset,
+            len,
+            advice,
+        }
+    }
+}
+
+// SAFETY: the entry points to no memory, and advice posts one completion.
+unsafe impl Operation for Fadvise {
+    type Output = io::Result<()>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_FADVISE;
+        self.fd.apply(sqe);
+        sqe.off = self.offset;
+        sqe.addr = self.len;
+        sqe.op_flags = self.advice.cast_unsigned();
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        completion.result().map(drop)
+    }
+}
+
 /// Closes a plain descriptor, like `close(2)`, reporting what closing it
 /// found, such as an error writing back data.
 ///
@@ -588,6 +820,18 @@ mod tests {
         assert_eq!((sqe.opcode, sqe.op_flags), (sys::IORING_OP_FSYNC, 0));
         let sqe = entry(&mut Fsync::new(3).data_only());
         assert_eq!(sqe.op_flags, sys::IORING_FSYNC_DATASYNC);
+    }
+
+    /// Whether a range sync waits is likewise invisible to a test; the entry
+    /// shows that it waits on both sides of the write-back by default.
+    #[test]
+    fn a_range_sync_waits_before_and_after_by_default() {
+        let sqe = entry(&mut SyncFileRange::new(3, 4096, 8192));
+        assert_eq!(sqe.opcode, sys::IORING_OP_SYNC_FILE_RANGE);
+        assert_eq!((sqe.fd, sqe.off, sqe.len), (3, 4096, 8192));
+        assert_eq!(sqe.op_flags, 1 | 2 | 4);
+        let mut write = SyncFileRange::new(3, 0, 0).flags(libc::SYNC_FILE_RANGE_WRITE);
+        assert_eq!(entry(&mut write).op_flags, 2);
     }
 }
 
