@@ -9,14 +9,16 @@ use std::marker::PhantomData;
 use std::mem;
 use std::net;
 use std::ops::Deref;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::ptr;
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
 use ruio_driver::buf::{BufBundle, BufPool, BufResult, IoBuf, IoBufMut, IoBufs, Slice};
-use ruio_driver::ops::{self, Recv, Send, SendVectored, Shutdown};
+use ruio_driver::ops::{
+    self, GetSockOpt, InstallFd, OptionValue, Recv, Send, SendVectored, SetSockOpt, Shutdown,
+};
 use ruio_driver::{Completion, Descriptor, DirectFd, Driver, Fd, Op, Operation, SentFd, SockAddr};
 
 use std::rc::Rc;
@@ -33,6 +35,37 @@ fn poll_gate(gate: &mut Option<&Behind>, cx: &mut Context<'_>) -> Poll<io::Resul
     let result = ready!(behind.poll_done(cx));
     *gate = None;
     Poll::Ready(result)
+}
+
+/// Reads the option `name` of `level` of the socket `fd` with
+/// `getsockopt(2)`, into a value of `T`; bytes the kernel does not write are
+/// zero.
+fn getsockopt<T: OptionValue>(fd: RawFd, level: i32, name: i32) -> io::Result<T> {
+    // SAFETY: every byte pattern is a value of an `OptionValue`, zeroes
+    // among them.
+    let mut value: T = unsafe { mem::zeroed() };
+    let mut len = size_of::<T>() as libc::socklen_t;
+    // SAFETY: `value` has room for `len` bytes and `len` for its length,
+    // which is all the kernel writes.
+    let got = unsafe { libc::getsockopt(fd, level, name, (&raw mut value).cast(), &mut len) };
+    if got == 0 {
+        Ok(value)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Sets the option `name` of `level` of the socket `fd` to `value` with
+/// `setsockopt(2)`.
+fn setsockopt<T: OptionValue>(fd: RawFd, level: i32, name: i32, value: &T) -> io::Result<()> {
+    let len = size_of::<T>() as libc::socklen_t;
+    // SAFETY: `value` is `len` readable bytes, which is all the kernel reads.
+    let set = unsafe { libc::setsockopt(fd, level, name, ptr::from_ref(value).cast(), len) };
+    if set == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Makes a type `!Send` and `!Sync`: sockets and files belong to the thread
@@ -308,8 +341,12 @@ impl<S: AsRawFd + Into<OwnedFd>> Sock<S> {
         (self.driver.get_or_init(|| driver).clone(), fd)
     }
 
-    /// The standard library's socket, for what only a plain descriptor can
-    /// do.
+    /// The standard library's type, for what only a plain descriptor can do
+    /// and a direct one is not given a plain descriptor for.
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` for a direct descriptor.
     pub(crate) fn plain(&self) -> io::Result<&S> {
         match &self.desc {
             Desc::Plain(socket) => Ok(socket),
@@ -317,6 +354,85 @@ impl<S: AsRawFd + Into<OwnedFd>> Sock<S> {
                 io::ErrorKind::Unsupported,
                 "not available for a direct descriptor",
             )),
+        }
+    }
+    /// Runs `f` on the standard library's socket, for what only a plain
+    /// descriptor can do, such as `getsockname(2)`: the socket's own, or, for
+    /// a direct descriptor, one installed for the call through the ring
+    /// ([`InstallFd`]) and closed after it, which leaves the slot's file
+    /// open, as both refer to the one file.
+    pub(crate) async fn with_plain<R>(&self, f: impl FnOnce(&S) -> io::Result<R>) -> io::Result<R>
+    where
+        S: From<OwnedFd>,
+    {
+        match &self.desc {
+            Desc::Plain(socket) => f(socket),
+            Desc::Direct(_) => {
+                let installed = self.op(InstallFd::new).await?;
+                f(&S::from(installed))
+            }
+        }
+    }
+
+    /// The socket as a plain descriptor: a plain one as it is, and a direct
+    /// one with its file installed as a descriptor of the process through
+    /// the ring, and its slot closed, on its ring, as the direct descriptor
+    /// goes. An operation the kernel has issued on the slot finishes, as the
+    /// kernel holds the file for it; one waiting in a chain behind another is
+    /// issued, and finds its file, only once that one completes, so the
+    /// caller sees to it that none is waiting.
+    pub(crate) async fn into_plain(self) -> io::Result<Self>
+    where
+        S: From<OwnedFd>,
+    {
+        match &self.desc {
+            Desc::Plain(_) => Ok(self),
+            Desc::Direct(_) => {
+                let installed = self.op(InstallFd::new).await?;
+                Ok(Sock::from_std(S::from(installed)))
+            }
+        }
+    }
+
+    /// Sets the option `name` of `level` to `value`: with `setsockopt(2)` on
+    /// a plain descriptor, at once, as the standard library sets it, and
+    /// through the ring on a direct descriptor, which has no file descriptor
+    /// for the call. A system call is the cheaper of the two where there is
+    /// a choice: an option through the ring costs a round trip of the ring
+    /// when awaited alone.
+    pub(crate) async fn set_option<T: OptionValue>(
+        &self,
+        level: i32,
+        name: i32,
+        value: T,
+    ) -> io::Result<()> {
+        match &self.desc {
+            Desc::Plain(socket) => setsockopt(socket.as_raw_fd(), level, name, &value),
+            Desc::Direct(_) => {
+                self.op(move |fd| SetSockOpt::new(fd, level, name, value))
+                    .await
+            }
+        }
+    }
+
+    /// Reads the option `name` of `level`: with `getsockopt(2)` on a plain
+    /// descriptor, at once; on a direct descriptor through the ring for an
+    /// option of `SOL_SOCKET`, which is all the kernel reads there, and
+    /// otherwise with `getsockopt(2)` on a descriptor installed for the call.
+    pub(crate) async fn option<T: OptionValue>(&self, level: i32, name: i32) -> io::Result<T>
+    where
+        S: From<OwnedFd>,
+    {
+        match &self.desc {
+            Desc::Plain(socket) => getsockopt(socket.as_raw_fd(), level, name),
+            Desc::Direct(_) if level == libc::SOL_SOCKET => {
+                self.op(move |fd| GetSockOpt::<T>::new(fd, level, name))
+                    .await
+            }
+            Desc::Direct(_) => {
+                self.with_plain(|socket| getsockopt(socket.as_raw_fd(), level, name))
+                    .await
+            }
         }
     }
 

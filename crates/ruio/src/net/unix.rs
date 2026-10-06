@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::fmt;
+use std::future::poll_fn;
 use std::io;
 use std::marker::PhantomData;
 use std::net::Shutdown;
@@ -161,22 +162,56 @@ impl UnixStream {
 
     /// The socket's own address.
     ///
+    /// A plain descriptor answers at once, with `getsockname(2)`. A direct
+    /// descriptor has no file descriptor to ask with, so one is installed for
+    /// the call through the ring and closed after it; [`into_plain`] gives a
+    /// stream that is asked often a plain descriptor for good.
+    ///
     /// # Errors
     ///
-    /// What `getsockname(2)` reports, and `Unsupported` for a direct
-    /// descriptor.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.sock.plain()?.local_addr()
+    /// What `getsockname(2)` reports.
+    ///
+    /// [`into_plain`]: UnixStream::into_plain
+    pub async fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.sock.with_plain(|stream| stream.local_addr()).await
     }
 
-    /// The peer's address.
+    /// The peer's address, asked for as [`local_addr`](UnixStream::local_addr)
+    /// asks.
     ///
     /// # Errors
     ///
-    /// What `getpeername(2)` reports, and `Unsupported` for a direct
-    /// descriptor.
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.sock.plain()?.peer_addr()
+    /// What `getpeername(2)` reports.
+    pub async fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.sock.with_plain(|stream| stream.peer_addr()).await
+    }
+
+    /// Takes the error pending on the socket, `SO_ERROR`, if there is one,
+    /// which clears it: a plain descriptor answers at once, with
+    /// `getsockopt(2)`, and a direct one through the ring.
+    ///
+    /// # Errors
+    ///
+    /// What `getsockopt(2)` reports.
+    pub async fn take_error(&self) -> io::Result<Option<io::Error>> {
+        let errno: i32 = self.sock.option(libc::SOL_SOCKET, libc::SO_ERROR).await?;
+        Ok((errno != 0).then(|| io::Error::from_raw_os_error(errno)))
+    }
+
+    /// The stream as a plain descriptor, the writes behind it finished first;
+    /// see [`TcpStream::into_plain`](super::TcpStream::into_plain).
+    ///
+    /// # Errors
+    ///
+    /// What installing the descriptor reports.
+    pub async fn into_plain(self) -> io::Result<Self> {
+        // The error, if one failed, waits for the next write to report it.
+        let _ = poll_fn(|cx| self.behind.poll_done(cx)).await;
+        Ok(Self {
+            sock: self.sock.into_plain().await?,
+            behind: self.behind,
+            _thread: PhantomData,
+        })
     }
 
     /// Whether the stream is a direct descriptor; see

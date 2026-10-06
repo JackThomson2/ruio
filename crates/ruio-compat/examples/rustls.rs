@@ -119,7 +119,7 @@ fn main() -> io::Result<()> {
                         continue;
                     }
                 };
-                stream.set_nodelay(true)?;
+                stream.set_nodelay(true).await?;
                 let acceptor = acceptor.clone();
                 let http = http.clone();
                 let stream = Compat::with_pool(&pool, stream);

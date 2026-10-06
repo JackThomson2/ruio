@@ -9,6 +9,7 @@ use std::net::{self, Shutdown, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use ruio_driver::buf::{BufPool, IoBuf, IoBufMut, IoBufs};
 use ruio_driver::ops::{self, Accept, AcceptMulti, AcceptStream, Connect, Recv, Send, Socket};
@@ -17,7 +18,7 @@ use ruio_driver::{Descriptor, Driver, Fd};
 use super::addr::{ToSocketAddrs, resolve};
 use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
-    Desc, Plain, ReadExact, RecvStream, SendZc, Sent, Sock, SocketOp, ThreadBound, WriteAll,
+    Plain, ReadExact, RecvStream, SendZc, Sent, Sock, SocketOp, ThreadBound, WriteAll,
     WriteAllVectored, bind_reuseport,
 };
 
@@ -109,10 +110,11 @@ impl TcpListener {
     /// thread's ring, or plain descriptors again.
     ///
     /// A direct descriptor saves the kernel looking up the socket for each
-    /// operation, and costs no file descriptor of the process. But only the
-    /// ring can use it: a direct [`TcpStream`] cannot tell its local address
-    /// or change socket options, and knows its peer's address only if
-    /// [`accept`](TcpListener::accept) accepted it.
+    /// operation, and costs no file descriptor of the process. Its options
+    /// are set and read through the ring as a plain stream's are; its
+    /// addresses, which only a file descriptor can ask for, cost it one
+    /// installed for the call, unless [`accept`](TcpListener::accept) told
+    /// it its peer's.
     ///
     /// The ring's registered file table holds the direct descriptors; see
     /// [`ruio_driver::Builder::files`]. When it is full, the kernel closes the
@@ -240,8 +242,9 @@ impl<S> fmt::Debug for Incoming<'_, S> {
 /// kernel.
 pub struct TcpStream {
     sock: Sock<net::TcpStream>,
-    /// The peer's address, where the kernel told it: a direct descriptor
-    /// cannot ask.
+    /// The peer's address, where the kernel told it as the stream connected
+    /// or was accepted, which spares [`peer_addr`](TcpStream::peer_addr) the
+    /// asking.
     peer: Option<SocketAddr>,
     /// The writes behind the stream, which every write waits for.
     behind: Rc<Behind>,
@@ -309,50 +312,158 @@ impl TcpStream {
 
     /// The local address of the connection.
     ///
+    /// A plain descriptor answers at once, with `getsockname(2)`. A direct
+    /// descriptor has no file descriptor to ask with, so one is installed for
+    /// the call through the ring and closed after it; [`into_plain`] gives a
+    /// stream that is asked often a plain descriptor for good.
+    ///
     /// # Errors
     ///
-    /// What `getsockname(2)` reports, and `Unsupported` for a direct
-    /// descriptor.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.sock.plain()?.local_addr()
+    /// What `getsockname(2)` reports.
+    ///
+    /// [`into_plain`]: TcpStream::into_plain
+    pub async fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.sock.with_plain(|stream| stream.local_addr()).await
     }
 
-    /// The peer's address.
+    /// The peer's address: the one the stream connected to, or was accepted
+    /// from by [`TcpListener::accept`], at once; otherwise what
+    /// `getpeername(2)` reports, asked as [`local_addr`](TcpStream::local_addr)
+    /// asks.
     ///
     /// # Errors
     ///
-    /// What `getpeername(2)` reports, and `Unsupported` for a direct
-    /// descriptor from [`TcpListener::incoming`], which has no way to learn
-    /// it.
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        match (self.sock.desc(), self.peer) {
-            (Desc::Plain(stream), _) => stream.peer_addr(),
-            (Desc::Direct(_), Some(peer)) => Ok(peer),
-            (Desc::Direct(_), None) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the peer's address of a direct descriptor from a multishot accept is unknown",
-            )),
+    /// What `getpeername(2)` reports.
+    pub async fn peer_addr(&self) -> io::Result<SocketAddr> {
+        match self.peer {
+            Some(peer) => Ok(peer),
+            None => self.sock.with_plain(|stream| stream.peer_addr()).await,
         }
     }
 
     /// Sets `TCP_NODELAY`, which sends small writes at once rather than
     /// holding them back to fill a segment.
     ///
+    /// A plain descriptor's option is set with `setsockopt(2)`, at once, as
+    /// the standard library sets it; a direct descriptor has no file
+    /// descriptor for the call, so its option goes through the ring, which
+    /// completes it as it is submitted.
+    ///
     /// # Errors
     ///
-    /// What `setsockopt(2)` reports, and `Unsupported` for a direct
-    /// descriptor.
-    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        self.sock.plain()?.set_nodelay(nodelay)
+    /// What `setsockopt(2)` reports.
+    pub async fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.sock
+            .set_option(libc::IPPROTO_TCP, libc::TCP_NODELAY, i32::from(nodelay))
+            .await
     }
 
     /// Whether `TCP_NODELAY` is set.
     ///
+    /// A plain descriptor answers at once, with `getsockopt(2)`. The kernel
+    /// reads an option of `IPPROTO_TCP` through the ring for no descriptor,
+    /// so a direct one answers through a descriptor installed for the call,
+    /// as for [`local_addr`](TcpStream::local_addr).
+    ///
     /// # Errors
     ///
-    /// As for [`set_nodelay`](TcpStream::set_nodelay).
-    pub fn nodelay(&self) -> io::Result<bool> {
-        self.sock.plain()?.nodelay()
+    /// What `getsockopt(2)` reports.
+    pub async fn nodelay(&self) -> io::Result<bool> {
+        let nodelay: i32 = self
+            .sock
+            .option(libc::IPPROTO_TCP, libc::TCP_NODELAY)
+            .await?;
+        Ok(nodelay != 0)
+    }
+
+    /// Sets `IP_TTL`, the time-to-live of the packets sent, as
+    /// [`set_nodelay`](TcpStream::set_nodelay) sets its option.
+    ///
+    /// # Errors
+    ///
+    /// What `setsockopt(2)` reports: `EINVAL` for a value above 255.
+    pub async fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        let ttl = i32::try_from(ttl).unwrap_or(i32::MAX);
+        self.sock
+            .set_option(libc::IPPROTO_IP, libc::IP_TTL, ttl)
+            .await
+    }
+
+    /// `IP_TTL`, read as [`nodelay`](TcpStream::nodelay) reads its option.
+    ///
+    /// # Errors
+    ///
+    /// What `getsockopt(2)` reports.
+    pub async fn ttl(&self) -> io::Result<u32> {
+        let ttl: i32 = self.sock.option(libc::IPPROTO_IP, libc::IP_TTL).await?;
+        Ok(ttl.cast_unsigned())
+    }
+
+    /// Sets `SO_LINGER`: for how long closing the stream waits for data not
+    /// yet sent to go, or `None` for not at all, which is the default; set as
+    /// [`set_nodelay`](TcpStream::set_nodelay) sets its option.
+    ///
+    /// # Errors
+    ///
+    /// What `setsockopt(2)` reports.
+    pub async fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
+        let value = libc::linger {
+            l_onoff: i32::from(linger.is_some()),
+            l_linger: linger.map_or(0, |linger| {
+                i32::try_from(linger.as_secs()).unwrap_or(i32::MAX)
+            }),
+        };
+        self.sock
+            .set_option(libc::SOL_SOCKET, libc::SO_LINGER, value)
+            .await
+    }
+
+    /// `SO_LINGER`: a plain descriptor answers at once, with `getsockopt(2)`,
+    /// and a direct one through the ring, which reads an option of
+    /// `SOL_SOCKET` for it.
+    ///
+    /// # Errors
+    ///
+    /// What `getsockopt(2)` reports.
+    pub async fn linger(&self) -> io::Result<Option<Duration>> {
+        let linger: libc::linger = self.sock.option(libc::SOL_SOCKET, libc::SO_LINGER).await?;
+        Ok((linger.l_onoff != 0)
+            .then(|| Duration::from_secs(linger.l_linger.cast_unsigned().into())))
+    }
+
+    /// Takes the error pending on the socket, `SO_ERROR`, if there is one,
+    /// which clears it; read as [`linger`](TcpStream::linger) is.
+    ///
+    /// # Errors
+    ///
+    /// What `getsockopt(2)` reports.
+    pub async fn take_error(&self) -> io::Result<Option<io::Error>> {
+        let errno: i32 = self.sock.option(libc::SOL_SOCKET, libc::SO_ERROR).await?;
+        Ok((errno != 0).then(|| io::Error::from_raw_os_error(errno)))
+    }
+
+    /// The stream as a plain descriptor: a plain stream as it is, and a
+    /// direct one with its file installed as a descriptor of the process
+    /// through the ring and its slot freed, for what only a file descriptor
+    /// can do, such as handing the connection to a library, or asking its
+    /// addresses often. The writes behind the stream finish first: a chain
+    /// of them is issued one send after another on the slot, and a send not
+    /// yet issued would find the slot gone. One that failed fails the next
+    /// write, as it would have.
+    ///
+    /// # Errors
+    ///
+    /// What installing the descriptor reports: `EMFILE` if the process has
+    /// no descriptor left.
+    pub async fn into_plain(self) -> io::Result<Self> {
+        // The error, if one failed, waits for the next write to report it.
+        let _ = poll_fn(|cx| self.behind.poll_done(cx)).await;
+        Ok(Self {
+            sock: self.sock.into_plain().await?,
+            peer: self.peer,
+            behind: self.behind,
+            _thread: PhantomData,
+        })
     }
 
     /// Whether the stream is a direct descriptor; see

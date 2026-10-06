@@ -61,8 +61,8 @@ fn block_on_this_thread<F: Future>(future: F) -> F::Output {
 async fn connects(listener: &TcpListener, addr: impl ToSocketAddrs) -> io::Result<()> {
     let client = within(TcpStream::connect(addr)).await?;
     let (server, peer) = within(listener.accept()).await?;
-    assert_eq!(peer, client.local_addr()?);
-    assert_eq!(server.local_addr()?, listener.local_addr()?);
+    assert_eq!(peer, client.local_addr().await?);
+    assert_eq!(server.local_addr().await?, listener.local_addr()?);
     Ok(())
 }
 

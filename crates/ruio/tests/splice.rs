@@ -85,7 +85,7 @@ fn a_splice_relays_small_pieces_that_fill_the_pipes_slots() {
     ruio::Runtime::new().unwrap().block_on(async {
         let (source, relay_in) = tcp_pair().await.unwrap();
         let (relay_out, sink) = tcp_pair().await.unwrap();
-        source.set_nodelay(true).unwrap();
+        source.set_nodelay(true).await.unwrap();
         let data = pattern(600_000);
         let feeder = feed(source, data.clone(), 100);
         let relay = ruio::spawn(async move {

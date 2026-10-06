@@ -73,8 +73,9 @@ async fn main() -> io::Result<()> {
                 continue;
             }
         };
-        // Responses go out as soon as they are written.
-        stream.set_nodelay(true)?;
+        // Responses go out as soon as they are written; the option is set
+        // through the ring, in the submission of the connection's first read.
+        stream.set_nodelay(true).await?;
         let io = Compat::with_pool(&pool, stream);
         let connection = http.serve_connection(io, service_fn(serve));
         let _detached = ruio::spawn(async move {

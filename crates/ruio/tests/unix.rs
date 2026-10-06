@@ -75,20 +75,35 @@ async fn streams_connect_to_a_listener() -> io::Result<()> {
     let (server, peer) = within(listener.accept()).await?;
     let client = client.await.unwrap()?;
     assert!(peer.is_unnamed());
-    assert_eq!(client.peer_addr()?.as_pathname(), Some(path.0.as_path()));
+    assert_eq!(
+        client.peer_addr().await?.as_pathname(),
+        Some(path.0.as_path())
+    );
 
     within(client.write_all("over a unix socket")).await.0?;
     let (read, buf) = within(server.read_exact(Vec::with_capacity(18))).await;
     read?;
     assert_eq!(buf, b"over a unix socket");
 
+    // A direct stream asks its addresses through a descriptor installed for
+    // the call, and is given one for good by `into_plain`.
     listener.set_direct(true);
     let mut incoming = listener.incoming();
     let _client = ruio::spawn(UnixStream::connect(path.0.clone()));
     let direct = within(incoming.next()).await.unwrap()?;
     assert!(direct.is_direct());
-    let unsupported = direct.peer_addr().unwrap_err();
-    assert_eq!(unsupported.kind(), ErrorKind::Unsupported);
+    assert_eq!(
+        within(direct.local_addr()).await?.as_pathname(),
+        Some(path.0.as_path())
+    );
+    assert!(within(direct.peer_addr()).await?.is_unnamed());
+    assert!(within(direct.take_error()).await?.is_none());
+    let plain = within(direct.into_plain()).await?;
+    assert!(!plain.is_direct());
+    assert_eq!(
+        within(plain.local_addr()).await?.as_pathname(),
+        Some(path.0.as_path())
+    );
     Ok(())
 }
 

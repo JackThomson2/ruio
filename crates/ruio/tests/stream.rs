@@ -66,7 +66,7 @@ async fn incoming_yields_connections_through_combinators() -> io::Result<()> {
     .await;
     assert_eq!(accepted.len(), 3);
     let fourth = within(StreamExt::next(&mut incoming)).await.unwrap()?;
-    assert!(fourth.peer_addr().is_ok());
+    assert!(fourth.peer_addr().await.is_ok());
     assert!(!incoming.is_terminated());
     drop(clients.await.unwrap());
     Ok(())

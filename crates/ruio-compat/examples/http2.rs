@@ -68,7 +68,7 @@ async fn main() -> io::Result<()> {
                 continue;
             }
         };
-        stream.set_nodelay(true)?;
+        stream.set_nodelay(true).await?;
         let connection = http.serve_connection(Compat::with_pool(&pool, stream), service_fn(serve));
         let _detached = ruio::spawn(async move {
             if let Err(err) = connection.await {

@@ -62,7 +62,7 @@ async fn a_server_echoes_what_its_clients_send() -> io::Result<()> {
         .map(|client| {
             ruio::spawn(async move {
                 let stream = within(TcpStream::connect(addr)).await?;
-                assert_eq!(stream.peer_addr()?, addr);
+                assert_eq!(stream.peer_addr().await?, addr);
                 let message = pattern(5000, client);
                 within(stream.write_all(message.clone())).await.0?;
                 let echo = Vec::with_capacity(message.len());
@@ -375,7 +375,7 @@ async fn listeners_bound_with_reuseport_share_an_address() -> io::Result<()> {
         // Past the last connection waiting, an accept waits.
         let wait = Duration::from_millis(100);
         while let Ok((stream, _)) = listener.accept().timeout(wait).await {
-            assert_eq!(stream.local_addr()?, addr);
+            assert_eq!(stream.local_addr().await?, addr);
             *count += 1;
         }
     }
@@ -522,12 +522,22 @@ async fn accept_reports_the_peer() -> io::Result<()> {
     let client = ruio::spawn(TcpStream::connect(addr));
     let (server, peer) = within(listener.accept()).await?;
     let client = client.await.unwrap()?;
-    assert_eq!(peer, client.local_addr()?);
-    assert_eq!(server.peer_addr()?, peer);
-    assert_eq!(server.local_addr()?, addr);
+    assert_eq!(peer, client.local_addr().await?);
+    assert_eq!(server.peer_addr().await?, peer);
+    assert_eq!(server.local_addr().await?, addr);
     assert!(!server.is_direct());
-    server.set_nodelay(true)?;
-    assert!(server.nodelay()?);
+    assert!(!within(server.nodelay()).await?);
+    within(server.set_nodelay(true)).await?;
+    assert!(within(server.nodelay()).await?);
+    assert_eq!(within(server.ttl()).await?, 64);
+    within(server.set_ttl(100)).await?;
+    assert_eq!(within(server.ttl()).await?, 100);
+    assert_eq!(within(server.linger()).await?, None);
+    within(server.set_linger(Some(Duration::from_secs(3)))).await?;
+    assert_eq!(within(server.linger()).await?, Some(Duration::from_secs(3)));
+    within(server.set_linger(None)).await?;
+    assert_eq!(within(server.linger()).await?, None);
+    assert!(within(server.take_error()).await?.is_none());
     Ok(())
 }
 
@@ -653,6 +663,9 @@ async fn a_stream_sends_zero_copy() -> io::Result<()> {
     Ok(())
 }
 
+/// A direct stream's options are set and read as a plain one's are, through
+/// the ring; its addresses, which only a file descriptor can ask for, come
+/// through one installed for the call.
 #[ruio::test]
 async fn a_listener_accepts_direct_streams_on_request() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -662,9 +675,17 @@ async fn a_listener_accepts_direct_streams_on_request() -> io::Result<()> {
     let (server, peer) = within(listener.accept()).await?;
     let client = client.await.unwrap()?;
     assert!(server.is_direct() && !client.is_direct());
-    assert_eq!(server.peer_addr()?, peer);
-    let unsupported = server.local_addr().unwrap_err();
-    assert_eq!(unsupported.kind(), ErrorKind::Unsupported);
+    assert_eq!(server.peer_addr().await?, peer);
+    assert_eq!(within(server.local_addr()).await?, addr);
+
+    assert!(!within(server.nodelay()).await?);
+    within(server.set_nodelay(true)).await?;
+    assert!(within(server.nodelay()).await?);
+    within(server.set_ttl(77)).await?;
+    assert_eq!(within(server.ttl()).await?, 77);
+    within(server.set_linger(Some(Duration::from_secs(2)))).await?;
+    assert_eq!(within(server.linger()).await?, Some(Duration::from_secs(2)));
+    assert!(within(server.take_error()).await?.is_none());
 
     within(client.write_all("ping")).await.0?;
     let (read, buf) = within(server.read_exact(Vec::with_capacity(4))).await;
@@ -674,13 +695,52 @@ async fn a_listener_accepts_direct_streams_on_request() -> io::Result<()> {
     read?;
     assert_eq!(buf, b"ping");
 
-    // A multishot accept cannot learn the peer's address.
+    // A multishot accept learns no peer's address; the stream asks for it.
     let mut incoming = listener.incoming();
-    let _client = ruio::spawn(TcpStream::connect(addr));
+    let client = ruio::spawn(TcpStream::connect(addr));
     let server = within(incoming.next()).await.unwrap()?;
+    let client = client.await.unwrap()?;
     assert!(server.is_direct());
-    let unknown = server.peer_addr().unwrap_err();
-    assert_eq!(unknown.kind(), ErrorKind::Unsupported);
+    assert_eq!(
+        within(server.peer_addr()).await?,
+        client.local_addr().await?
+    );
+    Ok(())
+}
+
+/// A direct stream becomes a plain one through `into_plain`: the same
+/// connection, with a file descriptor of the process, and the writes behind
+/// it carried over.
+#[ruio::test]
+async fn a_direct_stream_becomes_a_plain_one() -> io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_direct(true);
+    let addr = listener.local_addr()?;
+    let client = ruio::spawn(TcpStream::connect(addr));
+    let (server, peer) = within(listener.accept()).await?;
+    let client = client.await.unwrap()?;
+    assert!(server.is_direct());
+    within(server.set_nodelay(true)).await?;
+    within(server.write_behind(vec![pattern(100_000, 7)])).await?;
+
+    let server = within(server.into_plain()).await?;
+    assert!(!server.is_direct());
+    assert_eq!(server.peer_addr().await?, peer);
+    assert_eq!(server.local_addr().await?, addr);
+    assert!(within(server.nodelay()).await?, "the option stays set");
+    within(server.write_all("tail")).await.0?;
+    let (read, buf) = within(client.read_exact(Vec::with_capacity(100_004))).await;
+    read?;
+    assert_eq!(&buf[..100_000], &pattern(100_000, 7)[..]);
+    assert_eq!(&buf[100_000..], b"tail");
+
+    // A plain stream is given back as it is.
+    let client = within(client.into_plain()).await?;
+    assert!(!client.is_direct());
+    within(client.write_all("again")).await.0?;
+    let (read, buf) = within(server.read_exact(Vec::with_capacity(5))).await;
+    read?;
+    assert_eq!(buf, b"again");
     Ok(())
 }
 

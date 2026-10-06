@@ -86,7 +86,7 @@ async fn ruio_round_trips(
     until: Instant,
 ) -> io::Result<u64> {
     let stream = ruio::net::TcpStream::connect(addr).await?;
-    stream.set_nodelay(true)?;
+    stream.set_nodelay(true).await?;
     let mut message = vec![0x5a; size];
     let mut echo = Vec::with_capacity(size);
     let mut count = 0;
