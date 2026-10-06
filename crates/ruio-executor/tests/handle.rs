@@ -299,6 +299,58 @@ fn a_remote_task_can_be_aborted() {
     });
 }
 
+/// An abort handle aborts the task from another thread, while the join
+/// handle awaits it; clones abort the same task, and a finished task is left
+/// as it is.
+#[test]
+fn an_abort_handle_aborts_from_another_thread() {
+    let runtime = Runtime::new().unwrap();
+    let handle = runtime.handle();
+    let (started, has_started) = oneshot::channel();
+    runtime.block_on(async {
+        let task = handle.spawn(async move {
+            started.send(()).unwrap();
+            pending::<()>().await;
+        });
+        let abort = task.abort_handle();
+        assert!(!abort.is_finished());
+        has_started.await.unwrap();
+        let aborter = thread::spawn(move || {
+            let clone = abort.clone();
+            clone.abort();
+            abort
+        });
+        assert!(task.await.unwrap_err().is_cancelled());
+        let abort = aborter.join().unwrap();
+        assert!(abort.is_finished());
+
+        let mut task = handle.spawn(async { 5 });
+        let abort = task.abort_handle();
+        assert_eq!((&mut task).await.unwrap(), 5);
+        abort.abort();
+        assert!(abort.is_finished());
+        drop(task);
+        // The handle keeps the task's memory, and still answers.
+        assert!(abort.is_finished());
+    });
+}
+
+/// Dropping every abort handle leaves the task to run and its join handle
+/// to get the output.
+#[test]
+fn dropping_an_abort_handle_leaves_the_task_alone() {
+    let runtime = Runtime::new().unwrap();
+    let handle = runtime.handle();
+    runtime.block_on(async {
+        let task = handle.spawn(async {
+            yield_now().await;
+            8
+        });
+        drop(task.abort_handle());
+        assert_eq!(task.await.unwrap(), 8);
+    });
+}
+
 /// A runtime that shuts down drops the spawns it has not run, and refuses
 /// those that come after: their handles report them cancelled.
 #[test]

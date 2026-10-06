@@ -68,9 +68,9 @@
 //! merge with its shutdown signal through `select`.
 
 pub use ruio_executor::{
-    AbortHandle, Builder, Core, Cores, Handle, JoinError, JoinHandle, JoinSet, RemoteJoinHandle,
-    Runtime, core, core_count, driver, handle, handle_of, spawn, spawn_blocking, spawn_on,
-    yield_now,
+    AbortHandle, Builder, Core, Cores, Handle, JoinError, JoinHandle, JoinSet, RemoteAbortHandle,
+    RemoteJoinHandle, Runtime, core, core_count, driver, handle, handle_of, spawn, spawn_blocking,
+    spawn_on, yield_now,
 };
 pub use ruio_executor::{blocking, sync, time};
 pub use ruio_macros::{main, test};

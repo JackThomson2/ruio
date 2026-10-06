@@ -73,7 +73,7 @@ pub use handle::Handle;
 pub use join_set::JoinSet;
 pub use ruio_driver::Driver;
 pub use runtime::{Builder, Runtime};
-pub use task::{AbortHandle, JoinError, JoinHandle, RemoteJoinHandle};
+pub use task::{AbortHandle, JoinError, JoinHandle, RemoteAbortHandle, RemoteJoinHandle};
 
 /// A handle that spawns tasks onto the thread's runtime from any thread;
 /// see [`Handle`].

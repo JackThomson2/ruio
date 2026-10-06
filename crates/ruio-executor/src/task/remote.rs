@@ -413,7 +413,8 @@ pub(crate) fn cancel_spawned(task: RemoteRef) {
 /// cancelled: aborted, or its runtime shut down before it finished. Dropping
 /// the handle leaves the task running, detached, its output dropped on its
 /// own thread. The handle is a reference to the task, and keeps the task's
-/// memory until it is dropped.
+/// memory until it is dropped; [`abort_handle`](RemoteJoinHandle::abort_handle)
+/// gives another, which aborts the task without awaiting it.
 ///
 /// ```
 /// fn assert_send_sync<T: Send + Sync>() {}
@@ -451,6 +452,15 @@ impl<T> RemoteJoinHandle<T> {
         // SAFETY: as for `abort`.
         unsafe { (self.task.header().vtable.is_finished)(self.task.as_ptr()) }
     }
+
+    /// A handle that aborts the task without awaiting it, from whichever
+    /// thread, which can be kept or given away while this handle awaits the
+    /// output; see [`RemoteAbortHandle`].
+    pub fn abort_handle(&self) -> RemoteAbortHandle {
+        RemoteAbortHandle {
+            task: self.task.clone(),
+        }
+    }
 }
 
 impl<T> Future for RemoteJoinHandle<T> {
@@ -467,6 +477,50 @@ impl<T> Drop for RemoteJoinHandle<T> {
     fn drop(&mut self) {
         // SAFETY: as for `abort`.
         unsafe { (self.task.header().vtable.detach)(self.task.as_ptr()) }
+    }
+}
+
+/// Aborts a task spawned from another thread without awaiting its output;
+/// made by [`RemoteJoinHandle::abort_handle`].
+///
+/// `Send` and `Sync`, unlike an [`AbortHandle`](super::AbortHandle): the
+/// handle, and its clones, abort the task from whichever thread. Dropping
+/// one neither aborts the task nor detaches it, as dropping the
+/// [`RemoteJoinHandle`] does: the task runs on, and its output goes to the
+/// join handle, if there is one. A handle keeps the task's memory until it
+/// is dropped.
+///
+/// ```
+/// fn assert_send_sync<T: Send + Sync>() {}
+/// assert_send_sync::<ruio_executor::RemoteAbortHandle>();
+/// ```
+#[derive(Clone)]
+pub struct RemoteAbortHandle {
+    task: RemoteRef,
+}
+
+impl RemoteAbortHandle {
+    /// Cancels the task; see [`RemoteJoinHandle::abort`].
+    pub fn abort(&self) {
+        // SAFETY: the reference keeps the task alive, the vtable is the
+        // task's own, and the task is one spawned from another thread, whose
+        // abort any thread may call.
+        unsafe { (self.task.header().vtable.abort)(self.task.as_ptr()) }
+    }
+
+    /// Whether the task has finished, by completing, panicking or being
+    /// cancelled.
+    pub fn is_finished(&self) -> bool {
+        // SAFETY: as for `abort`.
+        unsafe { (self.task.header().vtable.is_finished)(self.task.as_ptr()) }
+    }
+}
+
+impl fmt::Debug for RemoteAbortHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteAbortHandle")
+            .field("finished", &self.is_finished())
+            .finish_non_exhaustive()
     }
 }
 

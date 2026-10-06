@@ -42,7 +42,7 @@ use crate::{context, coop};
 
 mod remote;
 
-pub use remote::RemoteJoinHandle;
+pub use remote::{RemoteAbortHandle, RemoteJoinHandle};
 pub(crate) use remote::{RemoteTask, adopt_spawned, cancel_spawned};
 
 /// A spawned future and, once it finishes, its output. The header comes
