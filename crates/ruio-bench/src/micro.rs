@@ -28,6 +28,21 @@
 //! - `stream fold`: the same thousand, taken out through
 //!   `StreamExt::take(1000).fold`: the combinators over the trait against
 //!   the loop over the method.
+//! - `sockopt`: set `TCP_NODELAY` on a plain stream, on and off in turn: a
+//!   `setsockopt(2)` on either runtime.
+//! - `sockopt direct`: the same on a direct descriptor, which only the ring
+//!   can set an option on: a request the kernel completes as it is
+//!   submitted.
+//! - `write read`: a byte written to the peer and read back from it, on a
+//!   direct pair on ruio and a plain one on tokio: what the next two add
+//!   their option to.
+//! - `sockopt direct in turn`: set the option on the direct stream, write
+//!   the byte and read it, each awaited before the next.
+//! - `sockopt direct batched`: the same, the option and the write polled
+//!   together, so that one submission takes both to the kernel: the option
+//!   costs no system call of its own, as it costs none in a loaded runtime,
+//!   whose turn submits every task's requests together. tokio's stream is
+//!   plain, and its option a system call, in both rows.
 //! - `broadcast`: a value to another task and one back through broadcast
 //!   channels with one receiver each.
 //! - `watch`: a value to another task and one back through watch channels:
@@ -200,6 +215,31 @@ pub(crate) const ALL: &[Micro] = &[
         name: "stream fold",
         ruio: ruio_stream_fold,
         tokio: Some(tokio_stream_fold),
+    },
+    Micro {
+        name: "sockopt",
+        ruio: ruio_sockopt,
+        tokio: Some(tokio_sockopt),
+    },
+    Micro {
+        name: "sockopt direct",
+        ruio: ruio_sockopt_direct,
+        tokio: None,
+    },
+    Micro {
+        name: "write read",
+        ruio: ruio_write_read,
+        tokio: Some(tokio_write_read),
+    },
+    Micro {
+        name: "sockopt direct in turn",
+        ruio: ruio_sockopt_in_turn,
+        tokio: Some(tokio_sockopt_in_turn),
+    },
+    Micro {
+        name: "sockopt direct batched",
+        ruio: ruio_sockopt_batched,
+        tokio: Some(tokio_sockopt_in_turn),
     },
     Micro {
         name: "broadcast",
@@ -1353,6 +1393,151 @@ fn tokio_stream_fold(load: &Load) -> io::Result<f64> {
                 .fold(0, |sum, value| async move { sum + value })
                 .await;
             assert_eq!(sum, DRAINED * (DRAINED - 1) / 2);
+        })
+        .await)
+    })
+}
+
+/// A connected pair of ruio TCP streams, the accepted one a direct
+/// descriptor.
+async fn ruio_direct_pair() -> io::Result<(ruio::net::TcpStream, ruio::net::TcpStream)> {
+    let listener = ruio::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_direct(true);
+    let addr = listener.local_addr()?;
+    let client = ruio::spawn(ruio::net::TcpStream::connect(addr));
+    let (server, _) = listener.accept().await?;
+    Ok((server, client.await.map_err(io::Error::other)??))
+}
+
+/// Sets `TCP_NODELAY` on `stream`, on and off in turn, through the ring.
+async fn ruio_toggle_nodelay(measure: Duration, stream: &ruio::net::TcpStream) -> f64 {
+    let mut on = false;
+    rate(measure, async || {
+        on = !on;
+        stream.set_nodelay(on).await.expect("the option is set");
+    })
+    .await
+}
+
+/// `TCP_NODELAY` set on a plain stream, on and off in turn, through the ring.
+fn ruio_sockopt(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (stream, _peer) = ruio_pair().await?;
+        Ok(ruio_toggle_nodelay(measure, &stream).await)
+    })
+}
+
+/// The same on a direct descriptor.
+fn ruio_sockopt_direct(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (stream, _peer) = ruio_direct_pair().await?;
+        assert!(stream.is_direct());
+        Ok(ruio_toggle_nodelay(measure, &stream).await)
+    })
+}
+
+fn tokio_sockopt(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let (stream, _peer) = tokio_pair().await?;
+        let mut on = false;
+        Ok(rate(measure, async || {
+            on = !on;
+            stream.set_nodelay(on).expect("the option is set");
+        })
+        .await)
+    })
+}
+
+/// A byte written to the peer and read back from it, on a direct pair.
+fn ruio_write_read(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (a, b) = ruio_direct_pair().await?;
+        let mut buf = Some(Vec::with_capacity(1));
+        Ok(rate(measure, async || {
+            a.write("x").await.0.expect("the byte is written");
+            let (read, taken) = b.read(buf.take().expect("the buffer is back")).await;
+            assert_eq!(read.expect("the byte is read"), 1);
+            buf = Some(taken);
+        })
+        .await)
+    })
+}
+
+fn tokio_write_read(load: &Load) -> io::Result<f64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let (mut a, mut b) = tokio_pair().await?;
+        let mut byte = [0u8; 1];
+        Ok(rate(measure, async || {
+            a.write_all(b"x").await.expect("the byte is written");
+            b.read_exact(&mut byte).await.expect("the byte is read");
+        })
+        .await)
+    })
+}
+
+/// The option set on the direct stream, a byte written and read from the
+/// peer, each awaited before the next.
+fn ruio_sockopt_in_turn(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (a, b) = ruio_direct_pair().await?;
+        let mut on = false;
+        let mut buf = Some(Vec::with_capacity(1));
+        Ok(rate(measure, async || {
+            on = !on;
+            a.set_nodelay(on).await.expect("the option is set");
+            a.write("x").await.0.expect("the byte is written");
+            let (read, taken) = b.read(buf.take().expect("the buffer is back")).await;
+            assert_eq!(read.expect("the byte is read"), 1);
+            buf = Some(taken);
+        })
+        .await)
+    })
+}
+
+/// The option and the write polled together, so that one submission takes
+/// both to the kernel, then the byte read from the peer.
+fn ruio_sockopt_batched(load: &Load) -> io::Result<f64> {
+    use futures_util::future::join;
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (a, b) = ruio_direct_pair().await?;
+        let mut on = false;
+        let mut buf = Some(Vec::with_capacity(1));
+        Ok(rate(measure, async || {
+            on = !on;
+            let (set, (written, _)) = join(a.set_nodelay(on), a.write("x")).await;
+            set.expect("the option is set");
+            written.expect("the byte is written");
+            let (read, taken) = b.read(buf.take().expect("the buffer is back")).await;
+            assert_eq!(read.expect("the byte is read"), 1);
+            buf = Some(taken);
+        })
+        .await)
+    })
+}
+
+fn tokio_sockopt_in_turn(load: &Load) -> io::Result<f64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let (mut a, mut b) = tokio_pair().await?;
+        let mut on = false;
+        let mut byte = [0u8; 1];
+        Ok(rate(measure, async || {
+            on = !on;
+            a.set_nodelay(on).expect("the option is set");
+            a.write_all(b"x").await.expect("the byte is written");
+            b.read_exact(&mut byte).await.expect("the byte is read");
         })
         .await)
     })
