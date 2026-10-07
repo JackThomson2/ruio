@@ -586,6 +586,61 @@ impl<P> Table<P> {
         orphans
     }
 
+    /// Whether `user_data` names an operation in flight that its future
+    /// waits for.
+    #[inline]
+    pub(crate) fn is_waiting(&self, user_data: u64) -> bool {
+        self.index(user_data)
+            .is_some_and(|index| matches!(self.slots[index as usize].state, State::Waiting(_)))
+    }
+
+    /// Whether `user_data` names an orphaned operation still in flight.
+    #[inline]
+    pub(crate) fn is_orphaned(&self, user_data: u64) -> bool {
+        self.index(user_data)
+            .is_some_and(|index| matches!(self.slots[index as usize].state, State::Orphaned(_)))
+    }
+
+    /// Lets go of the wakes of the operations still waiting for their
+    /// futures, as the driver is dropped: those of portable operations,
+    /// whose futures are on other threads, or gone, and whom no completion
+    /// is to wake. The foreign wakers come back, for the caller to drop
+    /// after releasing the table.
+    pub(crate) fn clear_wakes(&mut self) -> Vec<Waker> {
+        let mut wakers = Vec::new();
+        for index in 0..self.slots.len() {
+            if let State::Waiting(wake) = &mut self.slots[index].state {
+                let wake = mem::replace(wake, Wake::None);
+                wakers.extend(self.release(wake));
+            }
+        }
+        wakers
+    }
+
+    /// Takes the operations whose futures never collected them, as the
+    /// driver is dropped, after [`clear_wakes`](Table::clear_wakes): the
+    /// `user_data` of each, with its completion, or none if the kernel has
+    /// not finished it. Their slots are freed.
+    pub(crate) fn strand(&mut self) -> Vec<(u64, Option<Completion>)> {
+        let mut stranded = Vec::new();
+        for index in 0..self.slots.len() {
+            let slot = &self.slots[index];
+            let completion = match &slot.state {
+                State::Completed(completion) => Some(*completion),
+                State::Waiting(_) => None,
+                _ => continue,
+            };
+            stranded.push((user_data(index as u32, slot.generation), completion));
+            if completion.is_none() {
+                self.in_flight -= 1;
+            }
+            // Completed, or waiting with its wake let go of: either owns
+            // nothing.
+            forget_trivial(self.free(index as u32));
+        }
+        stranded
+    }
+
     /// The slot index `user_data` names, if its generation is current and the
     /// slot is in use.
     #[inline]

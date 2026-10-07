@@ -91,6 +91,12 @@ impl Payload {
         Self::inline(payload)
     }
 
+    /// The payload of an operation that another thread handed over, boxed
+    /// there: the box goes in place.
+    pub(crate) fn sent(payload: Box<dyn Orphan + Send>) -> Self {
+        Self::inline(payload)
+    }
+
     /// A payload written into the storage, which `P` must fit.
     fn inline<P: Orphan>(payload: P) -> Self {
         debug_assert!(Shape::<P>::FITS, "the payload does not fit in a slot");

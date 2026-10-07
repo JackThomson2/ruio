@@ -14,6 +14,7 @@
 //! [`Driver::submit`]: crate::Driver::submit
 //! [`Driver::park`]: crate::Driver::park
 
+use std::fmt;
 use std::future::poll_fn;
 use std::io;
 use std::ptr;
@@ -96,6 +97,51 @@ unsafe impl Operation for Nop {
     #[inline]
     fn complete(self, completion: Completion) -> io::Result<()> {
         completion.result().map(drop)
+    }
+}
+
+/// An operation whose output `map` makes into another as it completes: one
+/// whose output must cross threads, say, as a [`PortableOp`](crate::PortableOp)'s
+/// may, made into what can, an [`OpenAt`]'s descriptor into the plain
+/// descriptor it is.
+pub struct Map<T: Operation, U> {
+    operation: T,
+    map: fn(T::Output) -> U,
+}
+
+impl<T: Operation, U> Map<T, U> {
+    /// Makes `operation`'s output into another with `map`.
+    pub fn new(operation: T, map: fn(T::Output) -> U) -> Self {
+        Self { operation, map }
+    }
+}
+
+// SAFETY: the entry is the operation's own, which keeps the memory it points
+// to as its contract says, and posts the one completion it does.
+unsafe impl<T: Operation, U: 'static> Operation for Map<T, U> {
+    type Output = U;
+
+    #[inline]
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        self.operation.prepare(sqe);
+    }
+
+    #[inline]
+    fn complete(self, completion: Completion) -> U {
+        (self.map)(self.operation.complete(completion))
+    }
+
+    #[inline]
+    fn polled(&self) -> bool {
+        self.operation.polled()
+    }
+}
+
+impl<T: Operation + fmt::Debug, U> fmt::Debug for Map<T, U> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Map")
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
     }
 }
 

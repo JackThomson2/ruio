@@ -11,6 +11,12 @@
 //! keeps the operation's memory until the kernel is done with it. An
 //! [`Unparker`] wakes a parked driver from any thread.
 //!
+//! An `Op` belongs to its driver's thread. A [`PortableOp`] is `Send`: it
+//! queues its operation on the ring of the thread's current driver
+//! ([`Driver::enter`]) when first polled, and a future that moves to another
+//! thread meanwhile hands the operation back to that ring, which finishes
+//! it there.
+//!
 //! Operations act on an [`Fd`]: a plain file descriptor, or a direct
 //! descriptor, a slot of the ring's registered file table, which saves the
 //! kernel looking the file up. Operations that make files can put them
@@ -56,6 +62,7 @@ mod op;
 pub mod ops;
 mod orphan;
 mod pool;
+mod portable;
 mod probe;
 mod remote;
 mod ring;
@@ -65,10 +72,11 @@ mod table;
 mod unpark;
 mod waker;
 
-pub use driver::{Builder, Driver, Stats, monotonic_now};
+pub use driver::{Builder, Driver, Entered, Stats, monotonic_now};
 pub use fd::{Descriptor, DirectFd, Fd, PolledFd};
 pub use link::{Chain, Link};
 pub use op::{Completion, Op, Operation};
+pub use portable::PortableOp;
 pub use probe::{BaselineError, Probe};
 pub use remote::{RemoteRing, SentFd};
 pub use sockaddr::SockAddr;

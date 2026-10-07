@@ -1,16 +1,24 @@
-//! Rings as other threads see them, and direct descriptors sent from one
-//! ring's file table to another's with `IORING_OP_MSG_RING`.
+//! Rings as other threads see them, direct descriptors sent from one
+//! ring's file table to another's with `IORING_OP_MSG_RING`, and what
+//! other threads ask of a ring for the portable operations and descriptors
+//! whose futures took them there.
 
 use std::fmt;
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use ruio_sys as sys;
 
+use crate::op::Orphan;
 use crate::{Completion, DirectFd, Driver, Operation, Unparker};
+
+/// The rings alive in the process, by the ID of their drivers, for what
+/// names a ring on another thread rather than holding it: a portable
+/// operation that left its ring's thread; see [`Remote::find`].
+static REMOTES: Mutex<Vec<(u64, Weak<Remote>)>> = Mutex::new(Vec::new());
 
 /// A ring as other threads see it: one to send direct descriptors to, with
 /// [`DirectFd::send_to`]. It is `Send`, `Sync` and cheap to clone, and does
@@ -20,12 +28,13 @@ pub struct RemoteRing {
     shared: Arc<Remote>,
 }
 
-/// What a driver shares with the threads that send it descriptors.
+/// What a driver shares with the threads that send it descriptors, and with
+/// those that hand back its portable operations.
 pub(crate) struct Remote {
     /// The driver's ID.
     id: u64,
     state: Mutex<RemoteState>,
-    /// Set once `state` has slots to close.
+    /// Set once `state` has slots to close or requests to take.
     pending: AtomicBool,
     unparker: Unparker,
 }
@@ -36,19 +45,54 @@ struct RemoteState {
     /// The slots of descriptors sent to the ring and dropped on other
     /// threads, which the ring closes at its next turn.
     closes: Vec<u32>,
+    /// What other threads asked of the ring, which it does at its next turn.
+    requests: Vec<Request>,
+}
+
+/// What another thread asks of a ring for a portable operation or
+/// descriptor of the ring's, whose future or owner has left the ring's
+/// thread; see [`PortableOp`](crate::PortableOp).
+pub(crate) enum Request {
+    /// Take over the operation in slot `user_data`, which `payload`
+    /// finishes when it completes, at once if it has; and cancel it, if
+    /// `cancel` says to.
+    Adopt {
+        user_data: u64,
+        payload: Box<dyn Orphan + Send>,
+        cancel: bool,
+    },
+    /// Cancel the operation in slot `user_data`, taken over before, if it is
+    /// still in flight.
+    Cancel { user_data: u64 },
 }
 
 impl Remote {
     pub(crate) fn new(id: u64, fd: RawFd, unparker: Unparker) -> Arc<Self> {
-        Arc::new(Self {
+        let remote = Arc::new(Self {
             id,
             state: Mutex::new(RemoteState {
                 fd: Some(fd),
                 closes: Vec::new(),
+                requests: Vec::new(),
             }),
             pending: AtomicBool::new(false),
             unparker,
-        })
+        });
+        let mut remotes = REMOTES.lock().unwrap_or_else(PoisonError::into_inner);
+        remotes.retain(|(_, remote)| remote.strong_count() > 0);
+        remotes.push((id, Arc::downgrade(&remote)));
+        drop(remotes);
+        remote
+    }
+
+    /// The ring of the driver with ID `id`, on whichever thread, until it
+    /// closes.
+    pub(crate) fn find(id: u64) -> Option<Arc<Self>> {
+        let remotes = REMOTES.lock().unwrap_or_else(PoisonError::into_inner);
+        remotes
+            .iter()
+            .find(|(known, _)| *known == id)
+            .and_then(|(_, remote)| remote.upgrade())
     }
 
     fn lock(&self) -> MutexGuard<'_, RemoteState> {
@@ -56,25 +100,37 @@ impl Remote {
     }
 
     /// Forgets the ring's descriptor, before the ring closes it: senders
-    /// from then on find the ring closed.
-    pub(crate) fn close(&self) {
-        let mut state = self.lock();
-        state.fd = None;
-        // The ring's file table goes with it.
-        state.closes.clear();
+    /// from then on find the ring closed, and so do requests, which come
+    /// back to whoever made them. The requests made before come back to the
+    /// ring.
+    pub(crate) fn close(&self) -> Vec<Request> {
+        let requests = {
+            let mut state = self.lock();
+            state.fd = None;
+            // The ring's file table goes with it.
+            state.closes.clear();
+            mem::take(&mut state.requests)
+        };
+        REMOTES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(known, _)| *known != self.id);
+        requests
     }
 
-    /// The slots that other threads have asked the ring to close.
+    /// The slots that other threads have asked the ring to close, and what
+    /// else they have asked of it, if anything.
     #[inline]
-    pub(crate) fn take_closes(&self) -> Vec<u32> {
+    pub(crate) fn take(&self) -> Option<(Vec<u32>, Vec<Request>)> {
         // A plain load on every turn of the ring, which almost always finds
-        // nothing. A slot queued after the check sets the flag again, and
+        // nothing. Anything queued after the check sets the flag again, and
         // unparks the ring: its next turn takes it.
         if !self.pending.load(Ordering::Acquire) {
-            return Vec::new();
+            return None;
         }
         self.pending.store(false, Ordering::Relaxed);
-        mem::take(&mut self.lock().closes)
+        let mut state = self.lock();
+        Some((mem::take(&mut state.closes), mem::take(&mut state.requests)))
     }
 
     /// Asks the ring to close `slot` at its next turn, unless it is closed.
@@ -88,6 +144,22 @@ impl Remote {
         }
         self.pending.store(true, Ordering::Release);
         self.unparker.unpark();
+    }
+
+    /// Asks the ring for what `make` makes of `value`, at its next turn, and
+    /// unparks it; or hands `value` back if the ring is closed, without
+    /// making anything of it.
+    pub(crate) fn post_with<V>(&self, value: V, make: impl FnOnce(V) -> Request) -> Result<(), V> {
+        {
+            let mut state = self.lock();
+            if state.fd.is_none() {
+                return Err(value);
+            }
+            state.requests.push(make(value));
+        }
+        self.pending.store(true, Ordering::Release);
+        self.unparker.unpark();
+        Ok(())
     }
 }
 

@@ -24,7 +24,8 @@ use crate::link::private::{Linkable, Member};
 use crate::op::{Completion, Op, Operation, Orphan};
 use crate::ops::InstallPolled;
 use crate::orphan::Payload;
-use crate::remote::{Remote, RemoteRing};
+use crate::portable;
+use crate::remote::{Remote, RemoteRing, Request};
 use crate::ring::Ring;
 use crate::stream::{MultiOp, Multishot, Stranded};
 use crate::table::{IGNORED, Outcome, Table, Wake};
@@ -81,6 +82,10 @@ thread_local! {
     /// The drivers of this thread by ID, for resources that name their ring
     /// without keeping it alive, such as direct descriptors.
     static DRIVERS: RefCell<Vec<(u64, Weak<Shared>)>> = const { RefCell::new(Vec::new()) };
+
+    /// The thread's current driver, as [`Driver::enter`] made it, holding a
+    /// strong reference to it; null if none is.
+    static CURRENT: Cell<*const Shared> = const { Cell::new(ptr::null()) };
 }
 
 /// Configures and creates a [`Driver`].
@@ -214,6 +219,7 @@ impl Builder {
             shutdown_timeout: self.shutdown_timeout,
         });
         let inner = Rc::new(Shared {
+            id,
             notify,
             timer: Timer::default(),
             state,
@@ -321,10 +327,45 @@ impl WeakDriver {
     }
 }
 
+/// Makes current again, as it is dropped, the driver that was the thread's
+/// current one before [`Driver::enter`] made another so. It cannot leave its
+/// thread.
+#[must_use = "the driver is the thread's current one only until the guard is dropped"]
+pub struct Entered {
+    /// The driver current before, whose strong reference the guard holds
+    /// until it gives it back to the thread; null if none was.
+    previous: *const Shared,
+}
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        // A thread whose locals are gone keeps both references for good.
+        let Ok(entered) = CURRENT.try_with(|current| current.replace(self.previous)) else {
+            return;
+        };
+        if !entered.is_null() {
+            // SAFETY: the thread held this strong reference while the driver
+            // was current, and lets go of it once, here. Dropped once the
+            // thread's driver is the one before, as the last reference runs
+            // the driver's drop, which may look for the current one.
+            drop(unsafe { Rc::from_raw(entered) });
+        }
+    }
+}
+
+impl fmt::Debug for Entered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Entered").finish_non_exhaustive()
+    }
+}
+
 /// What every handle to a driver shares: the ring's state, behind the cell
 /// that its one thread borrows for each use, and beside it what parking and
 /// the runtime's timers reach on every turn without borrowing anything.
 struct Shared {
+    /// The driver's ID, which portable operations compare without
+    /// borrowing the state.
+    id: u64,
     /// What the driver shares with its unparkers.
     notify: Arc<Notify>,
     timer: Timer,
@@ -755,7 +796,7 @@ impl Driver {
     /// process has had.
     #[inline]
     pub fn id(&self) -> u64 {
-        self.inner.state.borrow().id
+        self.inner.id
     }
 
     /// The driver of this thread with ID `id`, if it still exists.
@@ -768,6 +809,62 @@ impl Driver {
             })
             .ok()
             .flatten()
+    }
+
+    /// Makes this driver the thread's current one until the guard is
+    /// dropped: the ring on which [`PortableOp`](crate::PortableOp)s first
+    /// polled on this thread queue their operations. A runtime enters its
+    /// driver while it runs. Guards nest: dropping one makes current again
+    /// the driver that was before it.
+    pub fn enter(&self) -> Entered {
+        let entered = Rc::into_raw(Rc::clone(&self.inner));
+        let previous = CURRENT.with(|current| current.replace(entered));
+        Entered { previous }
+    }
+
+    /// The thread's current driver, if it has one; see [`Driver::enter`].
+    #[inline]
+    pub fn current() -> Option<Driver> {
+        let current = CURRENT.try_with(Cell::get).ok()?;
+        if current.is_null() {
+            return None;
+        }
+        // SAFETY: it is the thread's current driver.
+        Some(unsafe { Driver::from_current(current) })
+    }
+
+    /// The driver with ID `id`, if it is on this thread: the current one, as
+    /// it nearly always is for an operation queued on it, which takes one
+    /// comparison to find, or another of the thread's.
+    #[inline]
+    pub(crate) fn home(id: u64) -> Option<Driver> {
+        if let Ok(current) = CURRENT.try_with(Cell::get)
+            && !current.is_null()
+            // SAFETY: the thread holds a strong reference to its current
+            // driver, so the pointer names a live shared part.
+            && unsafe { (*current).id } == id
+        {
+            // SAFETY: it is the thread's current driver.
+            return Some(unsafe { Driver::from_current(current) });
+        }
+        Driver::find(id)
+    }
+
+    /// A new handle to the thread's current driver, whose shared part
+    /// `current` names.
+    ///
+    /// # Safety
+    ///
+    /// `current` must be what `CURRENT` holds, and not null.
+    #[inline]
+    unsafe fn from_current(current: *const Shared) -> Driver {
+        // SAFETY: the thread holds a strong reference to its current driver,
+        // so the pointer names a live shared part, as `Rc::into_raw` gave
+        // it; the count raised is the new handle's.
+        unsafe { Rc::increment_strong_count(current) };
+        // SAFETY: as above.
+        let inner = unsafe { Rc::from_raw(current) };
+        Driver { inner }
     }
 
     /// Closes `fd`, a plain descriptor, with a request queued now: the kernel
@@ -1449,11 +1546,19 @@ impl Inner {
         timeout: Option<Duration>,
         park: Option<&Park<'_>>,
     ) -> io::Result<()> {
+        // What other threads asked of the ring: closing descriptors sent
+        // here that they dropped unclaimed, and taking back portable
+        // operations, which can add cancellations.
+        self.take_remote()?;
+        // An operation taken back may have completed already, and what it
+        // leaves to deliver waits for no completion: a turn that would wait
+        // for one delivers it instead, as it ends.
+        let min_complete = if self.has_deliveries() {
+            0
+        } else {
+            min_complete
+        };
         self.queue_cancels()?;
-        // Descriptors sent here, which other threads dropped unclaimed.
-        for slot in self.remote.take_closes() {
-            self.queue_close(slot)?;
-        }
         if !self.polling() {
             return self.enter_main(min_complete, timeout);
         }
@@ -1698,6 +1803,60 @@ impl Inner {
         Ok(())
     }
 
+    /// Takes what other threads asked of the ring since its last turn:
+    /// closes of direct descriptors sent here and dropped there, and
+    /// requests for its portable operations and descriptors.
+    fn take_remote(&mut self) -> io::Result<()> {
+        let Some((closes, requests)) = self.remote.take() else {
+            return Ok(());
+        };
+        for request in requests {
+            self.handle(request);
+        }
+        for slot in closes {
+            self.queue_close(slot)?;
+        }
+        Ok(())
+    }
+
+    /// Does what another thread asked for a portable operation of the
+    /// ring's, whose future left this thread, or for a descriptor whose
+    /// operations ran here; see [`Request`]. What runs code of its own, a
+    /// payload finishing or a waker, waits until the driver is released.
+    fn handle(&mut self, request: Request) {
+        match request {
+            Request::Adopt {
+                user_data,
+                payload,
+                cancel,
+            } => {
+                let payload = Payload::sent(payload);
+                if let Some(completion) = self.table.take_completed(user_data) {
+                    self.released.push((payload, completion));
+                } else if self.table.is_waiting(user_data) {
+                    // The waker of whoever polled the operation here last,
+                    // which no longer waits for it: woken for nothing.
+                    self.wakers.extend(self.table.orphan(user_data, payload));
+                    if cancel {
+                        self.cancels.push(user_data);
+                    }
+                } else {
+                    // Only the future of the operation in the slot hands it
+                    // over, once, so this cannot happen. The kernel may
+                    // still use the payload, which leaking keeps safe.
+                    debug_assert!(false, "adopted an operation that is not in flight");
+                    mem::forget(payload);
+                }
+            }
+            Request::Cancel { user_data } => {
+                // Gone already if it has completed, as is the slot.
+                if self.table.is_orphaned(user_data) {
+                    self.cancels.push(user_data);
+                }
+            }
+        }
+    }
+
     /// Queues a cancellation of every request in flight.
     fn queue_cancel_all(&mut self) -> io::Result<()> {
         self.cancels.clear();
@@ -1861,11 +2020,31 @@ fn route(
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        // What other threads asked of the ring before it closes goes to the
+        // kernel with everything else queued, closes queued in order among
+        // them, which a ring dropped without another turn would lose.
+        let _ = self.enter(0, None, None);
         // Before the ring closes its descriptor, which senders duplicate.
-        self.remote.close();
+        for request in self.remote.close() {
+            self.handle(request);
+        }
+        // What handling the requests replaced, woken for nothing otherwise;
+        // and the operations it took over that had completed.
+        drop(mem::take(&mut self.wakers));
+        for (mut payload, completion) in mem::take(&mut self.released) {
+            payload.deliver(completion);
+        }
+        // Every operation still waiting is a portable one, whose future is on
+        // another thread or gone, as an `Op` keeps the driver alive: nothing
+        // is to be woken by its completion.
+        drop(self.table.clear_wakes());
         if self.table.in_flight() > 0 {
             self.drain();
+        } else {
+            let _ = self.enter(0, None, None);
         }
+        // Their futures find out how they ended wherever they are.
+        portable::record(self.id, self.table.strand());
         // Whatever the kernel may still be using cannot be freed. Leaking it
         // is safe; the ring is closed after this, and the kernel cancels what
         // is left.
@@ -1970,5 +2149,21 @@ mod tests {
             !STUCK_DROPPED.load(Ordering::SeqCst),
             "freed while the kernel might still use it"
         );
+    }
+
+    /// A portable operation whose future is away, and which the kernel never
+    /// finishes, is recorded lost as its ring shuts down.
+    #[test]
+    fn a_portable_operation_the_kernel_never_finishes_is_lost_with_its_ring() {
+        let timeout = Duration::from_millis(20);
+        let driver = Driver::builder().shutdown_timeout(timeout).build().unwrap();
+        // Waiting for a future that is elsewhere, with nothing submitted.
+        let user_data = driver.inner.state.borrow_mut().table.insert(None);
+        let id = driver.id();
+        drop(driver);
+        assert!(matches!(
+            portable::stranded::fate(id, user_data),
+            Some(portable::Fate::Lost)
+        ));
     }
 }

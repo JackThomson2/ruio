@@ -132,6 +132,14 @@ impl Orphan for Box<dyn Orphan> {
     }
 }
 
+/// The payload of an operation whose future handed it over from another
+/// thread; see [`PortableOp`](crate::PortableOp).
+impl Orphan for Box<dyn Orphan + Send> {
+    fn deliver(&mut self, completion: Completion) {
+        (**self).deliver(completion);
+    }
+}
+
 /// A future that submits an operation when first polled and resolves to its
 /// output.
 ///
@@ -248,9 +256,9 @@ impl<T: Operation> Op<T> {
 }
 
 /// A detached operation, which completes as the `Op` would have seen it.
-struct Seen<T> {
-    operation: T,
-    timed: bool,
+pub(crate) struct Seen<T> {
+    pub(crate) operation: T,
+    pub(crate) timed: bool,
 }
 
 // SAFETY: a detached operation has been submitted already, so it is never
@@ -276,7 +284,7 @@ unsafe impl<T: Operation> Operation for Seen<T> {
 /// timeout, cancelled means timed out: nothing else cancels an operation
 /// whose `Op` still exists.
 #[inline]
-fn seen(completion: Completion, timed: bool) -> Completion {
+pub(crate) fn seen(completion: Completion, timed: bool) -> Completion {
     if timed && completion.res() == -libc::ECANCELED {
         Completion::new(-libc::ETIMEDOUT, completion.flags())
     } else {
