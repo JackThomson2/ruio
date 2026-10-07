@@ -1,11 +1,14 @@
 //! UDP sockets.
 
 use std::fmt;
+use std::future::poll_fn;
 use std::io;
 use std::marker::PhantomData;
 use std::net::{self, SocketAddr};
+use std::ops::{Deref, DerefMut};
+use std::task::{Context, Poll};
 
-use ruio_driver::buf::{BufPool, BufResult, IoBuf, IoBufMut};
+use ruio_driver::buf::{BufLease, BufPool, BufResult, IoBuf, IoBufMut};
 use ruio_driver::ops::{self, Recv, RecvFrom, Send, SendTo};
 use ruio_driver::{Fd, SockAddr};
 
@@ -166,9 +169,55 @@ impl UdpSocket {
     }
 
     /// The datagrams arriving on the socket, each received into a buffer of
-    /// `pool`, which must belong to the thread's ring.
+    /// `pool`, which must belong to the thread's ring, without the address
+    /// it came from: for a connected socket, whose datagrams all come from
+    /// its peer. [`recv_from_stream`](UdpSocket::recv_from_stream) gives each
+    /// datagram's address, for a socket that answers whoever sends to it.
     pub fn recv_stream(&self, pool: &BufPool) -> RecvStream<'_> {
         self.sock.recv_stream(pool)
+    }
+
+    /// The datagrams arriving on the socket, each with the address it came
+    /// from, received into buffers of `pool`, which must belong to the
+    /// thread's ring, by one multishot `recvmsg` that the stream keeps armed:
+    /// what a socket that is not connected answers its senders from.
+    ///
+    /// Each datagram takes one buffer, in which a header and the address come
+    /// before the payload: 32 bytes of it for an IPv4 socket, and 48 for an
+    /// IPv6 one. A datagram longer than the rest of the buffer is cut short,
+    /// and the rest of it lost, as by [`recv_from`](UdpSocket::recv_from)
+    /// into a buffer of that size, which [`Datagram::is_truncated`] tells.
+    ///
+    /// ```no_run
+    /// use ruio::buf::BufPool;
+    /// use ruio::net::UdpSocket;
+    ///
+    /// # async fn echo() -> std::io::Result<()> {
+    /// let socket = UdpSocket::bind("127.0.0.1:7878")?;
+    /// let pool = BufPool::new(&ruio::driver(), 256, 2048)?;
+    /// let mut datagrams = socket.recv_from_stream(&pool)?;
+    /// while let Some(datagram) = datagrams.next().await {
+    ///     let (data, from) = datagram?.into_parts();
+    ///     socket.send_to(data, from).await.0?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if the pool's buffers have no room for a payload after
+    /// the header and the address, and what `getsockname(2)` reports.
+    pub fn recv_from_stream(&self, pool: &BufPool) -> io::Result<RecvFromStream<'_>> {
+        let family = match self.local_addr()? {
+            SocketAddr::V4(_) => libc::AF_INET,
+            SocketAddr::V6(_) => libc::AF_INET6,
+        };
+        let (driver, fd) = self.sock.target();
+        Ok(RecvFromStream {
+            stream: ops::RecvFromStream::new(&driver, fd, pool, family)?,
+            _socket: PhantomData,
+        })
     }
 }
 
@@ -189,5 +238,147 @@ impl fmt::Debug for UdpSocket {
 impl From<net::UdpSocket> for UdpSocket {
     fn from(socket: net::UdpSocket) -> Self {
         Self::from_std(socket)
+    }
+}
+
+/// The datagrams arriving on a UDP socket, each with the address it came
+/// from, received into a [`BufPool`] by a multishot `recvmsg` that the
+/// stream keeps armed. Made by [`UdpSocket::recv_from_stream`]; see
+/// [`ops::RecvFromStream`].
+///
+/// When the pool runs dry, the stream waits for a buffer to return, and the
+/// datagrams that arrive meanwhile wait in the socket, as many as its
+/// receive buffer holds. The stream ends after yielding an error, such as
+/// `ECONNREFUSED` on a socket connected to a port no socket is bound to.
+#[derive(Debug)]
+pub struct RecvFromStream<'a> {
+    stream: ops::RecvFromStream,
+    _socket: PhantomData<&'a ()>,
+}
+
+impl RecvFromStream<'_> {
+    /// The next datagram, or `None` once an error has been yielded.
+    #[inline]
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Datagram>>> {
+        self.stream
+            .poll_next(cx)
+            .map(|datagram| datagram.map(|datagram| datagram.and_then(Datagram::new)))
+    }
+
+    /// The next datagram; see [`poll_next`](RecvFromStream::poll_next).
+    pub async fn next(&mut self) -> Option<io::Result<Datagram>> {
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// The next datagram if it has arrived already, or `None`, without
+    /// waiting; see [`ops::RecvFromStream::next_ready`]. A task that hands
+    /// the datagrams on in batches, to another task through a channel say,
+    /// takes those that have arrived so after each one it waits for:
+    ///
+    /// ```no_run
+    /// use ruio::net::Datagram;
+    /// use ruio::sync::local::mpsc;
+    ///
+    /// # async fn feed(socket: ruio::net::UdpSocket, pool: ruio::buf::BufPool) -> std::io::Result<()> {
+    /// let (batches, _worker) = mpsc::channel::<Vec<Datagram>>(16);
+    /// let mut datagrams = socket.recv_from_stream(&pool)?;
+    /// while let Some(datagram) = datagrams.next().await {
+    ///     let mut batch = vec![datagram?];
+    ///     while let Some(datagram) = datagrams.next_ready() {
+    ///         batch.push(datagram?);
+    ///     }
+    ///     if batches.send(batch).await.is_err() {
+    ///         break;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn next_ready(&mut self) -> Option<io::Result<Datagram>> {
+        self.stream
+            .next_ready()
+            .map(|datagram| datagram.and_then(Datagram::new))
+    }
+
+    /// Whether the stream has ended, after yielding an error.
+    #[inline]
+    pub fn is_ended(&self) -> bool {
+        self.stream.is_ended()
+    }
+}
+
+/// A datagram that a UDP socket received into a buffer of a pool, with the
+/// address it came from. It derefs to the payload. Made by
+/// [`RecvFromStream`].
+///
+/// The buffer returns to the pool when the datagram is dropped, or when the
+/// lease of its payload that [`into_data`](Datagram::into_data) makes is.
+pub struct Datagram {
+    datagram: ops::Datagram,
+    from: SocketAddr,
+}
+
+impl Datagram {
+    #[inline]
+    fn new(datagram: ops::Datagram) -> io::Result<Self> {
+        let from = datagram
+            .inet_from()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not an internet address"))?;
+        Ok(Self { datagram, from })
+    }
+
+    /// The address the datagram came from.
+    #[inline]
+    pub fn from(&self) -> SocketAddr {
+        self.from
+    }
+
+    /// Whether the datagram was longer than its buffer had room for, so that
+    /// the kernel cut it short, and the rest of it was lost.
+    #[inline]
+    pub fn is_truncated(&self) -> bool {
+        self.datagram.is_truncated()
+    }
+
+    /// The payload, as a lease of its buffer whose data and room leave out
+    /// the header and the address before it, to keep or to send as any
+    /// buffer.
+    #[inline]
+    pub fn into_data(self) -> BufLease {
+        self.datagram.into_data()
+    }
+
+    /// The payload, as [`into_data`](Datagram::into_data) leases it, and the
+    /// address it came from: what an answer to the datagram takes.
+    #[inline]
+    pub fn into_parts(self) -> (BufLease, SocketAddr) {
+        (self.datagram.into_data(), self.from)
+    }
+}
+
+impl Deref for Datagram {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        &self.datagram
+    }
+}
+
+impl DerefMut for Datagram {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.datagram
+    }
+}
+
+impl fmt::Debug for Datagram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Datagram")
+            .field("from", &self.from)
+            .field("len", &self.len())
+            .field("truncated", &self.is_truncated())
+            .finish()
     }
 }

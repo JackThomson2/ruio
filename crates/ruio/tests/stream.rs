@@ -1,13 +1,13 @@
-//! The streams of connections, data, directory entries, readiness and
-//! signals through the `Stream` and `FusedStream` traits of futures-core, and
-//! futures-util's combinators over them.
+//! The streams of connections, data, datagrams, directory entries,
+//! readiness and signals through the `Stream` and `FusedStream` traits of
+//! futures-core, and futures-util's combinators over them.
 
 #![cfg(feature = "futures")]
 
 mod support;
 
 use std::io::{self, Write as _};
-use std::net::Shutdown;
+use std::net::{Shutdown, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use futures_util::stream::FusedStream;
 use ruio::buf::BufPool;
 use ruio::fs::File;
 use ruio::io::AsyncFd;
-use ruio::net::{TcpListener, TcpStream};
+use ruio::net::{TcpListener, TcpStream, UdpSocket};
 use ruio::signal::{SignalKind, signal};
 
 use support::within;
@@ -114,6 +114,32 @@ async fn recv_stream_folds_a_connections_data() -> io::Result<()> {
     assert_eq!(checksum, expected);
     assert!(received.is_terminated());
     drop(sender.await.unwrap());
+    Ok(())
+}
+
+/// Datagrams stream through `map` and `take` to their senders, and the
+/// stream goes on after.
+#[ruio::test]
+async fn recv_from_stream_maps_datagrams_to_their_senders() -> io::Result<()> {
+    let receiver = UdpSocket::bind("127.0.0.1:0")?;
+    let senders = [
+        UdpSocket::bind("127.0.0.1:0")?,
+        UdpSocket::bind("127.0.0.1:0")?,
+    ];
+    for sender in &senders {
+        within(sender.send_to("hi", receiver.local_addr()?))
+            .await
+            .0?;
+    }
+    let pool = BufPool::new(&ruio::driver(), 4, 64)?;
+    let mut datagrams = receiver.recv_from_stream(&pool)?;
+    let from: Vec<SocketAddr> = within(StreamExt::collect(StreamExt::take(
+        StreamExt::map(&mut datagrams, |datagram| datagram.unwrap().from()),
+        2,
+    )))
+    .await;
+    assert_eq!(from, [senders[0].local_addr()?, senders[1].local_addr()?]);
+    assert!(!datagrams.is_terminated());
     Ok(())
 }
 

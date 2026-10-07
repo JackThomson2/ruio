@@ -6,8 +6,11 @@
 //! will do, a slice of one or a lease from a [`BufPool`](crate::buf::BufPool)
 //! included. A `recv_stream` receives into a pool instead: the kernel picks a
 //! buffer only once data arrives, so idle connections pin no memory, and one
-//! multishot request keeps receiving. A listener's `incoming` accepts
-//! connection after connection with one multishot request too.
+//! multishot request keeps receiving. A UDP socket's
+//! [`recv_from_stream`](UdpSocket::recv_from_stream) does so too, with each
+//! datagram's sender, for a socket that is not connected to answer. A
+//! listener's `incoming` accepts connection after connection with one
+//! multishot request too.
 //!
 //! An operation borrows its socket, which so stays open until the kernel has
 //! the operation:
@@ -97,5 +100,5 @@ pub use behind::{Flush, WriteBehind};
 pub(crate) use socket::{Desc, Plain, Sock, ThreadBound};
 pub use socket::{ReadExact, RecvStream, SendZc, SocketOp, WriteAll, WriteAllVectored};
 pub use tcp::{Incoming, SentTcpStream, TcpListener, TcpStream};
-pub use udp::UdpSocket;
+pub use udp::{Datagram, RecvFromStream, UdpSocket};
 pub use unix::{UnixDatagram, UnixListener, UnixStream};

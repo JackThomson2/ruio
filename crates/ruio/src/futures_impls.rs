@@ -1,7 +1,7 @@
 //! The `Stream` and `FusedStream` traits of futures-core, for the streams of
-//! connections, data, directory entries, readiness and signals, so that they
-//! compose with the combinators of futures-util and with everything else
-//! that takes a `Stream`.
+//! connections, data, datagrams, directory entries, readiness and signals,
+//! so that they compose with the combinators of futures-util and with
+//! everything else that takes a `Stream`.
 //!
 //! Each implementation is one call to the type's own `poll_next`, which the
 //! compiler inlines: the trait costs nothing over the method, and what the
@@ -19,7 +19,7 @@ use ruio_driver::buf::{BufBundle, BufLease};
 
 use crate::fs::{DirEntry, ReadDir, ReadStream};
 use crate::io::Readiness;
-use crate::net::{Incoming, RecvStream};
+use crate::net::{Datagram, Incoming, RecvFromStream, RecvStream};
 use crate::signal::Signal;
 
 /// Each item is a connection, or an error the kernel reported instead; the
@@ -52,6 +52,23 @@ impl Stream for RecvStream<'_> {
 
 /// Terminated once the peer has shut down or an error has been yielded.
 impl FusedStream for RecvStream<'_> {
+    #[inline]
+    fn is_terminated(&self) -> bool {
+        self.is_ended()
+    }
+}
+
+impl Stream for RecvFromStream<'_> {
+    type Item = io::Result<Datagram>;
+
+    #[inline]
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        RecvFromStream::poll_next(self.get_mut(), cx)
+    }
+}
+
+/// Terminated once an error has been yielded.
+impl FusedStream for RecvFromStream<'_> {
     #[inline]
     fn is_terminated(&self) -> bool {
         self.is_ended()

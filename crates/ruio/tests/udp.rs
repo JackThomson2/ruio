@@ -91,3 +91,101 @@ async fn a_recv_stream_takes_datagram_after_datagram() -> io::Result<()> {
     }
     Ok(())
 }
+
+/// A socket that is not connected answers its senders from the stream of
+/// its datagrams, taking those that have arrived together: each sender gets
+/// its own datagrams back, in order, and only those.
+#[ruio::test]
+async fn a_recv_from_stream_answers_each_sender() -> io::Result<()> {
+    let server = UdpSocket::bind("127.0.0.1:0")?;
+    let addr = server.local_addr()?;
+    let clients = [
+        UdpSocket::bind("127.0.0.1:0")?,
+        UdpSocket::bind("127.0.0.1:0")?,
+    ];
+    for round in 0..3 {
+        for (index, client) in clients.iter().enumerate() {
+            within(client.send_to(vec![index as u8, round], addr))
+                .await
+                .0?;
+        }
+    }
+    let pool = BufPool::new(&ruio::driver(), 8, 2048)?;
+    let mut datagrams = server.recv_from_stream(&pool)?;
+    let mut answered = 0;
+    while answered < 6 {
+        let mut batch = vec![within(datagrams.next()).await.unwrap()?];
+        while let Some(datagram) = datagrams.next_ready() {
+            batch.push(datagram?);
+        }
+        for datagram in batch {
+            assert!(!datagram.is_truncated());
+            let (data, from) = datagram.into_parts();
+            within(server.send_to(data, from)).await.0?;
+            answered += 1;
+        }
+    }
+    for (index, client) in clients.iter().enumerate() {
+        for round in 0..3 {
+            let (received, buf) = within(client.recv_from(Vec::with_capacity(8))).await;
+            assert_eq!(received?, (2, addr));
+            assert_eq!(buf, [index as u8, round]);
+        }
+    }
+    assert_eq!(pool.available(), 8);
+    assert!(!datagrams.is_ended());
+    Ok(())
+}
+
+/// A datagram longer than its buffer has room for after the header and the
+/// address is cut short, and says so; the next one comes whole.
+#[ruio::test]
+async fn a_recv_from_stream_cuts_short_what_its_buffers_cannot_hold() -> io::Result<()> {
+    let receiver = UdpSocket::bind("127.0.0.1:0")?;
+    let sender = UdpSocket::bind("127.0.0.1:0")?;
+    // Of each buffer's 64 bytes, the header and an IPv4 address take 32.
+    let pool = BufPool::new(&ruio::driver(), 4, 64)?;
+    within(sender.send_to(vec![7; 33], receiver.local_addr()?))
+        .await
+        .0?;
+    within(sender.send_to(vec![8; 32], receiver.local_addr()?))
+        .await
+        .0?;
+    let mut datagrams = receiver.recv_from_stream(&pool)?;
+    let cut = within(datagrams.next()).await.unwrap()?;
+    assert_eq!((&*cut, cut.is_truncated()), (&[7; 32][..], true));
+    let whole = within(datagrams.next()).await.unwrap()?;
+    assert_eq!((&*whole, whole.is_truncated()), (&[8; 32][..], false));
+    assert_eq!(whole.from(), sender.local_addr()?);
+    assert_eq!(whole.into_data().capacity(), 32);
+    Ok(())
+}
+
+/// The header and an IPv4 address take 32 bytes of each buffer, and an
+/// IPv6 one 48, which a pool's buffers must have more than.
+#[ruio::test]
+async fn a_recv_from_stream_needs_room_for_a_payload() -> io::Result<()> {
+    let v4 = UdpSocket::bind("127.0.0.1:0")?;
+    let small = BufPool::new(&ruio::driver(), 2, 32)?;
+    let err = v4.recv_from_stream(&small).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    let pool = BufPool::new(&ruio::driver(), 2, 48)?;
+    assert!(v4.recv_from_stream(&pool).is_ok());
+
+    let Ok(v6) = UdpSocket::bind("[::1]:0") else {
+        eprintln!("skipped: no IPv6 loopback address");
+        return Ok(());
+    };
+    let err = v6.recv_from_stream(&pool).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    let sender = UdpSocket::bind("[::1]:0")?;
+    within(sender.send_to("six", v6.local_addr()?)).await.0?;
+    let pool = BufPool::new(&ruio::driver(), 2, 64)?;
+    let mut datagrams = v6.recv_from_stream(&pool)?;
+    let datagram = within(datagrams.next()).await.unwrap()?;
+    assert_eq!(
+        (&*datagram, datagram.from()),
+        (&b"six"[..], sender.local_addr()?)
+    );
+    Ok(())
+}
