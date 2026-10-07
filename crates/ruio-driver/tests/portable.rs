@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use ruio_driver::buf::{IoBuf, IoBufMut};
 use ruio_driver::ops::{Map, Nop, OpenAt, Read};
-use ruio_driver::{Driver, PortableOp};
+use ruio_driver::{Driver, PortableFd, PortableOp};
 
 use support::{PATIENCE, block_on, poll_once, settle};
 
@@ -338,4 +338,81 @@ fn an_operation_whose_output_cannot_move_stays_put() {
     let open = OpenAt::new("/").unwrap();
     let plain = PortableOp::new(Map::new(open, |opened| opened.map(drop)));
     assert_send(&plain);
+}
+
+/// Whether the pipe's reading end is closed, as a write to it finds.
+fn reader_closed(writer: &mut PipeWriter) -> bool {
+    match writer.write(b"x") {
+        Ok(_) => false,
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => true,
+        Err(err) => panic!("unexpected error {err}"),
+    }
+}
+
+/// Dropped on its ring's thread, a portable descriptor closes with an entry
+/// queued after the read queued before it.
+#[test]
+fn a_portable_descriptor_closes_after_what_its_ring_queued() {
+    let driver = Driver::new().unwrap();
+    let _entered = driver.enter();
+    let (reader, mut writer) = pipe();
+    let reader = PortableFd::new(reader.into());
+    let mut op = reader.op(|fd| Read::new(fd, Vec::with_capacity(16)));
+    assert!(poll_once(&mut op).is_pending());
+    drop(op);
+    drop(reader);
+    assert!(!reader_closed(&mut writer), "closed before the ring's turn");
+    settle(&driver);
+    assert!(reader_closed(&mut writer));
+}
+
+/// Dropped on another thread, it closes on its ring, after what the ring
+/// queued, once the ring takes the request.
+#[test]
+fn dropped_on_another_thread_it_closes_on_its_ring() {
+    let driver = Driver::new().unwrap();
+    let _entered = driver.enter();
+    let (reader, mut writer) = pipe();
+    let reader = PortableFd::new(reader.into());
+    let mut op = reader.op(|fd| Read::new(fd, Vec::with_capacity(16)));
+    assert!(poll_once(&mut op).is_pending());
+    drop(op);
+    thread::spawn(move || drop(reader)).join().unwrap();
+    assert!(!reader_closed(&mut writer), "closed before the ring's turn");
+    turn_until(&driver, || reader_closed(&mut writer));
+    settle(&driver);
+}
+
+/// With no operation queued on a ring, or with its ring gone, it closes at
+/// once, wherever it is.
+#[test]
+fn with_no_ring_to_close_on_it_closes_at_once() {
+    let (reader, mut writer) = pipe();
+    drop(PortableFd::new(reader.into()));
+    assert!(reader_closed(&mut writer));
+
+    let driver = Driver::new().unwrap();
+    let entered = driver.enter();
+    let (reader, mut writer) = pipe();
+    let reader = PortableFd::new(reader.into());
+    writer.write_all(b"data").unwrap();
+    let (read, _) = block_on(
+        &driver,
+        reader.op(|fd| Read::new(fd, Vec::with_capacity(16))),
+    );
+    assert_eq!(read.unwrap(), 4);
+    drop(entered);
+    drop(driver);
+    thread::spawn(move || drop(reader)).join().unwrap();
+    assert!(reader_closed(&mut writer));
+}
+
+/// The descriptor taken out stays open, and closes as an `OwnedFd` does.
+#[test]
+fn a_descriptor_taken_out_stays_open() {
+    let (reader, mut writer) = pipe();
+    let reader = PortableFd::new(reader.into()).into_owned_fd();
+    assert!(!reader_closed(&mut writer));
+    drop(reader);
+    assert!(reader_closed(&mut writer));
 }

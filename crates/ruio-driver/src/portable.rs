@@ -1,18 +1,20 @@
 //! Operations that are not bound to the ring of one thread: [`PortableOp`],
-//! and what keeps one sound as its future moves between threads.
+//! the descriptors whose operations they are, [`PortableFd`], and what keeps
+//! them sound as their futures and owners move between threads.
 
 use std::fmt;
 use std::future::Future;
 use std::mem;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker, ready};
 use std::time::Duration;
 
-use crate::Driver;
 use crate::op::{Completion, Operation, Orphan, Seen, seen};
 use crate::remote::{Remote, Request};
+use crate::{Driver, Fd};
 
 /// An operation future that can move between threads: `Send` when its
 /// operation and its output are, so that a future that must be, one that
@@ -103,6 +105,18 @@ impl<T: Operation> PortableOp<'static, T> {
             state: State::Unsubmitted(operation),
             timeout: None,
             ring: None,
+        }
+    }
+}
+
+impl<'a, T: Operation> PortableOp<'a, T> {
+    /// A future that queues `operation`, which names the descriptor that
+    /// `ring` belongs to, and records there the ring it queues it on.
+    fn naming(operation: T, ring: &'a AtomicU64) -> Self {
+        Self {
+            state: State::Unsubmitted(operation),
+            timeout: None,
+            ring: Some(ring),
         }
     }
 }
@@ -366,6 +380,136 @@ impl<T: Operation> fmt::Debug for PortableOp<'_, T> {
         f.debug_struct("PortableOp")
             .field("state", &state)
             .finish_non_exhaustive()
+    }
+}
+
+/// A plain descriptor whose operations are [`PortableOp`]s: `Send` and
+/// `Sync`, so that a future that must be `Send` can hold it, as one holding
+/// a socket or a file of the thread's ring cannot.
+///
+/// Each operation queues on the ring of the thread that first polls it, as
+/// any portable operation does, and the descriptor records which ring that
+/// was. Dropped, it closes after what that ring has queued, which may name
+/// it, with a close queued there (see [`Driver::close_in_order`]): on that
+/// ring's thread at once, and from any other through a request the ring
+/// takes at its next turn. Closed at once instead, it would be gone before an
+/// entry still queued reached the kernel, which would find no file, or
+/// another that took the number. A descriptor whose operations never reached
+/// a ring, or whose ring is gone, having submitted everything it queued,
+/// closes at once.
+///
+/// Only the ring of the last operation is recorded: a descriptor whose
+/// operations ran on the rings of two threads at once, and that is dropped
+/// before the first ring has submitted what it queued, can close before that
+/// entry reaches the kernel.
+///
+/// ```
+/// use ruio_driver::ops::Read;
+/// use ruio_driver::{Driver, PortableFd};
+///
+/// fn assert_send<T: Send + Sync>(_: &T) {}
+///
+/// let (reader, _writer) = std::io::pipe()?;
+/// let reader = PortableFd::new(reader.into());
+/// assert_send(&reader);
+/// let read = reader.op(|fd| Read::new(fd, Vec::with_capacity(4096)));
+/// assert_send(&read);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub struct PortableFd {
+    /// Taken only as the descriptor closes, or leaves.
+    fd: Option<OwnedFd>,
+    /// The ID of the driver whose ring last queued an operation naming the
+    /// descriptor, or 0 if none has.
+    ring: AtomicU64,
+}
+
+impl PortableFd {
+    /// Takes over `fd`, whose operations have queued on no ring yet.
+    pub fn new(fd: OwnedFd) -> Self {
+        Self {
+            fd: Some(fd),
+            ring: AtomicU64::new(0),
+        }
+    }
+
+    /// The descriptor, for an operation.
+    #[inline]
+    pub fn fd(&self) -> Fd {
+        Fd::Plain(self.as_raw_fd())
+    }
+
+    /// The operation `make` makes for the descriptor, as a [`PortableOp`]
+    /// that borrows it, so that it stays open until the operation is
+    /// queued, and that records the ring the operation queues on.
+    #[inline]
+    pub fn op<T: Operation>(&self, make: impl FnOnce(Fd) -> T) -> PortableOp<'_, T> {
+        PortableOp::naming(make(self.fd()), &self.ring)
+    }
+
+    /// The descriptor, which stays open. Closing it then closes it at once,
+    /// as dropping an [`OwnedFd`] does, before what a ring may still have
+    /// queued naming it; dropping the `PortableFd` closes it in order.
+    pub fn into_owned_fd(mut self) -> OwnedFd {
+        self.fd
+            .take()
+            .expect("a portable descriptor is taken only once")
+    }
+}
+
+impl AsRawFd for PortableFd {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_fd().as_raw_fd()
+    }
+}
+
+impl AsFd for PortableFd {
+    #[inline]
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd
+            .as_ref()
+            .expect("a portable descriptor is used only until it is taken")
+            .as_fd()
+    }
+}
+
+impl From<OwnedFd> for PortableFd {
+    fn from(fd: OwnedFd) -> Self {
+        Self::new(fd)
+    }
+}
+
+impl From<PortableFd> for OwnedFd {
+    fn from(fd: PortableFd) -> Self {
+        fd.into_owned_fd()
+    }
+}
+
+impl Drop for PortableFd {
+    fn drop(&mut self) {
+        let Some(fd) = self.fd.take() else {
+            return;
+        };
+        let ring = *self.ring.get_mut();
+        if ring == 0 {
+            return drop(fd);
+        }
+        match Driver::home(ring) {
+            Some(driver) => driver.close_in_order(fd),
+            // A ring that refuses the request has submitted everything it
+            // queued before it closed, and the descriptor can close at once.
+            None => drop(post(ring, fd, Request::Close)),
+        }
+    }
+}
+
+impl fmt::Debug for PortableFd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PortableFd")
+            .field("fd", &self.fd)
+            .field("ring", &self.ring.load(Ordering::Relaxed))
+            .finish()
     }
 }
 

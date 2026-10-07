@@ -64,6 +64,9 @@ pub(crate) enum Request {
     /// Cancel the operation in slot `user_data`, taken over before, if it is
     /// still in flight.
     Cancel { user_data: u64 },
+    /// Close the descriptor after everything queued on the ring, which may
+    /// name it; see [`PortableFd`](crate::PortableFd).
+    Close(OwnedFd),
 }
 
 impl Remote {

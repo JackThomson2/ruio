@@ -1854,6 +1854,11 @@ impl Inner {
                     self.cancels.push(user_data);
                 }
             }
+            Request::Close(fd) => {
+                // Without room for the entry, even once what is queued is
+                // submitted, the descriptor closes at once.
+                let _ = self.queue_close_fd(fd);
+            }
         }
     }
 
