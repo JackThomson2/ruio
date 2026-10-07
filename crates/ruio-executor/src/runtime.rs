@@ -128,6 +128,9 @@ impl Runtime {
     /// If the thread is already inside `block_on`, or if `future` panics.
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         let _enter = context::enter(Rc::clone(&self.scheduler));
+        // Portable operations first polled here queue on the runtime's ring,
+        // and find it again with one comparison while they stay.
+        let _current = self.scheduler.driver().enter();
         // Wakers of the future name it as a task's name the task, so that
         // waking it on this thread takes no atomic operation.
         let main = Main::new(&self.scheduler);
@@ -168,8 +171,10 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         // Dropping futures runs their destructors, which may expect to be
-        // inside the runtime.
+        // inside the runtime, and drops the portable operations of its tasks,
+        // which so find their ring at hand.
         let _enter = context::enter_if_idle(Rc::clone(&self.scheduler));
+        let _current = self.scheduler.driver().enter();
         self.scheduler.shutdown();
     }
 }
