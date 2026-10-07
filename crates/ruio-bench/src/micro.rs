@@ -7,6 +7,9 @@
 //! - `nop 1`: one task awaiting no-ops, one at a time. Each is a turn of the
 //!   loop: queue, enter the kernel and wait, deliver, wake, run.
 //! - `nop 64`: 64 tasks awaiting no-ops, so that a turn delivers a batch.
+//! - `portable nop 1`, `portable nop 64`: the same through `PortableOp`,
+//!   which finds its ring as the thread's current driver, and whose future
+//!   is `Send`: what the difference from the two above costs.
 //! - `spawn`: spawn a task that does nothing, and await it.
 //! - `join set`: spawn a task that does nothing into a join set, and take
 //!   its output from the set.
@@ -71,6 +74,15 @@
 //! - `metadata`: the status of a file by path: statx through the ring,
 //!   which the kernel runs in an io-wq worker; tokio's `stat` on its
 //!   blocking pool.
+//! - `read file`: a 4 KiB file read whole by path with `fs::read`: opened,
+//!   read, read to its end and closed, each on the ring of the thread that
+//!   polls it, in a future that is `Send`; tokio's on its blocking pool.
+//! - `write file`: 4 KiB written to a file by path with `fs::write`, which
+//!   makes or empties it, and closes it: the open, which creates and
+//!   truncates, in an io-wq worker; tokio's on its blocking pool. On tmpfs,
+//!   where the host has it at `/dev/shm`: ext4 writes back a file emptied
+//!   and written again as it is closed, which takes a millisecond on either
+//!   runtime, and would be all that is measured.
 //! - `symlink`: a symbolic link made and removed: two operations through
 //!   the ring, each in an io-wq worker; tokio's two calls on its blocking
 //!   pool.
@@ -127,6 +139,15 @@
 //!   a wake and a run.
 //! - `cancel`: arm a wait for a token's cancellation by polling it once,
 //!   then drop it.
+//! - `spawn wait`: `/bin/true` spawned and waited for: `posix_spawn(3)`, a
+//!   pidfd, and a wait the kernel completes on the ring as the child exits,
+//!   then the reap. The child inherits the runtime's CPU, so the parent is
+//!   descheduled while it runs, on either runtime.
+//! - `spawn output`: `/bin/echo` spawned, its output read from a pipe to
+//!   the end, and waited for.
+//! - `child pipes`: 64 bytes written to the input of a `cat` that runs the
+//!   whole time and read back from its output: each way a write, a read and
+//!   a wake of the other process, on the one CPU they share.
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -144,6 +165,7 @@ use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ruio::uring::PortableOp;
 use ruio::uring::ops::Nop;
 
 use crate::sys;
@@ -211,6 +233,16 @@ pub(crate) const ALL: &[Micro] = &[
     Micro {
         name: "nop 64",
         ruio: |load| ruio_nop(load, 64),
+        tokio: None,
+    },
+    Micro {
+        name: "portable nop 1",
+        ruio: |load| ruio_portable_nop(load, 1),
+        tokio: None,
+    },
+    Micro {
+        name: "portable nop 64",
+        ruio: |load| ruio_portable_nop(load, 64),
         tokio: None,
     },
     Micro {
@@ -344,6 +376,16 @@ pub(crate) const ALL: &[Micro] = &[
         tokio: Some(tokio_metadata),
     },
     Micro {
+        name: "read file",
+        ruio: ruio_read_file,
+        tokio: Some(tokio_read_file),
+    },
+    Micro {
+        name: "write file",
+        ruio: ruio_write_file,
+        tokio: Some(tokio_write_file),
+    },
+    Micro {
         name: "symlink",
         ruio: ruio_symlink,
         tokio: Some(tokio_symlink),
@@ -453,6 +495,21 @@ pub(crate) const ALL: &[Micro] = &[
         ruio: ruio_cancel,
         tokio: Some(tokio_cancel),
     },
+    Micro {
+        name: "spawn wait",
+        ruio: ruio_spawn_wait,
+        tokio: Some(tokio_spawn_wait),
+    },
+    Micro {
+        name: "spawn output",
+        ruio: ruio_spawn_output,
+        tokio: Some(tokio_spawn_output),
+    },
+    Micro {
+        name: "child pipes",
+        ruio: ruio_child_pipes,
+        tokio: Some(tokio_child_pipes),
+    },
 ];
 
 /// How many tasks `sleep` runs.
@@ -516,6 +573,36 @@ fn ruio_nop(load: &Load, depth: usize) -> io::Result<f64> {
                     let mut count = 0;
                     while !stop.get() {
                         driver.op(Nop).await?;
+                        count += 1;
+                    }
+                    Ok::<u64, io::Error>(count)
+                })
+            })
+            .collect();
+        let start = Instant::now();
+        ruio::time::sleep(measure).await;
+        stop.set(true);
+        let mut total = 0;
+        for task in tasks {
+            total += task.await.map_err(io::Error::other)??;
+        }
+        Ok(total as f64 / start.elapsed().as_secs_f64())
+    })
+}
+
+/// `depth` tasks each awaiting portable no-ops one at a time: `ruio_nop`'s
+/// loop, each no-op a `PortableOp`.
+fn ruio_portable_nop(load: &Load, depth: usize) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let stop = Rc::new(Cell::new(false));
+        let tasks: Vec<_> = (0..depth)
+            .map(|_| {
+                let stop = Rc::clone(&stop);
+                ruio::spawn(async move {
+                    let mut count = 0;
+                    while !stop.get() {
+                        PortableOp::new(Nop).await?;
                         count += 1;
                     }
                     Ok::<u64, io::Error>(count)
@@ -1031,7 +1118,12 @@ struct Named {
 
 impl Named {
     fn new(name: &str) -> io::Result<Self> {
-        let dir = std::env::temp_dir().join(format!("ruio-bench-{name}-{}", std::process::id()));
+        Self::new_in(&std::env::temp_dir(), name)
+    }
+
+    /// The directory, made in `base`.
+    fn new_in(base: &std::path::Path, name: &str) -> io::Result<Self> {
+        let dir = base.join(format!("ruio-bench-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir)?;
         let file = dir.join("file");
@@ -1039,6 +1131,17 @@ impl Named {
         let link = dir.join("link");
         std::os::unix::fs::symlink("file", &link)?;
         Ok(Self { dir, file, link })
+    }
+}
+
+/// Where `write file` writes: tmpfs, if the host has one at `/dev/shm`, so
+/// that the writes are measured rather than the disk's write-back.
+fn tmpfs_dir() -> std::path::PathBuf {
+    let shm = std::path::Path::new("/dev/shm");
+    if shm.is_dir() {
+        shm.to_path_buf()
+    } else {
+        std::env::temp_dir()
     }
 }
 
@@ -1071,6 +1174,72 @@ fn tokio_metadata(load: &Load) -> io::Result<f64> {
         Ok(rate(measure, async || {
             let found = tokio::fs::metadata(path).await.expect("the file is there");
             assert_eq!(found.len(), 5);
+        })
+        .await)
+    })
+}
+
+/// How many bytes `read file` and `write file` move.
+const SMALL_FILE: usize = 4096;
+
+/// What `write file` writes: borrowed for as long as the program runs, which
+/// ruio writes as it is, and tokio copies to write on its pool.
+static SMALL_DATA: [u8; SMALL_FILE] = [7; SMALL_FILE];
+
+/// A 4 KiB file read whole by path.
+fn ruio_read_file(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("read-file")?;
+    std::fs::write(&named.file, SMALL_DATA)?;
+    ruio_runtime()?.block_on(async move {
+        let path = &named.file;
+        Ok(rate(measure, async || {
+            let data = ruio::fs::read(path).await.expect("the file reads");
+            assert_eq!(data.len(), SMALL_FILE);
+        })
+        .await)
+    })
+}
+
+fn tokio_read_file(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new("read-file")?;
+    std::fs::write(&named.file, SMALL_DATA)?;
+    tokio_runtime()?.block_on(async move {
+        let path = &named.file;
+        Ok(rate(measure, async || {
+            let data = tokio::fs::read(path).await.expect("the file reads");
+            assert_eq!(data.len(), SMALL_FILE);
+        })
+        .await)
+    })
+}
+
+/// 4 KiB written to a file by path, which is made the first time and
+/// emptied each time after.
+fn ruio_write_file(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new_in(&tmpfs_dir(), "write-file")?;
+    ruio_runtime()?.block_on(async move {
+        let path = named.dir.join("written");
+        Ok(rate(measure, async || {
+            ruio::fs::write(&path, &SMALL_DATA[..])
+                .await
+                .expect("the file is written");
+        })
+        .await)
+    })
+}
+
+fn tokio_write_file(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let named = Named::new_in(&tmpfs_dir(), "write-file")?;
+    tokio_runtime()?.block_on(async move {
+        let path = named.dir.join("written");
+        Ok(rate(measure, async || {
+            tokio::fs::write(&path, &SMALL_DATA[..])
+                .await
+                .expect("the file is written");
         })
         .await)
     })
@@ -2550,5 +2719,122 @@ fn tokio_cancel(load: &Load) -> io::Result<f64> {
             arm_and_drop(token.cancelled()).await;
         })
         .await)
+    })
+}
+
+/// `/bin/true` spawned and waited for.
+fn ruio_spawn_wait(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let mut command = ruio::process::Command::new("/bin/true");
+        Ok(rate(measure, async || {
+            let status = command.status().await.expect("the child runs");
+            assert!(status.success());
+        })
+        .await)
+    })
+}
+
+fn tokio_spawn_wait(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let mut command = tokio::process::Command::new("/bin/true");
+        Ok(rate(measure, async || {
+            let status = command.status().await.expect("the child runs");
+            assert!(status.success());
+        })
+        .await)
+    })
+}
+
+/// `/bin/echo` spawned, its output collected, and waited for.
+fn ruio_spawn_output(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let mut command = ruio::process::Command::new("/bin/echo");
+        command.arg("hello");
+        Ok(rate(measure, async || {
+            let output = command.output().await.expect("the child runs");
+            assert_eq!(output.stdout, b"hello\n");
+        })
+        .await)
+    })
+}
+
+fn tokio_spawn_output(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let mut command = tokio::process::Command::new("/bin/echo");
+        command.arg("hello");
+        Ok(rate(measure, async || {
+            let output = command.output().await.expect("the child runs");
+            assert_eq!(output.stdout, b"hello\n");
+        })
+        .await)
+    })
+}
+
+/// How many bytes `child pipes` sends through `cat` each way.
+const PIPED: usize = 64;
+
+/// What `child pipes` sends.
+static PIPED_DATA: [u8; PIPED] = [7; PIPED];
+
+/// 64 bytes written to a running `cat` and read back.
+fn ruio_child_pipes(load: &Load) -> io::Result<f64> {
+    use ruio::io::{AsyncRead, AsyncWrite};
+
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let mut child = ruio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let mut buf = Some(Vec::with_capacity(PIPED));
+        let rate = rate(measure, async || {
+            stdin
+                .write_all(&PIPED_DATA[..])
+                .await
+                .0
+                .expect("cat takes its input");
+            let mut back = buf.take().expect("put back after each read");
+            back.clear();
+            let (read, back) = stdout.read_exact(back).await;
+            read.expect("cat writes it back");
+            buf = Some(back);
+        })
+        .await;
+        drop(stdin);
+        assert!(child.wait().await?.success());
+        Ok(rate)
+    })
+}
+
+fn tokio_child_pipes(load: &Load) -> io::Result<f64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let (mut stdin, mut stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let mut back = [0; PIPED];
+        let rate = rate(measure, async || {
+            stdin
+                .write_all(&PIPED_DATA)
+                .await
+                .expect("cat takes its input");
+            stdout
+                .read_exact(&mut back)
+                .await
+                .expect("cat writes it back");
+        })
+        .await;
+        drop(stdin);
+        assert!(child.wait().await?.success());
+        Ok(rate)
     })
 }

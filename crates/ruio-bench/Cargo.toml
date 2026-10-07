@@ -17,7 +17,7 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 libc.workspace = true
 ruio = { workspace = true, features = ["futures"] }
 ruio-compat = { workspace = true, features = ["tokio"] }
-tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "signal", "sync"] }
 # For `UnboundedReceiverStream`, which gives tokio's channels the `Stream`
 # ruio's have.
 tokio-stream = { version = "0.1.17", default-features = false }
