@@ -354,6 +354,24 @@ works with it.
   such a file is opened `O_NONBLOCK` for streaming, which ruio leaves to
   the caller, as the flag belongs to the file description and so to
   everyone sharing it.
+  `RecvFromStream` keeps a multishot `recvmsg` into a pool armed the same
+  way, for sockets that need not be connected: each completion is one
+  datagram in one buffer, which the kernel fills with a header
+  (`io_uring_recvmsg_out`), the sender's address in the room that the
+  request's `msghdr` keeps for it, and the payload in the rest. A
+  datagram never spans buffers, as the data of a stream does in a bundle,
+  so one longer than the rest of its buffer is cut short, which the
+  header's `MSG_TRUNC` tells. The room follows the socket's family,
+  rounded up to 16 bytes so that the payload starts 16-byte aligned in a
+  buffer that is: 32 bytes come before an IPv4 datagram's payload and 48
+  before an IPv6 one's, and a pool whose buffers leave no room after them
+  is refused. The kernel takes an empty datagram for the end of the data,
+  as a stream socket's, and ends the request with it; the stream yields it
+  as the datagram it is, and re-arms. A `Datagram` derefs to its payload
+  and reads its sender out of the buffer, into a `SocketAddr` with
+  `inet_from` and a `SockAddr` with `from`; `into_data` makes the payload a
+  lease of its own, the header and the address left out of its data and
+  room, which a reply sends as it is.
   `AcceptStream` does the same for a multishot accept, which the kernel ends
   when the completion queue is full; the connections wait in the backlog.
   It yields an error that ends the request and re-arms when polled again, as
@@ -361,8 +379,8 @@ works with it.
 
 ### Kernel features
 
-- Multishot accept, recv, read (6.7) and poll, exposed as streams and
-  re-armed automatically when the kernel ends them (no
+- Multishot accept, recv, recvmsg, read (6.7) and poll, exposed as
+  streams and re-armed automatically when the kernel ends them (no
   `IORING_CQE_F_MORE`) or the buffer pool runs dry (`ENOBUFS`).
 - Direct descriptors: socket and accept install straight into the registered
   file table (`IORING_FILE_INDEX_ALLOC`), so later operations skip the file
@@ -859,6 +877,19 @@ baseline are used only when probed.
   `write_behind` writes back with one send; a listener's `incoming` accepts
   with one request, and `accept` takes one connection and reports the peer.
   TCP and UDP sockets send zero-copy with `send_zc`.
+- A UDP socket's `recv_stream` leaves out where each datagram came from,
+  which a connected socket, whose datagrams all come from its peer, need
+  not know. `recv_from_stream` keeps the driver's multishot `recvmsg` armed
+  instead, for a socket that is not connected, its room for addresses
+  sized by the family that `getsockname` reports, and yields each datagram
+  as a `Datagram`: the payload, the sender's `SocketAddr`, read once from
+  the buffer as the item is made, whether the kernel cut the datagram
+  short, and with `into_parts` the payload's lease and the address, which
+  `send_to` sends back as they are. In `ruio-bench micro` a socket takes
+  936k datagrams a second through it, 1.24× tokio's `recv_from` and 1.75×
+  ruio's own, which makes a request a datagram; the kernel's work on each
+  datagram is most of either runtime's (see
+  [The runtime itself](#the-runtime-itself)).
 - A stream's `write_behind` writes with a detached vectored send, and
   resolves once the send is on its way; the driver drops the buffers when the
   kernel is done. A task echoing what it receives is so polled once per
@@ -1224,10 +1255,11 @@ futures-core, which futures-util's combinators and everything else that
 takes a stream of items want. With the `futures` feature of `ruio`, which
 turns on the same feature of `ruio-executor` and `ruio-driver`, every
 stream of the three crates implements them: `Incoming`, `RecvStream`,
-`ReadStream`, `ReadDir`, `Readiness` and `Signal`; the receivers of the
-bounded and unbounded channels, across cores and for one thread, the
-broadcast receiver and `Interval`; and `MultiOp`, `AcceptStream`,
-`RecvStream`, `ReadStream` and `PollStream` of the driver. A watch
+`RecvFromStream`, `ReadStream`, `ReadDir`, `Readiness` and `Signal`; the
+receivers of the bounded and unbounded channels, across cores and for one
+thread, the broadcast receiver and `Interval`; and `MultiOp`,
+`AcceptStream`, `RecvStream`, `RecvFromStream`, `ReadStream` and
+`PollStream` of the driver. A watch
 channel's values stream through `sync::watch::WatchStream`, each item a
 clone of the latest value once one the receiver has not seen is there, as
 tokio-stream's does. Each `poll_next` is one call to the type's own
@@ -2352,6 +2384,40 @@ to: a first version did, ran both cores on one CPU without knowing, and
 read 10k a second, the two threads taking the CPU in turns of the spin
 budget.
 
+`recv from`, `recv from stream`, `datagrams in`, `datagrams in stream` and
+`datagrams in without senders`, added with `recv_from_stream`, measure
+datagrams. `recv from` sends a 64-byte datagram from a client to an echo
+task on the same runtime, which takes it with `recv_from`, a request a
+datagram, and sends it back with `send_to`, and receives the echo; `recv
+from stream` has the echo task take its datagrams and their senders from
+`recv_from_stream`, both against tokio's echo through its `recv_from` and
+`send_to`. The other three time how fast one socket takes datagrams in: a
+thread on another core fills the socket's receive buffer with 128
+datagrams of 64 bytes in one `sendmmsg(2)`, and the runtime takes them,
+again and again, only the taking timed, with `recv_from` in `datagrams
+in`, from `recv_from_stream` in `datagrams in stream`, and from
+`recv_stream`, which leaves the senders out, in `datagrams in without
+senders`, against tokio's `recv_from`, and its `recv` in the last. Medians
+of five runs taken in turns: `recv from` 206k round trips a second against
+163k, and `recv from stream` 201k against 164k; `datagrams in` 534k
+datagrams a second against 751k, `datagrams in stream` 936k against 754k,
+1.24×, and `datagrams in without senders` 968k against 858k. A datagram
+taken from the stream costs 1.07 µs, most of it the kernel's: profiled,
+the drain spends its time in `udp_recvmsg`, in the copy out of an skb that
+another core wrote and in the deferred free of the skb back to that core,
+as datagrams from a network card whose interrupts another core serves
+would, and ruio's own work in user space is about an eighth of it. tokio
+pays the same and a system call a datagram, and ruio's `recv_from` an
+entry into the kernel a datagram and a request whose header and iovec the
+kernel copies in, neither of which the stream pays; its addresses cost 3%
+over `recv_stream`'s none, where tokio's `recv_from` costs 14% over its
+`recv`. A first version flooded the socket from threads that sent as fast
+as they could, and measured the senders until there were eight, and from
+then on eight cores contending for one socket's queue. The round trips
+read the same through either receive: the kernel's sends and receives on
+the loopback, its conntrack and AppArmor hooks included, are most of
+their time.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -2585,6 +2651,15 @@ Since M7:
   takes 1.2 µs of user-space work, from 1.7, and with both cores parking
   between steps makes 184k a second against tokio's 166k (see
   [Executor](#executor) and [The runtime itself](#the-runtime-itself)).
+- A UDP socket that is not connected takes its datagrams and their
+  senders off one multishot `recvmsg` (`UdpSocket::recv_from_stream`, the
+  driver's `RecvFromStream`): each datagram takes one buffer, a header and
+  the sender's address before the payload, and comes as a `Datagram` that
+  reads the address straight from the buffer and hands the payload over
+  as a lease to send back. A socket takes 936k datagrams a second so, 1.24×
+  tokio's `recv_from` and 1.75× ruio's request a datagram, its addresses
+  costing 3% over none (see [Networking](#networking) and [The runtime
+  itself](#the-runtime-itself)).
 
 ## Open questions
 

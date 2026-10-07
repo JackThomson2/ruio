@@ -150,7 +150,11 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   cores parking between steps, where the kernel's wakes set the pace, and
   some 860k a second with both cores spinning, 1.5 times what the executor
   made before, with no system call on the path; aborting it from any
-  thread and collecting it through a `JoinSet` cost about the same.
+  thread and collecting it through a `JoinSet` cost about the same. A UDP
+  socket that is not connected takes its datagrams and their senders off
+  one multishot `recvmsg` (`recv_from_stream`) at 936k a second, 1.24
+  times tokio's `recv_from` and 1.75 times a request a datagram, the
+  kernel's own work on each datagram being most of either.
 
 ## Development
 
