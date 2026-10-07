@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 use futures_core::stream::{FusedStream, Stream};
 
 use crate::buf::{BufBundle, BufLease};
-use crate::ops::{AcceptStream, PollStream, ReadStream, RecvStream};
+use crate::ops::{AcceptStream, Datagram, PollStream, ReadStream, RecvFromStream, RecvStream};
 use crate::{Descriptor, MultiOp, Multishot};
 
 impl<T: Multishot> Stream for MultiOp<T> {
@@ -65,6 +65,23 @@ impl Stream for RecvStream {
 
 /// Terminated once the peer has shut down or an error has been yielded.
 impl FusedStream for RecvStream {
+    #[inline]
+    fn is_terminated(&self) -> bool {
+        self.is_ended()
+    }
+}
+
+impl Stream for RecvFromStream {
+    type Item = io::Result<Datagram>;
+
+    #[inline]
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        RecvFromStream::poll_next(self.get_mut(), cx)
+    }
+}
+
+/// Terminated once an error has been yielded.
+impl FusedStream for RecvFromStream {
     #[inline]
     fn is_terminated(&self) -> bool {
         self.is_ended()

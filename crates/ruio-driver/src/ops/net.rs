@@ -4,14 +4,15 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::mem;
 use std::net;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::ptr;
 use std::task::{Context, Poll, ready};
 
 use ruio_sys as sys;
 
-use super::{Install, complete_read};
-use crate::buf::{BufResult, IoBuf, IoBufMut, IoBufs};
+use super::{Install, Rearming, complete_read};
+use crate::buf::{BufLease, BufPool, BufResult, IoBuf, IoBufMut, IoBufs};
 use crate::{Completion, Descriptor, Driver, Fd, MultiOp, Multishot, Operation, Probe, SockAddr};
 
 impl Install {
@@ -804,6 +805,295 @@ unsafe impl<B: IoBufMut> Operation for RecvFrom<B> {
         let from = *from;
         let (received, buf) = complete_read(self.buf, completion);
         (received.map(|received| (received, from)), buf)
+    }
+}
+
+/// How many bytes the header that a multishot `recvmsg` writes at the start
+/// of each buffer takes.
+const RECVMSG_OUT: usize = size_of::<sys::io_uring_recvmsg_out>();
+
+/// The room a buffer keeps for the address of a sender of `family`: that
+/// family's address, or any family's, rounded up to 16 bytes, so that the
+/// payload starts 16-byte aligned in a buffer that is.
+fn address_room(family: i32) -> usize {
+    let len = match family {
+        libc::AF_INET => size_of::<libc::sockaddr_in>(),
+        libc::AF_INET6 => size_of::<libc::sockaddr_in6>(),
+        libc::AF_UNIX => size_of::<libc::sockaddr_un>(),
+        _ => size_of::<libc::sockaddr_storage>(),
+    };
+    len.next_multiple_of(16)
+}
+
+/// Receives datagrams from a socket into a [`BufPool`] again and again as
+/// they arrive, each with its sender's address: a multishot `recvmsg(2)`
+/// (`IORING_RECV_MULTISHOT`), for sockets that need not be connected, such
+/// as datagram sockets.
+///
+/// Each datagram takes one buffer, which the kernel fills with a header, the
+/// sender's address, in the room the request keeps for an address of the
+/// socket's family, and the payload, in the rest: a datagram longer than
+/// that is cut short, and the rest of it lost, as one received into a
+/// buffer of that size is, which the [`Datagram`] says. A datagram never
+/// spans buffers, as data of a stream does in a bundle, so the buffers want
+/// room for the largest datagram expected. When the pool runs dry the
+/// kernel ends the request with `ENOBUFS`; [`RecvFromStream`] waits for a
+/// buffer and re-arms it.
+pub struct RecvFromMulti {
+    fd: Fd,
+    pool: BufPool,
+    /// What the kernel reads the room for the address from: of its fields,
+    /// only `msg_namelen` is set. Boxed, as the request moves while the
+    /// kernel may read it.
+    header: Box<libc::msghdr>,
+    /// Where the payload starts in each buffer: past the header and the room
+    /// for the address.
+    payload: usize,
+}
+
+impl RecvFromMulti {
+    /// Receives datagrams from `fd`, a socket of address family `family`,
+    /// such as `AF_INET6`, into `pool`. The family sizes the room each buffer
+    /// keeps for the sender's address; a family other than IPv4's, IPv6's
+    /// and Unix sockets' gets room for any address.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if the pool's buffers have no room for a payload after
+    /// the header and the address.
+    pub fn new(fd: impl Into<Fd>, pool: &BufPool, family: i32) -> io::Result<Self> {
+        let room = address_room(family);
+        let payload = RECVMSG_OUT + room;
+        if pool.buffer_size() <= payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the pool's buffers have no room for a datagram after its header and address",
+            ));
+        }
+        // SAFETY: all zeroes is a valid `msghdr`, with null pointers.
+        let mut header: Box<libc::msghdr> = Box::new(unsafe { mem::zeroed() });
+        // The kernel writes the address into each buffer, not through the
+        // null `msg_name`, and with no `msg_iov` a datagram may fill the rest
+        // of its buffer.
+        header.msg_namelen = room as libc::socklen_t;
+        Ok(Self {
+            fd: fd.into(),
+            pool: pool.clone(),
+            header,
+            payload,
+        })
+    }
+}
+
+impl std::fmt::Debug for RecvFromMulti {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecvFromMulti")
+            .field("fd", &self.fd)
+            .field("pool", &self.pool)
+            .field("payload", &self.payload)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: the entry points to the boxed header, which the request owns and
+// which stays put when it moves, and the kernel writes into buffers of the
+// pool, which the request keeps alive. A multishot `recvmsg`'s completions
+// carry IORING_CQE_F_MORE until the last.
+unsafe impl Multishot for RecvFromMulti {
+    type Item = io::Result<Option<Datagram>>;
+
+    /// `len` is 1, for the one header, as for any `recvmsg`; the kernel
+    /// takes how much of a buffer a datagram may fill from the header's
+    /// iovec, of which there is none, so that one may fill all of it.
+    #[inline]
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        sqe.opcode = sys::IORING_OP_RECVMSG;
+        self.fd.apply(sqe);
+        sqe.addr = (&raw const *self.header).expose_provenance() as u64;
+        sqe.len = 1;
+        sqe.ioprio = sys::IORING_RECV_MULTISHOT;
+        sqe.flags |= sys::IOSQE_BUFFER_SELECT;
+        sqe.buf_index = self.pool.group();
+    }
+
+    #[inline]
+    fn item(&mut self, completion: Completion) -> Self::Item {
+        let len = usize::try_from(completion.res()).unwrap_or(0);
+        // Taken before looking at the result, so that a buffer the receive
+        // consumed returns to the pool whatever happened.
+        let lease = self.pool.lease(completion.flags(), len);
+        completion.result()?;
+        let lease = lease.ok_or_else(|| io::Error::other("the kernel filled no pooled buffer"))?;
+        Datagram::new(lease, self.payload).map(Some)
+    }
+}
+
+/// A datagram that a [`RecvFromMulti`] received into a buffer of a pool,
+/// with its sender's address, which the buffer holds before the payload.
+/// It derefs to the payload.
+///
+/// The buffer returns to the pool when the datagram is dropped, or the
+/// lease of its payload that [`into_data`](Datagram::into_data) makes.
+pub struct Datagram {
+    /// What the kernel wrote into the buffer: the header, the address in its
+    /// room, and the payload.
+    lease: BufLease,
+    /// Where the payload starts in the lease.
+    payload: usize,
+    /// The address's length, as the kernel reported it.
+    name_len: u32,
+    /// The `recvmsg(2)` result flags.
+    flags: u32,
+}
+
+impl Datagram {
+    /// The datagram in `lease`, whose payload starts at `payload`.
+    #[inline]
+    fn new(lease: BufLease, payload: usize) -> io::Result<Self> {
+        if lease.len() < payload {
+            return Err(io::Error::other(
+                "the kernel wrote less than a datagram's header and address",
+            ));
+        }
+        // SAFETY: the lease holds a whole header, read unaligned, as the
+        // buffers need not be aligned, and any bytes are a valid one.
+        let header = unsafe {
+            lease
+                .as_ptr()
+                .cast::<sys::io_uring_recvmsg_out>()
+                .read_unaligned()
+        };
+        Ok(Self {
+            lease,
+            payload,
+            name_len: header.namelen,
+            flags: header.flags,
+        })
+    }
+
+    /// The sender's address. A datagram from a Unix socket without an
+    /// address comes from the empty one, which [`SockAddr::as_unix`] makes
+    /// the unnamed address.
+    pub fn from(&self) -> SockAddr {
+        SockAddr::from_kernel(self.name())
+    }
+
+    /// The sender's address if it is an IPv4 or IPv6 one, as a UDP
+    /// socket's senders' are: what [`from`](Datagram::from) and then
+    /// [`SockAddr::as_inet`] give, read straight from the buffer.
+    #[inline]
+    pub fn inet_from(&self) -> Option<net::SocketAddr> {
+        crate::sockaddr::inet(self.name())
+    }
+
+    /// Whether the datagram was longer than its buffer had room for, so
+    /// that the kernel cut it short, and the rest of it was lost.
+    #[inline]
+    pub fn is_truncated(&self) -> bool {
+        self.flags & libc::MSG_TRUNC.cast_unsigned() != 0
+    }
+
+    /// The payload, as a lease of the buffer whose data and room leave the
+    /// header and the address out.
+    #[inline]
+    pub fn into_data(self) -> BufLease {
+        let mut lease = self.lease;
+        lease.skip(self.payload);
+        lease
+    }
+
+    /// The address, as the kernel wrote it, up to its room.
+    #[inline]
+    fn name(&self) -> &[u8] {
+        let len = (self.name_len as usize).min(self.payload - RECVMSG_OUT);
+        &self.lease[RECVMSG_OUT..RECVMSG_OUT + len]
+    }
+}
+
+impl Deref for Datagram {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        &self.lease[self.payload..]
+    }
+}
+
+impl DerefMut for Datagram {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.lease[self.payload..]
+    }
+}
+
+impl std::fmt::Debug for Datagram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Datagram")
+            .field("from", &self.from())
+            .field("len", &self.len())
+            .field("truncated", &self.is_truncated())
+            .finish()
+    }
+}
+
+/// The datagrams arriving on a socket, each with its sender's address,
+/// received into a [`BufPool`] by a multishot `recvmsg` that the stream
+/// keeps armed, as [`RecvStream`](super::RecvStream) keeps a receive armed:
+/// re-armed once a buffer returns to a pool that ran dry, and when the
+/// kernel ends it for reasons of its own, as it does after an empty
+/// datagram, which it takes for the end of the data.
+///
+/// The stream ends after yielding an error, such as `ECONNREFUSED` on a
+/// connected UDP socket whose peer has no socket bound.
+#[derive(Debug)]
+pub struct RecvFromStream {
+    inner: Rearming<RecvFromMulti>,
+}
+
+impl RecvFromStream {
+    /// A stream of the datagrams arriving on `fd`, a socket of address
+    /// family `family`, received into `pool`; see [`RecvFromMulti::new`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`RecvFromMulti::new`].
+    pub fn new(
+        driver: &Driver,
+        fd: impl Into<Fd>,
+        pool: &BufPool,
+        family: i32,
+    ) -> io::Result<Self> {
+        let request = RecvFromMulti::new(fd, pool, family)?;
+        Ok(Self {
+            inner: Rearming::new(driver, request, pool),
+        })
+    }
+
+    /// The next datagram, or `None` once an error has been yielded.
+    #[inline]
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Datagram>>> {
+        self.inner.poll_next(cx)
+    }
+
+    /// The next datagram; see [`poll_next`](RecvFromStream::poll_next).
+    pub async fn next(&mut self) -> Option<io::Result<Datagram>> {
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// The next datagram if it has arrived already, without waiting, or
+    /// `None`: nothing has, or the stream has ended, which the next
+    /// [`poll_next`](RecvFromStream::poll_next) tells. A server that takes
+    /// the datagrams that have arrived so, after each one it waits for,
+    /// answers them all before the thread next waits.
+    #[inline]
+    pub fn next_ready(&mut self) -> Option<io::Result<Datagram>> {
+        self.inner.next_ready()
+    }
+
+    /// Whether the stream has ended, after yielding an error.
+    #[inline]
+    pub fn is_ended(&self) -> bool {
+        self.inner.finished
     }
 }
 

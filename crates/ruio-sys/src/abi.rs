@@ -323,6 +323,26 @@ pub struct io_uring_clone_buffers {
     pub pad: [u32; 3],
 }
 
+/// What a multishot `recvmsg` request ([`IORING_OP_RECVMSG`] with
+/// [`IORING_RECV_MULTISHOT`]) writes at the start of each provided buffer it
+/// fills. The sender's address follows it, in as much room as the request's
+/// `msghdr` gives `msg_namelen`, then the control messages, in the room of
+/// its `msg_controllen`, and then the payload, in the rest of the buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct io_uring_recvmsg_out {
+    /// The address's length: more than its room if the kernel cut it short.
+    pub namelen: u32,
+    /// How much of their room the control messages fill.
+    pub controllen: u32,
+    /// How much of the datagram the kernel copied, or with `MSG_TRUNC` among
+    /// the request's flags, how long it was.
+    pub payloadlen: u32,
+    /// The `recvmsg(2)` result flags, such as `MSG_TRUNC` for a payload the
+    /// buffer had no room for all of.
+    pub flags: u32,
+}
+
 /// The kernel's 64-bit `timespec`, from `linux/time_types.h`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -345,6 +365,7 @@ const _: () = {
     assert!(size_of::<io_uring_rsrc_register>() == 32);
     assert!(size_of::<io_uring_rsrc_update>() == 16);
     assert!(size_of::<io_uring_clone_buffers>() == 32);
+    assert!(size_of::<io_uring_recvmsg_out>() == 16);
     assert!(size_of::<io_uring_buf>() == 16);
     assert!(size_of::<io_uring_buf_ring>() == 16);
     assert!(size_of::<io_uring_buf_reg>() == 40);

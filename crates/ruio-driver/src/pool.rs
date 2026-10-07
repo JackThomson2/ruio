@@ -661,6 +661,16 @@ impl BufLease {
     fn ptr(&self) -> *mut u8 {
         self.pool.buffer(self.bid).wrapping_add(self.start)
     }
+
+    /// Leaves the first `count` bytes of the data, and as much of the room,
+    /// out of the lease, as for a header the kernel wrote before the data.
+    #[inline]
+    pub(crate) fn skip(&mut self, count: usize) {
+        let count = count.min(self.len);
+        self.start += count;
+        self.len -= count;
+        self.room -= count;
+    }
 }
 
 impl Deref for BufLease {

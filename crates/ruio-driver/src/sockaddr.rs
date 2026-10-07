@@ -42,6 +42,16 @@ impl SockAddr {
         }
     }
 
+    /// The address the kernel wrote as `bytes`, as long as they are, up to
+    /// the room of a `sockaddr_storage`.
+    pub(crate) fn from_kernel(bytes: &[u8]) -> Self {
+        let mut addr = Self::empty();
+        let len = bytes.len().min(size_of::<libc::sockaddr_storage>());
+        addr.bytes_mut()[..len].copy_from_slice(&bytes[..len]);
+        addr.len = len as libc::socklen_t;
+        addr
+    }
+
     /// A Unix socket address for the path `path`.
     ///
     /// # Errors
@@ -106,32 +116,7 @@ impl SockAddr {
 
     /// The IPv4 or IPv6 address, if it is one.
     pub fn as_inet(&self) -> Option<SocketAddr> {
-        match i32::from(self.family()) {
-            libc::AF_INET if self.len() >= size_of::<libc::sockaddr_in>() => {
-                // SAFETY: the storage is large and aligned enough for any
-                // address, holds an IPv4 one, and any bytes are a valid
-                // `sockaddr_in`.
-                let addr = unsafe {
-                    ptr::from_ref(&self.storage)
-                        .cast::<libc::sockaddr_in>()
-                        .read()
-                };
-                let ip = Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
-                Some(SocketAddrV4::new(ip, u16::from_be(addr.sin_port)).into())
-            }
-            libc::AF_INET6 if self.len() >= size_of::<libc::sockaddr_in6>() => {
-                // SAFETY: as above, for an IPv6 address.
-                let addr = unsafe {
-                    ptr::from_ref(&self.storage)
-                        .cast::<libc::sockaddr_in6>()
-                        .read()
-                };
-                let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
-                let port = u16::from_be(addr.sin6_port);
-                Some(SocketAddrV6::new(ip, port, addr.sin6_flowinfo, addr.sin6_scope_id).into())
-            }
-            _ => None,
-        }
+        inet(&self.bytes()[..self.len()])
     }
 
     /// The Unix socket address, if it is one.
@@ -283,6 +268,31 @@ impl fmt::Debug for SockAddr {
                 .field("len", &self.len)
                 .finish_non_exhaustive()
         }
+    }
+}
+
+/// The IPv4 or IPv6 address that `bytes` hold whole, laid out as the kernel
+/// writes a `sockaddr_in` or a `sockaddr_in6`, which they may hold at any
+/// alignment, as a provided buffer does after a multishot `recvmsg`'s header.
+#[inline]
+pub(crate) fn inet(bytes: &[u8]) -> Option<SocketAddr> {
+    let family = libc::sa_family_t::from_ne_bytes(bytes.get(..2)?.try_into().ok()?);
+    match i32::from(family) {
+        libc::AF_INET if bytes.len() >= size_of::<libc::sockaddr_in>() => {
+            // SAFETY: `bytes` hold a whole `sockaddr_in`, read unaligned, and
+            // any bytes are a valid one.
+            let addr = unsafe { bytes.as_ptr().cast::<libc::sockaddr_in>().read_unaligned() };
+            let ip = Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
+            Some(SocketAddrV4::new(ip, u16::from_be(addr.sin_port)).into())
+        }
+        libc::AF_INET6 if bytes.len() >= size_of::<libc::sockaddr_in6>() => {
+            // SAFETY: as above, for a `sockaddr_in6`.
+            let addr = unsafe { bytes.as_ptr().cast::<libc::sockaddr_in6>().read_unaligned() };
+            let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
+            let port = u16::from_be(addr.sin6_port);
+            Some(SocketAddrV6::new(ip, port, addr.sin6_flowinfo, addr.sin6_scope_id).into())
+        }
+        _ => None,
     }
 }
 

@@ -37,8 +37,8 @@ pub use fs::{
     Statx, SymlinkAt, SyncFileRange, UnlinkAt,
 };
 pub use net::{
-    Accept, AcceptMulti, AcceptStream, Connect, Recv, RecvFrom, Send, SendTo, SendVectored, SendZc,
-    Shutdown, Socket,
+    Accept, AcceptMulti, AcceptStream, Connect, Datagram, Recv, RecvFrom, RecvFromMulti,
+    RecvFromStream, Send, SendTo, SendVectored, SendZc, Shutdown, Socket,
 };
 pub use sockopt::{GetSockOpt, InstallFd, OptionValue, SetSockOpt, UnreadBytes, UnsentBytes};
 pub use splice::{PollAdd, PollMulti, PollStream, Splice, Tee};

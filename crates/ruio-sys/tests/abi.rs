@@ -205,6 +205,12 @@ const LAYOUTS: &[Layout] = &[
         nr => nr,
         pad => pad,
     }),
+    layout!(io_uring_recvmsg_out, in_header: true, {
+        namelen => namelen,
+        controllen => controllen,
+        payloadlen => payloadlen,
+        flags => flags,
+    }),
     layout!(__kernel_timespec, in_header: false, {
         tv_sec => tv_sec,
         tv_nsec => tv_nsec,
