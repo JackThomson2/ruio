@@ -29,6 +29,7 @@ an API that still reads like ordinary async Rust.
 |---|---|---|
 | Execution model | Thread-per-core: one ring and one executor per thread; spawned tasks need not be `Send`. | `SINGLE_ISSUER` and `DEFER_TASKRUN` assume one submitting thread, registered files and buffers belong to a single ring, and the hot path needs no atomics or locks. |
 | Work stealing | Not in the first release, but kept possible (see [Keeping work stealing possible](#keeping-work-stealing-possible)). | It fights per-ring state, but some workloads want it. |
+| Send I/O | Portable operations (`PortableOp`, and `PortableFd` for a descriptor) run on the ring of the thread that polls them; the sockets and files stay with their ring. | Futures that must be `Send`, as `async_trait`'s and those spawned onto another core are, could hold no I/O of the ring; a portable operation costs a comparison a poll while it stays on its thread. |
 | Minimum kernel | Linux 6.10. Detected by capability, not by version string. | 6.1, the oldest LTS with `DEFER_TASKRUN`, had everything the core needs, but 6.10 adds bundles, which send and receive several provided buffers per request: the network path needs them to beat epoll on large messages (see [Benchmarks](#benchmarks)). It also brings `NO_SQARRAY` (6.6), multishot read (6.7) and socket options through `URING_CMD` (6.7). Distribution kernels backport features, so version numbers mislead. |
 | Bindings | Our own, in `ruio-sys`: written by hand from the kernel's uapi header and tested against it. | Full control of the ABI surface and the hot path, no bindgen at build time, and new kernel features arrive when we need them. |
 | Interop | `futures-io` and `tokio::io` adapters in `ruio-compat`, which hyper and rustls run over. | Ecosystem access matters, but must not shape the core API. |
@@ -45,7 +46,7 @@ crates/
                   registered files, capability probe
   ruio-executor/  per-thread scheduler, tasks, timer wheel, thread-per-core builder
   ruio-macros/    #[ruio::main], #[ruio::test]
-  ruio/           public API: runtime, time, uring, buf, net, fs; later io
+  ruio/           public API: runtime, time, uring, buf, net, fs, io, signal, process
   ruio-bench/     benchmarks against other runtimes, the one crate that depends on them
   ruio-compat/    futures-io and tokio::io adapters
 ```
@@ -99,6 +100,20 @@ it is dropped. Three rules follow.
    leaked, never freed, and only then is the ring closed. The bound is a
    second unless set, through `shutdown_timeout` on the driver's builder
    and the runtime's, which `Cores::builder` takes for every core.
+4. **A portable operation goes back to its ring.** A `PortableOp` queues
+   its operation on the ring of the thread that first polls it, and is
+   `Send` only when its operation and its output are. A future that moves
+   to another thread while its operation is in flight cannot reach that
+   ring, so it hands the operation back, as a request the ring takes at its
+   next turn: polled away, with a relay the ring sends the output through
+   as the operation completes; dropped away, to be adopted as an orphan and
+   cancelled, as rule 2 has it. Whatever is sent so goes to the ring's
+   thread, where the operation came from. A ring dropped while such a
+   future is away drains the operation as rule 3 has it, and records how it
+   ended, its completion or that the kernel had not finished it, in a
+   registry of the process, where the future finds it on whichever thread:
+   it completes with the completion, or, if the kernel may still use its
+   memory, leaks it and never completes.
 
 Receives let the kernel choose the buffer from a provided-buffer ring
 (`BufPool`), so idle connections do not pin memory. A completed receive
@@ -377,6 +392,50 @@ works with it.
   It yields an error that ends the request and re-arms when polled again, as
   a server carries on after a failed `accept(2)`.
 
+### Portable operations
+
+An `Op` holds its driver, a reference-counted handle of the driver's thread,
+so a future that holds one across an await is not `Send`, and code whose
+futures must be, the boxed futures of `async_trait` or one spawned onto
+another core, could do no I/O on the ring. A `PortableOp` holds no driver: it
+queues its operation on the ring of the thread's current driver as it is
+first polled, keeping the ring's ID and the slot, and finds the ring again by
+comparing that ID with the current driver's. Beside that it costs what an
+`Op` does: `portable nop 1` makes within 2% of `nop 1`'s no-ops a second,
+and with 64 in flight each costs some 7 ns more (see [The runtime
+itself](#the-runtime-itself)). `Driver::enter` makes a driver the thread's
+current one while a guard lives; the runtime enters its own as `block_on`
+runs and as it shuts down.
+
+- A future polled on another thread than its ring's, as a task that moved
+  between cores is, hands the operation back through the ring's remote
+  part, which other threads reached already to close the direct
+  descriptors sent to it: a request the ring takes at the start of its next
+  turn, which the request unparks it for. The ring adopts the operation as
+  an orphan, with its completion if it has completed already: a turn whose
+  requests leave something to deliver does not wait for a completion, which
+  might never come. The output goes back through a relay that the future
+  registers its waker with. A future dropped away has the operation adopted
+  and cancelled.
+- A driver dropped with portable operations still waiting, whose futures
+  are away or gone, submits what is queued, takes the requests made before
+  its remote part closes, drains, and records each operation's fate in a
+  registry of the process. The futures find their fates wherever they are;
+  an operation parked there by a future dropped meanwhile is dropped once
+  the kernel is done with it, and leaked if it never was.
+- The type has the operation's output as a last parameter, which defaults
+  to it. The compiler erases lifetimes as it checks that a future holding
+  another across an await is `Send`, and could not then prove a write of a
+  `&'static str`, a buffer only `'static` borrows fit, `Send` through the
+  operation's implementation; named in the type, the output is normalised
+  as the generic function is checked, and its own type says whether it is.
+- A `PortableFd` is a plain descriptor whose operations are portable ones,
+  each recording the ring it queued on. Dropped, it closes after what that
+  ring queued, with a close queued there, or asked for from another thread;
+  one whose operations reached no ring, or whose ring is gone, closes at
+  once. `ops::Map` makes an operation's output into another: an open's
+  `Descriptor`, which could be a direct one, into the plain `OwnedFd` it is.
+
 ### Kernel features
 
 - Multishot accept, recv, recvmsg, read (6.7) and poll, exposed as
@@ -507,6 +566,18 @@ works with it.
   ring, one with `DEFER_TASKRUN`, costs more than the write, a busy sender
   would hold the wake back until its next enter, and threads without a
   ring need the eventfd in any case.
+- `IORING_OP_WAITID` (6.7) waits for a child process on the ring
+  (`ops::Waitid`): by process ID, pidfd or group, with the options of
+  `waitid(2)`. The kernel takes the idtype in the entry's `len`, the ID in
+  its `fd`, the options in its `file_index` and the `siginfo_t` it fills in
+  in its `addr2`; it writes `si_signo` as `SIGCHLD` only when it reports a
+  child, and zeroes nothing first, so a `WNOHANG` wait that found nothing
+  is told by `si_signo`.
+- Children are signalled through pidfds, with `pidfd_send_signal(2)`, and
+  the group a child leads with `PIDFD_SIGNAL_PROCESS_GROUP` (6.9), which the
+  kernel resolves through the pidfd's `struct pid` rather than a number: it
+  reaches that group after its leader has been reaped, and no group if the
+  child leads none (see [Processes](#processes)).
 
 ### Capability probe
 
@@ -528,6 +599,9 @@ baseline are used only when probed.
   which awaits the output on any thread, says whether the task has
   finished, and makes a `RemoteAbortHandle`, which aborts the task from
   any thread.
+- The runtime makes its driver the thread's current one (`Driver::enter`)
+  while `block_on` runs and while it shuts down, so the portable operations
+  its tasks poll queue on its ring, and those it drops are orphaned there.
 - A task is one allocation holding its future and, once it finishes, its
   output, and is its own waker. It is referred to in two ways. References
   from its own thread, which the scheduler's table, the run queue, the
@@ -854,6 +928,11 @@ baseline are used only when probed.
 - I/O types are `!Send` through an explicit marker, not because they happen to
   contain an `Rc`, so a work-stealing mode can lift the restriction without
   changing their layout. The sockets and `DirectFd` do this.
+- Portable operations are what a task that moves takes with it: a
+  `PortableOp` runs on whichever ring polls it first, and goes back to that
+  ring if it moves. The path functions of `ruio::fs` and everything in
+  `ruio::process` are built on them; see [Portable
+  operations](#portable-operations).
 - Handles to registered resources (files, buffers) record which ring owns
   them, so an operation from a migrated task can be routed back to that ring
   (`MSG_RING`) or fall back to a plain descriptor. A `DirectFd` names its
@@ -1080,6 +1159,18 @@ the ring of the thread's runtime, and `read_link`, `canonicalize`,
 `set_permissions`, `copy` and `remove_dir_all`, running on the blocking
 pool, which io_uring has no operation for.
 
+The functions that take a path, all but `read_dir`, run their operations as
+portable ones (see [Portable operations](#portable-operations)), so their
+futures are `Send`: `read` and `write` open the file as a `PortableFd`, read
+or write it through it to the end, and close it, `write` with a close of its
+own whose result it reports. On the thread that polls them they cost what
+the ring's own operations do: a 4 KiB file is read whole 2.79 times as often
+as through tokio's `fs::read`, its status 2.40 times as often, and 4 KiB
+written to a file emptied each time 1.13 times, the open that creates and
+truncates going to an io-wq worker (see [The runtime
+itself](#the-runtime-itself)). A `File` stays with its ring, and so does a
+`ReadDir`.
+
 - Reads and writes take owned buffers and hand them back with the result, at
   an offset, so any number can run at once. `read_exact_at` and
   `write_all_at` take as many as a buffer needs; `read_fixed_at` and
@@ -1179,6 +1270,61 @@ pool, which io_uring has no operation for.
 - Files implement `io::AsyncRead` and `io::AsyncWrite` at their position,
   and are spliced from and to with `io::splice`, from an offset and for a
   length; see [Networking](#networking).
+
+## Processes
+
+`ruio::process` has `Command`, `Child`, and the pipes `ChildStdin`,
+`ChildStdout` and `ChildStderr`; a `Child` and every future in it are
+`Send`.
+
+- `Command` wraps the standard library's, with its settings and defaults,
+  and spawns as it does: with `posix_spawn(3)`, a clone that shares the
+  parent's memory until the child execs, unless `pre_exec`, a user, a group
+  or a `PATH` of the child's own for a bare program name forces a fork,
+  which costs the more the more memory the parent maps. `process_group`
+  keeps the fast way. The child's pidfd is opened at once; unreaped, the
+  child cannot have given its number to another process.
+- `wait` closes the child's input, as the standard library does, and waits
+  with a portable `IORING_OP_WAITID` on the pidfd, which the kernel
+  completes as the child exits: no thread blocks and nothing handles
+  `SIGCHLD`. The wait watches the child rather than reap it (`WNOWAIT`),
+  and the child is reaped with one `waitid(2)` as the future completes,
+  which keeps the status: a wait that reaped in the kernel, dropped as the
+  child exited, under a timeout say, would lose the status with its
+  output. `try_wait` reaps the same way without waiting.
+- Signals go through the pidfd, so they reach the child and no process that
+  took its number. `signal_group` reaches the group the child leads, as one
+  spawned with `process_group(0)` does, through the pidfd's `struct pid`:
+  after the child has been reaped too, and no group at all, the parent's
+  least of all, if the child leads none. `kill_on_drop` kills the group,
+  then the child, as the `Child` is dropped, so a command's background jobs
+  go with it, even once the command has exited.
+- A child dropped before it exited is reaped as it exits by a thread of its
+  own, started as the first is dropped, which polls the pidfds of such
+  children: a thread rather than the ring of the runtime that dropped the
+  child, so that the child outlives runtimes and their shutdowns.
+- The parent's ends of the pipes are nonblocking, which touches no file of
+  the child's, and are read and written with system calls made at once; a
+  read that finds the pipe empty, or a write that finds it full, waits with
+  a portable `POLL_ADD` and is made again. Through the ring, every read and
+  write took a turn of the loop, and a read of an empty pipe failed in the
+  kernel first, which allocated its retry's state, armed a poll and read
+  again: with a `cat` answering 64 bytes at a time, profiled, the runtime's
+  thread spent two fifths more CPU on each round trip than tokio's, and
+  made 0.85 of its round trips. Made at once, the reads and writes make as
+  many as tokio's. A pipe whose transfers complete at once 32 times in a
+  row yields to the runtime's other tasks before the next, so that a child
+  on another CPU that keeps a pipe full cannot hold up the loop.
+- `output` and `wait_with_output` read the output and the error at once, so
+  a child that fills one pipe while the other is read cannot stall.
+  `status` and `output` spawn as they are called, and return futures that
+  borrow nothing.
+
+Spawning `/bin/true` and waiting for it, and spawning `/bin/echo` and
+collecting its output, run 1k a second on either runtime, the process's
+creation and exit being nearly all of either, and 64 bytes go through a
+`cat`'s pipes and back 273k times a second on either (see [The runtime
+itself](#the-runtime-itself)).
 
 ## Compatibility
 
@@ -2416,6 +2562,39 @@ as they could, and measured the senders until there were eight, and from
 then on eight cores contending for one socket's queue. The round trips
 read the same through either receive: the kernel's sends and receives on
 the loopback, its conntrack and AppArmor hooks included, are most of
+`portable nop 1`, `portable nop 64`, `read file`, `write file`, `spawn
+wait`, `spawn output` and `child pipes`, added with portable operations and
+child processes, measure those. The first two run `nop 1`'s and `nop 64`'s
+loops with each no-op a `PortableOp`. `read file` reads a 4 KiB file whole
+by path, and `write file` writes 4 KiB to one, emptied each time, on tmpfs:
+ext4 writes back a file emptied and written again as it closes, which took
+a millisecond on either runtime and was all the row measured on the host's
+disk. `spawn wait` spawns `/bin/true` and waits for it, `spawn output`
+spawns `/bin/echo` and collects its output, and `child pipes` writes 64
+bytes to a `cat` that runs the whole time and reads them back, against
+`tokio::fs` and `tokio::process`; the children inherit the runtime's CPU on
+either runtime. Medians of five runs taken in turns, with other work
+loading the host (a load average of 84 on its 96 CPUs):
+
+| Step | tokio | ruio |
+|---|---:|---:|
+| nop 1 | | 3.24M |
+| portable nop 1 | | 3.18M |
+| nop 64 | | 13.98M |
+| portable nop 64 | | 12.70M |
+| metadata | 133k | 319k (2.40×) |
+| read file | 107k | 300k (2.79×) |
+| write file | 96k | 108k (1.13×) |
+| spawn wait | 1k | 1k (1.01×) |
+| spawn output | 1k | 1k (1.00×) |
+| child pipes | 273k | 273k (1.00×) |
+
+With 64 in flight a portable no-op costs some 7 ns more than an `Op`'s, and
+with one as much as the noise. `metadata`, a portable operation now, reads
+2.40× tokio's, where it read 2.5× through an `Op` on a quieter host. `child
+pipes` read 0.85× tokio's when the pipes were read and written through the
+ring; [Processes](#processes) has what its profile showed.
+
 their time.
 
 ## Milestones
@@ -2660,10 +2839,32 @@ Since M7:
   tokio's `recv_from` and 1.75× ruio's request a datagram, its addresses
   costing 3% over none (see [Networking](#networking) and [The runtime
   itself](#the-runtime-itself)).
+- Futures that must be `Send` can do I/O on the ring: a `PortableOp` runs
+  its operation on the ring of the thread that first polls it, found as the
+  thread's current driver, which the runtime enters as it runs, and goes
+  back to that ring if its future moves; a `PortableFd` closes in order on
+  the ring its operations ran on. The path functions of `ruio::fs` run on
+  them, a file read whole 2.79× as often as through tokio's `fs::read`, and
+  a portable no-op costs what an `Op`'s does alone and 7 ns more with 64 in
+  flight (see [Portable operations](#portable-operations) and
+  [Files](#files)).
+- `ruio::process` spawns child processes as the standard library does, with
+  a pidfd each, waits for them with `IORING_OP_WAITID` on the ring, which
+  the driver has as `Waitid`, watching rather than reaping so that a
+  dropped wait loses no status, signals them and the groups they lead
+  through their pidfds, kills the group on drop if asked, and reaps
+  dropped children on a thread of its own; its pipes are nonblocking, read
+  and written at once and waited for with portable polls, as fast as
+  tokio's (see [Processes](#processes)).
 
 ## Open questions
 
 - License. Crates are `publish = false` until one is chosen.
+- Portable sockets and files. A plain descriptor's operations could all be
+  portable, as a `PortableFd`'s are, so that a `TcpStream` or a `File`
+  could be held in a `Send` future, as hyper-util's client wants its
+  connections; what a stream's write behind and its pools of buffers,
+  which belong to one ring, would become is the question.
 - The receive stream's stall. While the ask of a buffer less (see
   [Networking](#networking)) was built, the test of many re-arms once hung
   within a few hundred cycles: a capped receive, issued at submission

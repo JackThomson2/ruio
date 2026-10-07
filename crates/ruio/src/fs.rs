@@ -54,10 +54,10 @@
 //! ring.
 //!
 //! The functions that take a path, [`read`], [`write()`], [`metadata`] and
-//! the others, hold no file of the ring across an await, so their futures
-//! are `Send` when what they are given is: code whose futures must be, such
-//! as `async_trait`'s, or a future spawned onto another core, can await
-//! them. Each runs its operations as [`PortableOp`]s on the ring of the
+//! the others but [`read_dir`], whose [`ReadDir`] reads on its thread's
+//! ring, hold no file of the ring across an await, so their futures are
+//! `Send` when what they are given is: code whose futures must be, such as
+//! `async_trait`'s, or a future spawned onto another core, can await them. Each runs its operations as [`PortableOp`]s on the ring of the
 //! thread that polls it, which cost what the ring's own operations do, and a
 //! file it opens is a [`PortableFd`] for as long as it is open. A [`File`]
 //! belongs to its thread's ring.

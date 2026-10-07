@@ -47,7 +47,7 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 
 | Crate | What it has |
 |---|---|
-| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, which holds tasks of other cores too, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, and `signal`; with the `futures` feature, every stream implements futures-core's `Stream` |
+| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, which holds tasks of other cores too, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, `signal`, and `process`, which spawns child processes and waits for them on the ring; the path functions of `fs` and everything in `process` are `Send`, running on the ring of whichever thread polls them; with the `futures` feature, every stream implements futures-core's `Stream` |
 | [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; and `Timer`, which gives hyper ruio's timers for its timeouts |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
@@ -155,6 +155,13 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   one multishot `recvmsg` (`recv_from_stream`) at 936k a second, 1.24
   times tokio's `recv_from` and 1.75 times a request a datagram, the
   kernel's own work on each datagram being most of either.
+- **Send I/O and child processes**: the functions of `fs` that take a path
+  run on the ring of whichever thread polls them, in futures that are
+  `Send`, for `async_trait` and tasks that move between cores: a 4 KiB file
+  is read whole 2.8 times as often as through `tokio::fs::read`, and its
+  status comes 2.4 times as often. Child processes spawn as tokio's do and
+  are waited for on the ring, with no `SIGCHLD` handler, and 64 bytes go
+  through a child's pipes and back as often as through tokio's.
 
 ## Development
 
