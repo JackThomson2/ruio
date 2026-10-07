@@ -29,6 +29,7 @@ use crate::{Completion, Descriptor, DirectFd, Driver, Fd, MultiOp, Multishot, Op
 
 mod fs;
 mod net;
+mod process;
 mod sockopt;
 mod splice;
 
@@ -41,6 +42,7 @@ pub use net::{
     Accept, AcceptMulti, AcceptStream, Connect, Datagram, Recv, RecvFrom, RecvFromMulti,
     RecvFromStream, Send, SendTo, SendVectored, SendZc, Shutdown, Socket,
 };
+pub use process::{ChildState, Waitid};
 pub use sockopt::{GetSockOpt, InstallFd, OptionValue, SetSockOpt, UnreadBytes, UnsentBytes};
 pub use splice::{PollAdd, PollMulti, PollStream, Splice, Tee};
 
