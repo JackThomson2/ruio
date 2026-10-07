@@ -947,3 +947,90 @@ async fn an_incremental_read_stream_takes_what_arrives() -> io::Result<()> {
     assert_eq!(received, sent);
     Ok(())
 }
+
+/// What `async_trait` makes of a method: a boxed future that must be `Send`.
+type SendFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// The functions that take a path give `Send` futures, which a boxed future
+/// that must be one can hold across its awaits.
+#[ruio::test]
+async fn the_path_functions_run_in_futures_that_must_be_send() -> io::Result<()> {
+    let scratch = Scratch::new("send");
+    let dir = scratch.path("nested/deeper");
+    let work: SendFuture<'_, io::Result<()>> = Box::pin(async {
+        fs::create_dir_all(&dir).await?;
+        let file = dir.join("file");
+        fs::write(&file, pattern(20_000)).await?;
+        assert_eq!(fs::read(&file).await?, pattern(20_000));
+        assert_eq!(fs::metadata(&file).await?.len(), 20_000);
+        assert!(fs::try_exists(&file).await?);
+        fs::symlink(&file, dir.join("soft")).await?;
+        assert!(fs::symlink_metadata(dir.join("soft")).await?.is_symlink());
+        assert_eq!(fs::read_link(dir.join("soft")).await?, file);
+        assert_eq!(
+            fs::canonicalize(dir.join("soft")).await?,
+            std::fs::canonicalize(&file)?
+        );
+        fs::hard_link(&file, dir.join("hard")).await?;
+        fs::rename(dir.join("hard"), dir.join("moved")).await?;
+        fs::copy(dir.join("moved"), dir.join("copied")).await?;
+        fs::write(dir.join("text"), "text").await?;
+        assert_eq!(fs::read_to_string(dir.join("text")).await?, "text");
+        fs::set_permissions(&file, Permissions::from_mode(0o600)).await?;
+        fs::remove_file(dir.join("soft")).await?;
+        fs::remove_dir(scratch.path("empty")).await.unwrap_err();
+        fs::create_dir(scratch.path("empty")).await?;
+        fs::remove_dir(scratch.path("empty")).await?;
+        fs::remove_dir_all(scratch.path("nested")).await?;
+        assert!(!fs::try_exists(scratch.path("nested")).await?);
+        Ok(())
+    });
+    within(work).await
+}
+
+/// A future reading and writing by path is spawned onto another core, which
+/// runs its operations on its own ring.
+#[test]
+fn the_path_functions_run_on_any_core() {
+    let all = ruio::Cores::all().unwrap();
+    let cores = ruio::Cores::cpus(all.cpu_list().iter().copied().cycle().take(2));
+    let scratch = Scratch::new("cores");
+    let path = scratch.path("file");
+    let outputs = cores
+        .run(|core| {
+            let path = path.clone();
+            async move {
+                if core.index() != 0 {
+                    return None;
+                }
+                let task = ruio::spawn_on(1, async move {
+                    fs::write(&path, b"from core one".to_vec()).await?;
+                    let read = fs::read(&path).await?;
+                    io::Result::Ok((read, ruio::core().unwrap().index()))
+                });
+                Some(task.await.unwrap())
+            }
+        })
+        .unwrap();
+    let (read, core) = outputs.into_iter().next().flatten().unwrap().unwrap();
+    assert_eq!((&read[..], core), (&b"from core one"[..], 1));
+}
+
+/// A file whose size says nothing of what it holds, as a procfs file's
+/// does, is read to its end, as the reads find it.
+#[ruio::test]
+async fn read_takes_a_file_to_its_end_whatever_its_size() -> io::Result<()> {
+    assert_eq!(std::fs::metadata("/proc/self/status")?.len(), 0);
+    let status = within(fs::read_to_string("/proc/self/status")).await?;
+    assert!(status.contains("Pid:"), "{status}");
+    let scratch = Scratch::new("ends");
+    std::fs::write(scratch.path("empty"), b"")?;
+    assert!(within(fs::read(scratch.path("empty"))).await?.is_empty());
+    let err = within(fs::write(scratch.path("missing/file"), "x"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    let err = within(fs::read(scratch.path("missing"))).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    Ok(())
+}

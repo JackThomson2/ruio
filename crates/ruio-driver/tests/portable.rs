@@ -6,7 +6,7 @@ mod support;
 use std::future::Future;
 use std::io::{PipeReader, PipeWriter, Write as _};
 use std::os::fd::AsRawFd;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ruio_driver::buf::{IoBuf, IoBufMut};
-use ruio_driver::ops::{Map, Nop, OpenAt, Read};
+use ruio_driver::ops::{Map, Nop, OpenAt, Read, Write};
 use ruio_driver::{Driver, PortableFd, PortableOp};
 
 use support::{PATIENCE, block_on, poll_once, settle};
@@ -329,6 +329,26 @@ fn a_detached_operation_finishes_on_its_ring() {
     drop(writer);
     std::io::Read::read_to_end(&mut &reader, &mut rest).unwrap();
     assert!(rest.is_empty(), "both reads took their data");
+}
+
+/// A future that must be `Send` can hold, across an await, a portable
+/// operation on a buffer that only `'static` borrows fit, made in a function
+/// generic over the buffer: whether it is `Send` follows from its output's
+/// type, which the compiler sees without the operation's implementation.
+#[test]
+fn a_send_future_holds_an_operation_on_a_static_buffer() {
+    async fn write<B: IoBuf>(writer: &PipeWriter, buf: B) -> std::io::Result<usize> {
+        PortableOp::new(Write::new(writer.as_raw_fd(), buf)).await.0
+    }
+    let driver = Driver::new().unwrap();
+    let _entered = driver.enter();
+    let (reader, writer) = pipe();
+    let future: Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + '_>> =
+        Box::pin(async { write(&writer, "static").await });
+    assert_eq!(block_on(&driver, future).unwrap(), 6);
+    let mut read = [0; 6];
+    std::io::Read::read_exact(&mut &reader, &mut read).unwrap();
+    assert_eq!(&read, b"static");
 }
 
 /// A portable operation whose output cannot cross threads cannot either:

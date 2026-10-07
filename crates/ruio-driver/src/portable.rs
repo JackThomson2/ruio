@@ -43,6 +43,13 @@ use crate::{Driver, Fd};
 /// is leaked, as the kernel may still use its memory, and its future never
 /// completes.
 ///
+/// The type's last parameter is the operation's output, which it defaults
+/// to, so that whether the future is `Send` follows from the output's own
+/// type rather than through the operation's implementation: the compiler
+/// erases lifetimes as it checks a future that holds this one across an
+/// await, and could not then find the implementation for an operation on a
+/// buffer that only `'static` borrows fit, a `&'static str`, say.
+///
 /// ```
 /// use ruio_driver::ops::Nop;
 /// use ruio_driver::{Driver, PortableOp};
@@ -67,15 +74,17 @@ use crate::{Driver, Fd};
 /// # Ok::<(), std::io::Error>(())
 /// ```
 #[must_use = "an operation does nothing until polled"]
-pub struct PortableOp<'a, T: Operation> {
-    state: State<T>,
+pub struct PortableOp<'a, T: Operation<Output = O>, O = <T as Operation>::Output> {
+    state: State<T, O>,
     timeout: Option<Duration>,
     /// Where the descriptor the operation names records the ring it is
     /// queued on, for the descriptor to close after it.
     ring: Option<&'a AtomicU64>,
 }
 
-enum State<T: Operation> {
+/// Where a portable operation is: its operation, of type `T`, and the relay
+/// of its output, of type `O`, once handed back.
+enum State<T, O> {
     Unsubmitted(T),
     /// Queued on the ring of the driver with ID `home`, in slot `user_data`.
     Queued {
@@ -88,7 +97,7 @@ enum State<T: Operation> {
     /// Handed back to the ring of `home` from another thread: the ring's
     /// thread completes it and sends the output to `relay`.
     Forwarded {
-        relay: Arc<Relay<T::Output>>,
+        relay: Arc<Relay<O>>,
         home: u64,
         user_data: u64,
     },
@@ -356,7 +365,7 @@ impl<T: Operation> Future for PortableOp<'_, T> {
     }
 }
 
-impl<T: Operation> Drop for PortableOp<'_, T> {
+impl<T: Operation<Output = O>, O> Drop for PortableOp<'_, T, O> {
     fn drop(&mut self) {
         if matches!(self.state, State::Queued { .. } | State::Forwarded { .. }) {
             self.let_go(true);
@@ -366,7 +375,7 @@ impl<T: Operation> Drop for PortableOp<'_, T> {
 
 // A `PortableOp` never pins its operation: the memory the kernel uses is not
 // inside it, by the contract of `Operation`.
-impl<T: Operation> Unpin for PortableOp<'_, T> {}
+impl<T: Operation<Output = O>, O> Unpin for PortableOp<'_, T, O> {}
 
 impl<T: Operation> fmt::Debug for PortableOp<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

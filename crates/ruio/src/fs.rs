@@ -52,13 +52,31 @@
 //! making, changing and linking names. Buffered reads and writes that miss
 //! the page cache go there too, while direct ones go to the device from the
 //! ring.
+//!
+//! The functions that take a path, [`read`], [`write()`], [`metadata`] and
+//! the others, hold no file of the ring across an await, so their futures
+//! are `Send` when what they are given is: code whose futures must be, such
+//! as `async_trait`'s, or a future spawned onto another core, can await
+//! them. Each runs its operations as [`PortableOp`]s on the ring of the
+//! thread that polls it, which cost what the ring's own operations do, and a
+//! file it opens is a [`PortableFd`] for as long as it is open. A [`File`]
+//! belongs to its thread's ring.
+//!
+//! ```
+//! fn assert_send<T: Send>(_: T) {}
+//!
+//! assert_send(ruio::fs::read("config.toml"));
+//! assert_send(ruio::fs::write("config.toml", b"key = 1".to_vec()));
+//! assert_send(ruio::fs::metadata("config.toml"));
+//! assert_send(ruio::fs::canonicalize("config.toml"));
+//! ```
 
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -67,10 +85,12 @@ use std::time::{Duration, SystemTime};
 
 use ruio_driver::buf::{BufLease, BufPool, BufResult, FixedIoBuf, IoBuf, IoBufMut, Slice};
 use ruio_driver::ops::{
-    self, Fadvise, Fallocate, Fsync, Ftruncate, InstallFd, LinkAt, MkdirAt, OpenAt, Read,
+    self, Fadvise, Fallocate, Fsync, Ftruncate, InstallFd, LinkAt, Map, MkdirAt, OpenAt, Read,
     ReadFixed, RenameAt, Statx, SymlinkAt, SyncFileRange, UnlinkAt, Write, WriteFixed,
 };
-use ruio_driver::{Chain, Driver, Fd, Link, Op, Operation, PolledFd};
+use ruio_driver::{
+    Chain, Descriptor, Driver, Fd, Link, Op, Operation, PolledFd, PortableFd, PortableOp,
+};
 
 use crate::net::{Desc, Sock, ThreadBound};
 
@@ -1286,7 +1306,7 @@ async fn on_pool<R: Send + 'static>(
 /// byte.
 pub async fn metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
     let stat = Statx::new(path)?.mask(METADATA);
-    let stat = crate::driver().op(stat).await?;
+    let stat = PortableOp::new(stat).await?;
     Ok(Metadata { stat: *stat })
 }
 
@@ -1299,7 +1319,7 @@ pub async fn symlink_metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
     let stat = Statx::new(path)?
         .flags(libc::AT_SYMLINK_NOFOLLOW)
         .mask(METADATA);
-    let stat = crate::driver().op(stat).await?;
+    let stat = PortableOp::new(stat).await?;
     Ok(Metadata { stat: *stat })
 }
 
@@ -1361,14 +1381,16 @@ pub async fn set_permissions(path: impl AsRef<Path>, perm: std::fs::Permissions)
 ///
 /// What opening and reading the file report.
 pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    let file = File::open(path).await?;
+    let file = open_portable(path, libc::O_RDONLY, 0).await?;
     let mut data = Vec::with_capacity(8 << 10);
     loop {
         if data.len() == data.capacity() {
             data.reserve(data.capacity());
         }
         let len = data.len();
-        let (read, rest) = file.read_at(data.slice(len..), len as u64).await;
+        let (read, rest) = file
+            .op(|fd| Read::at(fd, data.slice(len..), len as u64))
+            .await;
         data = rest.into_inner();
         if read? == 0 {
             return Ok(data);
@@ -1393,9 +1415,43 @@ pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
 ///
 /// What opening, writing and closing the file report.
 pub async fn write<B: IoBuf>(path: impl AsRef<Path>, contents: B) -> io::Result<()> {
-    let file = File::create(path).await?;
-    file.write_all_at(contents, 0).await.0?;
-    file.close().await
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
+    let file = open_portable(path, flags, 0o666).await?;
+    let total = contents.bytes_init();
+    let (mut contents, mut done) = (contents, 0);
+    while done < total {
+        let (written, rest) = file
+            .op(|fd| Write::at(fd, contents.slice(done..), done as u64))
+            .await;
+        contents = rest.into_inner();
+        match written? {
+            0 => return Err(io::ErrorKind::WriteZero.into()),
+            written => done += written,
+        }
+    }
+    // Nothing queued names the file any more, the writes being done, so it
+    // closes on whichever ring this runs on, with what that finds.
+    PortableOp::new(ops::Close::new(file.into_owned_fd())).await
+}
+
+/// Opens the file at `path` with the `open(2)` flags `flags`, and the
+/// permissions `mode` if it makes the file, as a plain descriptor whose
+/// operations queue on the ring of the thread that polls them.
+async fn open_portable(path: impl AsRef<Path>, flags: i32, mode: u32) -> io::Result<PortableFd> {
+    let open = OpenAt::new(path)?.flags(flags).mode(mode);
+    // A plain descriptor crosses threads where a `Descriptor`, which could be
+    // a direct one of the ring's, cannot.
+    let fd = PortableOp::new(Map::new(open, plain)).await?;
+    Ok(PortableFd::new(fd))
+}
+
+/// The plain descriptor an open made, as an open that asked for no direct
+/// descriptor makes.
+fn plain(opened: io::Result<Descriptor>) -> io::Result<OwnedFd> {
+    match opened? {
+        Descriptor::Plain(fd) => Ok(fd),
+        Descriptor::Direct(_) => unreachable!("an open for a plain descriptor made a direct one"),
+    }
 }
 
 /// Removes the file at `path`.
@@ -1405,7 +1461,7 @@ pub async fn write<B: IoBuf>(path: impl AsRef<Path>, contents: B) -> io::Result<
 /// What `unlinkat(2)` reports, and `InvalidInput` if the path contains a nul
 /// byte.
 pub async fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
-    crate::driver().op(UnlinkAt::new(path)?).await
+    PortableOp::new(UnlinkAt::new(path)?).await
 }
 
 /// Removes the empty directory at `path`.
@@ -1414,7 +1470,7 @@ pub async fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
 ///
 /// As for [`remove_file`].
 pub async fn remove_dir(path: impl AsRef<Path>) -> io::Result<()> {
-    crate::driver().op(UnlinkAt::new(path)?.directory()).await
+    PortableOp::new(UnlinkAt::new(path)?.directory()).await
 }
 
 /// Makes a directory at `path`.
@@ -1424,7 +1480,7 @@ pub async fn remove_dir(path: impl AsRef<Path>) -> io::Result<()> {
 /// What `mkdirat(2)` reports, and `InvalidInput` if the path contains a nul
 /// byte.
 pub async fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
-    crate::driver().op(MkdirAt::new(path)?).await
+    PortableOp::new(MkdirAt::new(path)?).await
 }
 
 /// Makes a directory at `path`, and any of its parents that do not exist.
@@ -1464,7 +1520,7 @@ pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
 /// What `renameat2(2)` reports, and `InvalidInput` if a path contains a nul
 /// byte.
 pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
-    crate::driver().op(RenameAt::new(from, to)?).await
+    PortableOp::new(RenameAt::new(from, to)?).await
 }
 
 /// Makes `link` a symbolic link to `original`, which it holds as given and
@@ -1475,7 +1531,7 @@ pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<
 /// What `symlinkat(2)` reports, and `InvalidInput` if a path contains a nul
 /// byte.
 pub async fn symlink(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
-    crate::driver().op(SymlinkAt::new(original, link)?).await
+    PortableOp::new(SymlinkAt::new(original, link)?).await
 }
 
 /// Makes `link` another name for the file at `original`: a hard link. A
@@ -1487,7 +1543,7 @@ pub async fn symlink(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::
 /// What `linkat(2)` reports, and `InvalidInput` if a path contains a nul
 /// byte.
 pub async fn hard_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
-    crate::driver().op(LinkAt::new(original, link)?).await
+    PortableOp::new(LinkAt::new(original, link)?).await
 }
 
 /// Copies the contents and permissions of the file at `from` to `to`,

@@ -86,11 +86,15 @@ pub mod signal;
 
 /// The io_uring driver: operations, the futures that run them, and the types
 /// for writing new ones, down to the kernel's own structures in
-/// [`sys`](uring::sys).
+/// [`sys`](uring::sys). A [`PortableOp`](uring::PortableOp), unlike an
+/// [`Op`](uring::Op), is `Send`: it runs on the ring of the thread that
+/// first polls it, and a [`PortableFd`](uring::PortableFd) is a plain
+/// descriptor whose operations are portable ones.
 pub mod uring {
     pub use ruio_driver::{
-        BaselineError, Chain, Completion, Descriptor, DirectFd, Driver, Fd, Link, MultiOp,
-        Multishot, Op, Operation, Probe, RemoteRing, SentFd, SockAddr, Stats, Unparker, ops,
+        BaselineError, Chain, Completion, Descriptor, DirectFd, Driver, Entered, Fd, Link, MultiOp,
+        Multishot, Op, Operation, PortableFd, PortableOp, Probe, RemoteRing, SentFd, SockAddr,
+        Stats, Unparker, ops,
     };
     pub use ruio_sys as sys;
 }
