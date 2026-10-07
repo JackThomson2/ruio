@@ -1,5 +1,5 @@
 //! The process setup a fair benchmark needs: CPU pinning, enough file
-//! descriptors, and `TCP_NODELAY`.
+//! descriptors, `TCP_NODELAY`, and receive buffers.
 
 use std::io;
 use std::mem;
@@ -48,6 +48,22 @@ pub(crate) fn set_nodelay(fd: RawFd) -> io::Result<()> {
             libc::IPPROTO_TCP,
             libc::TCP_NODELAY,
             ptr::from_ref(&on).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    })
+}
+
+/// Sets a socket's receive buffer to `bytes` (`SO_RCVBUF`), which the kernel
+/// caps at what the host allows a socket, `net.core.rmem_max`.
+pub(crate) fn set_receive_buffer(fd: RawFd, bytes: usize) -> io::Result<()> {
+    let bytes = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `setsockopt` reads the one `c_int` it is given.
+    check(unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            ptr::from_ref(&bytes).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
         )
     })

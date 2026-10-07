@@ -92,6 +92,26 @@
 //! - `sendfile`: a cached 1 MiB file spliced into a connection that a
 //!   thread on another CPU drains, as a server sends a file; tokio copies
 //!   it from its `File` with `io::copy`.
+//! - `recv from`: a 64-byte datagram from a client to an echo task on the
+//!   same runtime, which takes it with `recv_from`, one request a datagram,
+//!   and sends it back to its sender with `send_to`, and the echo received:
+//!   a request and its answer, each way a send and a receive. tokio's
+//!   receives wait for readiness, and each send and receive is a system
+//!   call.
+//! - `recv from stream`: the same, the echo task taking the datagrams and
+//!   their senders from `recv_from_stream`, one multishot request kept
+//!   armed.
+//! - `datagrams in`: a thread on another core fills a socket's receive
+//!   buffer with 128 datagrams of 64 bytes, and the runtime takes them with
+//!   `recv_from`, one request a datagram; again and again, only the taking
+//!   timed: what one socket on one core takes in a second, each datagram's
+//!   sender included, apart from the sending. The skbs come from the other
+//!   core, as a network card's interrupts would bring them, and the
+//!   kernel's work on them is most of either runtime's.
+//! - `datagrams in stream`: the same through `recv_from_stream`.
+//! - `datagrams in without senders`: the same through `recv_stream`, a
+//!   multishot receive, which leaves the senders out, and tokio's `recv`:
+//!   what the addresses cost.
 //! - `readiness`: write to an eventfd, wait for it to be readable through
 //!   `AsyncFd`, one poll request a wait, and read it.
 //! - `readiness stream`: the same, the waits on one multishot poll kept
@@ -111,7 +131,10 @@
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::{Future, poll_fn};
+use std::hint::black_box;
 use std::io;
+use std::mem;
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::pin;
 use std::rc::Rc;
@@ -364,6 +387,31 @@ pub(crate) const ALL: &[Micro] = &[
         name: "sendfile",
         ruio: ruio_sendfile,
         tokio: Some(tokio_sendfile),
+    },
+    Micro {
+        name: "recv from",
+        ruio: ruio_recv_from,
+        tokio: Some(tokio_recv_from),
+    },
+    Micro {
+        name: "recv from stream",
+        ruio: ruio_recv_from_stream,
+        tokio: Some(tokio_recv_from),
+    },
+    Micro {
+        name: "datagrams in",
+        ruio: ruio_datagrams_in,
+        tokio: Some(tokio_datagrams_in),
+    },
+    Micro {
+        name: "datagrams in stream",
+        ruio: ruio_datagrams_in_stream,
+        tokio: Some(tokio_datagrams_in),
+    },
+    Micro {
+        name: "datagrams in without senders",
+        ruio: ruio_datagrams_in_without_senders,
+        tokio: Some(tokio_datagrams_in_without_senders),
     },
     Micro {
         name: "readiness",
@@ -1400,6 +1448,337 @@ fn tokio_sendfile(load: &Load) -> io::Result<f64> {
             .join()
             .map_err(|_| io::Error::other("the thread panicked"))?;
         Ok(rate)
+    })
+}
+
+/// How many bytes the datagrams of `recv from` and `datagrams in` carry.
+const DATAGRAM: usize = 64;
+
+/// How large the buffers are that datagrams are received into: room for
+/// any that fits an Ethernet frame.
+const DATAGRAM_ROOM: usize = 2048;
+
+/// How many datagrams `datagrams in` fills its socket with at a time.
+const FILL: usize = 128;
+
+/// How large the receive buffer of the socket that `datagrams in` fills is:
+/// room for [`FILL`] datagrams many times over, or as much as the host
+/// allows a socket, which is still room for them.
+const FILLED_BUFFER: usize = 1 << 20;
+
+/// Datagrams sent to `server`, the socket of an echo task on the runtime,
+/// and their echoes received, one round trip a step; the empty datagram
+/// sent last stops the echo task.
+async fn ruio_round_trips(measure: Duration, server: SocketAddr) -> io::Result<f64> {
+    let client = ruio::net::UdpSocket::bind("127.0.0.1:0")?;
+    client.connect(server)?;
+    let back = RefCell::new(Some(vec![7; DATAGRAM]));
+    let rate = rate(measure, async || {
+        let buf = back.borrow_mut().take().expect("the buffer is back");
+        let (sent, mut buf) = client.send(buf).await;
+        sent.expect("the echo task listens");
+        buf.clear();
+        let (received, buf) = client.recv(buf).await;
+        assert_eq!(received.expect("the echo task answers"), DATAGRAM);
+        *back.borrow_mut() = Some(buf);
+    })
+    .await;
+    client.send(Vec::new()).await.0?;
+    Ok(rate)
+}
+
+/// An echo task that takes each datagram with `recv_from`, one request a
+/// datagram, and sends it back to its sender with `send_to`.
+fn ruio_recv_from(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let server = ruio::net::UdpSocket::bind("127.0.0.1:0")?;
+        let addr = server.local_addr()?;
+        let echo = ruio::spawn(async move {
+            let mut buf = Vec::with_capacity(DATAGRAM_ROOM);
+            loop {
+                buf.clear();
+                let (received, datagram) = server.recv_from(buf).await;
+                let (len, from) = received?;
+                if len == 0 {
+                    return io::Result::Ok(());
+                }
+                let (sent, datagram) = server.send_to(datagram, from).await;
+                sent?;
+                buf = datagram;
+            }
+        });
+        let rate = ruio_round_trips(measure, addr).await?;
+        echo.await.map_err(io::Error::other)??;
+        Ok(rate)
+    })
+}
+
+/// An echo task that takes each datagram and its sender from
+/// `recv_from_stream`, and sends the datagram's buffer back to the sender.
+fn ruio_recv_from_stream(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let server = ruio::net::UdpSocket::bind("127.0.0.1:0")?;
+        let addr = server.local_addr()?;
+        let pool = ruio::buf::BufPool::new(&ruio::driver(), 64, DATAGRAM_ROOM as u32)?;
+        let echo = ruio::spawn(async move {
+            let mut datagrams = server.recv_from_stream(&pool)?;
+            while let Some(datagram) = datagrams.next().await {
+                let datagram = datagram?;
+                if datagram.is_empty() {
+                    break;
+                }
+                let (data, from) = datagram.into_parts();
+                server.send_to(data, from).await.0?;
+            }
+            io::Result::Ok(())
+        });
+        let rate = ruio_round_trips(measure, addr).await?;
+        echo.await.map_err(io::Error::other)??;
+        Ok(rate)
+    })
+}
+
+fn tokio_recv_from(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = server.local_addr()?;
+        let echo = tokio::spawn(async move {
+            let mut buf = vec![0; DATAGRAM_ROOM];
+            loop {
+                let (len, from) = server.recv_from(&mut buf).await?;
+                if len == 0 {
+                    return io::Result::Ok(());
+                }
+                server.send_to(&buf[..len], from).await?;
+            }
+        });
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(addr).await?;
+        let mut buf = vec![7; DATAGRAM];
+        let rate = rate(measure, async || {
+            client.send(&buf).await.expect("the echo task listens");
+            let received = client.recv(&mut buf).await.expect("the echo task answers");
+            assert_eq!(received, DATAGRAM);
+        })
+        .await;
+        client.send(&[]).await?;
+        echo.await.map_err(io::Error::other)??;
+        Ok(rate)
+    })
+}
+
+/// A thread on another core than the runtime's that fills a socket's
+/// receive buffer with [`FILL`] datagrams of [`DATAGRAM`] bytes each time
+/// it is asked.
+struct Filler {
+    /// Taken when the filler is dropped, which ends the thread.
+    ask: Option<std_mpsc::Sender<()>>,
+    filled: std_mpsc::Receiver<io::Result<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Filler {
+    /// A filler of the socket bound to `to`, whose receive buffer it sets to
+    /// [`FILLED_BUFFER`] bytes through `fd`.
+    fn start(load: &Load, fd: RawFd, to: SocketAddr) -> io::Result<Self> {
+        sys::set_receive_buffer(fd, FILLED_BUFFER)?;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        socket.connect(to)?;
+        let (ask, asked) = std_mpsc::channel::<()>();
+        let (done, filled) = std_mpsc::channel();
+        let cpu = remote_cpu(load);
+        let thread = thread::spawn(move || {
+            let _ = sys::pin(&[cpu]);
+            for () in asked {
+                if done.send(fill(&socket)).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            ask: Some(ask),
+            filled,
+            thread: Some(thread),
+        })
+    }
+
+    /// Fills the socket's receive buffer, and waits until it is full. The
+    /// runtime's thread waits outside the ring meanwhile, so that taking the
+    /// datagrams after it is all that a drain measures.
+    fn fill(&self) -> io::Result<()> {
+        let gone = || io::Error::other("the filling thread is gone");
+        let ask = self.ask.as_ref().ok_or_else(gone)?;
+        ask.send(()).map_err(|_| gone())?;
+        self.filled.recv().map_err(|_| gone())?
+    }
+}
+
+impl Drop for Filler {
+    fn drop(&mut self) {
+        drop(self.ask.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Sends [`FILL`] datagrams of [`DATAGRAM`] bytes on `socket`, which is
+/// connected, with as few `sendmmsg(2)` calls as the kernel takes them in.
+fn fill(socket: &std::net::UdpSocket) -> io::Result<()> {
+    let payload = [7u8; DATAGRAM];
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr().cast_mut().cast(),
+        iov_len: DATAGRAM,
+    };
+    // SAFETY: all zeroes is a valid `mmsghdr`, with null pointers.
+    let mut headers: [libc::mmsghdr; FILL] = unsafe { mem::zeroed() };
+    for header in &mut headers {
+        header.msg_hdr.msg_iov = &raw mut iov;
+        header.msg_hdr.msg_iovlen = 1;
+    }
+    let mut sent = 0;
+    while sent < FILL {
+        let left = &mut headers[sent..];
+        // SAFETY: each header points to the one iovec, which points to the
+        // payload; the kernel only reads them, and writes the headers'
+        // `msg_len`.
+        let count = unsafe {
+            libc::sendmmsg(
+                socket.as_raw_fd(),
+                left.as_mut_ptr(),
+                left.len() as libc::c_uint,
+                0,
+            )
+        };
+        sent += usize::try_from(count).map_err(|_| io::Error::last_os_error())?;
+    }
+    Ok(())
+}
+
+/// Fills the socket that `filler` sends to, takes the [`FILL`] datagrams
+/// with `take`, one step each, and again, until the taking has run for
+/// `measure`: steps per second of taking, the fills left out.
+async fn drain_rate(
+    measure: Duration,
+    filler: &Filler,
+    mut take: impl AsyncFnMut(),
+) -> io::Result<f64> {
+    let mut taking = Duration::ZERO;
+    let mut taken: u64 = 0;
+    while taking < measure {
+        filler.fill()?;
+        let start = Instant::now();
+        for _ in 0..FILL {
+            take().await;
+        }
+        taking += start.elapsed();
+        taken += FILL as u64;
+    }
+    Ok(taken as f64 / taking.as_secs_f64())
+}
+
+/// The file descriptor of a ruio socket, which a UDP socket's always is.
+fn plain_fd(fd: ruio::uring::Fd) -> RawFd {
+    match fd {
+        ruio::uring::Fd::Plain(fd) => fd,
+        ruio::uring::Fd::Direct(_) => unreachable!("UDP sockets have plain descriptors"),
+    }
+}
+
+/// A socket's datagrams taken with `recv_from`, one request a datagram.
+fn ruio_datagrams_in(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let socket = ruio::net::UdpSocket::bind("127.0.0.1:0")?;
+        let filler = Filler::start(load, plain_fd(socket.fd()), socket.local_addr()?)?;
+        let back = RefCell::new(Some(Vec::with_capacity(DATAGRAM_ROOM)));
+        drain_rate(measure, &filler, async || {
+            let mut buf = back.borrow_mut().take().expect("the buffer is back");
+            buf.clear();
+            let (received, buf) = socket.recv_from(buf).await;
+            let (len, from) = received.expect("the datagram arrives");
+            assert_eq!(len, DATAGRAM);
+            black_box(from);
+            *back.borrow_mut() = Some(buf);
+        })
+        .await
+    })
+}
+
+/// A socket's datagrams and their senders taken from `recv_from_stream`.
+fn ruio_datagrams_in_stream(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let socket = ruio::net::UdpSocket::bind("127.0.0.1:0")?;
+        let pool = ruio::buf::BufPool::new(&ruio::driver(), 256, DATAGRAM_ROOM as u32)?;
+        let mut datagrams = socket.recv_from_stream(&pool)?;
+        let filler = Filler::start(load, plain_fd(socket.fd()), socket.local_addr()?)?;
+        drain_rate(measure, &filler, async || {
+            let datagram = datagrams
+                .next()
+                .await
+                .expect("the stream goes on")
+                .expect("the datagram arrives");
+            assert_eq!(datagram.len(), DATAGRAM);
+            black_box(datagram.from());
+        })
+        .await
+    })
+}
+
+/// A socket's datagrams taken from `recv_stream`, which leaves their senders
+/// out.
+fn ruio_datagrams_in_without_senders(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let socket = ruio::net::UdpSocket::bind("127.0.0.1:0")?;
+        let pool = ruio::buf::BufPool::new(&ruio::driver(), 256, DATAGRAM_ROOM as u32)?;
+        let mut datagrams = socket.recv_stream(&pool);
+        let filler = Filler::start(load, plain_fd(socket.fd()), socket.local_addr()?)?;
+        drain_rate(measure, &filler, async || {
+            let datagram = datagrams
+                .next()
+                .await
+                .expect("the stream goes on")
+                .expect("the datagram arrives");
+            assert_eq!(datagram.len(), DATAGRAM);
+        })
+        .await
+    })
+}
+
+fn tokio_datagrams_in(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let filler = Filler::start(load, socket.as_raw_fd(), socket.local_addr()?)?;
+        let mut buf = vec![0; DATAGRAM_ROOM];
+        drain_rate(measure, &filler, async || {
+            let (len, from) = socket
+                .recv_from(&mut buf)
+                .await
+                .expect("the datagram arrives");
+            assert_eq!(len, DATAGRAM);
+            black_box(from);
+        })
+        .await
+    })
+}
+
+fn tokio_datagrams_in_without_senders(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    tokio_runtime()?.block_on(async move {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let filler = Filler::start(load, socket.as_raw_fd(), socket.local_addr()?)?;
+        let mut buf = vec![0; DATAGRAM_ROOM];
+        drain_rate(measure, &filler, async || {
+            let len = socket.recv(&mut buf).await.expect("the datagram arrives");
+            assert_eq!(len, DATAGRAM);
+        })
+        .await
     })
 }
 
