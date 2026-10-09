@@ -3,9 +3,10 @@
 
 mod support;
 
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io::{PipeReader, PipeWriter, Write as _};
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use ruio_driver::buf::{IoBuf, IoBufMut};
 use ruio_driver::ops::{Map, Nop, OpenAt, Read, Write};
-use ruio_driver::{Driver, PortableFd, PortableOp};
+use ruio_driver::{Driver, PortableFd, PortableOp, ReadyWait};
 
 use support::{PATIENCE, block_on, poll_once, settle};
 
@@ -435,4 +436,159 @@ fn a_descriptor_taken_out_stays_open() {
     assert!(!reader_closed(&mut writer));
     drop(reader);
     assert!(reader_closed(&mut writer));
+}
+
+/// What a wait for a pipe's reading end to be readable waits for.
+const READABLE: u32 = libc::POLLIN as u32;
+
+/// What a wait for a socket to be writable waits for.
+const WRITABLE: u32 = libc::POLLOUT as u32;
+
+#[test]
+fn a_ready_wait_is_send_sync_and_unpin() {
+    fn assert_traits<T: Send + Sync + Unpin>() {}
+    assert_traits::<ReadyWait>();
+}
+
+/// A wait on an empty pipe is pending, stays one poll in flight however
+/// often it is polled, and completes with the readiness once data arrives;
+/// polled again with the data still there, it completes at once.
+#[test]
+fn a_ready_wait_is_queued_once_and_completes_as_the_descriptor_is_ready() {
+    let driver = Driver::new().unwrap();
+    let _entered = driver.enter();
+    let (reader, mut writer) = pipe();
+    let reader = PortableFd::new(reader.into());
+    let mut wait = ReadyWait::new();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(reader.poll_ready(&mut cx, READABLE, &mut wait).is_pending());
+    assert!(wait.is_waiting());
+    for _ in 0..3 {
+        driver.submit().unwrap();
+        assert!(reader.poll_ready(&mut cx, READABLE, &mut wait).is_pending());
+    }
+    driver.submit().unwrap();
+    assert_eq!(driver.in_flight(), 1, "one poll for every call");
+    writer.write_all(b"x").unwrap();
+    let ready = block_on(
+        &driver,
+        poll_fn(|cx| reader.poll_ready(cx, READABLE, &mut wait)),
+    );
+    assert_ne!(ready.unwrap() & READABLE, 0);
+    assert!(!wait.is_waiting());
+    let again = block_on(
+        &driver,
+        poll_fn(|cx| reader.poll_ready(cx, READABLE, &mut wait)),
+    );
+    assert_ne!(again.unwrap() & READABLE, 0);
+    assert_eq!(driver.in_flight(), 0);
+}
+
+/// Polled for other events, a wait lets go of its poll, which the ring
+/// cancels, and waits for the new ones; dropped, it lets go of it too.
+#[test]
+fn a_ready_wait_lets_go_of_a_poll_for_other_events_and_as_it_is_dropped() {
+    let driver = Driver::new().unwrap();
+    let _entered = driver.enter();
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let socket = PortableFd::new(socket.into());
+    let mut wait = ReadyWait::new();
+    let mut cx = Context::from_waker(Waker::noop());
+    // Nothing to read.
+    assert!(socket.poll_ready(&mut cx, READABLE, &mut wait).is_pending());
+    driver.submit().unwrap();
+    assert_eq!(driver.in_flight(), 1);
+    // Room to write, at once; the poll for reading goes.
+    let writable = block_on(
+        &driver,
+        poll_fn(|cx| socket.poll_ready(cx, WRITABLE, &mut wait)),
+    );
+    assert_ne!(writable.unwrap() & WRITABLE, 0);
+    settle(&driver);
+    assert!(socket.poll_ready(&mut cx, READABLE, &mut wait).is_pending());
+    driver.submit().unwrap();
+    assert_eq!(driver.in_flight(), 1);
+    drop(wait);
+    settle(&driver);
+}
+
+/// Whether the pipe has no reading end left, as the writing end reports
+/// with `POLLERR`, which a write would find too but this leaves the pipe as
+/// it is: a byte written would make a poll for reading ready.
+fn reader_gone(writer: &PipeWriter) -> bool {
+    let mut poll = libc::pollfd {
+        fd: writer.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: poll writes the one `pollfd` it is given, and waits for none.
+    let polled = unsafe { libc::poll(&raw mut poll, 1, 0) };
+    assert_eq!(
+        polled, 1,
+        "a pipe's writing end is always ready for something"
+    );
+    poll.revents & libc::POLLERR != 0
+}
+
+/// The descriptor of a wait whose poll is queued closes after the poll,
+/// once the ring takes the close queued after it, and the poll keeps the
+/// file until it goes.
+#[test]
+fn a_descriptor_waited_on_closes_after_its_poll() {
+    let driver = Driver::new().unwrap();
+    let _entered = driver.enter();
+    let (reader, writer) = pipe();
+    let reader = PortableFd::new(reader.into());
+    let mut wait = ReadyWait::new();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(reader.poll_ready(&mut cx, READABLE, &mut wait).is_pending());
+    // Queued, not submitted: the close goes after it.
+    drop(reader);
+    assert!(!reader_gone(&writer), "closed before the ring's turn");
+    driver.submit().unwrap();
+    assert!(!reader_gone(&writer), "the armed poll holds the file");
+    drop(wait);
+    settle(&driver);
+    assert!(reader_gone(&writer));
+}
+
+/// `ready` is the wait as a future of its own.
+#[test]
+fn ready_waits_with_a_poll_of_its_own() {
+    let driver = Driver::new().unwrap();
+    let _entered = driver.enter();
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let socket = PortableFd::new(socket.into());
+    let writable = block_on(&driver, socket.ready(WRITABLE)).unwrap();
+    assert_ne!(writable & WRITABLE, 0);
+    assert_send(&socket.ready(READABLE));
+}
+
+/// A wait whose poll is in flight moves to another thread with its
+/// descriptor, and completes there with the readiness its ring sends over.
+#[test]
+fn a_ready_wait_moved_to_another_thread_completes_from_its_ring() {
+    let driver = Driver::new().unwrap();
+    let _entered = driver.enter();
+    let (reader, mut writer) = pipe();
+    let reader = PortableFd::new(reader.into());
+    let mut wait = ReadyWait::new();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(reader.poll_ready(&mut cx, READABLE, &mut wait).is_pending());
+    driver.submit().unwrap();
+    let (polled, first_poll) = mpsc::channel();
+    let away = thread::spawn(move || {
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(reader.poll_ready(&mut cx, READABLE, &mut wait).is_pending());
+        polled.send(()).unwrap();
+        let ready = block_on_away(poll_fn(|cx| reader.poll_ready(cx, READABLE, &mut wait)));
+        (ready.unwrap(), reader)
+    });
+    first_poll.recv().unwrap();
+    writer.write_all(b"x").unwrap();
+    turn_until(&driver, || away.is_finished());
+    let (ready, reader) = away.join().unwrap();
+    assert_ne!(ready & READABLE, 0);
+    drop(reader);
+    settle(&driver);
 }

@@ -1,9 +1,11 @@
 //! Operations that are not bound to the ring of one thread: [`PortableOp`],
-//! the descriptors whose operations they are, [`PortableFd`], and what keeps
-//! them sound as their futures and owners move between threads.
+//! the descriptors whose operations they are, [`PortableFd`], the waits for
+//! such a descriptor to be ready, [`ReadyWait`], and what keeps them sound
+//! as their futures and owners move between threads.
 
 use std::fmt;
 use std::future::Future;
+use std::io;
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::pin::Pin;
@@ -13,6 +15,7 @@ use std::task::{Context, Poll, Waker, ready};
 use std::time::Duration;
 
 use crate::op::{Completion, Operation, Orphan, Seen, seen};
+use crate::ops::PollAdd;
 use crate::remote::{Remote, Request};
 use crate::{Driver, Fd};
 
@@ -412,6 +415,12 @@ impl<T: Operation> fmt::Debug for PortableOp<'_, T> {
 /// before the first ring has submitted what it queued, can close before that
 /// entry reaches the kernel.
 ///
+/// [`poll_ready`](PortableFd::poll_ready) waits for the descriptor to be
+/// ready, with a poll queued so on the ring of the thread that polls it and
+/// kept in a [`ReadyWait`] of the caller's, so that a nonblocking read or
+/// write that finds nothing to take, or no room, can wait for the next
+/// attempt to succeed.
+///
 /// ```
 /// use ruio_driver::ops::Read;
 /// use ruio_driver::{Driver, PortableFd};
@@ -463,6 +472,74 @@ impl PortableFd {
         self.fd
             .take()
             .expect("a portable descriptor is taken only once")
+    }
+
+    /// Polls for the descriptor to have any of `events`, a mask of
+    /// `libc::POLLIN`, `libc::POLLOUT` and the other `POLL*` events, with the
+    /// events it has as the output: a single-shot `IORING_OP_POLL_ADD` as a
+    /// [`PortableOp`], queued on the ring of the thread that first polls it,
+    /// which the descriptor records, so that it closes after the poll.
+    ///
+    /// The poll lives in `wait`, which the caller keeps from one call to the
+    /// next, so that it is queued once however many times it is polled, and
+    /// completes with the readiness that came after it was queued. The wait
+    /// owns nothing of the descriptor, so an adapter can keep it beside the
+    /// descriptor it waits on. Polled for other events than those its poll
+    /// waits for, it lets go of that poll, which its ring cancels, and
+    /// queues another; dropped, it lets go of it too. A future that moves to
+    /// another thread while the poll is in flight takes it along, and the
+    /// poll's ring sends the readiness over, as for any portable operation.
+    ///
+    /// A wait belongs to the descriptor that first polls it: polled for
+    /// another, it would go on waiting on the first.
+    ///
+    /// # Errors
+    ///
+    /// What the kernel reports for the poll, such as `EBADF`.
+    ///
+    /// # Panics
+    ///
+    /// If the poll is queued on a thread with no current driver; see
+    /// [`PortableOp`].
+    pub fn poll_ready(
+        &self,
+        cx: &mut Context<'_>,
+        events: u32,
+        wait: &mut ReadyWait,
+    ) -> Poll<io::Result<u32>> {
+        let fd = self.as_raw_fd();
+        if wait.poll.as_ref().is_some_and(|poll| poll.events != events) {
+            // Its ring cancels it.
+            wait.poll = None;
+        }
+        let poll = wait.poll.get_or_insert_with(|| WaitPoll {
+            fd,
+            events,
+            op: PortableOp::new(PollAdd::new(fd, events)),
+        });
+        debug_assert_eq!(
+            poll.fd, fd,
+            "a wait is polled for the descriptor it waits on"
+        );
+        let unsubmitted = matches!(poll.op.state, State::Unsubmitted(_));
+        let polled = Pin::new(&mut poll.op).poll(cx);
+        if unsubmitted && let State::Queued { home, .. } = poll.op.state {
+            // Relaxed: the descriptor reads it as it is dropped, once this
+            // borrow of it is over, which orders the two.
+            self.ring.store(home, Ordering::Relaxed);
+        }
+        if polled.is_ready() {
+            wait.poll = None;
+        }
+        polled
+    }
+
+    /// Waits for the descriptor to have any of `events`, as
+    /// [`poll_ready`](PortableFd::poll_ready) does, with a poll of the
+    /// future's own that borrows the descriptor.
+    #[inline]
+    pub fn ready(&self, events: u32) -> PortableOp<'_, PollAdd> {
+        self.op(|fd| PollAdd::new(fd, events))
     }
 }
 
@@ -519,6 +596,54 @@ impl fmt::Debug for PortableFd {
             .field("fd", &self.fd)
             .field("ring", &self.ring.load(Ordering::Relaxed))
             .finish()
+    }
+}
+
+/// A wait for a [`PortableFd`] to be ready, which whoever polls it keeps from
+/// one poll to the next: none, or a poll in flight for some events; see
+/// [`PortableFd::poll_ready`].
+///
+/// It is `Send`, `Sync` and `Unpin`, and owns nothing of the descriptor, so
+/// it can sit beside it in an adapter that owns both. Dropping it lets go of
+/// its poll, which the poll's ring cancels.
+#[derive(Default)]
+pub struct ReadyWait {
+    poll: Option<WaitPoll>,
+}
+
+/// The poll in flight of a [`ReadyWait`].
+struct WaitPoll {
+    /// The descriptor it polls, which the wait belongs to.
+    fd: RawFd,
+    /// The events it waits for.
+    events: u32,
+    op: PortableOp<'static, PollAdd>,
+}
+
+impl ReadyWait {
+    /// A wait with no poll in flight.
+    pub const fn new() -> Self {
+        Self { poll: None }
+    }
+
+    /// Whether it has a poll in flight, which a later
+    /// [`poll_ready`](PortableFd::poll_ready) for the same events goes on
+    /// with.
+    pub fn is_waiting(&self) -> bool {
+        self.poll.is_some()
+    }
+}
+
+impl fmt::Debug for ReadyWait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.poll {
+            Some(poll) => f
+                .debug_struct("ReadyWait")
+                .field("fd", &poll.fd)
+                .field("events", &format_args!("{:#x}", poll.events))
+                .finish(),
+            None => f.write_str("ReadyWait(idle)"),
+        }
     }
 }
 

@@ -16,7 +16,9 @@
 //! ([`Driver::enter`]) when first polled, and a future that moves to another
 //! thread meanwhile hands the operation back to that ring, which finishes
 //! it there. A [`PortableFd`] is a plain descriptor whose operations are
-//! portable ones, and which closes after them on the ring they ran on.
+//! portable ones, and which closes after them on the ring they ran on; a
+//! [`ReadyWait`] waits for one to be ready, so that a nonblocking read or
+//! write can wait for the next attempt.
 //!
 //! Operations act on an [`Fd`]: a plain file descriptor, or a direct
 //! descriptor, a slot of the ring's registered file table, which saves the
@@ -77,7 +79,7 @@ pub use driver::{Builder, Driver, Entered, Stats, monotonic_now};
 pub use fd::{Descriptor, DirectFd, Fd, PolledFd};
 pub use link::{Chain, Link};
 pub use op::{Completion, Op, Operation};
-pub use portable::{PortableFd, PortableOp};
+pub use portable::{PortableFd, PortableOp, ReadyWait};
 pub use probe::{BaselineError, Probe};
 pub use remote::{RemoteRing, SentFd};
 pub use sockaddr::SockAddr;

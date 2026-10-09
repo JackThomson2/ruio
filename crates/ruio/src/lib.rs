@@ -98,12 +98,13 @@ pub mod signal;
 /// [`sys`](uring::sys). A [`PortableOp`](uring::PortableOp), unlike an
 /// [`Op`](uring::Op), is `Send`: it runs on the ring of the thread that
 /// first polls it, and a [`PortableFd`](uring::PortableFd) is a plain
-/// descriptor whose operations are portable ones.
+/// descriptor whose operations are portable ones, and which a
+/// [`ReadyWait`](uring::ReadyWait) waits on to be ready.
 pub mod uring {
     pub use ruio_driver::{
         BaselineError, Chain, Completion, Descriptor, DirectFd, Driver, Entered, Fd, Link, MultiOp,
-        Multishot, Op, Operation, PortableFd, PortableOp, Probe, RemoteRing, SentFd, SockAddr,
-        Stats, Unparker, ops,
+        Multishot, Op, Operation, PortableFd, PortableOp, Probe, ReadyWait, RemoteRing, SentFd,
+        SockAddr, Stats, Unparker, ops,
     };
     pub use ruio_sys as sys;
 }
