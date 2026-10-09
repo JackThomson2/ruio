@@ -208,8 +208,45 @@ async fn hyper_runs_http2_over_the_adapter() -> io::Result<()> {
         .await
         .unwrap()
         .map_err(io::Error::other)?;
-    within(server).await.unwrap()?;
+    // The client closes once its own streams are done; if the server's last
+    // frames are unread then, the kernel resets the connection, which the
+    // server finds as it shuts down: the client's going, not the server
+    // failing.
+    match within(server).await.unwrap() {
+        Err(err) if !peer_gone(&err) => return Err(err),
+        _ => {}
+    }
     Ok(())
+}
+
+/// Whether `err`, or an error it came from, is the peer having gone: a
+/// connection reset, which then finds itself not connected or its pipe
+/// broken.
+fn peer_gone(err: &io::Error) -> bool {
+    let gone = |kind| {
+        matches!(
+            kind,
+            io::ErrorKind::NotConnected
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+        )
+    };
+    if gone(err.kind()) {
+        return true;
+    }
+    let mut source = err
+        .get_ref()
+        .map(|inner| inner as &(dyn std::error::Error + 'static));
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| gone(io.kind()))
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// A server's configuration and a client's: the server's certificate is

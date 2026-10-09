@@ -14,6 +14,16 @@
 //! task was woken for something else, and the system call would find what
 //! the poll says it would.
 //!
+//! A read that takes less than its buffer has drained the descriptor, and a
+//! write that gives less than it was given has filled it, so the next
+//! transfer that way would only find nothing, or no room: it arms its poll
+//! first instead, without the system call, as tokio clears the readiness it
+//! has after such a transfer. A request whose answer has not come yet, the
+//! common case of a client, so costs one read, not two. The kernel checks
+//! the events as it arms the poll, so a descriptor that became ready
+//! meanwhile completes the wait at the ring's next turn: a hint gone stale
+//! costs that turn, never the readiness.
+//!
 //! A descriptor that is ready again and again, as one a peer keeps full, is
 //! read with no wait at all, so each read and write spends a step of the
 //! task's budget ([`coop`]), and once the budget is spent the task yields.
@@ -25,6 +35,7 @@ use std::mem::{self, MaybeUninit};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, ready};
 
 use ruio_driver::buf::{BufResult, IoBuf, IoBufMut, IoBufs};
@@ -65,6 +76,12 @@ pub(crate) enum Kind {
 pub(crate) struct Nonblocking {
     fd: PortableFd,
     kind: Kind,
+    /// Whether the last read took less than its buffer, which drained the
+    /// descriptor, so that the next waits for it to be readable first.
+    drained: AtomicBool,
+    /// Whether the last write gave less than it was given, which filled the
+    /// descriptor, so that the next waits for it to be writable first.
+    filled: AtomicBool,
 }
 
 impl Nonblocking {
@@ -81,6 +98,8 @@ impl Nonblocking {
         Self {
             fd: PortableFd::new(fd),
             kind,
+            drained: AtomicBool::new(false),
+            filled: AtomicBool::new(false),
         }
     }
 
@@ -225,7 +244,8 @@ impl Nonblocking {
         buf: &mut [MaybeUninit<u8>],
         wait: &mut ReadyWait,
     ) -> Poll<io::Result<usize>> {
-        self.poll_transfer(cx, READABLE, wait, |io| io.try_read(buf))
+        let len = buf.len();
+        self.poll_transfer(cx, READABLE, wait, len, |io| io.try_read(buf))
     }
 
     /// Writes as much of `buf` as there is room for, waiting with `wait` for
@@ -240,7 +260,7 @@ impl Nonblocking {
         buf: &[u8],
         wait: &mut ReadyWait,
     ) -> Poll<io::Result<usize>> {
-        self.poll_transfer(cx, WRITABLE, wait, |io| io.try_write(buf))
+        self.poll_transfer(cx, WRITABLE, wait, buf.len(), |io| io.try_write(buf))
     }
 
     /// Writes as much of `bufs`, one after the other, as there is room for,
@@ -255,7 +275,8 @@ impl Nonblocking {
         bufs: &[IoSlice<'_>],
         wait: &mut ReadyWait,
     ) -> Poll<io::Result<usize>> {
-        self.poll_transfer(cx, WRITABLE, wait, |io| io.try_write_vectored(bufs))
+        let len = bufs.iter().take(MAX_IOVECS).map(|buf| buf.len()).sum();
+        self.poll_transfer(cx, WRITABLE, wait, len, |io| io.try_write_vectored(bufs))
     }
 
     /// Waits with `wait` for the descriptor to have any of `events`, as
@@ -270,18 +291,31 @@ impl Nonblocking {
         self.fd.poll_ready(cx, events, wait)
     }
 
-    /// Runs `transfer`, a system call made at once, once the task's budget
-    /// allows, waiting with `wait` for `events` while it finds the descriptor
-    /// not ready.
+    /// Runs `transfer`, a system call made at once that is to move `len`
+    /// bytes, once the task's budget allows, waiting with `wait` for `events`
+    /// while it finds the descriptor not ready; after a transfer this way that
+    /// moved less than it was to, it waits first. See the module's
+    /// documentation.
     #[inline]
     fn poll_transfer(
         &self,
         cx: &mut Context<'_>,
         events: u32,
         wait: &mut ReadyWait,
+        len: usize,
         mut transfer: impl FnMut(&Self) -> io::Result<usize>,
     ) -> Poll<io::Result<usize>> {
         let proceed = ready!(coop::poll_proceed(cx));
+        let short = if events == READABLE {
+            &self.drained
+        } else {
+            &self.filled
+        };
+        // Relaxed: a hint, which says only whether the system call or the
+        // poll comes first.
+        if !wait.is_waiting() && short.swap(false, Ordering::Relaxed) {
+            ready!(self.fd.poll_ready(cx, events, wait))?;
+        }
         loop {
             if wait.is_waiting() {
                 // Woken for something else, or by the poll: the poll knows
@@ -291,6 +325,9 @@ impl Nonblocking {
             match transfer(self) {
                 Ok(done) => {
                     proceed.made_progress();
+                    if 0 < done && done < len {
+                        short.store(true, Ordering::Relaxed);
+                    }
                     return Poll::Ready(Ok(done));
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -377,6 +414,29 @@ fn set_nonblocking(fd: &OwnedFd, nonblocking: bool) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// How many bytes of `bufs` past the first `skip` one write of
+/// [`Nonblocking::try_write_bufs`] offers: those of up to [`OWNED_IOVECS`]
+/// buffers.
+fn offered<V: IoBufs>(bufs: &V, skip: usize) -> usize {
+    let mut skip = skip;
+    let mut count = 0;
+    let mut total = 0;
+    for index in 0..bufs.buf_count() {
+        if count == OWNED_IOVECS {
+            break;
+        }
+        let (_, len) = bufs.buf(index);
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        total += len - skip;
+        skip = 0;
+        count += 1;
+    }
+    total
 }
 
 /// What a system call that moved bytes returned: how many, or the error it
@@ -558,9 +618,10 @@ impl<B: IoBufMut> Future for PortableReadExact<'_, B> {
             // longer than the buffer is borrowed; the read writes none but
             // initialized bytes.
             let into = unsafe { slice::from_raw_parts_mut(start.cast(), total - this.done) };
+            let len = into.len();
             let read = ready!(
                 this.io
-                    .poll_transfer(cx, READABLE, &mut this.wait, |io| { io.try_read(into) })
+                    .poll_transfer(cx, READABLE, &mut this.wait, len, |io| io.try_read(into))
             );
             match read {
                 Ok(0) => {
@@ -636,10 +697,12 @@ impl<B: IoBuf> Future for PortableWriteAll<'_, B> {
             // initialized, of which the slice borrows those past `done` for no
             // longer than the buffer is borrowed.
             let from = unsafe { slice::from_raw_parts(start, total - this.done) };
-            let written = ready!(
-                this.io
-                    .poll_transfer(cx, WRITABLE, &mut this.wait, |io| { io.try_write(from) })
-            );
+            let written =
+                ready!(
+                    this.io
+                        .poll_transfer(cx, WRITABLE, &mut this.wait, from.len(), |io| io
+                            .try_write(from))
+                );
             match written {
                 Ok(0) => {
                     failed = Some(io::ErrorKind::WriteZero.into());
@@ -708,9 +771,13 @@ impl<V: IoBufs> Future for PortableWriteAllVectored<'_, V> {
         let total = bufs.bytes_init();
         while this.done < total {
             let done = this.done;
-            let written = ready!(this.io.poll_transfer(cx, WRITABLE, &mut this.wait, |io| {
-                io.try_write_bufs(bufs, done)
-            }));
+            let len = offered(bufs, done);
+            let written = ready!(
+                this.io
+                    .poll_transfer(cx, WRITABLE, &mut this.wait, len, |io| {
+                        io.try_write_bufs(bufs, done)
+                    })
+            );
             match written {
                 Ok(0) => {
                     let bufs = this
@@ -858,6 +925,88 @@ mod tests {
             let read = std::future::poll_fn(|cx| reader.poll_read(cx, &mut buf, &mut wait)).await;
             assert_eq!(read.unwrap(), 1);
             assert!(!wait.is_waiting());
+        });
+    }
+
+    /// Whether a read polled once completes on that poll, and with what.
+    async fn read_at_once(
+        reader: &Nonblocking,
+        buf: &mut [MaybeUninit<u8>],
+        wait: &mut ReadyWait,
+    ) -> Option<usize> {
+        std::future::poll_fn(|cx| {
+            Poll::Ready(match reader.poll_read(cx, buf, wait) {
+                Poll::Ready(read) => Some(read.unwrap()),
+                Poll::Pending => None,
+            })
+        })
+        .await
+    }
+
+    /// A read that took less than its buffer drained the pipe, so the next
+    /// waits for the ring before it reads, even with data waiting, and then
+    /// reads it.
+    #[test]
+    fn a_read_after_a_short_one_waits_for_the_ring_first() {
+        run(async {
+            let (reader, mut writer) = reading();
+            let mut wait = ReadyWait::new();
+            let mut buf = [MaybeUninit::uninit(); 16];
+            writer.write_all(b"one").unwrap();
+            assert_eq!(read_at_once(&reader, &mut buf, &mut wait).await, Some(3));
+            writer.write_all(b"two").unwrap();
+            assert_eq!(read_at_once(&reader, &mut buf, &mut wait).await, None);
+            assert!(wait.is_waiting(), "the poll is armed, with no read made");
+            let read = std::future::poll_fn(|cx| reader.poll_read(cx, &mut buf, &mut wait)).await;
+            assert_eq!(read.unwrap(), 3);
+        });
+    }
+
+    /// A read that filled its buffer may have left more, so the next reads at
+    /// once.
+    #[test]
+    fn a_read_after_a_full_one_reads_at_once() {
+        run(async {
+            let (reader, mut writer) = reading();
+            let mut wait = ReadyWait::new();
+            let mut buf = [MaybeUninit::uninit(); 4];
+            writer.write_all(b"12345678").unwrap();
+            assert_eq!(read_at_once(&reader, &mut buf, &mut wait).await, Some(4));
+            assert_eq!(read_at_once(&reader, &mut buf, &mut wait).await, Some(4));
+            assert!(!wait.is_waiting());
+            // Short at last, by the end of the data.
+            writer.write_all(b"9").unwrap();
+            assert_eq!(read_at_once(&reader, &mut buf, &mut wait).await, Some(1));
+            assert_eq!(read_at_once(&reader, &mut buf, &mut wait).await, None);
+        });
+    }
+
+    /// A write that gave less than it was given filled the socket, so the
+    /// next waits for room first; written on as the peer drains it slowly,
+    /// eight megabytes go through whole.
+    #[test]
+    fn writes_after_short_ones_wait_for_room_and_go_through() {
+        use std::os::unix::net::UnixStream;
+
+        run(async {
+            let (ours, mut theirs) = UnixStream::pair().unwrap();
+            let ours = Nonblocking::new(ours.into(), Kind::Socket).unwrap();
+            let data: Vec<u8> = (0..8u32 << 20).map(|index| (index % 253) as u8).collect();
+            let expected = data.clone();
+            let draining = std::thread::spawn(move || {
+                let mut got = Vec::with_capacity(expected.len());
+                let mut chunk = vec![0; 64 << 10];
+                while got.len() < expected.len() {
+                    let read = theirs.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    got.extend_from_slice(&chunk[..read]);
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+                got == expected
+            });
+            let (written, _) = ours.write_all(data).await;
+            written.unwrap();
+            assert!(draining.join().unwrap());
         });
     }
 
