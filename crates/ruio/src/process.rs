@@ -95,7 +95,7 @@ use ruio_driver::PortableFd;
 use ruio_driver::buf::{IoBuf, IoBufMut};
 use ruio_driver::ops::Waitid;
 
-use crate::io::{AsyncRead, AsyncWrite, Nonblocking, PortableRead, PortableWrite};
+use crate::io::{AsyncRead, AsyncWrite, Kind, Nonblocking, PortableRead, PortableWrite};
 
 mod reaper;
 
@@ -688,7 +688,7 @@ impl TryFrom<std::process::ChildStdin> for ChildStdin {
 
     fn try_from(stdin: std::process::ChildStdin) -> io::Result<Self> {
         Ok(Self {
-            pipe: Nonblocking::new(stdin.into())?,
+            pipe: Nonblocking::new(stdin.into(), Kind::Pipe)?,
         })
     }
 }
@@ -730,7 +730,7 @@ impl TryFrom<std::process::ChildStdout> for ChildStdout {
 
     fn try_from(stdout: std::process::ChildStdout) -> io::Result<Self> {
         Ok(Self {
-            pipe: Nonblocking::new(stdout.into())?,
+            pipe: Nonblocking::new(stdout.into(), Kind::Pipe)?,
         })
     }
 }
@@ -768,7 +768,7 @@ impl TryFrom<std::process::ChildStderr> for ChildStderr {
 
     fn try_from(stderr: std::process::ChildStderr) -> io::Result<Self> {
         Ok(Self {
-            pipe: Nonblocking::new(stderr.into())?,
+            pipe: Nonblocking::new(stderr.into(), Kind::Pipe)?,
         })
     }
 }

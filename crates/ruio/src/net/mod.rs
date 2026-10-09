@@ -87,9 +87,16 @@
 //! fn assert_send<T: Send>() {}
 //! assert_send::<ruio::net::TcpStream>();
 //! ```
+//!
+//! Code whose futures must be `Send`, such as `async_trait`'s, or that moves
+//! a connection between cores, has the sockets of [`portable`], which are
+//! `Send` and `Sync`: their reads and writes are system calls made at once
+//! on whichever thread polls them, which wait on that thread's ring only
+//! when there is nothing to read or no room to write.
 
 mod addr;
 mod behind;
+pub mod portable;
 mod socket;
 mod tcp;
 mod udp;

@@ -40,7 +40,7 @@ fn poll_gate(gate: &mut Option<&Behind>, cx: &mut Context<'_>) -> Poll<io::Resul
 /// Reads the option `name` of `level` of the socket `fd` with
 /// `getsockopt(2)`, into a value of `T`; bytes the kernel does not write are
 /// zero.
-fn getsockopt<T: OptionValue>(fd: RawFd, level: i32, name: i32) -> io::Result<T> {
+pub(crate) fn getsockopt<T: OptionValue>(fd: RawFd, level: i32, name: i32) -> io::Result<T> {
     // SAFETY: every byte pattern is a value of an `OptionValue`, zeroes
     // among them.
     let mut value: T = unsafe { mem::zeroed() };
@@ -57,7 +57,12 @@ fn getsockopt<T: OptionValue>(fd: RawFd, level: i32, name: i32) -> io::Result<T>
 
 /// Sets the option `name` of `level` of the socket `fd` to `value` with
 /// `setsockopt(2)`.
-fn setsockopt<T: OptionValue>(fd: RawFd, level: i32, name: i32, value: &T) -> io::Result<()> {
+pub(crate) fn setsockopt<T: OptionValue>(
+    fd: RawFd,
+    level: i32,
+    name: i32,
+    value: &T,
+) -> io::Result<()> {
     let len = size_of::<T>() as libc::socklen_t;
     // SAFETY: `value` is `len` readable bytes, which is all the kernel reads.
     let set = unsafe { libc::setsockopt(fd, level, name, ptr::from_ref(value).cast(), len) };

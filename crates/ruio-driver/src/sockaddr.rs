@@ -43,8 +43,10 @@ impl SockAddr {
     }
 
     /// The address the kernel wrote as `bytes`, as long as they are, up to
-    /// the room of a `sockaddr_storage`.
-    pub(crate) fn from_kernel(bytes: &[u8]) -> Self {
+    /// the room of a `sockaddr_storage`: what `accept4(2)`, `getsockname(2)`
+    /// or a received message's header holds, as the kernel laid it out for
+    /// its family.
+    pub fn from_kernel(bytes: &[u8]) -> Self {
         let mut addr = Self::empty();
         let len = bytes.len().min(size_of::<libc::sockaddr_storage>());
         addr.bytes_mut()[..len].copy_from_slice(&bytes[..len]);
