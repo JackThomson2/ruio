@@ -8,6 +8,17 @@ publish.workspace = true
 
 [features]
 default = ["futures-io", "hyper", "tokio"]
+# `client::Connector`, which makes the connections of hyper-util's client
+# with ruio's portable TCP streams, and `client::builder`, which gives the
+# client ruio's executor and timer. The client speaks HTTP/1.1; hyper-util's
+# `http2` feature adds HTTP/2.
+client = [
+    "hyper",
+    "dep:hyper-util",
+    "hyper-util/client-legacy",
+    "hyper-util/http1",
+    "dep:tower-service",
+]
 # `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of futures-io.
 futures-io = ["dep:futures-io"]
 # `Executor`, which spawns the tasks hyper's HTTP/2 needs, `Timer`, which
@@ -21,21 +32,26 @@ tokio = ["dep:tokio"]
 [dependencies]
 futures-io = { version = "0.3.34", optional = true }
 hyper = { version = "1.11.1", default-features = false, optional = true }
+hyper-util = { version = "0.1.21", default-features = false, optional = true }
 libc.workspace = true
 ruio.workspace = true
 tokio = { version = "1.53.1", default-features = false, optional = true }
+tower-service = { version = "0.3.3", optional = true }
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["io"] }
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["client", "http1", "http2", "server"] }
-# For `TokioIo`, which gives hyper's traits to types with tokio's.
-hyper-util = { version = "0.1.21", features = ["tokio"] }
+# For `TokioIo`, which gives hyper's traits to types with tokio's, and
+# HTTP/2 for the client's tests.
+hyper-util = { version = "0.1.21", features = ["http2", "tokio"] }
 rcgen = "0.14.10"
 # ring for cryptography, which builds with a C compiler alone.
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1.53.1", features = ["io-util"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+# For the client's tests, whose TLS connector wraps the plain one.
+tower-service = "0.3.3"
 
 [[example]]
 name = "hyper"
