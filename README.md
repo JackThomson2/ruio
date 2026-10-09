@@ -47,8 +47,8 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 
 | Crate | What it has |
 |---|---|
-| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, which holds tasks of other cores too, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, `signal`, and `process`, which spawns child processes and waits for them on the ring; the path functions of `fs` and everything in `process` are `Send`, running on the ring of whichever thread polls them; with the `futures` feature, every stream implements futures-core's `Stream` |
-| [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; and `Timer`, which gives hyper ruio's timers for its timeouts |
+| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, which holds tasks of other cores too, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, `signal`, and `process`, which spawns child processes and waits for them on the ring; the path functions of `fs`, everything in `process`, and the sockets of `net::portable` and the file of `fs::portable` are `Send`, running on the ring of whichever thread polls them; with the `futures` feature, every stream implements futures-core's `Stream` |
+| [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; `Timer`, which gives hyper ruio's timers for its timeouts; `PortableCompat`, which gives the portable streams those traits with no buffers of its own; and, with the `client` feature, a connector that runs hyper-util's client on them |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
 | [`ruio-sys`](crates/ruio-sys) | The kernel's io_uring ABI and system calls |
@@ -61,7 +61,10 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 `AsyncFd` to the poll-based traits that most of the ecosystem takes its I/O
 through; tokio's traits need none of tokio's runtime. The adapter has
 hyper's own traits too, so hyper serves it as it is, `Executor` runs hyper's
-HTTP/2 on ruio's tasks, and tokio-rustls runs TLS over it. `Timer` gives
+HTTP/2 on ruio's tasks, and tokio-rustls runs TLS over it.
+`PortableCompat` does the same for the portable streams, which are `Send`,
+with no buffers of its own, and with the `client` feature
+`ruio_compat::client` runs hyper-util's client on them. `Timer` gives
 hyper ruio's timers, with which it times out a client that is slow to send
 a request's head:
 
@@ -162,6 +165,12 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   status comes 2.4 times as often. Child processes spawn as tokio's do and
   are waited for on the ring, with no `SIGCHLD` handler, and 64 bytes go
   through a child's pipes and back as often as through tokio's.
+- **Send sockets and hyper-util's client**: the streams of `net::portable`
+  are `Send` and read and write with system calls made at once on
+  whichever thread polls them, so 64 bytes go to an echo thread and back
+  as often as through the thread's streams and tokio's, and hyper-util's
+  client, one for every core, makes as many requests a second through them
+  as on tokio, one at a time or from 16 tasks at once.
 
 ## Development
 
