@@ -38,6 +38,13 @@
 //! Like the streams, an adapter belongs to its thread, whose runtime's ring
 //! runs its I/O.
 //!
+//! [`PortableCompat`] adapts ruio's portable streams, of
+//! [`ruio::net::portable`], to the same traits with no buffers of its own:
+//! they read and write with system calls made at once on whichever thread
+//! polls them, so a read goes into the caller's buffer and a write comes
+//! from the caller's, and the adapter, as the stream, is `Send` and `Sync`,
+//! for what needs a connection that is, as hyper-util's client does.
+//!
 //! With the `hyper` feature, on by default, an adapter has hyper's own I/O
 //! traits, `hyper::rt::Read` and `Write`, so hyper serves it, or connects
 //! through it, as it is, with nothing between them; [`Executor`] spawns
@@ -88,6 +95,7 @@ mod executor;
 mod futures_impls;
 #[cfg(feature = "hyper")]
 mod hyper_impls;
+mod portable;
 #[cfg(feature = "hyper")]
 mod timer;
 #[cfg(feature = "tokio")]
@@ -95,6 +103,7 @@ mod tokio_impls;
 
 #[cfg(feature = "hyper")]
 pub use executor::Executor;
+pub use portable::{PortableCompat, PortableStream};
 #[cfg(feature = "hyper")]
 pub use timer::Timer;
 
