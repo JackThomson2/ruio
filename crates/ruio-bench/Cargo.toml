@@ -13,10 +13,12 @@ publish.workspace = true
 futures-util = { version = "0.3.34", default-features = false }
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["client", "http1", "http2", "server"] }
-hyper-util = { version = "0.1.21", features = ["tokio"] }
+# The legacy client, on both runtimes, and tokio's executor, timer and
+# connector for it.
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
 libc.workspace = true
 ruio = { workspace = true, features = ["futures"] }
-ruio-compat = { workspace = true, features = ["tokio"] }
+ruio-compat = { workspace = true, features = ["client", "tokio"] }
 tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "signal", "sync"] }
 # For `UnboundedReceiverStream`, which gives tokio's channels the `Stream`
 # ruio's have.

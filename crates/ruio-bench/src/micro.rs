@@ -148,6 +148,22 @@
 //! - `child pipes`: 64 bytes written to the input of a `cat` that runs the
 //!   whole time and read back from its output: each way a write, a read and
 //!   a wake of the other process, on the one CPU they share.
+//! - `portable write read`: `write read` on a pair of portable streams: a
+//!   `send(2)` and a `recv(2)` made at once, which find room and the byte,
+//!   so that the ring is never entered.
+//! - `round trip`: 64 bytes over TCP to an echo thread on another core and
+//!   back, through a stream of the ring's on ruio: a write and a read, and a
+//!   wait for the echo.
+//! - `portable round trip`: the same through a portable stream: a send made
+//!   at once, a receive that finds nothing yet and waits with a poll on the
+//!   ring, and the receive made again as the echo arrives.
+//! - `hyper get`: hyper-util's client sending GETs one at a time over one
+//!   pooled connection to a server thread on another core, which answers
+//!   each with five bytes: ruio's through `ruio_compat::client`'s connector
+//!   and portable streams, tokio's through its `HttpConnector`, both with
+//!   `TCP_NODELAY`.
+//! - `hyper get 16`: the same from 16 tasks at once through one client and
+//!   its pool, the server a thread a connection over eight other cores.
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -509,6 +525,31 @@ pub(crate) const ALL: &[Micro] = &[
         name: "child pipes",
         ruio: ruio_child_pipes,
         tokio: Some(tokio_child_pipes),
+    },
+    Micro {
+        name: "portable write read",
+        ruio: ruio_portable_write_read,
+        tokio: Some(tokio_write_read),
+    },
+    Micro {
+        name: "round trip",
+        ruio: ruio_round_trip,
+        tokio: Some(tokio_round_trip),
+    },
+    Micro {
+        name: "portable round trip",
+        ruio: ruio_portable_round_trip,
+        tokio: Some(tokio_round_trip),
+    },
+    Micro {
+        name: "hyper get",
+        ruio: ruio_hyper_get,
+        tokio: Some(tokio_hyper_get),
+    },
+    Micro {
+        name: "hyper get 16",
+        ruio: ruio_hyper_get_many,
+        tokio: Some(tokio_hyper_get_many),
     },
 ];
 
@@ -2836,5 +2877,352 @@ fn tokio_child_pipes(load: &Load) -> io::Result<f64> {
         drop(stdin);
         assert!(child.wait().await?.success());
         Ok(rate)
+    })
+}
+
+/// A byte written to the peer and read back from it, on a pair of portable
+/// streams.
+fn ruio_portable_write_read(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    ruio_runtime()?.block_on(async move {
+        let (a, b) = portable_pair().await?;
+        let mut buf = Some(Vec::with_capacity(1));
+        Ok(rate(measure, async || {
+            a.write("x").await.0.expect("the byte is written");
+            let (read, taken) = b.read(buf.take().expect("the buffer is back")).await;
+            assert_eq!(read.expect("the byte is read"), 1);
+            buf = Some(taken);
+        })
+        .await)
+    })
+}
+
+/// A connected pair of portable TCP streams on the loopback interface.
+async fn portable_pair() -> io::Result<(
+    ruio::net::portable::TcpStream,
+    ruio::net::portable::TcpStream,
+)> {
+    let listener = ruio::net::portable::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let client = ruio::net::portable::TcpStream::connect(addr).await?;
+    let (server, _) = listener.accept().await?;
+    Ok((client, server))
+}
+
+/// How many bytes `round trip` and `portable round trip` send each way.
+const ROUND: usize = 64;
+
+/// What `round trip` and `portable round trip` send.
+static ROUND_DATA: [u8; ROUND] = [7; ROUND];
+
+/// How many tasks `hyper get 16` makes requests from.
+const HYPER_TASKS: usize = 16;
+
+/// How many cores the server of `hyper get 16` spreads its connections over.
+const HYPER_CORES: usize = 8;
+
+/// What the server of the `hyper get` rows answers each request with.
+const HELLO: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello";
+
+/// Threads that serve each connection to a listener on the loopback
+/// interface, a thread a connection, each pinned to the next of a list of
+/// CPUs in turn: the peers of the round trips and of hyper's clients, which
+/// are the same whichever runtime is measured. Dropped, it stops accepting;
+/// a connection's thread ends with its connection.
+struct Peers {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    accepting: Option<thread::JoinHandle<()>>,
+}
+
+impl Peers {
+    /// Serves each connection with `serve`, on `cpus` in turn.
+    fn start(cpus: Vec<usize>, serve: fn(std::net::TcpStream)) -> io::Result<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let accepting = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                for (index, stream) in listener.incoming().enumerate() {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(stream) = stream else {
+                        continue;
+                    };
+                    let cpu = cpus[index % cpus.len()];
+                    thread::spawn(move || {
+                        let _ = sys::pin(&[cpu]);
+                        let _ = sys::set_nodelay(stream.as_raw_fd());
+                        serve(stream);
+                    });
+                }
+            }
+        });
+        Ok(Self {
+            addr,
+            stop,
+            accepting: Some(accepting),
+        })
+    }
+
+    /// The URI of the server's root.
+    fn uri(&self) -> io::Result<hyper::Uri> {
+        format!("http://{}/", self.addr)
+            .parse()
+            .map_err(io::Error::other)
+    }
+}
+
+impl Drop for Peers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Wakes the accept, which then finds the flag set.
+        let _ = std::net::TcpStream::connect(self.addr);
+        if let Some(accepting) = self.accepting.take() {
+            let _ = accepting.join();
+        }
+    }
+}
+
+/// Sends back what the connection sends, until it ends.
+fn serve_echo(mut stream: std::net::TcpStream) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match std::io::Read::read(&mut stream, &mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(read) => {
+                if std::io::Write::write_all(&mut stream, &buf[..read]).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Answers each request the connection sends with [`HELLO`], as an HTTP/1.1
+/// server that keeps its connections alive does, until the connection
+/// ends. The requests are GETs, which end with their heads.
+fn serve_hello(mut stream: std::net::TcpStream) {
+    let mut pending = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+    loop {
+        match std::io::Read::read(&mut stream, &mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(read) => pending.extend_from_slice(&buf[..read]),
+        }
+        while let Some(end) = pending.windows(4).position(|window| window == b"\r\n\r\n") {
+            pending.drain(..end + 4);
+            if std::io::Write::write_all(&mut stream, HELLO).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// 64 bytes to an echo thread on another core and back, through a stream of
+/// the ring's.
+fn ruio_round_trip(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let peers = Peers::start(vec![remote_cpu(load)], serve_echo)?;
+    let addr = peers.addr;
+    ruio_runtime()?.block_on(async move {
+        let stream = ruio::net::TcpStream::connect(addr).await?;
+        stream.set_nodelay(true).await?;
+        let mut buf = Some(Vec::with_capacity(ROUND));
+        Ok(rate(measure, async || {
+            stream
+                .write_all(&ROUND_DATA[..])
+                .await
+                .0
+                .expect("the bytes are written");
+            let (read, back) = stream
+                .read_exact(buf.take().expect("the buffer is back"))
+                .await;
+            read.expect("the bytes come back");
+            buf = Some(back);
+        })
+        .await)
+    })
+}
+
+/// The same through a portable stream.
+fn ruio_portable_round_trip(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let peers = Peers::start(vec![remote_cpu(load)], serve_echo)?;
+    let addr = peers.addr;
+    ruio_runtime()?.block_on(async move {
+        let stream = ruio::net::portable::TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        let mut buf = Some(Vec::with_capacity(ROUND));
+        Ok(rate(measure, async || {
+            stream
+                .write_all(&ROUND_DATA[..])
+                .await
+                .0
+                .expect("the bytes are written");
+            let (read, back) = stream
+                .read_exact(buf.take().expect("the buffer is back"))
+                .await;
+            read.expect("the bytes come back");
+            buf = Some(back);
+        })
+        .await)
+    })
+}
+
+fn tokio_round_trip(load: &Load) -> io::Result<f64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let measure = load.measure;
+    let peers = Peers::start(vec![remote_cpu(load)], serve_echo)?;
+    let addr = peers.addr;
+    tokio_runtime()?.block_on(async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        let mut back = [0u8; ROUND];
+        Ok(rate(measure, async || {
+            stream
+                .write_all(&ROUND_DATA)
+                .await
+                .expect("the bytes are written");
+            stream
+                .read_exact(&mut back)
+                .await
+                .expect("the bytes come back");
+        })
+        .await)
+    })
+}
+
+/// The body of the `hyper get` rows' requests, which is none.
+type NoBody = http_body_util::Empty<hyper::body::Bytes>;
+
+/// hyper-util's client on ruio, whose connections are portable streams.
+fn ruio_client() -> hyper_util::client::legacy::Client<ruio_compat::client::Connector, NoBody> {
+    ruio_compat::client::builder().build(ruio_compat::client::Connector::new())
+}
+
+/// hyper-util's client on tokio, with `TCP_NODELAY` and a timer for its
+/// pool, as ruio's has them.
+fn tokio_client()
+-> hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, NoBody> {
+    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    connector.set_nodelay(true);
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .pool_timer(hyper_util::rt::TokioTimer::new())
+        .build(connector)
+}
+
+/// A GET of `uri`, its body read to its end, which must be `hello`.
+async fn hyper_get<C>(client: &hyper_util::client::legacy::Client<C, NoBody>, uri: &hyper::Uri)
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
+    use http_body_util::BodyExt;
+
+    let response = client
+        .get(uri.clone())
+        .await
+        .expect("the request is answered");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the body is read")
+        .to_bytes();
+    assert_eq!(&body[..], b"hello");
+}
+
+/// GETs one at a time through hyper-util's client to a server thread on
+/// another core.
+fn ruio_hyper_get(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let peers = Peers::start(vec![remote_cpu(load)], serve_hello)?;
+    let uri = peers.uri()?;
+    ruio_runtime()?.block_on(async move {
+        let client = ruio_client();
+        Ok(rate(measure, async || hyper_get(&client, &uri).await).await)
+    })
+}
+
+fn tokio_hyper_get(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let peers = Peers::start(vec![remote_cpu(load)], serve_hello)?;
+    let uri = peers.uri()?;
+    tokio_runtime()?.block_on(async move {
+        let client = tokio_client();
+        Ok(rate(measure, async || hyper_get(&client, &uri).await).await)
+    })
+}
+
+/// The cores the server of `hyper get 16` spreads its connections over.
+fn hyper_cores(load: &Load) -> Vec<usize> {
+    (0..HYPER_CORES)
+        .map(|core| remote_cpu(load) + 2 * core)
+        .collect()
+}
+
+/// GETs from 16 tasks at once through one client of hyper-util's.
+fn ruio_hyper_get_many(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let peers = Peers::start(hyper_cores(load), serve_hello)?;
+    let uri = peers.uri()?;
+    ruio_runtime()?.block_on(async move {
+        let client = ruio_client();
+        let stop = Arc::new(AtomicBool::new(false));
+        let tasks: Vec<_> = (0..HYPER_TASKS)
+            .map(|_| {
+                let (client, uri, stop) = (client.clone(), uri.clone(), Arc::clone(&stop));
+                ruio::spawn(async move {
+                    let mut count = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        hyper_get(&client, &uri).await;
+                        count += 1;
+                    }
+                    count
+                })
+            })
+            .collect();
+        let start = Instant::now();
+        ruio::time::sleep(measure).await;
+        stop.store(true, Ordering::Relaxed);
+        let mut total = 0;
+        for task in tasks {
+            total += task.await.map_err(io::Error::other)?;
+        }
+        Ok(total as f64 / start.elapsed().as_secs_f64())
+    })
+}
+
+fn tokio_hyper_get_many(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let peers = Peers::start(hyper_cores(load), serve_hello)?;
+    let uri = peers.uri()?;
+    tokio_runtime()?.block_on(async move {
+        let client = tokio_client();
+        let stop = Arc::new(AtomicBool::new(false));
+        let tasks: Vec<_> = (0..HYPER_TASKS)
+            .map(|_| {
+                let (client, uri, stop) = (client.clone(), uri.clone(), Arc::clone(&stop));
+                tokio::spawn(async move {
+                    let mut count = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        hyper_get(&client, &uri).await;
+                        count += 1;
+                    }
+                    count
+                })
+            })
+            .collect();
+        let start = Instant::now();
+        tokio::time::sleep(measure).await;
+        stop.store(true, Ordering::Relaxed);
+        let mut total = 0;
+        for task in tasks {
+            total += task.await.map_err(io::Error::other)?;
+        }
+        Ok(total as f64 / start.elapsed().as_secs_f64())
     })
 }
