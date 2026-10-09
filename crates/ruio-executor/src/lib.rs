@@ -24,7 +24,8 @@
 //! [`JoinHandle`]s, which can be ready every time they are polled, spend a
 //! step of it each time they are, and once it is spent make the task
 //! yield, so that a task that always finds them ready cannot hold up the
-//! others or the ring.
+//! others or the ring. [`coop`] lets the primitives of other crates take
+//! part.
 //!
 //! ```
 //! use ruio_driver::ops::Nop;
@@ -50,7 +51,7 @@
 
 pub mod blocking;
 mod context;
-mod coop;
+pub mod coop;
 mod cores;
 #[cfg(feature = "futures")]
 mod futures_impls;

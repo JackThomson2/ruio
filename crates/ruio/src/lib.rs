@@ -80,7 +80,7 @@ pub use ruio_executor::{
     RemoteJoinHandle, Runtime, core, core_count, driver, handle, handle_of, spawn, spawn_blocking,
     spawn_on, yield_now,
 };
-pub use ruio_executor::{blocking, sync, time};
+pub use ruio_executor::{blocking, coop, sync, time};
 pub use ruio_macros::{main, test};
 
 pub use ruio_driver::buf;
