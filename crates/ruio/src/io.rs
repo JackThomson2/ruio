@@ -21,6 +21,13 @@
 //! wait for it to be ready, once or again and again, and read and write it
 //! through the ring.
 //!
+//! A child's pipes read and write with system calls made at once instead,
+//! on whichever thread polls them, and wait on that thread's ring only when
+//! there is nothing to read or no room to write: their reads and writes are
+//! [`PortableRead`]s and [`PortableWrite`]s, which are `Send` and `Sync`, and
+//! spend a step of the task's budget ([`coop`](crate::coop)) each time they
+//! move data.
+//!
 //! A stream socket's own `read_exact` and `write_all` stay what they are,
 //! with their linked timeouts and `MSG_WAITALL`: a method call on a stream
 //! reaches them, and the traits' through a generic bound only.
@@ -52,9 +59,12 @@ use crate::fs::{File, FileOp};
 use crate::net::{SocketOp, TcpStream, UnixStream};
 
 mod async_fd;
+mod nonblocking;
 mod splice;
 
 pub use async_fd::{AsyncFd, FdOp, Readiness, Ready};
+pub(crate) use nonblocking::Nonblocking;
+pub use nonblocking::{PortableRead, PortableWrite};
 pub use splice::{Splice, Spliceable, splice};
 
 /// How many bytes each of [`copy`]'s two buffers holds.
