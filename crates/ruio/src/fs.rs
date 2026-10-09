@@ -60,7 +60,9 @@
 //! `async_trait`'s, or a future spawned onto another core, can await them. Each runs its operations as [`PortableOp`]s on the ring of the
 //! thread that polls it, which cost what the ring's own operations do, and a
 //! file it opens is a [`PortableFd`] for as long as it is open. A [`File`]
-//! belongs to its thread's ring.
+//! belongs to its thread's ring; a [`portable::File`], opened with
+//! [`OpenOptions::open_portable`], is `Send` and `Sync`, and runs each of its
+//! operations on the ring of the thread that polls it, as these functions do.
 //!
 //! ```
 //! fn assert_send<T: Send>(_: T) {}
@@ -95,6 +97,7 @@ use ruio_driver::{
 use crate::net::{Desc, Sock, ThreadBound};
 
 mod dir;
+pub mod portable;
 
 pub use dir::{DirEntry, ReadDir, read_dir};
 
@@ -1012,6 +1015,12 @@ impl OpenOptions {
         })
     }
 
+    /// The `open(2)` flags the options make: the access mode, the creation
+    /// flags and the custom ones.
+    fn flags(&self) -> io::Result<i32> {
+        Ok(self.access_mode()? | self.creation_mode()? | (self.custom_flags & !libc::O_ACCMODE))
+    }
+
     /// Opens the file at `path` with these options.
     ///
     /// # Errors
@@ -1023,8 +1032,7 @@ impl OpenOptions {
     /// one fails with `Unsupported` if the kernel's io_uring has no polled
     /// rings, and with `ENFILE` if the polled ring's file table is full.
     pub async fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
-        let flags =
-            self.access_mode()? | self.creation_mode()? | (self.custom_flags & !libc::O_ACCMODE);
+        let flags = self.flags()?;
         let driver = crate::driver();
         if self.polled {
             if flags & libc::O_DIRECT == 0 {
@@ -1054,6 +1062,33 @@ impl OpenOptions {
             polled,
             _thread: PhantomData,
         })
+    }
+
+    /// Opens the file at `path` with these options as a [`portable::File`],
+    /// a plain descriptor that is `Send` and `Sync`, with the flags
+    /// [`open`](OpenOptions::open) would open it with. The open, as each of
+    /// the file's operations after it, runs on the ring of the thread that
+    /// polls it.
+    ///
+    /// # Errors
+    ///
+    /// As for [`open`](OpenOptions::open), and `InvalidInput` for options
+    /// that a plain descriptor of no ring in particular cannot honour: a
+    /// [`direct_descriptor`](OpenOptions::direct_descriptor), which belongs
+    /// to one ring's table, and [polled](OpenOptions::polled) I/O, which
+    /// goes on one thread's polled ring.
+    pub async fn open_portable(&self, path: impl AsRef<Path>) -> io::Result<portable::File> {
+        if self.direct_descriptor {
+            return Err(invalid(
+                "a portable file is a plain descriptor, not a direct one",
+            ));
+        }
+        if self.polled {
+            return Err(invalid("a portable file cannot be opened for polled I/O"));
+        }
+        let flags = self.flags()?;
+        let fd = open_portable(path, flags, self.mode).await?;
+        Ok(portable::File::from_fd(fd))
     }
 }
 
