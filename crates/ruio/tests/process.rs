@@ -6,7 +6,8 @@
 mod support;
 
 use std::future::{Future, poll_fn};
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, IoSlice};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::pin::Pin;
@@ -15,7 +16,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use ruio::io::{AsyncRead, AsyncWrite};
-use ruio::process::{Child, ChildStdout, Command};
+use ruio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 use support::{PATIENCE, within};
 
@@ -145,6 +146,135 @@ async fn data_goes_through_the_childs_pipes() -> io::Result<()> {
     within(writer).await.unwrap()?;
     assert!(within(child.wait()).await?.success());
     Ok(())
+}
+
+/// Everything `stdout` has, to its end, read with its poll method into a
+/// buffer of the caller's.
+async fn poll_read_to_end(stdout: &mut ChildStdout) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = [MaybeUninit::<u8>::uninit(); 4096];
+    loop {
+        let read = poll_fn(|cx| stdout.poll_read(cx, &mut buf)).await?;
+        if read == 0 {
+            return Ok(out);
+        }
+        // SAFETY: the read initialized the first `read` bytes.
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), read) });
+    }
+}
+
+/// A megabyte through `cat` with the poll methods, written by one task from
+/// the caller's buffer while another reads into its own, so that the pipes
+/// fill and both sides wait.
+#[ruio::test]
+async fn data_goes_through_the_childs_pipes_with_poll_methods() -> io::Result<()> {
+    let data: Vec<u8> = (0..1 << 20).map(|index| (index % 251) as u8).collect();
+    let mut child = Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().unwrap();
+    let expected = data.clone();
+    let writer = ruio::spawn(async move {
+        let mut done = 0;
+        while done < data.len() {
+            let written = poll_fn(|cx| stdin.poll_write(cx, &data[done..])).await?;
+            assert_ne!(written, 0);
+            done += written;
+        }
+        // Dropped here, which closes the pipe: cat's input ends.
+        io::Result::Ok(())
+    });
+    let mut stdout = child.stdout.take().unwrap();
+    let out = within(poll_read_to_end(&mut stdout)).await?;
+    assert_eq!(out.len(), expected.len());
+    assert!(out == expected);
+    within(writer).await.unwrap()?;
+    assert!(within(child.wait()).await?.success());
+    Ok(())
+}
+
+/// A vectored write gives its buffers' bytes one after the other.
+#[ruio::test]
+async fn poll_write_vectored_writes_the_buffers_in_order() -> io::Result<()> {
+    let mut child = Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().unwrap();
+    let parts: [&[u8]; 4] = [b"one ", b"", b"two ", b"three"];
+    let bufs = parts.map(IoSlice::new);
+    let written = within(poll_fn(|cx| stdin.poll_write_vectored(cx, &bufs))).await?;
+    assert_eq!(written, 13, "an empty pipe has room for them all");
+    drop(stdin);
+    let mut stdout = child.stdout.take().unwrap();
+    let out = within(poll_read_to_end(&mut stdout)).await?;
+    assert_eq!(out, b"one two three");
+    assert!(within(child.wait()).await?.success());
+    Ok(())
+}
+
+/// The calls made with no wait: a read of an empty pipe would block, and
+/// one once the pipe is readable takes what arrived; a write to a pipe with
+/// room goes at once.
+#[ruio::test]
+async fn try_read_and_try_write_wait_for_nothing() -> io::Result<()> {
+    let mut child = Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut buf = [0; 64];
+    let err = stdout.try_read(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::WouldBlock, "nothing has arrived");
+    within(stdin.writable()).await?;
+    assert_eq!(stdin.try_write(b"ping ")?, 5);
+    let bufs = [IoSlice::new(b"pi"), IoSlice::new(b"ng")];
+    assert_eq!(stdin.try_write_vectored(&bufs)?, 4);
+    let mut out = Vec::new();
+    while out.len() < 9 {
+        within(stdout.readable()).await?;
+        // Readable, and read by nothing else, so there is something.
+        let read = stdout.try_read(&mut buf)?;
+        assert_ne!(read, 0, "the output ended early");
+        out.extend_from_slice(&buf[..read]);
+    }
+    assert_eq!(out, b"ping ping");
+    drop(stdin);
+    within(stdout.readable()).await?;
+    assert_eq!(stdout.try_read(&mut buf)?, 0, "the end");
+    assert!(within(child.wait()).await?.success());
+    Ok(())
+}
+
+/// A poll read of a child's standard error, which waits for the child to
+/// write, as standard output's does.
+#[ruio::test]
+async fn stderr_is_read_with_its_poll_method() -> io::Result<()> {
+    let mut child = shell("sleep 0.05; echo err >&2")
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stderr = child.stderr.take().unwrap();
+    let mut buf = [MaybeUninit::<u8>::uninit(); 16];
+    let read = within(poll_fn(|cx| stderr.poll_read(cx, &mut buf))).await?;
+    // SAFETY: the read initialized the first `read` bytes.
+    let out = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), read) };
+    assert_eq!(out, b"err\n");
+    assert_eq!(
+        within(poll_fn(|cx| stderr.poll_read(cx, &mut buf))).await?,
+        0
+    );
+    assert!(within(child.wait()).await?.success());
+    Ok(())
+}
+
+#[test]
+fn the_pipes_are_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync + Unpin>() {}
+    assert_send_sync::<ChildStdin>();
+    assert_send_sync::<ChildStdout>();
+    assert_send_sync::<ChildStderr>();
 }
 
 #[ruio::test]

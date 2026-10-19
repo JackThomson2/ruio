@@ -42,9 +42,17 @@
 //! read and write that moves data spends a step of the task's budget
 //! ([`coop`](crate::coop)), so a pipe a child keeps full cannot hold up the
 //! runtime's other tasks.
+//!
+//! The pipes read into and write from owned buffers, and also, through
+//! their poll methods, [`ChildStdout::poll_read`] and
+//! [`ChildStdin::poll_write`] among them, into and from the caller's own,
+//! with no copy, as the portable sockets do: what an adapter to the
+//! poll-based I/O traits reads and writes through. A poll method that waits
+//! keeps its wait in the pipe until it is polled again.
+//!
 //! A `Child` and every future here are `Send`, so code whose futures must
 //! be, such as `async_trait`'s, can hold them, and a task can move between
-//! cores with them.
+//! cores with them; the pipes are `Send` and `Sync`.
 //!
 //! ```no_run
 //! # ruio::Runtime::new().unwrap().block_on(async {
@@ -81,7 +89,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::future::{Future, poll_fn};
-use std::io;
+use std::io::{self, IoSlice};
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -89,11 +97,11 @@ use std::path::Path;
 use std::pin::pin;
 use std::process::{ExitStatus, Output, Stdio};
 use std::ptr;
-use std::task::Poll;
+use std::task::{Context, Poll};
 
-use ruio_driver::PortableFd;
 use ruio_driver::buf::{IoBuf, IoBufMut};
 use ruio_driver::ops::Waitid;
+use ruio_driver::{PortableFd, ReadyWait};
 
 use crate::io::{AsyncRead, AsyncWrite, Kind, Nonblocking, PortableRead, PortableWrite};
 
@@ -102,6 +110,12 @@ mod reaper;
 /// The flag of `pidfd_send_signal(2)` that sends the signal to the process
 /// group the pidfd's process leads (Linux 6.9).
 const PIDFD_SIGNAL_PROCESS_GROUP: libc::c_uint = 1 << 2;
+
+/// The events a read of a pipe waits for.
+const READABLE: u32 = libc::POLLIN as u32;
+
+/// The events a write to a pipe waits for.
+const WRITABLE: u32 = libc::POLLOUT as u32;
 
 /// A process to spawn: the standard library's [`Command`](std::process::Command),
 /// with its child waited for on the ring.
@@ -653,10 +667,13 @@ async fn join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
 
 /// Writes to a child's standard input, with system calls made at once that
 /// wait on the ring of the thread polling them only if the pipe is full;
-/// [`AsyncWrite`] writes it all. Dropping it closes the pipe, after any wait
-/// queued for it on a ring, which the child reads as the end of its input.
+/// [`AsyncWrite`] writes it all, and the poll methods write from the
+/// caller's buffers. Dropping it closes the pipe, after any wait queued for
+/// it on a ring, which the child reads as the end of its input.
 pub struct ChildStdin {
     pipe: Nonblocking,
+    /// The wait of `poll_write` and `poll_write_vectored`.
+    wait: ReadyWait,
 }
 
 impl ChildStdin {
@@ -664,6 +681,66 @@ impl ChildStdin {
     /// for, waiting for room if it has none.
     pub fn write<B: IoBuf>(&self, buf: B) -> PortableWrite<'_, B> {
         self.pipe.write(buf)
+    }
+
+    /// Writes as much of the caller's `buf` as the pipe has room for, as
+    /// [`write`](Self::write) does, polled: a system call made at once, and
+    /// if there is no room, a wait the pipe keeps until it is polled again,
+    /// so that the next poll goes on with it.
+    ///
+    /// A write that gives less than `buf` has filled the pipe, so the next
+    /// one waits for room before it writes. Each write spends a step of the
+    /// task's budget ([`coop`](crate::coop)). A write that finds the pipe
+    /// full waits as
+    /// [`PortableFd::poll_ready`](crate::uring::PortableFd::poll_ready)
+    /// does. The wait of the poll methods is the pipe's own, which they
+    /// borrow it mutably to keep; the owned-buffer writes have their own.
+    pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.pipe.poll_write(cx, buf, &mut self.wait)
+    }
+
+    /// Writes as much of the caller's `bufs`, one after the other, as the
+    /// pipe has room for, with one `writev(2)` of up to 1024 of them; see
+    /// [`poll_write`](Self::poll_write).
+    pub fn poll_write_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.pipe.poll_write_vectored(cx, bufs, &mut self.wait)
+    }
+
+    /// Writes as much of `buf` as the pipe has room for, with one system
+    /// call and no wait: `WouldBlock` if there is none.
+    ///
+    /// # Errors
+    ///
+    /// What `write(2)` reports: `BrokenPipe` once nothing holds the pipe's
+    /// reading end.
+    pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+        self.pipe.try_write(buf)
+    }
+
+    /// Writes as much of `bufs`, one after the other, as the pipe has room
+    /// for, with one system call and no wait: `WouldBlock` if there is none.
+    ///
+    /// # Errors
+    ///
+    /// As for [`try_write`](Self::try_write).
+    pub fn try_write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.pipe.try_write_vectored(bufs)
+    }
+
+    /// Waits for the pipe to be writable: for room, or for its reading end
+    /// to have gone, which a write then finds, with a poll on the ring of
+    /// the thread polling it. Another writer may take the room first, so a
+    /// [`try_write`](Self::try_write) after it can still find none.
+    ///
+    /// # Errors
+    ///
+    /// What the kernel reports for the poll.
+    pub async fn writable(&self) -> io::Result<()> {
+        self.pipe.fd().ready(WRITABLE).await.map(drop)
     }
 
     /// The pipe's descriptor, blocking again, which then closes as an
@@ -689,15 +766,73 @@ impl TryFrom<std::process::ChildStdin> for ChildStdin {
     fn try_from(stdin: std::process::ChildStdin) -> io::Result<Self> {
         Ok(Self {
             pipe: Nonblocking::new(stdin.into(), Kind::Pipe)?,
+            wait: ReadyWait::new(),
         })
     }
 }
 
+/// The poll methods of the pipes a child writes to, on their `pipe` and
+/// `wait`.
+macro_rules! pipe_read_methods {
+    () => {
+        /// Reads into the caller's `buf` what has arrived, as
+        /// [`read`](Self::read) does, polled: a system call made at once, and
+        /// if nothing has arrived, a wait the pipe keeps until it is polled
+        /// again, so that the next poll goes on with it. The first bytes of
+        /// `buf`, as many as were read, are then initialized; 0 bytes are
+        /// read at the end.
+        ///
+        /// A read that takes less than `buf` has drained the pipe, so the
+        /// next one waits for the pipe to be readable before it reads. Each
+        /// read spends a step of the task's budget ([`coop`](crate::coop)).
+        /// A read that finds the pipe empty waits as
+        /// [`PortableFd::poll_ready`](crate::uring::PortableFd::poll_ready)
+        /// does. The wait of the poll method is the pipe's own, which it
+        /// borrows the pipe mutably to keep; the owned-buffer reads have
+        /// their own.
+        pub fn poll_read(
+            &mut self,
+            cx: &mut Context<'_>,
+            buf: &mut [MaybeUninit<u8>],
+        ) -> Poll<io::Result<usize>> {
+            self.pipe.poll_read(cx, buf, &mut self.wait)
+        }
+
+        /// Reads into `buf` what has arrived, with one system call and no
+        /// wait: `WouldBlock` if nothing has, 0 bytes at the end.
+        ///
+        /// # Errors
+        ///
+        /// What `read(2)` reports.
+        pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+            // SAFETY: the read writes none but initialized bytes, so the
+            // bytes stay initialized.
+            let buf = unsafe { &mut *(ptr::from_mut(buf) as *mut [MaybeUninit<u8>]) };
+            self.pipe.try_read(buf)
+        }
+
+        /// Waits for the pipe to be readable: for data, or the end, to have
+        /// arrived, which a read then takes, with a poll on the ring of the
+        /// thread polling it. Another reader may take it first, so a
+        /// [`try_read`](Self::try_read) after it can still find nothing.
+        ///
+        /// # Errors
+        ///
+        /// What the kernel reports for the poll.
+        pub async fn readable(&self) -> io::Result<()> {
+            self.pipe.fd().ready(READABLE).await.map(drop)
+        }
+    };
+}
+
 /// Reads a child's standard output, with system calls made at once that
 /// wait on the ring of the thread polling them only if nothing has arrived;
-/// [`AsyncRead`] reads it to its end.
+/// [`AsyncRead`] reads it to its end, and the poll methods into the caller's
+/// buffers.
 pub struct ChildStdout {
     pipe: Nonblocking,
+    /// The wait of `poll_read`.
+    wait: ReadyWait,
 }
 
 impl ChildStdout {
@@ -707,6 +842,8 @@ impl ChildStdout {
     pub fn read<B: IoBufMut>(&self, buf: B) -> PortableRead<'_, B> {
         self.pipe.read(buf)
     }
+
+    pipe_read_methods!();
 
     /// The pipe's descriptor, blocking again, which then closes as an
     /// [`OwnedFd`] does.
@@ -731,6 +868,7 @@ impl TryFrom<std::process::ChildStdout> for ChildStdout {
     fn try_from(stdout: std::process::ChildStdout) -> io::Result<Self> {
         Ok(Self {
             pipe: Nonblocking::new(stdout.into(), Kind::Pipe)?,
+            wait: ReadyWait::new(),
         })
     }
 }
@@ -738,6 +876,8 @@ impl TryFrom<std::process::ChildStdout> for ChildStdout {
 /// Reads a child's standard error, as [`ChildStdout`] reads its output.
 pub struct ChildStderr {
     pipe: Nonblocking,
+    /// The wait of `poll_read`.
+    wait: ReadyWait,
 }
 
 impl ChildStderr {
@@ -745,6 +885,8 @@ impl ChildStderr {
     pub fn read<B: IoBufMut>(&self, buf: B) -> PortableRead<'_, B> {
         self.pipe.read(buf)
     }
+
+    pipe_read_methods!();
 
     /// The pipe's descriptor, blocking again, which then closes as an
     /// [`OwnedFd`] does.
@@ -769,6 +911,7 @@ impl TryFrom<std::process::ChildStderr> for ChildStderr {
     fn try_from(stderr: std::process::ChildStderr) -> io::Result<Self> {
         Ok(Self {
             pipe: Nonblocking::new(stderr.into(), Kind::Pipe)?,
+            wait: ReadyWait::new(),
         })
     }
 }
