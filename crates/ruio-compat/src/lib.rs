@@ -50,6 +50,13 @@
 //! portable streams: a connector of portable TCP streams, and the client's
 //! builder with ruio's executor and timer.
 //!
+//! With the `tokio-reactor` feature, [`TokioReactor`] is tokio's reactor as
+//! ruio's foreign one ([`ruio::io::set_foreign_reactor`]): set so, the
+//! portable streams and listeners and a child's pipes polled on the threads
+//! of a tokio runtime wait on that runtime's reactor, as its own sockets do,
+//! rather than on the foreign ring, where each wait cost two wakes across
+//! threads.
+//!
 //! With the `hyper` feature, on by default, an adapter has hyper's own I/O
 //! traits, `hyper::rt::Read` and `Write`, so hyper serves it, or connects
 //! through it, as it is, with nothing between them; [`Executor`] spawns
@@ -107,12 +114,16 @@ mod portable;
 mod timer;
 #[cfg(feature = "tokio")]
 mod tokio_impls;
+#[cfg(feature = "tokio-reactor")]
+mod tokio_reactor;
 
 #[cfg(feature = "hyper")]
 pub use executor::Executor;
 pub use portable::{PortableCompat, PortableReader, PortableStream, PortableWriter};
 #[cfg(feature = "hyper")]
 pub use timer::Timer;
+#[cfg(feature = "tokio-reactor")]
+pub use tokio_reactor::TokioReactor;
 
 /// How many bytes a read asks the kernel for, unless the adapter was made
 /// [`with_capacity`](Compat::with_capacity).

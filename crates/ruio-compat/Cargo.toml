@@ -28,6 +28,10 @@ hyper = ["dep:hyper"]
 # `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io`, which need
 # none of tokio's runtime.
 tokio = ["dep:tokio"]
+# `TokioReactor`, tokio's reactor as ruio's foreign one, which the portable
+# sockets and a child's pipes wait on from the threads of a tokio runtime.
+# It brings tokio's `net` and `rt`, the reactor's own.
+tokio-reactor = ["tokio", "tokio/net", "tokio/rt"]
 
 [dependencies]
 futures-io = { version = "0.3.34", optional = true }
