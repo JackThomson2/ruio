@@ -1,6 +1,6 @@
-//! The adapter for ruio's portable streams and a child's pipes, which reads
-//! into the caller's buffer and writes from it, and so needs no buffer of
-//! its own.
+//! The adapter for ruio's portable streams, a child's pipes and the
+//! portable file, which reads into the caller's buffer and writes from it,
+//! and so needs no buffer of its own.
 
 use std::fmt;
 use std::io::{self, IoSlice};
@@ -8,31 +8,34 @@ use std::mem::MaybeUninit;
 use std::net::Shutdown;
 use std::task::{Context, Poll};
 
+use ruio::fs::portable::File;
 use ruio::net::portable::{TcpStream, UnixStream};
 use ruio::process::{ChildStderr, ChildStdin, ChildStdout};
 
 /// What a [`PortableCompat`] adapts: a portable
 /// [`TcpStream`](ruio::net::portable::TcpStream) or
 /// [`UnixStream`](ruio::net::portable::UnixStream), which it reads and writes,
-/// or a child's pipe, which it reads, a
+/// a child's pipe, which it reads, a
 /// [`ChildStdout`](ruio::process::ChildStdout) or a
 /// [`ChildStderr`](ruio::process::ChildStderr), or writes, a
-/// [`ChildStdin`](ruio::process::ChildStdin), through the poll methods of
-/// its own. [`PortableReader`] and [`PortableWriter`] say which way.
+/// [`ChildStdin`](ruio::process::ChildStdin), or a portable
+/// [`File`](ruio::fs::portable::File), which it reads, writes and seeks,
+/// through the poll methods of its own. [`PortableReader`] and
+/// [`PortableWriter`] say which way.
 ///
 /// The trait is sealed: only this crate's types implement it.
 pub trait PortableStream: sealed::Sealed {}
 
-/// A [`PortableStream`] that the adapter reads: a stream, or the pipe of a
-/// child's standard output or error. Its adapter has the `AsyncRead` of
-/// tokio and of futures-io, and hyper's `rt::Read`.
+/// A [`PortableStream`] that the adapter reads: a stream, the pipe of a
+/// child's standard output or error, or a file. Its adapter has the
+/// `AsyncRead` of tokio and of futures-io, and hyper's `rt::Read`.
 ///
 /// The trait is sealed: only this crate's types implement it.
 pub trait PortableReader: PortableStream + sealed::Read {}
 
-/// A [`PortableStream`] that the adapter writes: a stream, or the pipe of a
-/// child's standard input. Its adapter has the `AsyncWrite` of tokio and of
-/// futures-io, and hyper's `rt::Write`.
+/// A [`PortableStream`] that the adapter writes: a stream, the pipe of a
+/// child's standard input, or a file. Its adapter has the `AsyncWrite` of
+/// tokio and of futures-io, and hyper's `rt::Write`.
 ///
 /// The trait is sealed: only this crate's types implement it.
 pub trait PortableWriter: PortableStream + sealed::Write {}
@@ -42,15 +45,18 @@ impl PortableStream for UnixStream {}
 impl PortableStream for ChildStdin {}
 impl PortableStream for ChildStdout {}
 impl PortableStream for ChildStderr {}
+impl PortableStream for File {}
 
 impl PortableReader for TcpStream {}
 impl PortableReader for UnixStream {}
 impl PortableReader for ChildStdout {}
 impl PortableReader for ChildStderr {}
+impl PortableReader for File {}
 
 impl PortableWriter for TcpStream {}
 impl PortableWriter for UnixStream {}
 impl PortableWriter for ChildStdin {}
+impl PortableWriter for File {}
 
 mod sealed {
     use super::*;
@@ -67,8 +73,8 @@ mod sealed {
         ) -> Poll<io::Result<usize>>;
     }
 
-    /// The poll methods the adapter writes through, and what shutting down
-    /// does.
+    /// The poll methods the adapter writes through, flushes and shuts
+    /// down with.
     pub trait Write {
         fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
         fn poll_write_vectored(
@@ -76,8 +82,14 @@ mod sealed {
             cx: &mut Context<'_>,
             bufs: &[IoSlice<'_>],
         ) -> Poll<io::Result<usize>>;
-        /// Shuts the writing half of a connection down; a pipe has none.
-        fn shutdown_write(&self) -> io::Result<()>;
+        /// Whether the buffers of a vectored write go together.
+        fn is_write_vectored(&self) -> bool;
+        /// Waits for what the writer holds back: nothing, but for a file's
+        /// write gone behind.
+        fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+        /// Shuts the writing half of a connection down; a pipe has none, and
+        /// a file flushes.
+        fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
     }
 
     impl Sealed for TcpStream {}
@@ -85,6 +97,7 @@ mod sealed {
     impl Sealed for ChildStdin {}
     impl Sealed for ChildStdout {}
     impl Sealed for ChildStderr {}
+    impl Sealed for File {}
 
     /// The reading poll method of each `$reader`.
     macro_rules! reader {
@@ -102,8 +115,9 @@ mod sealed {
         )*};
     }
 
-    /// The writing poll methods of `$writer`, and `$shutdown`, which shuts
-    /// its writing half down with the writer bound to `$this`.
+    /// The writing poll methods of `$writer`, which hold nothing back, and
+    /// `$shutdown`, which shuts its writing half down with the writer bound
+    /// to `$this`.
     macro_rules! writer {
         ($writer:ty, $this:pat => $shutdown:expr) => {
             impl Write for $writer {
@@ -126,28 +140,77 @@ mod sealed {
                 }
 
                 #[inline]
-                fn shutdown_write(&self) -> io::Result<()> {
+                fn is_write_vectored(&self) -> bool {
+                    true
+                }
+
+                #[inline]
+                fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+
+                #[inline]
+                fn poll_shutdown(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                     let $this = self;
-                    $shutdown
+                    Poll::Ready($shutdown)
                 }
             }
         };
     }
 
-    reader!(TcpStream, UnixStream, ChildStdout, ChildStderr);
+    reader!(TcpStream, UnixStream, ChildStdout, ChildStderr, File);
     writer!(TcpStream, stream => stream.shutdown(Shutdown::Write));
     writer!(UnixStream, stream => stream.shutdown(Shutdown::Write));
     // Closed as it is dropped, which the child reads as the end of its
     // input: shutting down has nothing to do before then.
     writer!(ChildStdin, _ => Ok(()));
+
+    /// A file writes one buffer at a time, through its own buffer, and
+    /// holds a write back until it has finished, which a flush waits for,
+    /// as shutting down does.
+    impl Write for File {
+        #[inline]
+        fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            File::poll_write(self, cx, buf)
+        }
+
+        #[inline]
+        fn poll_write_vectored(
+            &mut self,
+            cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let buf = bufs
+                .iter()
+                .find(|buf| !buf.is_empty())
+                .map_or(&[][..], |buf| &**buf);
+            File::poll_write(self, cx, buf)
+        }
+
+        #[inline]
+        fn is_write_vectored(&self) -> bool {
+            false
+        }
+
+        #[inline]
+        fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            File::poll_flush(self, cx)
+        }
+
+        #[inline]
+        fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            File::poll_flush(self, cx)
+        }
+    }
 }
 
-/// An adapter from one of ruio's portable streams, or a child's pipe, to the
-/// poll-based I/O traits: tokio's, futures-io's and hyper's, each behind the
-/// feature of its name. A stream has the reading traits and the writing
-/// ones; a child's standard output or error only the reading ones
-/// ([`PortableReader`]), and its standard input only the writing ones
-/// ([`PortableWriter`]).
+/// An adapter from one of ruio's portable streams, a child's pipe or a
+/// portable file to the poll-based I/O traits: tokio's, futures-io's and
+/// hyper's, each behind the feature of its name. A stream and a file have
+/// the reading traits and the writing ones; a child's standard output or
+/// error only the reading ones ([`PortableReader`]), and its standard input
+/// only the writing ones ([`PortableWriter`]); a file has the seeking
+/// traits of tokio and futures-io too.
 ///
 /// A portable stream, as a child's pipe, reads and writes with system calls
 /// made at once, on whichever thread polls it, which wait on that thread's
@@ -163,6 +226,12 @@ mod sealed {
 /// adapter, or the pipe, is dropped. A read or a write that waits keeps its
 /// wait in the stream until it is polled again, as the poll-based traits
 /// poll it.
+///
+/// A file reads and writes through its own poll methods instead, as
+/// tokio's `File` does: a read goes into the file's buffer, on the ring, and
+/// is copied out; a write is copied there and goes behind, and a flush, as
+/// shutting down, waits for it. A seek is an `lseek(2)` made once nothing
+/// is in flight; see [`File`](ruio::fs::portable::File).
 ///
 /// It is `Send` and `Sync`, as the stream is, so a connection that must be,
 /// as hyper-util's client and hyper's upgrades want theirs, can be one of
@@ -238,14 +307,6 @@ impl<S: PortableStream> PortableCompat<S> {
     }
 }
 
-impl<S: PortableWriter> PortableCompat<S> {
-    /// Shuts the writing half of the connection down, at once; a pipe has
-    /// none, and is ready at once.
-    fn poll_shutdown_write(&mut self) -> Poll<io::Result<()>> {
-        Poll::Ready(self.stream.shutdown_write())
-    }
-}
-
 impl<S: PortableStream> From<S> for PortableCompat<S> {
     fn from(stream: S) -> Self {
         Self::new(stream)
@@ -262,10 +323,11 @@ impl<S: fmt::Debug> fmt::Debug for PortableCompat<S> {
 
 #[cfg(feature = "tokio")]
 mod tokio_impls {
+    use std::io::SeekFrom;
     use std::pin::Pin;
     use std::task::ready;
 
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
     use super::*;
 
@@ -306,30 +368,45 @@ mod tokio_impls {
             self.get_mut().stream.poll_write_vectored(cx, bufs)
         }
 
-        /// Yes: the buffers go together, with one `sendmsg(2)`, or one
-        /// `writev(2)` to a pipe.
+        /// Yes for a stream, whose buffers go together, with one
+        /// `sendmsg(2)`, and a pipe, with one `writev(2)`; no for a file,
+        /// which writes the first.
         fn is_write_vectored(&self) -> bool {
-            true
+            self.stream.is_write_vectored()
         }
 
-        /// Ready at once: the adapter holds nothing back.
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+        /// Ready at once for a stream or a pipe, which hold nothing back; a
+        /// file waits for its write gone behind.
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().stream.poll_flush(cx)
         }
 
-        /// Shuts the writing half of the connection down, at once; a pipe
-        /// has none to shut, and closes as it is dropped.
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.get_mut().poll_shutdown_write()
+        /// Shuts the writing half of a connection down, at once; a pipe has
+        /// none to shut, and closes as it is dropped; a file flushes.
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().stream.poll_shutdown(cx)
+        }
+    }
+
+    /// Seeks the file as tokio's does: the seek asked for is made once
+    /// nothing is in flight, from where the reader is.
+    impl AsyncSeek for PortableCompat<File> {
+        fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+            self.get_mut().stream.start_seek(position)
+        }
+
+        fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+            self.get_mut().stream.poll_seek(cx)
         }
     }
 }
 
 #[cfg(feature = "futures-io")]
 mod futures_impls {
+    use std::io::SeekFrom;
     use std::pin::Pin;
 
-    use futures_io::{AsyncRead, AsyncWrite};
+    use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 
     use super::*;
 
@@ -365,15 +442,30 @@ mod futures_impls {
             self.get_mut().stream.poll_write_vectored(cx, bufs)
         }
 
-        /// Ready at once: the adapter holds nothing back.
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+        /// Ready at once for a stream or a pipe, which hold nothing back; a
+        /// file waits for its write gone behind.
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().stream.poll_flush(cx)
         }
 
-        /// Shuts the writing half of the connection down, at once; a pipe
-        /// has none to shut, and closes as it is dropped.
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.get_mut().poll_shutdown_write()
+        /// Shuts the writing half of a connection down, at once; a pipe has
+        /// none to shut, and closes as it is dropped; a file flushes.
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().stream.poll_shutdown(cx)
+        }
+    }
+
+    /// Seeks the file, the seek made once nothing is in flight, from where
+    /// the reader is; polled again for the same position, it goes on.
+    impl AsyncSeek for PortableCompat<File> {
+        fn poll_seek(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            pos: SeekFrom,
+        ) -> Poll<io::Result<u64>> {
+            let file = &mut self.get_mut().stream;
+            file.start_seek(pos)?;
+            file.poll_seek(cx)
         }
     }
 }
@@ -424,21 +516,23 @@ mod hyper_impls {
             self.get_mut().stream.poll_write_vectored(cx, bufs)
         }
 
-        /// Yes: hyper hands a message's head and body over at once, which go
-        /// with one `sendmsg(2)`, or one `writev(2)` to a pipe.
+        /// Yes for a stream: hyper hands a message's head and body over at
+        /// once, which go with one `sendmsg(2)`, or one `writev(2)` to a
+        /// pipe; no for a file, which writes the first.
         fn is_write_vectored(&self) -> bool {
-            true
+            self.stream.is_write_vectored()
         }
 
-        /// Ready at once: the adapter holds nothing back.
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+        /// Ready at once for a stream or a pipe, which hold nothing back; a
+        /// file waits for its write gone behind.
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().stream.poll_flush(cx)
         }
 
-        /// Shuts the writing half of the connection down, at once; a pipe
-        /// has none to shut, and closes as it is dropped.
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.get_mut().poll_shutdown_write()
+        /// Shuts the writing half of a connection down, at once; a pipe has
+        /// none to shut, and closes as it is dropped; a file flushes.
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().stream.poll_shutdown(cx)
         }
     }
 }

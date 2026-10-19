@@ -48,7 +48,9 @@ hyper-util = { version = "0.1.21", features = ["http2", "tokio"] }
 rcgen = "0.14.10"
 # ring for cryptography, which builds with a C compiler alone.
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
-tokio = { version = "1.53.1", features = ["io-util"] }
+# The multi-threaded runtime for the portable file's tests, which run its
+# I/O from tokio's workers.
+tokio = { version = "1.53.1", features = ["io-util", "rt-multi-thread", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 # For the client's tests, whose TLS connector wraps the plain one.
 tower-service = "0.3.3"
