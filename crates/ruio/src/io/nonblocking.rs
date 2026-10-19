@@ -29,16 +29,26 @@
 //! task's budget ([`coop`]), and once the budget is spent the task yields.
 //!
 //! Polled where no runtime runs, by another executor's task say, a read or
-//! a write is the same system call, and a wait goes to the foreign ring the
-//! embedder set ([`set_foreign_ring`](ruio_driver::set_foreign_ring)), as
-//! any portable operation first polled there does; with none set, it fails
-//! with `ENOSYS`, whose kind is [`io::ErrorKind::Unsupported`].
+//! a write is the same system call. A wait goes to the foreign reactor
+//! ([`set_foreign_reactor`](super::set_foreign_reactor)) where the thread
+//! is one of its: the descriptor is registered with it as it first waits
+//! there, and a call that finds the descriptor not ready is made again
+//! under the reactor's readiness, which then says when it is worth making,
+//! with no other thread in between, as that executor's own sockets wait.
+//! A call that finds what it came for costs the reactor nothing: the next
+//! one this way goes through the reactor first only if this one had to
+//! wait, or was made as its task woke from a wait, or moved less than it
+//! was to, as a request whose answer has yet to come does. Elsewhere a wait
+//! goes to the foreign ring the embedder set
+//! ([`set_foreign_ring`](ruio_driver::set_foreign_ring)), as any portable
+//! operation first polled there does; with neither, it fails with `ENOSYS`,
+//! whose kind is [`io::ErrorKind::Unsupported`].
 
 use std::fmt;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io::{self, IoSlice};
 use std::mem::{self, MaybeUninit};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::pin::Pin;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +57,7 @@ use std::task::{Context, Poll, ready};
 use ruio_driver::buf::{BufResult, IoBuf, IoBufMut, IoBufs};
 use ruio_driver::{PortableFd, ReadyWait};
 
+use super::foreign::{Foreign, interest, level};
 use crate::coop;
 
 /// The events a read waits for.
@@ -78,16 +89,32 @@ pub(crate) enum Kind {
 
 /// A descriptor made nonblocking, read and written with system calls made
 /// at once, which waits with polls on the ring of the thread that polls each
-/// wait.
+/// wait, or on the foreign reactor where that thread is one of its.
 pub(crate) struct Nonblocking {
+    /// The descriptor's registration with the foreign reactor, if it has
+    /// waited on one of its threads: first, so that it leaves the reactor
+    /// before the descriptor closes.
+    foreign: Foreign,
     fd: PortableFd,
     kind: Kind,
-    /// Whether the last read took less than its buffer, which drained the
-    /// descriptor, so that the next waits for it to be readable first.
-    drained: AtomicBool,
-    /// Whether the last write gave less than it was given, which filled the
-    /// descriptor, so that the next waits for it to be writable first.
-    filled: AtomicBool,
+    /// What the last reads found.
+    read: Hint,
+    /// What the last writes found.
+    write: Hint,
+}
+
+/// What the last transfers one way found, which says whether the next makes
+/// its system call at once, or waits for the descriptor to be ready first.
+#[derive(Debug, Default)]
+struct Hint {
+    /// Whether the next transfer this way waits first: the last moved less
+    /// than it was to, and so drained the descriptor or filled it; or, on
+    /// the foreign reactor, it had to wait, or was made as the task woke
+    /// from such a wait, so that the next is likely to wait too.
+    first: AtomicBool,
+    /// Whether the last transfer this way waited on the foreign reactor, so
+    /// that the one made as the task wakes keeps `first` set.
+    waited: AtomicBool,
 }
 
 impl Nonblocking {
@@ -102,10 +129,11 @@ impl Nonblocking {
     /// with `SOCK_NONBLOCK` is.
     pub(crate) fn from_nonblocking(fd: OwnedFd, kind: Kind) -> Self {
         Self {
+            foreign: Foreign::new(),
             fd: PortableFd::new(fd),
             kind,
-            drained: AtomicBool::new(false),
-            filled: AtomicBool::new(false),
+            read: Hint::default(),
+            write: Hint::default(),
         }
     }
 
@@ -117,7 +145,10 @@ impl Nonblocking {
 
     /// The descriptor, blocking again, as the standard library's types are.
     pub(crate) fn into_owned_fd(self) -> OwnedFd {
-        let fd = self.fd.into_owned_fd();
+        let Self { foreign, fd, .. } = self;
+        // Out of the reactor while the descriptor is still this one's.
+        drop(foreign);
+        let fd = fd.into_owned_fd();
         // A descriptor that stays nonblocking reads and writes all the same.
         let _ = set_nonblocking(&fd, false);
         fd
@@ -274,7 +305,9 @@ impl Nonblocking {
     }
 
     /// Waits with `wait` for the descriptor to have any of `events`, as
-    /// [`PortableFd::poll_ready`] does.
+    /// [`PortableFd::poll_ready`] does; or, where the descriptor waits on the
+    /// foreign reactor, until the reactor says it may, and one `poll(2)` that
+    /// does not wait finds it does.
     #[inline]
     pub(crate) fn poll_ready(
         &self,
@@ -282,7 +315,22 @@ impl Nonblocking {
         events: u32,
         wait: &mut ReadyWait,
     ) -> Poll<io::Result<u32>> {
+        if !wait.is_waiting()
+            && let Some(registered) = self.foreign.here(self.fd.as_fd())
+            && let Some(polled) =
+                registered.poll_io(cx, interest(events), 0, &mut || level(&self.fd, events))
+        {
+            // The `POLL*` bits of a `short`.
+            return polled.map_ok(|events| events as u32);
+        }
         self.fd.poll_ready(cx, events, wait)
+    }
+
+    /// Waits for the descriptor to have any of `events`, as
+    /// [`poll_ready`](Nonblocking::poll_ready) does, with a wait of its own.
+    pub(crate) async fn ready(&self, events: u32) -> io::Result<u32> {
+        let mut wait = ReadyWait::new();
+        poll_fn(|cx| self.poll_ready(cx, events, &mut wait)).await
     }
 
     /// Runs `transfer`, a system call made at once that is to move `len`
@@ -297,17 +345,59 @@ impl Nonblocking {
         events: u32,
         wait: &mut ReadyWait,
         len: usize,
-        mut transfer: impl FnMut(&Self) -> io::Result<usize>,
+        transfer: impl FnMut(&Self) -> io::Result<usize>,
     ) -> Poll<io::Result<usize>> {
-        let proceed = ready!(coop::poll_proceed(cx));
-        let short = if events == READABLE {
-            &self.drained
+        let hint = if events == READABLE {
+            &self.read
         } else {
-            &self.filled
+            &self.write
         };
+        self.poll_call(cx, events, wait, Some(hint), len, transfer, |done| *done)
+    }
+
+    /// Runs `call`, a system call made at once that takes something from the
+    /// descriptor, as accepting a connection does, once the task's budget
+    /// allows, waiting with `wait` for `events` while it finds the descriptor
+    /// not ready.
+    #[inline]
+    pub(crate) fn poll_take<T>(
+        &self,
+        cx: &mut Context<'_>,
+        events: u32,
+        wait: &mut ReadyWait,
+        call: impl FnMut(&Self) -> io::Result<T>,
+    ) -> Poll<io::Result<T>> {
+        self.poll_call(cx, events, wait, None, 0, call, |_| 0)
+    }
+
+    /// Runs `call`, a system call made at once that is to move `len` bytes,
+    /// and that moved as many as `moved` says of its output, waiting with
+    /// `wait` for `events` while it finds the descriptor not ready; where
+    /// `hint` says the descriptor is likely not ready, it waits first. On a
+    /// thread of the foreign reactor's, a call that finds the descriptor not
+    /// ready, or one that would wait first, is made under the reactor's
+    /// readiness instead, and waits on the reactor. Each call that succeeds
+    /// spends a step of the task's budget.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn poll_call<T>(
+        &self,
+        cx: &mut Context<'_>,
+        events: u32,
+        wait: &mut ReadyWait,
+        hint: Option<&Hint>,
+        len: usize,
+        mut call: impl FnMut(&Self) -> io::Result<T>,
+        moved: impl Fn(&T) -> usize,
+    ) -> Poll<io::Result<T>> {
+        let proceed = ready!(coop::poll_proceed(cx));
         // Relaxed: a hint, which says only whether the system call or the
-        // poll comes first.
-        if !wait.is_waiting() && short.swap(false, Ordering::Relaxed) {
+        // wait comes first.
+        if !wait.is_waiting() && hint.is_some_and(|hint| hint.first.swap(false, Ordering::Relaxed))
+        {
+            if let Some(polled) = self.poll_registered(cx, events, hint, len, &mut call, &moved) {
+                return progressed(polled, proceed);
+            }
             ready!(self.fd.poll_ready(cx, events, wait))?;
         }
         loop {
@@ -316,20 +406,74 @@ impl Nonblocking {
                 // which, and costs no system call to ask.
                 ready!(self.fd.poll_ready(cx, events, wait))?;
             }
-            match transfer(self) {
-                Ok(done) => {
+            match call(self) {
+                Ok(made) => {
                     proceed.made_progress();
-                    if 0 < done && done < len {
-                        short.store(true, Ordering::Relaxed);
+                    if let Some(hint) = hint
+                        && short(moved(&made), len)
+                    {
+                        hint.first.store(true, Ordering::Relaxed);
                     }
-                    return Poll::Ready(Ok(done));
+                    return Poll::Ready(Ok(made));
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if let Some(polled) =
+                        self.poll_registered(cx, events, hint, len, &mut call, &moved)
+                    {
+                        return progressed(polled, proceed);
+                    }
                     ready!(self.fd.poll_ready(cx, events, wait))?;
                 }
                 Err(err) => return Poll::Ready(Err(err)),
             }
         }
+    }
+
+    /// Makes `call` once the foreign reactor says the descriptor may be
+    /// ready for `events`, as [`Registration::poll_io`](super::Registration::poll_io)
+    /// does, on a thread of the reactor's, where no runtime of ruio's runs
+    /// and the descriptor is registered with the reactor, or can be; `None`
+    /// elsewhere, for the wait to go to a ring. A call that has to wait
+    /// leaves `hint` so that the next this way waits first, as does the call
+    /// made as the task wakes from that wait, and one that moved less than
+    /// it was to, whose readiness the reactor has cleared.
+    fn poll_registered<T>(
+        &self,
+        cx: &mut Context<'_>,
+        events: u32,
+        hint: Option<&Hint>,
+        len: usize,
+        call: &mut impl FnMut(&Self) -> io::Result<T>,
+        moved: &impl Fn(&T) -> usize,
+    ) -> Option<Poll<io::Result<T>>> {
+        let registered = self.foreign.here(self.fd.as_fd())?;
+        let mut made = None;
+        let mut through = || {
+            let output = call(self)?;
+            let done = moved(&output);
+            made = Some(output);
+            Ok(done)
+        };
+        let polled = registered.poll_io(cx, interest(events), len, &mut through)?;
+        Some(match polled {
+            Poll::Ready(Ok(done)) => {
+                if let Some(hint) = hint {
+                    let woke = hint.waited.swap(false, Ordering::Relaxed);
+                    if woke || short(done, len) {
+                        hint.first.store(true, Ordering::Relaxed);
+                    }
+                }
+                Poll::Ready(Ok(made.expect("a call that succeeded made its output")))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => {
+                if let Some(hint) = hint {
+                    hint.first.store(true, Ordering::Relaxed);
+                    hint.waited.store(true, Ordering::Relaxed);
+                }
+                Poll::Pending
+            }
+        })
     }
 
     /// Reads into `buf`, up to its capacity, what has arrived, waiting for
@@ -396,6 +540,7 @@ impl fmt::Debug for Nonblocking {
         f.debug_struct("Nonblocking")
             .field("fd", &self.fd.as_raw_fd())
             .field("kind", &self.kind)
+            .field("foreign", &self.foreign)
             .finish()
     }
 }
@@ -445,6 +590,22 @@ fn transferred(result: isize) -> Option<io::Result<usize>> {
     (err.kind() != io::ErrorKind::Interrupted).then_some(Err(err))
 }
 
+/// Whether a call that was to move `len` bytes and moved `done` stopped
+/// short of them, having drained the descriptor, or filled it.
+#[inline]
+fn short(done: usize, len: usize) -> bool {
+    0 < done && done < len
+}
+
+/// `polled`, having spent `proceed` if it made something.
+#[inline]
+fn progressed<T>(polled: Poll<io::Result<T>>, proceed: coop::Proceed) -> Poll<io::Result<T>> {
+    if let Poll::Ready(Ok(_)) = polled {
+        proceed.made_progress();
+    }
+    polled
+}
+
 /// A read of a descriptor with a system call made at once, which waits on
 /// the ring of the thread that polls it only if nothing has arrived: made by
 /// the `read` of the portable sockets and of a child's standard output and
@@ -455,10 +616,11 @@ fn transferred(result: isize) -> Option<io::Result<usize>> {
 /// It spends a step of the task's budget ([`coop`]) when it reads, so a
 /// descriptor that always has something to read cannot hold up the thread.
 /// Dropped while it waits, it lets go of its poll; nothing is read but
-/// what it returns, so nothing is lost. Its wait runs where a
+/// what it returns, so nothing is lost. Its wait runs on the foreign
+/// reactor where the thread is one of its, and otherwise where a
 /// [`PortableOp`](ruio_driver::PortableOp) first polled on the same thread
-/// would: where no runtime runs and no foreign ring is set, a read that
-/// finds nothing fails with `ENOSYS`, whose kind is
+/// would: where no runtime runs and neither the reactor nor a foreign ring
+/// takes it, a read that finds nothing fails with `ENOSYS`, whose kind is
 /// [`io::ErrorKind::Unsupported`].
 ///
 /// # Panics

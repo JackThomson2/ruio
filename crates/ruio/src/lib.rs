@@ -110,7 +110,11 @@ pub mod signal;
 /// a child's pipes and its wait, and the path functions of [`fs`]
 /// work from such a thread too. With no foreign ring set they fail with
 /// `ENOSYS`, whose kind is [`std::io::ErrorKind::Unsupported`], so that the
-/// caller can do its I/O another way.
+/// caller can do its I/O another way. The waits of the portable sockets and
+/// a child's pipes go to the foreign reactor instead where one is set and
+/// the thread is one of its executor's
+/// ([`set_foreign_reactor`](crate::io::set_foreign_reactor)): tokio's, say,
+/// whose reactor then wakes the task as for its own sockets.
 ///
 /// ```no_run
 /// # fn main() -> std::io::Result<()> {

@@ -740,7 +740,7 @@ impl ChildStdin {
     ///
     /// What the kernel reports for the poll.
     pub async fn writable(&self) -> io::Result<()> {
-        self.pipe.fd().ready(WRITABLE).await.map(drop)
+        self.pipe.ready(WRITABLE).await.map(drop)
     }
 
     /// The pipe's descriptor, blocking again, which then closes as an
@@ -820,7 +820,7 @@ macro_rules! pipe_read_methods {
         ///
         /// What the kernel reports for the poll.
         pub async fn readable(&self) -> io::Result<()> {
-            self.pipe.fd().ready(READABLE).await.map(drop)
+            self.pipe.ready(READABLE).await.map(drop)
         }
     };
 }

@@ -29,6 +29,12 @@
 //! spend a step of the task's budget ([`coop`](crate::coop)) each time they
 //! move data.
 //!
+//! Polled on a thread of another executor's, where no runtime of ruio's
+//! runs, they wait on that executor's reactor once it is set as the foreign
+//! one ([`set_foreign_reactor`]), as the executor's own sockets do, rather
+//! than on the foreign ring, which costs each wait two wakes across threads;
+//! `ruio-compat`'s `TokioReactor` is tokio's.
+//!
 //! [`portable::AsyncFd`] wraps any descriptor for a task that must be
 //! `Send`, with the readiness API of tokio's `AsyncFd`: its waits run on the
 //! ring of the thread that polls them, and the owner reads and writes with
@@ -65,11 +71,15 @@ use crate::fs::{File, FileOp};
 use crate::net::{SocketOp, TcpStream, UnixStream};
 
 mod async_fd;
+mod foreign;
 mod nonblocking;
 pub mod portable;
 mod splice;
 
 pub use async_fd::{AsyncFd, FdOp, Readiness, Ready};
+pub use foreign::{
+    Reactor, Registration, clear_foreign_reactor, foreign_reactor, set_foreign_reactor,
+};
 pub(crate) use nonblocking::{Kind, Nonblocking};
 pub use nonblocking::{
     PortableRead, PortableReadExact, PortableWrite, PortableWriteAll, PortableWriteAllVectored,

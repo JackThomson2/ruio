@@ -12,16 +12,20 @@
 //! is made again once the socket is ready. A future that moves to another
 //! thread mid-wait takes the wait along, which its ring finishes, as for any
 //! portable operation. Each read and write that moves data spends a step of
-//! the task's budget ([`coop`]), so a peer that keeps a socket
+//! the task's budget ([`coop`](crate::coop)), so a peer that keeps a socket
 //! full cannot hold up the thread. Nothing is read but what a read returns,
 //! so a read dropped while it waits loses nothing.
 //!
 //! A thread where no runtime runs, one of another executor's say, reads and
-//! writes a portable socket the same way, and its waits go to the foreign
-//! ring the embedder set ([`set_foreign_ring`](crate::uring::set_foreign_ring)),
-//! whose thread sends the readiness back; with none set, a wait fails with
-//! `ENOSYS`, whose kind is [`io::ErrorKind::Unsupported`], so the caller can
-//! do its I/O another way.
+//! writes a portable socket the same way. Its waits go to the foreign
+//! reactor ([`set_foreign_reactor`](crate::io::set_foreign_reactor)) where
+//! the thread is one of its, tokio's say, which then says when the socket
+//! may be ready, as for that executor's own sockets; and otherwise to the
+//! foreign ring the embedder set
+//! ([`set_foreign_ring`](crate::uring::set_foreign_ring)), whose thread
+//! sends the readiness back. With neither, a wait fails with `ENOSYS`,
+//! whose kind is [`io::ErrorKind::Unsupported`], so the caller can do its
+//! I/O another way.
 //!
 //! The streams read into and write from owned buffers, as the thread's
 //! sockets do, and also, through their poll methods, into and from the
@@ -73,11 +77,10 @@ use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::slice;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
 
 use ruio_driver::{ReadyWait, SockAddr};
 
-use crate::coop;
 use crate::io::{Kind, Nonblocking};
 use crate::net::socket::getsockopt;
 
@@ -140,8 +143,8 @@ macro_rules! stream_methods {
         /// The waits of the poll methods are the stream's own, which they
         /// borrow it mutably to keep; the owned-buffer methods have their
         /// own. A wait runs where a portable operation does: on the ring of
-        /// the thread polling it, or on the foreign ring where no runtime
-        /// runs; see the [module's documentation](super).
+        /// the thread polling it, or on the foreign reactor or the foreign
+        /// ring where no runtime runs; see the [module's documentation](super).
         pub fn poll_read(
             &mut self,
             cx: &mut Context<'_>,
@@ -201,7 +204,7 @@ macro_rules! stream_methods {
         ///
         /// What the kernel reports for the poll.
         pub async fn readable(&self) -> io::Result<()> {
-            self.stream.io.fd().ready(super::READABLE).await.map(drop)
+            self.stream.io.ready(super::READABLE).await.map(drop)
         }
 
         /// Waits for the stream to be writable, as
@@ -211,7 +214,7 @@ macro_rules! stream_methods {
         ///
         /// What the kernel reports for the poll.
         pub async fn writable(&self) -> io::Result<()> {
-            self.stream.io.fd().ready(super::WRITABLE).await.map(drop)
+            self.stream.io.ready(super::WRITABLE).await.map(drop)
         }
 
         /// Shuts down the reading half, the writing half, or both, with one
@@ -357,7 +360,7 @@ async fn connect(io: &Nonblocking, addr: &SockAddr) -> io::Result<()> {
         Some(libc::EINPROGRESS | libc::EINTR) => {}
         _ => return Err(err),
     }
-    io.fd().ready(WRITABLE).await?;
+    io.ready(WRITABLE).await?;
     match take_error(io)? {
         None => Ok(()),
         Some(err) => Err(err),
@@ -406,22 +409,7 @@ fn poll_accept(
     cx: &mut Context<'_>,
     wait: &mut ReadyWait,
 ) -> Poll<io::Result<(OwnedFd, SockAddr)>> {
-    let proceed = ready!(coop::poll_proceed(cx));
-    loop {
-        if wait.is_waiting() {
-            ready!(io.poll_ready(cx, READABLE, wait))?;
-        }
-        match try_accept(io) {
-            Ok(accepted) => {
-                proceed.made_progress();
-                return Poll::Ready(Ok(accepted));
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                ready!(io.poll_ready(cx, READABLE, wait))?;
-            }
-            Err(err) => return Poll::Ready(Err(err)),
-        }
-    }
+    io.poll_take(cx, READABLE, wait, try_accept)
 }
 
 /// Shuts down a half, or both, of the socket of `io`.
