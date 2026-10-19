@@ -1,7 +1,10 @@
 //! Portable I/O polled where no runtime runs, by
 //! `futures::executor::block_on` on a plain thread and by the workers of
 //! tokio's multi-threaded runtime, while a ruio runtime on a thread of its
-//! own is the foreign ring their waits go to.
+//! own is the foreign ring their waits go to; and signals received there.
+//!
+//! Signal handlers are process-wide and the tests run in parallel, so each
+//! test that listens for a signal listens for a kind of its own.
 
 use std::future::{Future, poll_fn};
 use std::io::{self, Write as _};
@@ -17,6 +20,7 @@ use std::time::{Duration, Instant};
 use ruio::io::AsyncRead;
 use ruio::net::portable::{TcpListener, TcpStream};
 use ruio::process::Command;
+use ruio::signal::{Signal, SignalKind, ctrl_c, signal};
 use ruio::uring::PortableFd;
 
 /// How long a test waits for anything before it is considered hung.
@@ -325,4 +329,78 @@ fn streams_made_under_a_runtime_move_to_threads_with_none() {
         Ok(())
     });
     answering.join().unwrap().unwrap();
+}
+
+/// Sends `kind` to the process, as `kill(1)` would.
+fn send(kind: SignalKind) {
+    // SAFETY: `getpid` touches nothing.
+    let pid = unsafe { libc::getpid() };
+    // SAFETY: `kill` of the process itself, with a signal the test has a
+    // handler for.
+    let sent = unsafe { libc::kill(pid, kind.as_raw_value()) };
+    assert_eq!(sent, 0);
+}
+
+/// A listener made where no runtime runs receives each signal sent after
+/// it, handing the signals on itself.
+async fn signals_reach(kind: SignalKind) -> io::Result<()> {
+    let mut listener = signal(kind)?;
+    for _ in 0..3 {
+        send(kind);
+        assert_eq!(listener.recv().await, Some(()));
+    }
+    Ok(())
+}
+
+#[test]
+fn signals_reach_a_listener_on_a_plain_thread() {
+    on_plain_thread(|| signals_reach(SignalKind::user_defined1()));
+}
+
+#[test]
+fn signals_reach_a_listener_on_tokio() {
+    on_tokio(signals_reach(SignalKind::user_defined2()));
+}
+
+/// `ctrl_c` installs its handler as it is first polled, there as anywhere,
+/// and completes once the interrupt comes.
+#[test]
+fn ctrl_c_waits_for_sigint_on_a_plain_thread() {
+    on_plain_thread(|| async {
+        let mut waiting = pin!(ctrl_c());
+        let pending = poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await;
+        assert!(pending, "no interrupt yet");
+        send(SignalKind::interrupt());
+        waiting.await
+    });
+}
+
+/// A listener made under a runtime that goes on running is handed its
+/// signals by the runtime's dispatcher, wherever it is polled.
+#[test]
+fn a_listener_made_under_a_runtime_receives_on_tokio() {
+    let (made, listener) = mpsc::channel();
+    thread::spawn(move || {
+        ruio::Runtime::new().unwrap().block_on(async move {
+            made.send(signal(SignalKind::window_change()).unwrap())
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+    });
+    let mut winch = listener.recv().unwrap();
+    on_tokio(async move {
+        for _ in 0..2 {
+            send(SignalKind::window_change());
+            assert_eq!(winch.recv().await, Some(()));
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn listeners_and_ctrl_c_are_send() {
+    fn assert_send<T: Send>(_: &T) {}
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Signal>();
+    assert_send(&ctrl_c());
 }

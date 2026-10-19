@@ -9,6 +9,7 @@ use std::process::Stdio;
 
 use ruio::net::portable::UnixStream;
 use ruio::process::Command;
+use ruio::signal::{SignalKind, ctrl_c, signal};
 use ruio::uring::PortableFd;
 
 fn unsupported<T>(result: io::Result<T>) -> bool {
@@ -43,4 +44,21 @@ fn portable_io_with_no_runtime_and_no_foreign_ring_is_unsupported() {
         // Reaped, once it exits, as a child dropped unwaited for is.
         drop(child);
     });
+}
+
+/// A listener needs a ring to wait on: where none could, none is made, and
+/// no handler is installed, so the interrupt keeps its default action.
+#[test]
+fn a_signal_listener_with_no_runtime_and_no_foreign_ring_is_unsupported() {
+    let err = signal(SignalKind::user_defined1()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    let err = futures_executor::block_on(ctrl_c()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    // SAFETY: a zeroed `sigaction` is a valid place for the current one.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: `action` is a valid place for the current action; none is
+    // given.
+    let asked = unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &raw mut action) };
+    assert_eq!(asked, 0);
+    assert_eq!(action.sa_sigaction, libc::SIG_DFL, "no handler installed");
 }

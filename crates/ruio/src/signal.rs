@@ -19,6 +19,16 @@
 //! whose receivers, on this runtime and every other, are the listeners. So
 //! a signal costs its handler an atomic operation and a system call, the
 //! ring one completion, and each listener one wake, wherever it runs.
+//!
+//! A listener made where no runtime runs, on a thread of another executor's
+//! say, has no runtime's dispatcher to count on, and hands signals on
+//! itself while it is received: it takes the eventfd's count with a
+//! nonblocking read, and waits for the eventfd to be readable with a poll
+//! on the foreign ring
+//! ([`set_foreign_ring`](crate::uring::set_foreign_ring)), as any portable
+//! wait polled there does. Listeners are `Send`, and wherever a listener is
+//! polled, the dispatcher of the runtime that made it, or its own wait,
+//! wakes it.
 
 use std::cell::Cell;
 use std::fmt;
@@ -32,7 +42,11 @@ use std::task::{Context, Poll};
 
 use libc::c_int;
 use ruio_driver::ops::Read;
+use ruio_driver::{Driver, PortableFd, ReadyWait};
 use ruio_executor::sync::watch;
+
+/// What a listener dispatching for itself waits for the eventfd to be.
+const READABLE: u32 = libc::POLLIN as u32;
 
 /// How many signal numbers Linux has, `1..=64`; the word of pending kinds
 /// has a bit for each.
@@ -169,8 +183,10 @@ static PREVIOUS_FLAGS: [AtomicI32; SIGNALS] = [const { AtomicI32::new(0) }; SIGN
 
 /// What the process has for its signals, made at the first `signal`.
 struct Globals {
-    /// Written by the handlers, read by the runtimes' dispatchers.
-    event: OwnedFd,
+    /// Written by the handlers, read by the runtimes' dispatchers and by
+    /// the listeners that dispatch for themselves, which wait for it as a
+    /// portable descriptor.
+    event: PortableFd,
     /// The channel of each kind, made as its handler is installed.
     senders: [OnceLock<watch::Sender<u64>>; SIGNALS],
     /// Holds the installation of a handler, so that two tasks asking for
@@ -190,7 +206,7 @@ fn globals() -> io::Result<&'static Globals> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the descriptor is new, and owned by nobody else.
-    let event = unsafe { OwnedFd::from_raw_fd(fd) };
+    let event = PortableFd::new(unsafe { OwnedFd::from_raw_fd(fd) });
     let globals = GLOBALS.get_or_init(|| Globals {
         event,
         senders: [const { OnceLock::new() }; SIGNALS],
@@ -309,9 +325,10 @@ fn start_dispatcher(globals: &'static Globals) {
 /// The runtime's dispatcher: reads the eventfd, and hands each kind of
 /// signal that has arrived to its channel, for the listeners everywhere.
 ///
-/// Every runtime with a listener reads the one eventfd; the kernel gives a
-/// count to one of them, and the rest wait on. Whichever gets it swaps the
-/// pending word for zero, so each arrival is handed on once.
+/// Every runtime with a listener reads the one eventfd, and so does every
+/// listener dispatching for itself; the kernel gives a count to one of
+/// them, and the rest wait on. Whichever gets it swaps the pending word for
+/// zero, so each arrival is handed on once.
 async fn dispatch(globals: &'static Globals) {
     let fd: RawFd = globals.event.as_raw_fd();
     let mut buf = Vec::with_capacity(8);
@@ -326,15 +343,47 @@ async fn dispatch(globals: &'static Globals) {
             // process: nothing more to dispatch here.
             Err(_) => return,
         }
-        // AcqRel: the bits set before the count was written are seen, and
-        // taken once.
-        let mut pending = PENDING.swap(0, Ordering::AcqRel);
-        while pending != 0 {
-            let index = pending.trailing_zeros() as usize;
-            pending &= !(1 << index);
-            if let Some(sender) = globals.senders[index].get() {
-                sender.send_modify(|arrivals| *arrivals += 1);
-            }
+        hand_on(globals);
+    }
+}
+
+/// Hands each kind of signal that has arrived, since whoever took the
+/// eventfd's count last did this, to its channel.
+fn hand_on(globals: &Globals) {
+    // AcqRel: the bits set before the count was written are seen, and
+    // taken once.
+    let mut pending = PENDING.swap(0, Ordering::AcqRel);
+    while pending != 0 {
+        let index = pending.trailing_zeros() as usize;
+        pending &= !(1 << index);
+        if let Some(sender) = globals.senders[index].get() {
+            sender.send_modify(|arrivals| *arrivals += 1);
+        }
+    }
+}
+
+/// Takes the eventfd's count with one nonblocking `read(2)`: whether there
+/// was one, which signals have arrived since it was last taken, or none.
+fn take_count(globals: &Globals) -> io::Result<bool> {
+    let mut count = 0_u64;
+    loop {
+        // SAFETY: an eventfd's read writes the eight bytes of the `u64` it
+        // is given.
+        let read = unsafe {
+            libc::read(
+                globals.event.as_raw_fd(),
+                (&raw mut count).cast(),
+                mem::size_of::<u64>(),
+            )
+        };
+        if read >= 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        match err.kind() {
+            io::ErrorKind::WouldBlock => return Ok(false),
+            io::ErrorKind::Interrupted => {}
+            _ => return Err(err),
         }
     }
 }
@@ -344,16 +393,22 @@ async fn dispatch(globals: &'static Globals) {
 /// installed if it is not already, and the handler it replaces is called
 /// after it.
 ///
+/// Inside a runtime's `block_on`, the runtime's dispatcher hands the
+/// signals on, and is started if it has not been. Elsewhere, on a thread of
+/// another executor's say, the listener hands them on itself as it is
+/// received, waiting with a poll on the foreign ring
+/// ([`set_foreign_ring`](crate::uring::set_foreign_ring)), or on the ring of
+/// a driver the thread has made current.
+///
 /// # Errors
 ///
 /// [`io::ErrorKind::InvalidInput`] for a kind that cannot be listened for:
 /// `SIGKILL` and `SIGSTOP`, which cannot be caught, the fault signals
 /// `SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGFPE`, and numbers outside `1..=64`;
-/// otherwise what making the eventfd or installing the handler reports.
-///
-/// # Panics
-///
-/// If the thread is not inside a runtime's `block_on`.
+/// [`io::ErrorKind::Unsupported`] where no runtime runs and no ring could
+/// wait for the listener, with no driver current and no foreign ring set,
+/// before anything is installed; otherwise what making the eventfd or
+/// installing the handler reports.
 ///
 /// ```no_run
 /// use ruio::signal::{SignalKind, signal};
@@ -367,24 +422,35 @@ async fn dispatch(globals: &'static Globals) {
 /// # }).unwrap();
 /// ```
 pub fn signal(kind: SignalKind) -> io::Result<Signal> {
+    let in_runtime = ruio_executor::try_driver().is_some();
+    if !in_runtime && Driver::current().is_none() && ruio_driver::foreign_ring().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no ruio runtime runs on this thread, and no foreign ring is set to wait on",
+        ));
+    }
     let globals = globals()?;
     let sender = globals.sender(kind)?;
-    start_dispatcher(globals);
+    let dispatch = if in_runtime {
+        start_dispatcher(globals);
+        None
+    } else {
+        Some(ReadyWait::new())
+    };
     Ok(Signal {
         kind,
         arrivals: sender.subscribe(),
+        dispatch,
     })
 }
 
-/// Waits for `SIGINT`, the interrupt from the terminal: Ctrl-C.
+/// Waits for `SIGINT`, the interrupt from the terminal: Ctrl-C. The
+/// listener is made, and its handler installed, as the future is first
+/// polled, inside a runtime or not, as [`signal`] makes one.
 ///
 /// # Errors
 ///
 /// What [`signal`] reports.
-///
-/// # Panics
-///
-/// If the thread is not inside a runtime's `block_on`.
 ///
 /// ```no_run
 /// # ruio::Runtime::new().unwrap().block_on(async {
@@ -398,17 +464,29 @@ pub async fn ctrl_c() -> io::Result<()> {
     Ok(())
 }
 
-/// A listener for one kind of signal, made by [`signal`].
+/// A listener for one kind of signal, made by [`signal`]. It is `Send` and
+/// `Sync`, and receives on whichever thread polls it.
 ///
 /// Signals that arrive while the listener is not receiving coalesce: the
 /// next [`recv`](Signal::recv) completes once, however many came. One that
 /// arrived before the listener was made is not delivered to it.
+///
+/// One made inside a runtime is handed its signals by that runtime's
+/// dispatcher, wherever it is polled, for as long as the runtime runs. One
+/// made where no runtime runs hands them on itself as it is received, for
+/// itself and every other listener: it takes the eventfd's count with a
+/// nonblocking read, and otherwise waits for the eventfd, as a portable
+/// descriptor, on the ring of the thread that polls it, or the foreign
+/// ring.
 #[must_use = "a listener does nothing until it receives"]
 pub struct Signal {
     kind: SignalKind,
     /// How many times the signal has arrived, as the kind's channel counts;
     /// a receive is a change of the count.
     arrivals: watch::Receiver<u64>,
+    /// For a listener made where no runtime runs, the wait for the eventfd
+    /// with which it hands the signals on itself.
+    dispatch: Option<ReadyWait>,
 }
 
 impl Signal {
@@ -418,8 +496,10 @@ impl Signal {
     }
 
     /// Waits for the signal to arrive, once, however many times it does
-    /// meanwhile. `None` never comes: the channel behind the listener lives
-    /// as long as the process, and is here for the shape of a receive.
+    /// meanwhile. `None` comes only for a listener made where no runtime
+    /// runs that can wait no more, as when the foreign ring it waited on is
+    /// cleared or closes and its thread has no driver of its own; the
+    /// channel behind the listener lives as long as the process.
     pub async fn recv(&mut self) -> Option<()> {
         poll_fn(|cx| self.poll_recv(cx)).await
     }
@@ -427,7 +507,26 @@ impl Signal {
     /// Whether the signal has arrived since the last receive; arranges for
     /// the task to be woken when it does otherwise.
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<()>> {
-        self.arrivals.poll_changed(cx).map(|changed| changed.ok())
+        loop {
+            if let Poll::Ready(changed) = self.arrivals.poll_changed(cx) {
+                return Poll::Ready(changed.ok());
+            }
+            let (Some(wait), Some(globals)) = (&mut self.dispatch, GLOBALS.get()) else {
+                return Poll::Pending;
+            };
+            // With no runtime's dispatcher to count on: the count, taken
+            // here, hands every kind that has arrived on, this one
+            // included, if it is among them.
+            match take_count(globals) {
+                Ok(true) => hand_on(globals),
+                Ok(false) => match globals.event.poll_ready(cx, READABLE, wait) {
+                    Poll::Ready(Ok(_)) => {}
+                    Poll::Ready(Err(_)) => return Poll::Ready(None),
+                    Poll::Pending => return Poll::Pending,
+                },
+                Err(_) => return Poll::Ready(None),
+            }
+        }
     }
 }
 
