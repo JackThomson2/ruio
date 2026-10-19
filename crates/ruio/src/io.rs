@@ -29,6 +29,11 @@
 //! spend a step of the task's budget ([`coop`](crate::coop)) each time they
 //! move data.
 //!
+//! [`portable::AsyncFd`] wraps any descriptor for a task that must be
+//! `Send`, with the readiness API of tokio's `AsyncFd`: its waits run on the
+//! ring of the thread that polls them, and the owner reads and writes with
+//! nonblocking calls of its own.
+//!
 //! A stream socket's own `read_exact` and `write_all` stay what they are,
 //! with their linked timeouts and `MSG_WAITALL`: a method call on a stream
 //! reaches them, and the traits' through a generic bound only.
@@ -61,6 +66,7 @@ use crate::net::{SocketOp, TcpStream, UnixStream};
 
 mod async_fd;
 mod nonblocking;
+pub mod portable;
 mod splice;
 
 pub use async_fd::{AsyncFd, FdOp, Readiness, Ready};
