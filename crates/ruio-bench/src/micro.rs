@@ -157,6 +157,15 @@
 //! - `portable round trip`: the same through a portable stream: a send made
 //!   at once, a receive that finds nothing yet and waits with a poll on the
 //!   ring, and the receive made again as the echo arrives.
+//! - `foreign nop`: a portable no-op polled on a plain thread, where no
+//!   runtime runs, as `futures::executor::block_on` polls one: its entry
+//!   goes to the foreign ring, a runtime's on another core, whose thread
+//!   queues it and sends the completion back; each way a wake of the other
+//!   thread. tokio has no such thing.
+//! - `foreign round trip`: `portable round trip` polled by tokio's
+//!   current-thread runtime, whose thread runs no ruio runtime: each wait
+//!   goes to the foreign ring, a ruio runtime's on another core, and comes
+//!   back as a wake from it; against tokio's own stream.
 //! - `hyper get`: hyper-util's client sending GETs one at a time over one
 //!   pooled connection to a server thread on another core, which answers
 //!   each with five bytes: ruio's through `ruio_compat::client`'s connector
@@ -542,6 +551,16 @@ pub(crate) const ALL: &[Micro] = &[
         tokio: Some(tokio_round_trip),
     },
     Micro {
+        name: "foreign nop",
+        ruio: foreign_nop,
+        tokio: None,
+    },
+    Micro {
+        name: "foreign round trip",
+        ruio: foreign_round_trip,
+        tokio: Some(tokio_round_trip),
+    },
+    Micro {
         name: "hyper get",
         ruio: ruio_hyper_get,
         tokio: Some(tokio_hyper_get),
@@ -589,6 +608,13 @@ async fn count_until(stop: impl Fn() -> bool, mut step: impl AsyncFnMut()) -> u6
 /// this is run on.
 fn remote_cpu(load: &Load) -> usize {
     load.cpu + 2
+}
+
+/// The CPU the runtime whose ring is the foreign one runs on, in the
+/// `foreign` rows: a third core, beside the measured thread's and the
+/// peer's.
+fn foreign_cpu(load: &Load) -> usize {
+    load.cpu + 4
 }
 
 fn ruio_runtime() -> io::Result<ruio::Runtime> {
@@ -3094,6 +3120,121 @@ fn tokio_round_trip(load: &Load) -> io::Result<f64> {
         })
         .await)
     })
+}
+
+/// A ruio runtime on a thread of its own, pinned to a CPU, whose ring is
+/// the foreign one, which portable operations polled where no runtime runs
+/// go to, until this is dropped.
+struct ForeignRing {
+    stop: Option<ruio::sync::oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<io::Result<()>>>,
+}
+
+impl ForeignRing {
+    fn start(cpu: usize) -> io::Result<Self> {
+        let (ready, started) = std_mpsc::channel();
+        let (stop, stopped) = ruio::sync::oneshot::channel::<()>();
+        let thread = thread::spawn(move || {
+            // Not pinned if the host has no such CPU.
+            let _ = sys::pin(&[cpu]);
+            ruio_runtime()?.block_on(async move {
+                let _ = ready.send(ruio::handle().ring().clone());
+                let _ = stopped.await;
+            });
+            Ok(())
+        });
+        let ring = started
+            .recv()
+            .map_err(|_| io::Error::other("the foreign ring's runtime did not start"))?;
+        ruio::uring::set_foreign_ring(&ring);
+        Ok(Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for ForeignRing {
+    fn drop(&mut self) {
+        ruio::uring::clear_foreign_ring();
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Wakes the thread that waits for a future, as
+/// `futures::executor::block_on`'s waker does.
+struct Unpark(thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Runs `future` to completion on this thread, which runs no runtime,
+/// parking between polls until it is woken, as
+/// `futures::executor::block_on` does.
+fn block_on_plain<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let waker = std::task::Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+        thread::park();
+    }
+}
+
+/// Portable no-ops polled one at a time on this thread, which runs no
+/// runtime, through the foreign ring of a runtime on another core.
+fn foreign_nop(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let foreign = ForeignRing::start(foreign_cpu(load))?;
+    let rate = block_on_plain(rate(measure, async || {
+        PortableOp::new(Nop).await.expect("the no-op completes");
+    }));
+    drop(foreign);
+    Ok(rate)
+}
+
+/// `portable round trip` polled by tokio's current-thread runtime, its waits
+/// on the foreign ring of a ruio runtime on another core.
+fn foreign_round_trip(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let foreign = ForeignRing::start(foreign_cpu(load))?;
+    let peers = Peers::start(vec![remote_cpu(load)], serve_echo)?;
+    let addr = peers.addr;
+    let rate = tokio_runtime()?.block_on(async move {
+        let stream = ruio::net::portable::TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        let mut buf = Some(Vec::with_capacity(ROUND));
+        io::Result::Ok(
+            rate(measure, async || {
+                stream
+                    .write_all(&ROUND_DATA[..])
+                    .await
+                    .0
+                    .expect("the bytes are written");
+                let (read, back) = stream
+                    .read_exact(buf.take().expect("the buffer is back"))
+                    .await;
+                read.expect("the bytes come back");
+                buf = Some(back);
+            })
+            .await,
+        )
+    })?;
+    drop(peers);
+    drop(foreign);
+    Ok(rate)
 }
 
 /// The body of the `hyper get` rows' requests, which is none.
