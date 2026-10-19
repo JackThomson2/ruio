@@ -1202,14 +1202,19 @@ baseline are used only when probed.
   driver's identity, which costs nothing until a signal comes; the kernel
   gives the count to one runtime's read, which swaps the word for zero, so
   each arrival is handed on once, and gives each kind in it to the kind's
-  `watch` channel, whose receivers everywhere are the listeners. A signal
-  costs its handler an atomic operation and a system call, the ring one
-  completion, and each listener one wake, wherever it runs; arrivals of one
-  kind coalesce into one receive, as the channel's change does. A `signalfd`
-  would have needed the signal blocked in every thread of the process,
-  which threads other libraries make would not have. In `ruio-bench micro`
-  a signal raised and received runs 420k times a second, 1.3× tokio's, the
-  raise's own calls being most of either.
+  `watch` channel, whose receivers everywhere are the listeners. The read
+  does this as it completes, wherever that is: in the dispatcher's task,
+  or in the driver, which completes the read for the task it drops when
+  the runtime ends after the read took a count and before the task ran
+  again, so a runtime that ends as a signal arrives cannot keep it from
+  the listeners of the others. A signal costs its handler an atomic
+  operation and a system call, the ring one completion, and each listener
+  one wake, wherever it runs; arrivals of one kind coalesce into one
+  receive, as the channel's change does. A `signalfd` would have needed
+  the signal blocked in every thread of the process, which threads other
+  libraries make would not have. In `ruio-bench micro` a signal raised and
+  received runs 420k times a second, 1.3× tokio's, the raise's own calls
+  being most of either.
   A listener made where no runtime runs has no dispatcher to count on,
   and hands the signals on itself while it is received: it takes the
   eventfd's count with a nonblocking read, and waits for the eventfd with
