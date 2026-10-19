@@ -41,6 +41,14 @@
 //! wait for its interrupts: ruio's reader on its polled ring, fio with
 //! `hipri`. The report gives reads per second and how ruio's compare.
 //!
+//! `ruio-bench cold-read` counts what a cold read of a directory tree asks
+//! of the block device it is on: each run drops the tree's pages from the
+//! page cache, reads every file whole with `std::fs::read` and with
+//! `ruio::fs::read`, which take turns, and reads the device's statistics
+//! before and after; the report gives reads completed and merged, data
+//! read, and the average size of a read, for each reader (see
+//! [`cold`](mod@cold)).
+//!
 //! The server and the load generator also run on their own:
 //!
 //! ```text
@@ -59,9 +67,11 @@
 //! ruio-bench scale-run ruio|tokio [--cores N] [--connections N] [--size BYTES] [--seconds S]
 //!                                 [--warmup S]
 //! ruio-bench micro [--only LIST] [--runs N] [--seconds S] [--cpu N]
+//! ruio-bench cold-read DIR [--runs N] [--cpu N]
 //! ```
 
 mod client;
+mod cold;
 mod http;
 mod micro;
 mod randread;
@@ -103,7 +113,8 @@ const USAGE: &str =
                      [--seconds S] [--warmup S]
        ruio-bench scale-run ruio|tokio [--cores N] [--connections N] [--size BYTES] \
                      [--seconds S] [--warmup S]
-       ruio-bench micro [--only LIST] [--runs N] [--seconds S] [--cpu N]";
+       ruio-bench micro [--only LIST] [--runs N] [--seconds S] [--cpu N]
+       ruio-bench cold-read DIR [--runs N] [--cpu N]";
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -123,6 +134,7 @@ fn main() {
         Some("scale") => scale(&options),
         Some("scale-run") => scale_run(&options),
         Some("micro") => micro(&options),
+        Some("cold-read") => cold_read(&options),
         _ => Err(USAGE.to_owned()),
     });
     if let Err(err) = result {
@@ -468,6 +480,20 @@ fn micro(options: &Options) -> Result<(), String> {
         println!();
     }
     Ok(())
+}
+
+/// Counts the block-device reads of a cold read of a directory tree, with
+/// std's reader and ruio's, in turns; see [`cold`](mod@cold).
+fn cold_read(options: &Options) -> Result<(), String> {
+    let load = cold::Load {
+        dir: options.positional::<String>(0, "directory")?.into(),
+        runs: options.get("runs", 5)?,
+        cpu: options.get("cpu", 0)?,
+    };
+    if load.runs == 0 {
+        return Err("--runs must be at least 1".to_owned());
+    }
+    cold::run(&load)
 }
 
 fn echo_server(options: &Options) -> Result<(), String> {
