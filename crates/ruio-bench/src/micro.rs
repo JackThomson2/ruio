@@ -169,6 +169,12 @@
 //!   current-thread runtime, whose thread runs no ruio runtime: each wait
 //!   goes to the foreign ring, a ruio runtime's on another core, and comes
 //!   back as a wake from it; against tokio's own stream.
+//! - `reactor round trip`: the same with `ruio_compat::TokioReactor` the
+//!   foreign reactor: each wait goes to tokio's reactor on the thread
+//!   itself, as a wait of tokio's own stream does; against that stream.
+//! - `reactor child pipes`: `child pipes` polled by tokio's current-thread
+//!   runtime with the same reactor, against tokio's own pipes: what an MCP
+//!   server on a child's standard streams costs a tokio program.
 //! - `hyper get`: hyper-util's client sending GETs one at a time over one
 //!   pooled connection to a server thread on another core, which answers
 //!   each with five bytes: ruio's through `ruio_compat::client`'s connector
@@ -567,6 +573,16 @@ pub(crate) const ALL: &[Micro] = &[
         name: "foreign round trip",
         ruio: foreign_round_trip,
         tokio: Some(tokio_round_trip),
+    },
+    Micro {
+        name: "reactor round trip",
+        ruio: reactor_round_trip,
+        tokio: Some(tokio_round_trip),
+    },
+    Micro {
+        name: "reactor child pipes",
+        ruio: reactor_child_pipes,
+        tokio: Some(tokio_child_pipes),
     },
     Micro {
         name: "hyper get",
@@ -3263,6 +3279,92 @@ fn foreign_round_trip(load: &Load) -> io::Result<f64> {
     })?;
     drop(peers);
     drop(foreign);
+    Ok(rate)
+}
+
+/// tokio's reactor as the foreign one, which portable I/O polled on tokio's
+/// threads waits on, until this is dropped.
+struct TokioReactor;
+
+impl TokioReactor {
+    fn set() -> Self {
+        ruio::io::set_foreign_reactor(&ruio_compat::TokioReactor);
+        Self
+    }
+}
+
+impl Drop for TokioReactor {
+    fn drop(&mut self) {
+        ruio::io::clear_foreign_reactor();
+    }
+}
+
+/// `portable round trip` polled by tokio's current-thread runtime, its waits
+/// on tokio's reactor.
+fn reactor_round_trip(load: &Load) -> io::Result<f64> {
+    let measure = load.measure;
+    let reactor = TokioReactor::set();
+    let peers = Peers::start(vec![remote_cpu(load)], serve_echo)?;
+    let addr = peers.addr;
+    let rate = tokio_runtime()?.block_on(async move {
+        let stream = ruio::net::portable::TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        let mut buf = Some(Vec::with_capacity(ROUND));
+        io::Result::Ok(
+            rate(measure, async || {
+                stream
+                    .write_all(&ROUND_DATA[..])
+                    .await
+                    .0
+                    .expect("the bytes are written");
+                let (read, back) = stream
+                    .read_exact(buf.take().expect("the buffer is back"))
+                    .await;
+                read.expect("the bytes come back");
+                buf = Some(back);
+            })
+            .await,
+        )
+    })?;
+    drop(peers);
+    drop(reactor);
+    Ok(rate)
+}
+
+/// `child pipes` polled by tokio's current-thread runtime, the pipes'
+/// waits on tokio's reactor.
+fn reactor_child_pipes(load: &Load) -> io::Result<f64> {
+    use ruio::io::{AsyncRead, AsyncWrite};
+
+    let measure = load.measure;
+    let reactor = TokioReactor::set();
+    let rate = tokio_runtime()?.block_on(async move {
+        let mut child = ruio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let mut buf = Some(Vec::with_capacity(PIPED));
+        let rate = rate(measure, async || {
+            stdin
+                .write_all(&PIPED_DATA[..])
+                .await
+                .0
+                .expect("cat takes its input");
+            let mut back = buf.take().expect("put back after each read");
+            back.clear();
+            let (read, back) = stdout.read_exact(back).await;
+            read.expect("cat writes it back");
+            buf = Some(back);
+        })
+        .await;
+        drop(stdin);
+        // Its wait would go to a ring of ruio's, which this thread has none
+        // of: the reaper waits for it once it is dropped.
+        drop(child);
+        io::Result::Ok(rate)
+    })?;
+    drop(reactor);
     Ok(rate)
 }
 
