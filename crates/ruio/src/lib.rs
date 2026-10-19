@@ -100,11 +100,41 @@ pub mod signal;
 /// first polls it, and a [`PortableFd`](uring::PortableFd) is a plain
 /// descriptor whose operations are portable ones, and which a
 /// [`ReadyWait`](uring::ReadyWait) waits on to be ready.
+///
+/// Portable operations first polled where no runtime runs, on a thread of
+/// another executor's, such as tokio's, or of `futures::executor::block_on`,
+/// go to the foreign ring, which [`set_foreign_ring`](uring::set_foreign_ring)
+/// sets: that of one of the program's runtimes, through its
+/// [`Handle::ring`](crate::Handle::ring), say. So the portable sockets,
+/// a child's pipes and its wait, and the path functions of [`fs`]
+/// work from such a thread too. With no foreign ring set they fail with
+/// `ENOSYS`, whose kind is [`std::io::ErrorKind::Unsupported`], so that the
+/// caller can do its I/O another way.
+///
+/// ```no_run
+/// # fn main() -> std::io::Result<()> {
+/// // A runtime on a thread of its own, whose ring other threads' portable
+/// // operations run on.
+/// let (ring, ready) = std::sync::mpsc::channel();
+/// std::thread::spawn(move || {
+///     ruio::Runtime::new()?.block_on(async {
+///         ring.send(ruio::handle().ring().clone()).unwrap();
+///         std::future::pending::<()>().await
+///     });
+///     std::io::Result::Ok(())
+/// });
+/// ruio::uring::set_foreign_ring(&ready.recv().unwrap());
+/// // A thread with no runtime of its own reads a file through it.
+/// let data = futures_executor::block_on(ruio::fs::read("/etc/hostname"))?;
+/// # drop(data);
+/// # Ok(())
+/// # }
+/// ```
 pub mod uring {
     pub use ruio_driver::{
         BaselineError, Chain, Completion, Descriptor, DirectFd, Driver, Entered, Fd, Link, MultiOp,
         Multishot, Op, Operation, PortableFd, PortableOp, Probe, ReadyWait, RemoteRing, SentFd,
-        SockAddr, Stats, Unparker, ops,
+        SockAddr, Stats, Unparker, clear_foreign_ring, foreign_ring, ops, set_foreign_ring,
     };
     pub use ruio_sys as sys;
 }

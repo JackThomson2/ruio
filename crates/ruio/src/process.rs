@@ -395,18 +395,18 @@ impl Child {
     /// standard input is closed first, as the standard library closes it,
     /// so that a child that reads its input to the end can get there.
     ///
-    /// The wait runs on the ring of the thread that polls it; a wait dropped
+    /// The wait runs on the ring of the thread that polls it, or, polled
+    /// where no runtime runs, on the foreign ring the embedder set
+    /// ([`set_foreign_ring`](crate::uring::set_foreign_ring)); a wait dropped
     /// before it completes, as the child exits even, leaves the child to
     /// reap and its status to the next.
     ///
     /// # Errors
     ///
     /// What `waitid(2)` reports: `ECHILD` if something else in the process
-    /// reaped the child, with `waitpid(-1)` say.
-    ///
-    /// # Panics
-    ///
-    /// If first polled where no runtime runs.
+    /// reaped the child, with `waitpid(-1)` say; and `ENOSYS`, whose kind is
+    /// [`io::ErrorKind::Unsupported`], polled where no runtime runs and no
+    /// foreign ring is set.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         if let Some(status) = self.status {
             return Ok(status);

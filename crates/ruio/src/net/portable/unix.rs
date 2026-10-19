@@ -200,11 +200,9 @@ impl UnixListener {
     /// # Errors
     ///
     /// What `accept4(2)` reports, bar a connection given up before it was
-    /// taken, which the next replaces.
-    ///
-    /// # Panics
-    ///
-    /// If no connection is waiting where no runtime runs.
+    /// taken, which the next replaces; and, for a wait where no runtime runs
+    /// and no foreign ring is set, `ENOSYS`, whose kind is
+    /// [`io::ErrorKind::Unsupported`].
     pub async fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
         let mut wait = ruio_driver::ReadyWait::new();
         let (fd, addr) =
@@ -217,10 +215,6 @@ impl UnixListener {
     /// next poll goes on with it.
     ///
     /// # Errors
-    ///
-    /// As for [`accept`](UnixListener::accept).
-    ///
-    /// # Panics
     ///
     /// As for [`accept`](UnixListener::accept).
     pub fn poll_accept(

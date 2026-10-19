@@ -22,7 +22,12 @@ ruio-macros.workspace = true
 ruio-sys.workspace = true
 
 [dev-dependencies]
+# For the tests and examples of portable I/O polled where no runtime runs:
+# `futures::executor::block_on` on a plain thread, and tokio's own
+# multi-threaded runtime.
+futures-executor = { version = "0.3.34", default-features = false, features = ["std"] }
 futures-util = { version = "0.3.34", default-features = false }
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

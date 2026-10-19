@@ -16,6 +16,13 @@
 //! full cannot hold up the thread. Nothing is read but what a read returns,
 //! so a read dropped while it waits loses nothing.
 //!
+//! A thread where no runtime runs, one of another executor's say, reads and
+//! writes a portable socket the same way, and its waits go to the foreign
+//! ring the embedder set ([`set_foreign_ring`](crate::uring::set_foreign_ring)),
+//! whose thread sends the readiness back; with none set, a wait fails with
+//! `ENOSYS`, whose kind is [`io::ErrorKind::Unsupported`], so the caller can
+//! do its I/O another way.
+//!
 //! The streams read into and write from owned buffers, as the thread's
 //! sockets do, and also, through their poll methods, into and from the
 //! caller's own, with no copy: what `ruio-compat`'s adapter gives hyper and
@@ -132,11 +139,9 @@ macro_rules! stream_methods {
         ///
         /// The waits of the poll methods are the stream's own, which they
         /// borrow it mutably to keep; the owned-buffer methods have their
-        /// own.
-        ///
-        /// # Panics
-        ///
-        /// If nothing has arrived where no runtime runs.
+        /// own. A wait runs where a portable operation does: on the ring of
+        /// the thread polling it, or on the foreign ring where no runtime
+        /// runs; see the [module's documentation](super).
         pub fn poll_read(
             &mut self,
             cx: &mut Context<'_>,
@@ -149,10 +154,6 @@ macro_rules! stream_methods {
         /// Writes as much of the caller's `buf` as there is room for, as
         /// [`write`](Self::write) does, polled; see
         /// [`poll_read`](Self::poll_read).
-        ///
-        /// # Panics
-        ///
-        /// If there is no room where no runtime runs.
         pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
             let stream = &mut self.stream;
             stream.io.poll_write(cx, buf, &mut stream.write)
@@ -161,10 +162,6 @@ macro_rules! stream_methods {
         /// Writes as much of the caller's `bufs`, one after the other, as
         /// there is room for, with one `sendmsg(2)` of up to 1024 of them;
         /// see [`poll_write`](Self::poll_write).
-        ///
-        /// # Panics
-        ///
-        /// If there is no room where no runtime runs.
         pub fn poll_write_vectored(
             &mut self,
             cx: &mut Context<'_>,

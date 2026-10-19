@@ -27,6 +27,12 @@
 //! A descriptor that is ready again and again, as one a peer keeps full, is
 //! read with no wait at all, so each read and write spends a step of the
 //! task's budget ([`coop`]), and once the budget is spent the task yields.
+//!
+//! Polled where no runtime runs, by another executor's task say, a read or
+//! a write is the same system call, and a wait goes to the foreign ring the
+//! embedder set ([`set_foreign_ring`](ruio_driver::set_foreign_ring)), as
+//! any portable operation first polled there does; with none set, it fails
+//! with `ENOSYS`, whose kind is [`io::ErrorKind::Unsupported`].
 
 use std::fmt;
 use std::future::Future;
@@ -234,10 +240,6 @@ impl Nonblocking {
     /// Reads into `buf` what has arrived, 0 at the end, waiting with `wait`
     /// for something to arrive if nothing has; see the module's
     /// documentation.
-    ///
-    /// # Panics
-    ///
-    /// If nothing has arrived where no runtime runs.
     pub(crate) fn poll_read(
         &self,
         cx: &mut Context<'_>,
@@ -250,10 +252,6 @@ impl Nonblocking {
 
     /// Writes as much of `buf` as there is room for, waiting with `wait` for
     /// room if there is none.
-    ///
-    /// # Panics
-    ///
-    /// If there is no room where no runtime runs.
     pub(crate) fn poll_write(
         &self,
         cx: &mut Context<'_>,
@@ -265,10 +263,6 @@ impl Nonblocking {
 
     /// Writes as much of `bufs`, one after the other, as there is room for,
     /// waiting with `wait` for room if there is none.
-    ///
-    /// # Panics
-    ///
-    /// If there is no room where no runtime runs.
     pub(crate) fn poll_write_vectored(
         &self,
         cx: &mut Context<'_>,
@@ -461,12 +455,15 @@ fn transferred(result: isize) -> Option<io::Result<usize>> {
 /// It spends a step of the task's budget ([`coop`]) when it reads, so a
 /// descriptor that always has something to read cannot hold up the thread.
 /// Dropped while it waits, it lets go of its poll; nothing is read but
-/// what it returns, so nothing is lost.
+/// what it returns, so nothing is lost. Its wait runs where a
+/// [`PortableOp`](ruio_driver::PortableOp) first polled on the same thread
+/// would: where no runtime runs and no foreign ring is set, a read that
+/// finds nothing fails with `ENOSYS`, whose kind is
+/// [`io::ErrorKind::Unsupported`].
 ///
 /// # Panics
 ///
-/// Polled where no runtime runs, if nothing has arrived; and polled after it
-/// completed.
+/// If polled after it completed.
 #[must_use = "a read does nothing until polled"]
 pub struct PortableRead<'a, B> {
     io: &'a Nonblocking,
@@ -522,12 +519,12 @@ impl<B> fmt::Debug for PortableRead<'_, B> {
 /// output is how many bytes were written, and the buffer.
 ///
 /// It spends a step of the task's budget ([`coop`]) when it writes. Dropped
-/// while it waits, it lets go of its poll, having written nothing.
+/// while it waits, it lets go of its poll, having written nothing. Its wait
+/// runs as [`PortableRead`]'s does.
 ///
 /// # Panics
 ///
-/// Polled where no runtime runs, if there is no room; and polled after it
-/// completed.
+/// If polled after it completed.
 #[must_use = "a write does nothing until polled"]
 pub struct PortableWrite<'a, B> {
     io: &'a Nonblocking,
@@ -581,12 +578,12 @@ impl<B> fmt::Debug for PortableWrite<'_, B> {
 ///
 /// Its fields hold no type of a trait's, so a future that must be `Send`
 /// can hold it for any buffer that is `Send` and `Sync`, a borrowed one
-/// among them; the same goes for [`PortableWriteAll`].
+/// among them; the same goes for [`PortableWriteAll`]. Its waits run as
+/// [`PortableRead`]'s do.
 ///
 /// # Panics
 ///
-/// Polled where no runtime runs, if nothing has arrived; and polled after it
-/// completed.
+/// If polled after it completed.
 #[must_use = "a read does nothing until polled"]
 pub struct PortableReadExact<'a, B> {
     io: &'a Nonblocking,
@@ -661,12 +658,12 @@ impl<B> fmt::Debug for PortableReadExact<'_, B> {
 /// system calls made at once, as many as it takes, which wait on the ring of
 /// the thread that polls them only while there is no room: made by the
 /// `write_all` of the portable sockets. The output is the buffer, with how
-/// the writes went: a write that writes nothing fails with `WriteZero`.
+/// the writes went: a write that writes nothing fails with `WriteZero`. Its
+/// waits run as [`PortableRead`]'s do.
 ///
 /// # Panics
 ///
-/// Polled where no runtime runs, if there is no room; and polled after it
-/// completed.
+/// If polled after it completed.
 #[must_use = "a write does nothing until polled"]
 pub struct PortableWriteAll<'a, B> {
     io: &'a Nonblocking,
@@ -743,11 +740,11 @@ impl<B> fmt::Debug for PortableWriteAll<'_, B> {
 ///
 /// It spends a step of the task's budget ([`coop`]) with each write that
 /// moves data. Dropped part way, it has written what it has, and no more.
+/// Its waits run as [`PortableRead`]'s do.
 ///
 /// # Panics
 ///
-/// Polled where no runtime runs, if there is no room; and polled after it
-/// completed.
+/// If polled after it completed.
 #[must_use = "a write does nothing until polled"]
 pub struct PortableWriteAllVectored<'a, V> {
     io: &'a Nonblocking,
