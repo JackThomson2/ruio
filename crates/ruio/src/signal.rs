@@ -14,11 +14,13 @@
 //! kind's bit in one atomic word, and writes to an eventfd the process has
 //! for its signals, whose count cannot fill as a pipe can. Each runtime with
 //! a listener keeps one read of the eventfd on its ring, which costs nothing
-//! until a signal comes; the runtime whose read takes the count swaps the
-//! word for zero and hands each kind in it to the kind's `watch` channel,
-//! whose receivers, on this runtime and every other, are the listeners. So
-//! a signal costs its handler an atomic operation and a system call, the
-//! ring one completion, and each listener one wake, wherever it runs.
+//! until a signal comes; the read that takes the count swaps the word for
+//! zero as it completes and hands each kind in it to the kind's `watch`
+//! channel, whose receivers, on this runtime and every other, are the
+//! listeners. So a signal costs its handler an atomic operation and a system
+//! call, the ring one completion, and each listener one wake, wherever it
+//! runs; and a runtime that ends as its read takes a count still hands the
+//! signals on, as the driver completes the read.
 //!
 //! A listener made where no runtime runs, on a thread of another executor's
 //! say, has no runtime's dispatcher to count on, and hands signals on
@@ -41,9 +43,11 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 
 use libc::c_int;
+use ruio_driver::buf::BufResult;
 use ruio_driver::ops::Read;
-use ruio_driver::{Driver, PortableFd, ReadyWait};
+use ruio_driver::{Completion, Driver, Operation, PortableFd, ReadyWait};
 use ruio_executor::sync::watch;
+use ruio_sys as sys;
 
 /// What a listener dispatching for itself waits for the eventfd to be.
 const READABLE: u32 = libc::POLLIN as u32;
@@ -322,8 +326,9 @@ fn start_dispatcher(globals: &'static Globals) {
     });
 }
 
-/// The runtime's dispatcher: reads the eventfd, and hands each kind of
-/// signal that has arrived to its channel, for the listeners everywhere.
+/// The runtime's dispatcher: reads the eventfd, each read handing each kind
+/// of signal that has arrived to its channel, for the listeners everywhere,
+/// as it completes (see [`Take`]).
 ///
 /// Every runtime with a listener reads the one eventfd, and so does every
 /// listener dispatching for itself; the kernel gives a count to one of
@@ -333,17 +338,50 @@ async fn dispatch(globals: &'static Globals) {
     let fd: RawFd = globals.event.as_raw_fd();
     let mut buf = Vec::with_capacity(8);
     loop {
-        let (read, taken) = crate::driver().op(Read::new(fd, buf)).await;
+        let take = Take {
+            read: Read::new(fd, buf),
+            globals,
+        };
+        let (read, taken) = crate::driver().op(take).await;
         buf = taken;
         buf.clear();
         match read {
             Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             // The ring is shutting down, or the descriptor is gone with the
             // process: nothing more to dispatch here.
             Err(_) => return,
         }
-        hand_on(globals);
+    }
+}
+
+/// A dispatcher's read of the eventfd, which hands on the signals its count
+/// stands for as it completes, wherever that is. The kernel can finish the
+/// read after the dispatcher last ran, as its runtime ends: the completion
+/// reaped in the runtime's last turn, before the task could run again, or
+/// one the driver collects as it closes the ring. The driver completes the
+/// read then too, so a count the read took is not lost with the runtime.
+struct Take {
+    read: Read<Vec<u8>>,
+    globals: &'static Globals,
+}
+
+// SAFETY: the entry is the read's, which points into the vector's heap
+// memory, in place as the operation moves; a read posts one completion.
+unsafe impl Operation for Take {
+    /// The read's result, and the buffer.
+    type Output = BufResult<usize, Vec<u8>>;
+
+    fn prepare(&mut self, sqe: &mut sys::io_uring_sqe) {
+        self.read.prepare(sqe);
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        let (read, buf) = self.read.complete(completion);
+        if read.is_ok() {
+            hand_on(self.globals);
+        }
+        (read, buf)
     }
 }
 
