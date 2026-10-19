@@ -47,8 +47,8 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 
 | Crate | What it has |
 |---|---|
-| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, which holds tasks of other cores too, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, `signal`, and `process`, which spawns child processes and waits for them on the ring; the path functions of `fs`, everything in `process`, and the sockets of `net::portable` and the file of `fs::portable` are `Send`, running on the ring of whichever thread polls them; with the `futures` feature, every stream implements futures-core's `Stream` |
-| [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; `Timer`, which gives hyper ruio's timers for its timeouts; `PortableCompat`, which gives the portable streams those traits with no buffers of its own; and, with the `client` feature, a connector that runs hyper-util's client on them |
+| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, which holds tasks of other cores too, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, `signal`, and `process`, which spawns child processes and waits for them on the ring; the path functions of `fs`, `read_dir` among them, everything in `process`, the sockets of `net::portable`, the file of `fs::portable`, which also reads, writes and seeks through poll methods as tokio's file does, and `io::portable::AsyncFd`, shaped as tokio's, are `Send`, running on the ring of whichever thread polls them, and where no runtime runs, on a tokio worker say, on the foreign ring `uring::set_foreign_ring` sets, failing with `Unsupported` if none is set; with the `futures` feature, every stream implements futures-core's `Stream` |
+| [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; `Timer`, which gives hyper ruio's timers for its timeouts; `PortableCompat`, which gives the portable streams and a child's pipes those traits with no buffers of its own, and the portable file them and `AsyncSeek`; and, with the `client` feature, a connector that runs hyper-util's client on them |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
 | [`ruio-sys`](crates/ruio-sys) | The kernel's io_uring ABI and system calls |
@@ -170,7 +170,10 @@ On a Xeon Platinum 8488C with Linux 7.0, over loopback (see
   whichever thread polls them, so 64 bytes go to an echo thread and back
   as often as through the thread's streams and tokio's, and hyper-util's
   client, one for every core, makes as many requests a second through them
-  as on tokio, one at a time or from 16 tasks at once.
+  as on tokio, one at a time or from 16 tasks at once. Polled by tokio's
+  own runtime, with a ruio runtime's ring as the foreign one, the round
+  trip keeps 0.89 of tokio's own stream's rate, each wait two wakes across
+  cores, and a portable no-op from a plain thread makes 172k a second.
 
 ## Development
 

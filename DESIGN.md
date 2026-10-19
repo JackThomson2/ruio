@@ -29,7 +29,7 @@ an API that still reads like ordinary async Rust.
 |---|---|---|
 | Execution model | Thread-per-core: one ring and one executor per thread; spawned tasks need not be `Send`. | `SINGLE_ISSUER` and `DEFER_TASKRUN` assume one submitting thread, registered files and buffers belong to a single ring, and the hot path needs no atomics or locks. |
 | Work stealing | Not in the first release, but kept possible (see [Keeping work stealing possible](#keeping-work-stealing-possible)). | It fights per-ring state, but some workloads want it. |
-| Send I/O | Portable operations (`PortableOp`, and `PortableFd` for a descriptor) run on the ring of the thread that polls them; `fs::portable`'s file runs its operations as portable ones, and `net::portable`'s sockets are plain nonblocking descriptors whose reads and writes are system calls made at once, which wait on the polling thread's ring only when there is nothing to read or no room; the sockets and files of `net` and `fs` stay with their ring. | Futures that must be `Send`, as `async_trait`'s, hyper-util's client and those spawned onto another core are, could hold no I/O of the ring; a portable operation costs a comparison a poll while it stays on its thread, and a portable socket makes the system calls tokio's does. |
+| Send I/O | Portable operations (`PortableOp`, and `PortableFd` for a descriptor) run on the ring of the thread that polls them, and where no driver is current, on another executor's thread, on the foreign ring the embedder sets, or fail with `ENOSYS` (`Unsupported`) if none is set; `fs::portable`'s file runs its operations as portable ones, and `net::portable`'s sockets and a child's pipes are plain nonblocking descriptors whose reads and writes are system calls made at once, which wait on the polling thread's ring only when there is nothing to read or no room; the sockets and files of `net` and `fs` stay with their ring. | Futures that must be `Send`, as `async_trait`'s, hyper-util's client and those spawned onto another core are, could hold no I/O of the ring; a portable operation costs a comparison a poll while it stays on its thread, and a portable socket makes the system calls tokio's does. |
 | Minimum kernel | Linux 6.10. Detected by capability, not by version string. | 6.1, the oldest LTS with `DEFER_TASKRUN`, had everything the core needs, but 6.10 adds bundles, which send and receive several provided buffers per request: the network path needs them to beat epoll on large messages (see [Benchmarks](#benchmarks)). It also brings `NO_SQARRAY` (6.6), multishot read (6.7) and socket options through `URING_CMD` (6.7). Distribution kernels backport features, so version numbers mislead. |
 | Bindings | Our own, in `ruio-sys`: written by hand from the kernel's uapi header and tested against it. | Full control of the ABI surface and the hot path, no bindgen at build time, and new kernel features arrive when we need them. |
 | Interop | `futures-io` and `tokio::io` adapters in `ruio-compat`, which hyper and rustls run over, and a connector of portable streams for hyper-util's client. | Ecosystem access matters, but must not shape the core API. |
@@ -113,7 +113,16 @@ it is dropped. Three rules follow.
    ended, its completion or that the kernel had not finished it, in a
    registry of the process, where the future finds it on whichever thread:
    it completes with the completion, or, if the kernel may still use its
-   memory, leaks it and never completes.
+   memory, leaks it and never completes. One first polled on a thread with
+   no driver sends the foreign ring only its entry, prepared under the
+   ring's mailbox lock so that only an entry the ring takes is prepared,
+   and a ticket the ring sends the completion back through: the operation,
+   and the memory the kernel uses, stay with the future on its thread, so
+   nothing that is not `Send` crosses. A future dropped while the kernel
+   has its operation has the ring cancel it, and keeps the operation in a
+   grave of its thread until the completion comes, when the thread's next
+   foreign operation completes it there and drops its output; one left
+   in flight as its thread ends is leaked.
 
 Receives let the kernel choose the buffer from a provided-buffer ring
 (`BufPool`), so idle connections do not pin memory. A completed receive
@@ -446,6 +455,33 @@ runs and as it shuts down.
   lets go of it too. `PortableFd::ready` is the same wait as a future of
   its own. The portable sockets and a child's pipes wait with it (see
   [Networking](#networking)).
+- On a thread with no current driver, a thread of tokio's or of
+  `futures::executor::block_on` say, a portable operation goes to the
+  foreign ring, which the embedder sets with `set_foreign_ring` from any
+  `RemoteRing`, a runtime's `Handle::ring` say, and fails at once with
+  `ENOSYS`, which the standard library names `Unsupported`, if none is set
+  or it has closed, so that the caller can do its I/O another way. Its
+  entry is prepared where it is polled and sent as a request, which the
+  ring's thread queues at its next turn as an orphan whose payload is a
+  ticket; the completion goes into the ticket and wakes the task, and the
+  future completes the operation where it is, so an operation that is not
+  `Send` runs there too. A future dropped meanwhile has the ring cancel the
+  operation, which a grave of its thread keeps until the completion comes,
+  and a detached one is kept so too. Each thread keeps a copy of the
+  foreign ring, refreshed when the setting moves on, so the threads that
+  send to it take no lock but the ring's mailbox. A descriptor whose entry
+  went to the mailbox closes after it: the ring takes what other threads
+  asked before it closes a descriptor in order, and a ring that closes
+  does what the last requests ask, and submits it, under the mailbox's
+  lock, before another thread can find it closed and close a descriptor at
+  once. An operation first polled on a runtime's thread takes the path it
+  did, past one branch; `foreign nop` makes 172k portable no-ops a second
+  from a plain thread, each two wakes across cores (see [The runtime
+  itself](#the-runtime-itself)).
+- `PortableFd::poll_op` polls an operation the caller keeps beside the
+  descriptor across polls, as a `ReadyWait` keeps its poll, and records the
+  ring it queues on, so that the descriptor closes after it: what the
+  portable file's poll methods keep their read or write in flight with.
 
 ### Kernel features
 
@@ -1144,6 +1180,16 @@ baseline are used only when probed.
   `AsyncFd`, and 1.68M on the multishot poll; each is three system calls on
   either runtime, so both are near the floor, and the ring's completion
   path is what ruio gains by (see [The runtime itself](#the-runtime-itself)).
+- `io::portable::AsyncFd` is the `Send` counterpart, shaped as tokio's
+  `AsyncFd`, so code written for it moves over: `readable`, `writable`
+  and `ready` give a guard whose `try_io` runs the owner's call and clears
+  the readiness if it would block, `poll_read_ready` and `poll_write_ready`
+  keep their waits in the wrapper, and `get_ref` reaches the owner. A
+  readiness cache answers a wait with no system call while it holds the
+  events; a wait it cannot answer is one `POLL_ADD` as a portable
+  operation, on the ring of the thread that polls it or the foreign ring.
+  The poll is level-triggered, so clearing never loses readiness that is
+  still there.
 - `signal` delivers signals to tasks: `signal(kind)` gives a `Signal` whose
   `recv` completes each time the signal arrives, and `ctrl_c` waits for
   `SIGINT`. A process-wide handler is installed for each kind once, the
@@ -1164,6 +1210,13 @@ baseline are used only when probed.
   which threads other libraries make would not have. In `ruio-bench micro`
   a signal raised and received runs 420k times a second, 1.3× tokio's, the
   raise's own calls being most of either.
+  A listener made where no runtime runs has no dispatcher to count on,
+  and hands the signals on itself while it is received: it takes the
+  eventfd's count with a nonblocking read, and waits for the eventfd with
+  a portable poll on the foreign ring; where no ring could wait, `signal`
+  refuses with `Unsupported` before it installs anything. Listeners are
+  `Send` and `Sync`, and one made under a runtime is woken by its
+  dispatcher wherever it is polled.
 
 `ruio::net::portable` has `TcpStream`, `TcpListener`, `UnixStream` and
 `UnixListener` that are `Send` and `Sync`, for code whose futures must be:
@@ -1218,6 +1271,12 @@ round trip; hyper-util's client makes 37k requests a second through them
 one at a time, and 106k from 16 tasks at once through one client, against
 tokio's 36k and 108k (see [The runtime itself](#the-runtime-itself)).
 
+A thread of another executor's reads and writes a portable socket, or a
+child's pipe, the same way, and its waits go to the foreign ring (see
+[Portable operations](#portable-operations)): from tokio's current-thread
+runtime the round trip runs 44k times a second, against tokio's own
+stream's 50k, each wait a request to the ring's core and a wake back.
+
 ## Files
 
 `ruio::fs` has `File`, `OpenOptions`, `Metadata` and `Advice`, and the
@@ -1228,17 +1287,17 @@ the ring of the thread's runtime, and `read_link`, `canonicalize`,
 `set_permissions`, `copy` and `remove_dir_all`, running on the blocking
 pool, which io_uring has no operation for.
 
-The functions that take a path, all but `read_dir`, run their operations as
-portable ones (see [Portable operations](#portable-operations)), so their
-futures are `Send`: `read` and `write` open the file as a `PortableFd`, read
-or write it through it to the end, and close it, `write` with a close of its
-own whose result it reports. On the thread that polls them they cost what
-the ring's own operations do: a 4 KiB file is read whole 2.79 times as often
-as through tokio's `fs::read`, its status 2.40 times as often, and 4 KiB
-written to a file emptied each time 1.13 times, the open that creates and
-truncates going to an io-wq worker (see [The runtime
-itself](#the-runtime-itself)). A `File` stays with its ring, and so does a
-`ReadDir`.
+The functions that take a path, `read_dir` among them, run their
+operations as portable ones (see [Portable operations](#portable-operations)),
+so their futures are `Send`: `read` and `write` open the file as a
+`PortableFd`, read or write it through it to the end, and close it, `write`
+with a close of its own whose result it reports. On the thread that polls
+them they cost what the ring's own operations do: a 4 KiB file is read
+whole 2.79 times as often as through tokio's `fs::read`, its status 2.40
+times as often, and 4 KiB written to a file emptied each time 1.13 times,
+the open that creates and truncates going to an io-wq worker (see [The
+runtime itself](#the-runtime-itself)). A `File` stays with its ring; a
+`ReadDir` and its entries are `Send` and `Sync`, on a `PortableFd`.
 
 `fs::portable::File` is a file that is `Send` and `Sync`, on a
 `PortableFd`: each of its operations, `read_at` and `write_at` and their
@@ -1250,6 +1309,20 @@ always ready, so unlike a socket it has nothing to gain from nonblocking
 reads: they go through the ring, as the thread's `File`'s do.
 `OpenOptions::open_portable` opens one, and refuses a direct descriptor and
 a polled file, which a plain descriptor of no one ring cannot be.
+
+The portable file also reads, writes and seeks through poll methods, as
+tokio's file does, for the poll-based traits: `poll_read`, `poll_write`,
+`poll_flush`, `start_seek` and `poll_seek`. They keep a buffer of the
+file's own and one operation in flight at the file's position, kept beside
+the descriptor with `PortableFd::poll_op`: a read of what the caller's
+buffer has room for, up to 2 MiB, whose bytes it takes and whose rest waits
+for the next read; a write of the caller's bytes copied there, which goes
+behind, done as far as the caller can tell once it is on its way, written
+whole with as many writes as it takes, and reporting a failure at the next
+call. A flush waits for it, `close` waits and reports, and dropping the
+file lets it finish before the descriptor closes. A seek is one `lseek(2)`
+made once nothing is in flight, from where the reader is, and a write after
+a read that took more than the caller has goes there too.
 
 - Reads and writes take owned buffers and hand them back with the result, at
   an offset, so any number can run at once. `read_exact_at` and
@@ -1327,7 +1400,7 @@ a polled file, which a plain descriptor of no one ring cannot be.
   that a future dropped mid-way cannot leave `fchmod` aimed at a number the
   file closed and another reused.
 - io_uring has no operation that reads a directory, so `read_dir` opens
-  one through the ring, whose open takes the cached path without a worker
+  one with a portable operation, whose open takes the cached path without a worker
   thread, and `ReadDir` reads its entries with `getdents64(2)`, 32 KiB at
   a time, on the blocking pool, and ahead: it keeps two buffers, and while
   a task takes the entries of one batch the pool reads the next into the
@@ -1397,6 +1470,11 @@ a polled file, which a plain descriptor of no one ring cannot be.
   cannot hold up the loop, and one after a short one waits for the pipe
   first: the pipes are the portable sockets' kind of descriptor (see
   [Networking](#networking)).
+- The pipes read and write the caller's buffers too, with `poll_read`,
+  `poll_write` and `poll_write_vectored`, which keep their waits in the
+  pipe from one poll to the next as the portable streams do, and
+  `try_read`, `try_write`, `readable` and `writable`; `PortableCompat`
+  gives them the poll-based traits (see [Compatibility](#compatibility)).
 - `output` and `wait_with_output` read the output and the error at once, so
   a child that fills one pipe while the other is read cannot stall.
   `status` and `output` spawn as they are called, and return futures that
@@ -1523,15 +1601,24 @@ do. hyper's upgrades need `Send` streams, which the thread's are not and
 the portable ones are.
 
 `ruio_compat::PortableCompat` adapts the portable streams of
-[Networking](#networking) to tokio's, futures-io's and hyper's traits with
-no buffers of its own: their reads and writes are system calls made at
-once, so a read goes into the caller's buffer, uninitialized memory
-included, and a write comes from the caller's buffers, a vectored one as
-one `sendmsg(2)`, hyper's head and body together, with no copy either way.
-A flush has nothing to wait for, and a shutdown shuts the writing half down
-at once. The adapter is `Send`, `Sync` and `Unpin`, as the stream is, and
-its waits are the stream's, kept until it is polled again, on whichever
-thread.
+[Networking](#networking), a child's pipes and the portable file to
+tokio's, futures-io's and hyper's traits with no buffers of its own. The
+sealed `PortableReader` and `PortableWriter` say which way each goes: a
+stream and a file both, a child's standard output and error only reading,
+and its standard input only writing. A stream's and a pipe's reads and
+writes are system calls made at once, so a read goes into the caller's
+buffer, uninitialized memory included, and a write comes from the caller's
+buffers, a vectored one as one `sendmsg(2)` or `writev(2)`, hyper's head and
+body together, with no copy either way. A flush has nothing to wait for,
+and a shutdown shuts a connection's writing half down at once, and is
+ready at once for a child's standard input, as tokio's is, which closes
+as it is dropped. A file reads and writes through its own poll methods,
+whose buffer is the file's: a flush waits for its write gone behind, a
+shutdown flushes, and tokio's and futures-io's `AsyncSeek` seek it, so code
+written for tokio's `File`, made with `File::create` or with `create_new`,
+runs on ruio's wrapped in the adapter. The adapter is `Send`, `Sync` and
+`Unpin`, as what it adapts is, and its waits are kept until it is polled
+again, on whichever thread.
 
 With the `client` feature, `ruio_compat::client` runs hyper-util's legacy
 client on them. `Connector` is a `tower::Service<Uri>` that resolves the
@@ -2740,6 +2827,28 @@ client making two reads a request; with one, it reads 0.98× in these runs
 and 1.01× in another pass of three, the same as tokio's within the noise.
 The rest of a request is hyper's, and its pool's, on either runtime.
 
+`foreign nop` and `foreign round trip`, added with the foreign ring,
+measure portable I/O polled where no runtime runs. `foreign nop` polls
+portable no-ops one at a time on a plain thread, with a runtime on a third
+core as the foreign ring: the entry goes there and the completion comes
+back, each way a wake of the other thread. `foreign round trip` is
+`portable round trip` polled by tokio's current-thread runtime, against
+tokio's own stream. Medians of five runs on CPU 40:
+
+| Step | tokio | ruio |
+|---|---:|---:|
+| portable round trip | 50k | 50k (1.00×) |
+| foreign nop | | 172k |
+| foreign round trip | 50k | 44k (0.89×) |
+
+A foreign no-op is some 5.8 µs, the two wakes across cores; a wait of a
+portable stream on tokio's thread costs that over tokio's own, and the
+round trip keeps nine tenths of tokio's rate. Three passes of the other
+rows taken in turns with the commit before the foreign ring read the same
+within the noise, the portable no-ops 1 to 2 percent lower in each pass,
+which may be what the foreign path costs an operation that stays on its
+ring's thread, or the noise.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -3009,6 +3118,16 @@ Since M7:
   runs hyper-util's client on them, one client for every core, as fast as
   on tokio (see [Networking](#networking), [Files](#files) and
   [Compatibility](#compatibility)).
+- Portable I/O where no runtime runs: a portable operation first polled on
+  a thread with no driver, one of tokio's say, sends its entry to the
+  foreign ring the embedder sets, keeping the operation, and fails with
+  `Unsupported` where none is set; signals reach listeners made there;
+  the pipes have poll methods, and `PortableCompat` adapts them and the
+  portable file, whose poll methods read, write behind and seek as tokio's
+  file does; `io::portable::AsyncFd` is a `Send` `AsyncFd` shaped as
+  tokio's; and `read_dir` is `Send` (see [Portable
+  operations](#portable-operations), [Files](#files) and
+  [Compatibility](#compatibility)).
 - The cooperative budget is public as `ruio::coop`, for the primitives of
   other crates that can be ready every time they are polled (see
   [Executor](#executor)).
@@ -3025,8 +3144,8 @@ Since M7:
   of it into the caller's, and a send through the ring a write behind whose
   order holds when the stream moves between rings; whether that beats a
   system call made at once, and from how many connections, is unmeasured.
-- Portable datagram sockets and directory reads. `UdpSocket`,
-  `UnixDatagram` and `ReadDir` have no portable form yet.
+- Portable datagram sockets. `UdpSocket` and `UnixDatagram` have no
+  portable form yet.
 - The receive stream's stall. While the ask of a buffer less (see
   [Networking](#networking)) was built, the test of many re-arms once hung
   within a few hundred cycles: a capped receive, issued at submission
