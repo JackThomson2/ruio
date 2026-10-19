@@ -1420,14 +1420,48 @@ pub async fn set_permissions(path: impl AsRef<Path>, perm: std::fs::Permissions)
     on_pool(move || std::fs::set_permissions(path, perm)).await
 }
 
+/// The buffer a whole-file read starts with where the file's size says
+/// nothing of what it holds, and doubles while the reads fill it.
+const READ_FIRST: usize = 8 << 10;
+
+/// How many bytes the read past a file's size asks for, to find the end
+/// there: as many as the standard library's probe.
+const PROBE: usize = 32;
+
 /// Reads the whole file at `path`.
+///
+/// The buffer is as long as the kernel says the file is, and one read fills
+/// it, so that the kernel's readahead sees the whole file, as it does under
+/// the standard library's `fs::read`, rather than one read at a time. A read
+/// of a few bytes past the end goes to the kernel with it and finds the end
+/// there, so that a file is read in one turn of the ring. Should that read
+/// find more, the file having grown, or the first stop short, the reads go
+/// on from there until one finds the end, as they do, doubling the buffer,
+/// for a file whose size says nothing, such as a procfs file's 0.
 ///
 /// # Errors
 ///
-/// What opening and reading the file report.
+/// What opening and reading the file report, and `OutOfMemory` if no buffer
+/// as long as the file's size can be had.
 pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     let file = open_portable(path, libc::O_RDONLY, 0).await?;
-    let mut data = Vec::with_capacity(8 << 10);
+    read_whole(&file, cached_size(&file)).await
+}
+
+/// Reads `file`, which the kernel says holds `size` bytes, from its start
+/// to its end, as [`read`] describes.
+async fn read_whole(file: &PortableFd, size: usize) -> io::Result<Vec<u8>> {
+    let mut data = match size {
+        0 => Vec::with_capacity(READ_FIRST),
+        size => {
+            let mut data = Vec::new();
+            data.try_reserve_exact(size).map_err(out_of_memory)?;
+            match read_sized(file, data, size).await? {
+                (data, true) => return Ok(data),
+                (data, false) => data,
+            }
+        }
+    };
     loop {
         if data.len() == data.capacity() {
             data.reserve(data.capacity());
@@ -1441,6 +1475,109 @@ pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
             return Ok(data);
         }
     }
+}
+
+/// The size of the open `file` as the kernel has it, or 0 if it gives none:
+/// `FIONREAD`, which the kernel answers for a regular file from the size it
+/// keeps in the inode, less the position, which is 0, calling into no file
+/// system. So it never waits on a file server, as `lseek(2)` to the end can
+/// on NFS or FUSE, and costs less than `statx(2)`, which copies the whole
+/// status out. The answer is an `int`: a file of 2 GiB or more, which that
+/// cannot hold, may come back negative, and has its size from
+/// [`status_size`] then, or short of it, which the read finds. A size gone
+/// stale costs the read only more turns.
+fn cached_size(file: &PortableFd) -> usize {
+    let mut size: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one `int` into `size`.
+    if unsafe { libc::ioctl(file.as_raw_fd(), libc::FIONREAD, &raw mut size) } != 0 {
+        return 0;
+    }
+    usize::try_from(size).unwrap_or_else(|_| status_size(file))
+}
+
+/// The size of the open `file` as the status the kernel has cached for it
+/// says, or 0 if it says none: one `statx(2)`, which asks no file server
+/// (`AT_STATX_DONT_SYNC`), so that it never waits on one.
+fn status_size(file: &PortableFd) -> usize {
+    let mut status = mem::MaybeUninit::<libc::statx>::uninit();
+    let flags = libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC;
+    // SAFETY: statx(2) reads the empty path, which is nul-terminated, and
+    // writes at most one `statx` into `status`, which has room for it.
+    let done = unsafe {
+        libc::statx(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            flags,
+            libc::STATX_SIZE,
+            status.as_mut_ptr(),
+        )
+    };
+    if done != 0 {
+        return 0;
+    }
+    // SAFETY: the call succeeded, and the kernel writes the whole structure.
+    let status = unsafe { status.assume_init() };
+    if status.stx_mask & libc::STATX_SIZE == 0 {
+        return 0;
+    }
+    usize::try_from(status.stx_size).unwrap_or(usize::MAX)
+}
+
+/// Reads `file`, which the kernel says holds `size` bytes, into `data`,
+/// which has room for that many: a read of them, and a read of up to
+/// [`PROBE`] bytes past them, queued together, so that one submission takes
+/// both to the kernel. The output is the data read, and whether that is all
+/// of the file: the first read took `size` bytes and the second found the
+/// end. Otherwise the data is what has been read in order, the second
+/// read's bytes after the first's if it found more, for the caller to read
+/// on from.
+async fn read_sized(file: &PortableFd, data: Vec<u8>, size: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut whole = file.op(|fd| Read::at(fd, data, 0));
+    let mut probe = file.op(|fd| Read::at(fd, Vec::with_capacity(PROBE), size as u64));
+    let (mut whole_read, mut probe_read) = (None, None);
+    poll_fn(|cx| {
+        if whole_read.is_none()
+            && let Poll::Ready(read) = Pin::new(&mut whole).poll(cx)
+        {
+            whole_read = Some(read);
+        }
+        if probe_read.is_none()
+            && let Poll::Ready(read) = Pin::new(&mut probe).poll(cx)
+        {
+            probe_read = Some(read);
+        }
+        if whole_read.is_some() && probe_read.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    let (read, mut data) = whole_read.expect("the read of the whole file completed");
+    let (probed, past) = probe_read.expect("the read past the end completed");
+    // A read that stopped short, or took more, leaves the bytes past the size
+    // where they may not follow on: the caller reads on from where it ended.
+    if read? != size {
+        return Ok((data, false));
+    }
+    let probed = probed?;
+    if probed == 0 {
+        return Ok((data, true));
+    }
+    // Longer than the kernel said, the file has grown since, or is too long
+    // for `FIONREAD`'s answer: its status says how long it is now, and the
+    // buffer makes room for that, and for the read that finds the end there,
+    // before it takes the bytes found past the size, so that it grows once.
+    let rest = status_size(file).max(size + probed) - size;
+    data.try_reserve_exact(rest + PROBE)
+        .map_err(out_of_memory)?;
+    data.extend_from_slice(&past);
+    Ok((data, false))
+}
+
+/// The error of a buffer that could not be had.
+fn out_of_memory(_: std::collections::TryReserveError) -> io::Error {
+    io::ErrorKind::OutOfMemory.into()
 }
 
 /// Reads the whole file at `path`, which must hold UTF-8.
@@ -1619,4 +1756,100 @@ pub async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u6
 pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref().to_owned();
     on_pool(move || std::fs::remove_dir_all(path)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::Runtime;
+
+    fn run<F: Future>(future: F) -> F::Output {
+        Runtime::new()
+            .unwrap()
+            .block_on(crate::time::timeout(Duration::from_secs(20), future))
+            .expect("finished in time")
+    }
+
+    /// `len` bytes that repeat only every 251.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Writes `data` to a file of the test's own, named `name`, and reads it
+    /// whole as a file whose status said it holds `size` bytes, removing it
+    /// after.
+    fn read_as_if(name: &str, data: &[u8], size: usize) -> Vec<u8> {
+        let path = std::env::temp_dir().join(format!("ruio-fs-{name}-{}", std::process::id()));
+        std::fs::write(&path, data).unwrap();
+        let read = run(async {
+            let file = open_portable(&path, libc::O_RDONLY, 0).await?;
+            read_whole(&file, size).await
+        });
+        std::fs::remove_file(&path).unwrap();
+        read.unwrap()
+    }
+
+    /// A file read with the size its status gives fills a buffer of that
+    /// size, which never doubles.
+    #[test]
+    fn a_file_is_read_into_a_buffer_of_its_size() {
+        for len in [1, PROBE, 4096, 100_003] {
+            let read = read_as_if("sized", &pattern(len), len);
+            assert!(read == pattern(len), "{len} bytes");
+            assert!(
+                read.capacity() < 2 * len,
+                "{len} bytes in {}",
+                read.capacity()
+            );
+        }
+    }
+
+    /// A file that holds more than its size said, as one that grew does, is
+    /// read on past it to its end.
+    #[test]
+    fn a_file_longer_than_its_size_is_read_to_its_end() {
+        for (len, size) in [(10_000, 5_000), (10_000, 9_990), (100, 1), (40, 8)] {
+            let read = read_as_if("longer", &pattern(len), size);
+            assert!(read == pattern(len), "{len} bytes said to be {size}");
+            // Its status gave the rest's room, which was not doubled.
+            assert!(
+                read.capacity() <= len + 2 * PROBE,
+                "{len} bytes in {}",
+                read.capacity()
+            );
+        }
+    }
+
+    /// The size the kernel gives is the file's, and none for a procfs file
+    /// or a directory.
+    #[test]
+    fn the_kernel_gives_a_files_size() {
+        let path = std::env::temp_dir().join(format!("ruio-fs-size-{}", std::process::id()));
+        std::fs::write(&path, pattern(100_003)).unwrap();
+        let sizes = run(async {
+            let mut sizes = Vec::new();
+            for path in [&*path, "/proc/self/status".as_ref(), "/".as_ref()] {
+                let file = open_portable(path, libc::O_RDONLY, 0).await?;
+                sizes.push((cached_size(&file), status_size(&file)));
+            }
+            io::Result::Ok(sizes)
+        });
+        std::fs::remove_file(&path).unwrap();
+        let sizes = sizes.unwrap();
+        assert_eq!(sizes[0], (100_003, 100_003));
+        assert_eq!(sizes[1], (0, 0));
+        assert_eq!(sizes[2].0, 0);
+    }
+
+    /// A file that holds less than its size said, as one cut short does, or
+    /// a sysfs attribute, is read to its end.
+    #[test]
+    fn a_file_shorter_than_its_size_is_read_to_its_end() {
+        for (len, size) in [(5_000, 10_000), (0, 4096), (31, 32)] {
+            let read = read_as_if("shorter", &pattern(len), size);
+            assert!(read == pattern(len), "{len} bytes said to be {size}");
+        }
+    }
 }

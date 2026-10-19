@@ -1035,6 +1035,42 @@ async fn read_takes_a_file_to_its_end_whatever_its_size() -> io::Result<()> {
     Ok(())
 }
 
+/// Files of sizes about the edges of a page, and of the few bytes a read
+/// past the size asks for, read whole as the standard library reads them;
+/// and a sysfs attribute, whose size of a page says more than it holds.
+#[ruio::test]
+async fn read_takes_files_of_every_size_whole() -> io::Result<()> {
+    let scratch = Scratch::new("sizes");
+    for len in [
+        1,
+        31,
+        32,
+        33,
+        4095,
+        4096,
+        4097,
+        8192,
+        8193,
+        65_536,
+        (1 << 20) + 7,
+    ] {
+        let path = scratch.path(&format!("{len}"));
+        std::fs::write(&path, pattern(len))?;
+        assert!(
+            within(fs::read(&path)).await? == pattern(len),
+            "{len} bytes"
+        );
+    }
+    let attribute = "/sys/devices/system/cpu/online";
+    if std::fs::metadata(attribute).is_ok_and(|status| status.len() == 4096) {
+        assert_eq!(
+            within(fs::read(attribute)).await?,
+            std::fs::read(attribute)?
+        );
+    }
+    Ok(())
+}
+
 /// How many of the process's descriptors are open on the directory `dir`,
 /// as `/proc/self/fd` tells: each that links to its path, which is the
 /// scratch directory of one test, so no other test opens it.
