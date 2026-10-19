@@ -77,6 +77,9 @@
 //! - `read file`: a 4 KiB file read whole by path with `fs::read`: opened,
 //!   read, read to its end and closed, each on the ring of the thread that
 //!   polls it, in a future that is `Send`; tokio's on its blocking pool.
+//! - `read file 1 MiB`: the same for a cached file of 1 MiB, which one read
+//!   fills, sized from the file, where a buffer that grew from a few KiB by
+//!   doubling would take a read and a copy of what it held at each step.
 //! - `write file`: 4 KiB written to a file by path with `fs::write`, which
 //!   makes or empties it, and closes it: the open, which creates and
 //!   truncates, in an io-wq worker; tokio's on its blocking pool. On tmpfs,
@@ -404,6 +407,11 @@ pub(crate) const ALL: &[Micro] = &[
         name: "read file",
         ruio: ruio_read_file,
         tokio: Some(tokio_read_file),
+    },
+    Micro {
+        name: "read file 1 MiB",
+        ruio: ruio_read_large_file,
+        tokio: Some(tokio_read_large_file),
     },
     Micro {
         name: "write file",
@@ -1255,28 +1263,49 @@ static SMALL_DATA: [u8; SMALL_FILE] = [7; SMALL_FILE];
 
 /// A 4 KiB file read whole by path.
 fn ruio_read_file(load: &Load) -> io::Result<f64> {
+    ruio_read_whole(load, SMALL_FILE)
+}
+
+fn tokio_read_file(load: &Load) -> io::Result<f64> {
+    tokio_read_whole(load, SMALL_FILE)
+}
+
+/// How many bytes `read file 1 MiB` reads.
+const LARGE_FILE: usize = 1 << 20;
+
+/// A cached 1 MiB file read whole by path.
+fn ruio_read_large_file(load: &Load) -> io::Result<f64> {
+    ruio_read_whole(load, LARGE_FILE)
+}
+
+fn tokio_read_large_file(load: &Load) -> io::Result<f64> {
+    tokio_read_whole(load, LARGE_FILE)
+}
+
+/// A file of `len` bytes read whole by path, again and again.
+fn ruio_read_whole(load: &Load, len: usize) -> io::Result<f64> {
     let measure = load.measure;
     let named = Named::new("read-file")?;
-    std::fs::write(&named.file, SMALL_DATA)?;
+    std::fs::write(&named.file, vec![7; len])?;
     ruio_runtime()?.block_on(async move {
         let path = &named.file;
         Ok(rate(measure, async || {
             let data = ruio::fs::read(path).await.expect("the file reads");
-            assert_eq!(data.len(), SMALL_FILE);
+            assert_eq!(data.len(), len);
         })
         .await)
     })
 }
 
-fn tokio_read_file(load: &Load) -> io::Result<f64> {
+fn tokio_read_whole(load: &Load, len: usize) -> io::Result<f64> {
     let measure = load.measure;
     let named = Named::new("read-file")?;
-    std::fs::write(&named.file, SMALL_DATA)?;
+    std::fs::write(&named.file, vec![7; len])?;
     tokio_runtime()?.block_on(async move {
         let path = &named.file;
         Ok(rate(measure, async || {
             let data = tokio::fs::read(path).await.expect("the file reads");
-            assert_eq!(data.len(), SMALL_FILE);
+            assert_eq!(data.len(), len);
         })
         .await)
     })
