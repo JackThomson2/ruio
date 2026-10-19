@@ -592,6 +592,26 @@ fn ready_waits_with_a_poll_of_its_own() {
     assert_send(&socket.ready(READABLE));
 }
 
+/// An operation kept beside its descriptor and polled through it records
+/// its ring as one borrowing the descriptor does: dropped with the read
+/// queued and not yet submitted, the descriptor closes after it, and the
+/// read, which reached the kernel first, finds its file and its data.
+#[test]
+fn an_operation_polled_through_its_descriptor_closes_it_after() {
+    let driver = Driver::new().unwrap();
+    let _entered = driver.enter();
+    let (reader, mut writer) = pipe();
+    let reader = PortableFd::new(reader.into());
+    let mut read = PortableOp::new(Read::new(reader.as_raw_fd(), Vec::with_capacity(16)));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(reader.poll_op(&mut cx, &mut read).is_pending());
+    drop(reader);
+    writer.write_all(b"kept").unwrap();
+    let (read, buf) = block_on(&driver, read);
+    assert_eq!((read.unwrap(), &buf[..]), (4, &b"kept"[..]));
+    settle(&driver);
+}
+
 /// A wait whose poll is in flight moves to another thread with its
 /// descriptor, and completes there with the readiness its ring sends over.
 #[test]

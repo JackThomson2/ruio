@@ -570,6 +570,38 @@ impl PortableFd {
         PortableOp::naming(make(self.fd()), &self.ring)
     }
 
+    /// Polls `op`, an operation naming the descriptor that the caller keeps
+    /// beside it from one call to the next, as a [`ReadyWait`] keeps its
+    /// poll, and records the ring it queues on, or is sent to, as it is
+    /// first polled, as [`op`](PortableFd::op) does, so that the descriptor
+    /// closes after it. An adapter that owns the descriptor can so keep a
+    /// read or a write of its own in flight across polls, which an operation
+    /// borrowing the descriptor could not live beside.
+    ///
+    /// The caller lets go of the operation once it is ready, as a future is
+    /// not polled again after it completes; dropping it before then lets go
+    /// of it as dropping a [`PortableOp`] does. An operation polled first
+    /// for another descriptor, or otherwise, goes on as it is.
+    ///
+    /// # Panics
+    ///
+    /// If `op` is polled after it completed.
+    #[inline]
+    pub fn poll_op<T: Operation>(
+        &self,
+        cx: &mut Context<'_>,
+        op: &mut PortableOp<'static, T>,
+    ) -> Poll<T::Output> {
+        let unsubmitted = matches!(op.state, State::Unsubmitted(_));
+        let polled = Pin::new(&mut *op).poll(cx);
+        if unsubmitted && let Some(home) = op.ring() {
+            // Relaxed: the descriptor reads it as it is dropped, once this
+            // borrow of it is over, which orders the two.
+            self.ring.store(home, Ordering::Relaxed);
+        }
+        polled
+    }
+
     /// The descriptor, which stays open. Closing it then closes it at once,
     /// as dropping an [`OwnedFd`] does, before what a ring may still have
     /// queued naming it; dropping the `PortableFd` closes it in order.
@@ -624,13 +656,7 @@ impl PortableFd {
             poll.fd, fd,
             "a wait is polled for the descriptor it waits on"
         );
-        let unsubmitted = matches!(poll.op.state, State::Unsubmitted(_));
-        let polled = Pin::new(&mut poll.op).poll(cx);
-        if unsubmitted && let Some(home) = poll.op.ring() {
-            // Relaxed: the descriptor reads it as it is dropped, once this
-            // borrow of it is over, which orders the two.
-            self.ring.store(home, Ordering::Relaxed);
-        }
+        let polled = self.poll_op(cx, &mut poll.op);
         if polled.is_ready() {
             wait.poll = None;
         }
