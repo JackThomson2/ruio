@@ -3,11 +3,13 @@
 
 mod support;
 
-use std::future::Future;
-use std::io::{self, ErrorKind};
+use std::future::{Future, poll_fn};
+use std::io::{self, ErrorKind, SeekFrom};
+use std::mem::MaybeUninit;
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use ruio::fs::OpenOptions;
@@ -337,4 +339,166 @@ fn a_file_dropped_after_its_runtime_closes_at_once() {
     let other = std::fs::File::open(&path).unwrap();
     other.try_lock().unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"complete too");
+}
+
+/// Writes all of `data` through the file's poll methods, and flushes.
+async fn poll_write_all(file: &mut File, data: &[u8]) -> io::Result<()> {
+    let mut done = 0;
+    while done < data.len() {
+        let written = poll_fn(|cx| file.poll_write(cx, &data[done..])).await?;
+        assert!(written > 0);
+        done += written;
+    }
+    poll_fn(|cx| file.poll_flush(cx)).await
+}
+
+/// Reads everything left through the file's poll methods, `chunk` bytes at
+/// a time.
+async fn poll_read_to_end(file: &mut File, chunk: usize) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut buf = vec![MaybeUninit::uninit(); chunk];
+    loop {
+        let read = poll_fn(|cx| file.poll_read(cx, &mut buf)).await?;
+        if read == 0 {
+            return Ok(data);
+        }
+        // SAFETY: the read initialized the first `read` bytes.
+        data.extend(buf[..read].iter().map(|byte| unsafe { byte.assume_init() }));
+    }
+}
+
+/// Seeks through the file's poll methods.
+async fn seek(file: &mut File, pos: SeekFrom) -> io::Result<u64> {
+    file.start_seek(pos)?;
+    poll_fn(|cx| file.poll_seek(cx)).await
+}
+
+/// More than one write of the poll methods takes, written and read back
+/// through them, in chunks as a buffered reader asks for them.
+#[ruio::test]
+async fn the_poll_methods_write_and_read_a_file() -> io::Result<()> {
+    let scratch = Scratch::new("poll");
+    let path = scratch.path("file");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open_portable(&path)
+        .await?;
+    let data = pattern(3 << 20);
+    within(poll_write_all(&mut file, &data)).await?;
+    assert!(std::fs::read(&path)? == data);
+    assert_eq!(within(seek(&mut file, SeekFrom::Start(0))).await?, 0);
+    assert!(within(poll_read_to_end(&mut file, 7919)).await? == data);
+    within(file.close()).await
+}
+
+/// A write goes behind: done at once as far as the caller can tell, with
+/// the bytes in the file once the flush, which waits for it, says so.
+#[ruio::test]
+async fn a_write_goes_behind_and_a_flush_waits_for_it() -> io::Result<()> {
+    let scratch = Scratch::new("behind");
+    let path = scratch.path("file");
+    let mut file = File::create(&path).await?;
+    let written = poll_fn(|cx| file.poll_write(cx, b"behind")).await?;
+    assert_eq!(written, 6);
+    assert_eq!(std::fs::metadata(&path)?.len(), 0, "not yet on its way");
+    within(poll_fn(|cx| file.poll_flush(cx))).await?;
+    assert_eq!(std::fs::read(&path)?, b"behind");
+    Ok(())
+}
+
+/// Seeks move where the poll methods read and write, from the start, from
+/// where the reader is and from the end; with none asked, the position is
+/// where the reader is.
+#[ruio::test]
+async fn seeks_move_where_the_poll_methods_read_and_write() -> io::Result<()> {
+    let scratch = Scratch::new("seek");
+    let path = scratch.path("file");
+    std::fs::write(&path, b"0123456789")?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open_portable(&path)
+        .await?;
+    assert_eq!(within(seek(&mut file, SeekFrom::Start(3))).await?, 3);
+    let mut two = [MaybeUninit::uninit(); 2];
+    assert_eq!(within(poll_fn(|cx| file.poll_read(cx, &mut two))).await?, 2);
+    assert_eq!(within(seek(&mut file, SeekFrom::Current(2))).await?, 7);
+    assert_eq!(within(poll_read_to_end(&mut file, 16)).await?, b"789");
+    assert_eq!(within(seek(&mut file, SeekFrom::End(-4))).await?, 6);
+    within(poll_write_all(&mut file, b"XY")).await?;
+    assert_eq!(within(poll_fn(|cx| file.poll_seek(cx))).await?, 8);
+    assert_eq!(std::fs::read(&path)?, b"012345XY89");
+    let err = within(seek(&mut file, SeekFrom::Current(-100)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    Ok(())
+}
+
+/// A read started for more than the caller then takes keeps the rest for
+/// the next read; a write after it goes where the reader is, before what
+/// the read took ahead.
+#[ruio::test]
+async fn a_write_after_a_read_ahead_goes_where_the_reader_is() -> io::Result<()> {
+    let scratch = Scratch::new("ahead");
+    let path = scratch.path("file");
+    std::fs::write(&path, b"0123456789")?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open_portable(&path)
+        .await?;
+    let mut ten = [MaybeUninit::uninit(); 10];
+    let pending = poll_fn(|cx| Poll::Ready(file.poll_read(cx, &mut ten).is_pending())).await;
+    assert!(pending, "the read is in flight");
+    let mut three = [MaybeUninit::uninit(); 3];
+    assert_eq!(
+        within(poll_fn(|cx| file.poll_read(cx, &mut three))).await?,
+        3
+    );
+    assert_eq!(within(poll_fn(|cx| file.poll_seek(cx))).await?, 3);
+    within(poll_write_all(&mut file, b"ab")).await?;
+    assert_eq!(std::fs::read(&path)?, b"012ab56789");
+    assert_eq!(within(poll_read_to_end(&mut file, 4)).await?, b"56789");
+    Ok(())
+}
+
+/// A file dropped with a write in flight lets it finish, and closes after
+/// it; one closed waits for it.
+#[ruio::test]
+async fn a_write_in_flight_finishes_as_the_file_is_dropped_or_closed() -> io::Result<()> {
+    let scratch = Scratch::new("dropped-write");
+    let path = scratch.path("dropped");
+    let mut file = File::create(&path).await?;
+    assert_eq!(poll_fn(|cx| file.poll_write(cx, b"finished")).await?, 8);
+    drop(file);
+    let deadline = Instant::now() + PATIENCE;
+    while std::fs::read(&path)? != b"finished" {
+        assert!(Instant::now() < deadline, "the write never finished");
+        ruio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let path = scratch.path("closed");
+    let mut file = File::create(&path).await?;
+    assert_eq!(poll_fn(|cx| file.poll_write(cx, b"closed")).await?, 6);
+    within(file.close()).await?;
+    assert_eq!(std::fs::read(&path)?, b"closed");
+    Ok(())
+}
+
+/// A write gone behind that fails reports at the next call.
+#[ruio::test]
+async fn a_write_that_fails_behind_reports_at_the_next_call() -> io::Result<()> {
+    let scratch = Scratch::new("failed");
+    let path = scratch.path("file");
+    std::fs::write(&path, b"read only")?;
+    let mut file = File::open(&path).await?;
+    assert_eq!(poll_fn(|cx| file.poll_write(cx, b"no")).await?, 2);
+    let err = within(poll_fn(|cx| file.poll_flush(cx))).await.unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+    within(poll_fn(|cx| file.poll_flush(cx))).await?;
+    assert_eq!(std::fs::read(&path)?, b"read only");
+    Ok(())
 }

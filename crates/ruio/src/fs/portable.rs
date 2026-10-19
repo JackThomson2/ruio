@@ -18,6 +18,21 @@
 //! not is what belongs to one ring: a direct descriptor, polled I/O,
 //! registered buffers, multishot reads into a pool and linked chains.
 //!
+//! Beside the operations on owned buffers, the file reads, writes and seeks
+//! through poll methods, as tokio's file does, for the poll-based traits
+//! that `ruio-compat`'s adapter gives it: [`poll_read`](File::poll_read),
+//! [`poll_write`](File::poll_write), [`poll_flush`](File::poll_flush),
+//! [`start_seek`](File::start_seek) and [`poll_seek`](File::poll_seek).
+//! They keep a buffer of the file's own and one operation in flight at the
+//! file's position: a read into the buffer, whose bytes the caller's buffer
+//! takes, and a write of the caller's bytes copied there, which goes behind,
+//! as tokio's does: done as far as the caller can tell once it is on its
+//! way, and reporting a failure at the next call, which waits for it to
+//! finish first. A flush waits for it, and so does closing the file with
+//! [`close`](File::close); dropping the file lets it finish. A seek is an
+//! `lseek(2)`, made once nothing is in flight, from where the reader is
+//! rather than where the file's read ahead of it.
+//!
 //! ```no_run
 //! use ruio::fs::portable::File;
 //!
@@ -59,16 +74,24 @@
 //! ```
 
 use std::fmt;
-use std::io;
+use std::future::poll_fn;
+use std::io::{self, SeekFrom};
+use std::mem::{self, MaybeUninit};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::ptr;
+use std::task::{Context, Poll, ready};
 
-use ruio_driver::buf::{BufResult, IoBuf, IoBufMut};
+use ruio_driver::buf::{BufResult, IoBuf, IoBufMut, Slice};
 use ruio_driver::ops::{self, Fallocate, Fsync, Ftruncate, Read, Statx, Write};
 use ruio_driver::{PortableFd, PortableOp};
 
 use super::{METADATA, Metadata, OpenOptions};
 use crate::io::{AsyncRead, AsyncWrite};
+
+/// The most one read or write of the poll methods moves, which bounds the
+/// buffer they keep, as tokio's file bounds its own.
+const MAX_BUF: usize = 2 << 20;
 
 /// An open file that is `Send` and `Sync`, whose every operation runs on
 /// the ring of the thread that polls it; see the [module](self).
@@ -84,6 +107,9 @@ use crate::io::{AsyncRead, AsyncWrite};
 /// # }
 /// ```
 pub struct File {
+    /// What the poll methods keep from one call to the next. Dropped before
+    /// the descriptor, which so closes after what it had in flight.
+    polling: Polling,
     fd: PortableFd,
 }
 
@@ -114,7 +140,10 @@ impl File {
 
     /// The file whose descriptor `fd` is.
     pub(super) fn from_fd(fd: PortableFd) -> Self {
-        Self { fd }
+        Self {
+            polling: Polling::new(),
+            fd,
+        }
     }
 
     /// Wraps a file from the standard library.
@@ -125,9 +154,12 @@ impl File {
     /// The standard library's file, which stays open. Closing it then closes
     /// it at once, before what a ring may still have queued naming it, as
     /// [`PortableFd::into_owned_fd`] says; dropping this file closes it in
-    /// order.
+    /// order. A write of the poll methods still in flight goes on, so flush
+    /// it first ([`poll_flush`](File::poll_flush)).
     pub fn into_std(self) -> std::fs::File {
-        self.fd.into_owned_fd().into()
+        let Self { polling, fd } = self;
+        drop(polling);
+        fd.into_owned_fd().into()
     }
 
     /// Reads into `buf`, up to its capacity, from `offset` on. Fewer bytes
@@ -242,13 +274,164 @@ impl File {
     /// Closes the file on the ring of the thread that polls the close,
     /// after what that ring has queued, reporting what closing it found,
     /// such as an error writing back data, where dropping it closes it
-    /// without saying.
+    /// without saying. A write of the poll methods still in flight finishes
+    /// first, and its failure, if it failed, is what comes back.
     ///
     /// # Errors
     ///
-    /// What `close(2)` reports.
-    pub async fn close(self) -> io::Result<()> {
-        PortableOp::new(ops::Close::new(self.fd.into_owned_fd())).await
+    /// What the write in flight, if any, and `close(2)` report.
+    pub async fn close(mut self) -> io::Result<()> {
+        let flushed = poll_fn(|cx| self.poll_flush(cx)).await;
+        let Self { polling, fd } = self;
+        drop(polling);
+        let closed = PortableOp::new(ops::Close::new(fd.into_owned_fd())).await;
+        flushed.and(closed)
+    }
+
+    /// Reads into the caller's `buf` from the file's position, which the
+    /// read advances, polled, as tokio's file reads: what the file's own
+    /// buffer holds from a read before, or else a read of as many bytes as
+    /// `buf` has room for, up to 2 MiB, into that buffer, kept in flight
+    /// from one poll to the next, of which `buf` takes what it has room for
+    /// as it completes; 0 bytes at the end of the file. The first bytes of
+    /// `buf`, as many as were read, are then initialized.
+    ///
+    /// A write of [`poll_write`](File::poll_write)'s still in flight
+    /// finishes first. The poll methods share the file's position with
+    /// [`read`](File::read) and [`write`](File::write), so the two must not
+    /// be used at once.
+    ///
+    /// # Errors
+    ///
+    /// What the read reports, or how a write gone behind before it failed.
+    pub fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut [MaybeUninit<u8>],
+    ) -> Poll<io::Result<usize>> {
+        let Self { polling, fd } = self;
+        if matches!(polling.busy, Busy::Writing { .. }) {
+            ready!(polling.poll_settle(fd, cx));
+        }
+        if let Some(err) = polling.failed.take() {
+            return Poll::Ready(Err(err));
+        }
+        polling.seek_now(fd);
+        if polling.pos < polling.buf.len() || buf.is_empty() {
+            return Poll::Ready(Ok(polling.take_into(buf)));
+        }
+        if matches!(polling.busy, Busy::Idle) {
+            let want = buf.len().min(MAX_BUF);
+            let mut room = mem::take(&mut polling.buf);
+            room.clear();
+            room.reserve(want);
+            polling.pos = 0;
+            polling.busy = Busy::Reading(PortableOp::new(Read::new(fd.fd(), room.slice(..want))));
+        }
+        let Busy::Reading(read) = &mut polling.busy else {
+            unreachable!("a read is in flight");
+        };
+        let (read, slice) = ready!(fd.poll_op(cx, read));
+        polling.busy = Busy::Idle;
+        polling.buf = slice.into_inner();
+        polling.pos = 0;
+        if let Err(err) = read {
+            polling.buf.clear();
+            return Poll::Ready(Err(err));
+        }
+        Poll::Ready(Ok(polling.take_into(buf)))
+    }
+
+    /// Writes the caller's `buf`, up to 2 MiB of it, at the file's
+    /// position, which the write advances, or at its end if the file was
+    /// opened to append, polled, as tokio's file writes: the bytes are
+    /// copied into the file's own buffer and the write goes behind, so that
+    /// it is done, as far as the caller can tell, once it is on its way, and
+    /// all it took is written, with as many writes as it takes. The next
+    /// call of the poll methods waits for it to finish, and reports how it
+    /// failed if it did; [`poll_flush`](File::poll_flush) waits for it.
+    ///
+    /// The bytes go where the reader is: data a read before took into the
+    /// file's buffer and the caller has not, which lies before the file's
+    /// position, is let go of, and the write goes before it.
+    ///
+    /// # Errors
+    ///
+    /// How the write gone behind before it failed, what the seek back to
+    /// the reader reports, or what this write reports if it fails at once.
+    pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let Self { polling, fd } = self;
+        ready!(polling.poll_settle(fd, cx));
+        if let Some(err) = polling.failed.take() {
+            return Poll::Ready(Err(err));
+        }
+        polling.seek_now(fd);
+        polling.unread(fd)?;
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let len = buf.len().min(MAX_BUF);
+        let mut data = mem::take(&mut polling.buf);
+        data.clear();
+        data.extend_from_slice(&buf[..len]);
+        polling.busy = Busy::Writing {
+            write: PortableOp::new(Write::new(fd.fd(), data.slice(..))),
+            done: 0,
+        };
+        // Polled once, to be on its way; one that fails at once takes
+        // nothing, which this reports.
+        if let Poll::Ready(()) = polling.poll_settle(fd, cx)
+            && let Some(err) = polling.failed.take()
+        {
+            return Poll::Ready(Err(err));
+        }
+        Poll::Ready(Ok(len))
+    }
+
+    /// Waits for the write of [`poll_write`](File::poll_write)'s in flight,
+    /// if any, and the read too, to finish, and reports how the write
+    /// failed, if it did: what the file holds back.
+    ///
+    /// # Errors
+    ///
+    /// How the write gone behind failed.
+    pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Self { polling, fd } = self;
+        ready!(polling.poll_settle(fd, cx));
+        Poll::Ready(polling.failed.take().map_or(Ok(()), Err))
+    }
+
+    /// Asks for the file's position to move to `pos`, as tokio's file's
+    /// `start_seek` does: [`poll_seek`](File::poll_seek) makes the seek,
+    /// once nothing is in flight, and gives the new position. Asked again
+    /// before then, the last asking stands. From the current position, a
+    /// seek starts where the reader is.
+    ///
+    /// # Errors
+    ///
+    /// None as it is asked; what the seek finds comes from `poll_seek`.
+    pub fn start_seek(&mut self, pos: SeekFrom) -> io::Result<()> {
+        self.polling.seek = Seek::Asked(pos);
+        Ok(())
+    }
+
+    /// The file's position, once what is in flight has finished: where a
+    /// seek asked for with [`start_seek`](File::start_seek) has moved it,
+    /// with one `lseek(2)`, or, with none asked, where the reader is, as
+    /// tokio's file's `poll_complete` gives it.
+    ///
+    /// # Errors
+    ///
+    /// What `lseek(2)` reports, such as `InvalidInput` for a position
+    /// before the start of the file.
+    pub fn poll_seek(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        let Self { polling, fd } = self;
+        ready!(polling.poll_settle(fd, cx));
+        Poll::Ready(match mem::replace(&mut polling.seek, Seek::None) {
+            Seek::Asked(pos) => polling.move_to(fd, pos),
+            Seek::Made(made) => made,
+            Seek::None => polling.position(fd),
+        })
     }
 }
 
@@ -294,4 +477,190 @@ impl AsyncWrite for File {
     fn write<B: IoBuf>(&self, buf: B) -> Self::Write<'_, B> {
         File::write(self, buf)
     }
+}
+
+/// What the poll methods of a [`File`] keep from one call to the next.
+struct Polling {
+    /// The operation in flight at the file's position, if one is.
+    busy: Busy,
+    /// The buffer, while no operation has it: data a read took that the
+    /// caller has not yet, from `pos` to its length, or none.
+    buf: Vec<u8>,
+    pos: usize,
+    /// How a write gone behind failed, for the next call to report.
+    failed: Option<io::Error>,
+    seek: Seek,
+}
+
+/// The operation in flight of the poll methods, at the file's position.
+enum Busy {
+    Idle,
+    /// A read into the buffer, from its start.
+    Reading(PortableOp<'static, Read<Slice<Vec<u8>>>>),
+    /// A write of the buffer's bytes from `done` on, those before it being
+    /// written.
+    Writing {
+        write: PortableOp<'static, Write<Slice<Vec<u8>>>>,
+        done: usize,
+    },
+}
+
+/// A seek of the poll methods.
+enum Seek {
+    None,
+    /// Asked for, and made once nothing is in flight.
+    Asked(SeekFrom),
+    /// Made, as another poll method found it asked for, for `poll_seek` to
+    /// report.
+    Made(io::Result<u64>),
+}
+
+impl Polling {
+    fn new() -> Self {
+        Self {
+            busy: Busy::Idle,
+            buf: Vec::new(),
+            pos: 0,
+            failed: None,
+            seek: Seek::None,
+        }
+    }
+
+    /// How many bytes a read took into the buffer that the caller has not.
+    fn unread_len(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    /// Waits for the operation in flight, if any, to finish: keeps the data
+    /// a read took, writes on what a write left, and records how a write
+    /// failed. A read that fails takes nothing, and the next read, made
+    /// again, reports it.
+    fn poll_settle(&mut self, fd: &PortableFd, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            match &mut self.busy {
+                Busy::Idle => return Poll::Ready(()),
+                Busy::Reading(read) => {
+                    let (read, slice) = ready!(fd.poll_op(cx, read));
+                    self.busy = Busy::Idle;
+                    self.buf = slice.into_inner();
+                    self.pos = 0;
+                    if read.is_err() {
+                        self.buf.clear();
+                    }
+                }
+                Busy::Writing { write, done } => {
+                    let done = *done;
+                    let (written, slice) = ready!(fd.poll_op(cx, write));
+                    let mut data = slice.into_inner();
+                    match written {
+                        Ok(written) if written > 0 && done + written < data.len() => {
+                            let done = done + written;
+                            let rest = Write::new(fd.fd(), data.slice(done..));
+                            self.busy = Busy::Writing {
+                                write: PortableOp::new(rest),
+                                done,
+                            };
+                        }
+                        written => {
+                            self.failed = match written {
+                                Ok(0) => Some(io::ErrorKind::WriteZero.into()),
+                                Ok(_) => None,
+                                Err(err) => Some(err),
+                            };
+                            self.busy = Busy::Idle;
+                            data.clear();
+                            self.buf = data;
+                            self.pos = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Copies into `into` what it has room for of the data a read took,
+    /// which so goes to the caller, and says how much.
+    fn take_into(&mut self, into: &mut [MaybeUninit<u8>]) -> usize {
+        let held = &self.buf[self.pos..];
+        let len = held.len().min(into.len());
+        // SAFETY: `into` has room for `len` bytes, which `held` has, and the
+        // two do not overlap, the one being the file's and the other the
+        // caller's.
+        unsafe { ptr::copy_nonoverlapping(held.as_ptr(), into.as_mut_ptr().cast::<u8>(), len) };
+        self.pos += len;
+        if self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+        }
+        len
+    }
+
+    /// Makes the seek asked for, if one is, which `poll_seek` then reports:
+    /// what comes next goes where it moved the file to.
+    fn seek_now(&mut self, fd: &PortableFd) {
+        if let Seek::Asked(pos) = self.seek {
+            self.seek = Seek::Made(self.move_to(fd, pos));
+        }
+    }
+
+    /// Moves the file's position to `pos`, from where the reader is if it is
+    /// the current one, with one `lseek(2)`, letting go of what a read took
+    /// ahead of the reader.
+    fn move_to(&mut self, fd: &PortableFd, pos: SeekFrom) -> io::Result<u64> {
+        let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+        let (offset, whence) = match pos {
+            SeekFrom::Start(offset) => (
+                i64::try_from(offset).map_err(|_| invalid())?,
+                libc::SEEK_SET,
+            ),
+            SeekFrom::End(offset) => (offset, libc::SEEK_END),
+            // The data read ahead lies between the reader and the file's
+            // position.
+            SeekFrom::Current(offset) => {
+                let ahead = i64::try_from(self.unread_len()).map_err(|_| invalid())?;
+                (
+                    offset.checked_sub(ahead).ok_or_else(invalid)?,
+                    libc::SEEK_CUR,
+                )
+            }
+        };
+        let moved = lseek(fd, offset, whence)?;
+        self.buf.clear();
+        self.pos = 0;
+        Ok(moved)
+    }
+
+    /// Moves the file's position back to where the reader is, letting go of
+    /// what a read took ahead of it, so that a write goes there.
+    fn unread(&mut self, fd: &PortableFd) -> io::Result<()> {
+        if self.unread_len() > 0 {
+            self.move_to(fd, SeekFrom::Current(0))?;
+        }
+        Ok(())
+    }
+
+    /// Where the reader is: the file's position, less what a read took
+    /// ahead of it.
+    fn position(&self, fd: &PortableFd) -> io::Result<u64> {
+        let at = lseek(fd, 0, libc::SEEK_CUR)?;
+        Ok(at.saturating_sub(self.unread_len() as u64))
+    }
+}
+
+impl Drop for Polling {
+    /// Lets a write gone behind finish, as its caller counts on, and a read
+    /// go, which its ring cancels.
+    fn drop(&mut self) {
+        if let Busy::Writing { write, .. } = mem::replace(&mut self.busy, Busy::Idle) {
+            write.detach();
+        }
+    }
+}
+
+/// Moves the position of the file `fd` with one `lseek(2)`, which touches
+/// no file data and returns at once.
+fn lseek(fd: &PortableFd, offset: i64, whence: libc::c_int) -> io::Result<u64> {
+    // SAFETY: lseek(2) touches no memory.
+    let at = unsafe { libc::lseek(fd.as_raw_fd(), offset, whence) };
+    u64::try_from(at).map_err(|_| io::Error::last_os_error())
 }
