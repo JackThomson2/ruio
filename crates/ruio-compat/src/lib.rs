@@ -39,14 +39,16 @@
 //! runs its I/O.
 //!
 //! [`PortableCompat`] adapts ruio's portable streams, of
-//! [`ruio::net::portable`], to the same traits with no buffers of its own:
-//! they read and write with system calls made at once on whichever thread
-//! polls them, so a read goes into the caller's buffer and a write comes
-//! from the caller's, and the adapter, as the stream, is `Send` and `Sync`,
-//! for what needs a connection that is, as hyper-util's client does.
-//! With the `client` feature, [`client`] runs hyper-util's client on them:
-//! a connector of portable TCP streams, and the client's builder with ruio's
-//! executor and timer.
+//! [`ruio::net::portable`], and a child's pipes, of [`ruio::process`], to
+//! the same traits with no buffers of its own: they read and write with
+//! system calls made at once on whichever thread polls them, so a read goes
+//! into the caller's buffer and a write comes from the caller's, and the
+//! adapter, as the stream, is `Send` and `Sync`, for what needs a connection
+//! that is, as hyper-util's client does. A child's standard output and
+//! error are read through it, and its standard input written.
+//! With the `client` feature, [`client`] runs hyper-util's client on the
+//! portable streams: a connector of portable TCP streams, and the client's
+//! builder with ruio's executor and timer.
 //!
 //! With the `hyper` feature, on by default, an adapter has hyper's own I/O
 //! traits, `hyper::rt::Read` and `Write`, so hyper serves it, or connects
@@ -108,7 +110,7 @@ mod tokio_impls;
 
 #[cfg(feature = "hyper")]
 pub use executor::Executor;
-pub use portable::{PortableCompat, PortableStream};
+pub use portable::{PortableCompat, PortableReader, PortableStream, PortableWriter};
 #[cfg(feature = "hyper")]
 pub use timer::Timer;
 
