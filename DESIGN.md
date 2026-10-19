@@ -29,7 +29,7 @@ an API that still reads like ordinary async Rust.
 |---|---|---|
 | Execution model | Thread-per-core: one ring and one executor per thread; spawned tasks need not be `Send`. | `SINGLE_ISSUER` and `DEFER_TASKRUN` assume one submitting thread, registered files and buffers belong to a single ring, and the hot path needs no atomics or locks. |
 | Work stealing | Not in the first release, but kept possible (see [Keeping work stealing possible](#keeping-work-stealing-possible)). | It fights per-ring state, but some workloads want it. |
-| Send I/O | Portable operations (`PortableOp`, and `PortableFd` for a descriptor) run on the ring of the thread that polls them, and where no driver is current, on another executor's thread, on the foreign ring the embedder sets, or fail with `ENOSYS` (`Unsupported`) if none is set; `fs::portable`'s file runs its operations as portable ones, and `net::portable`'s sockets and a child's pipes are plain nonblocking descriptors whose reads and writes are system calls made at once, which wait on the polling thread's ring only when there is nothing to read or no room; the sockets and files of `net` and `fs` stay with their ring. | Futures that must be `Send`, as `async_trait`'s, hyper-util's client and those spawned onto another core are, could hold no I/O of the ring; a portable operation costs a comparison a poll while it stays on its thread, and a portable socket makes the system calls tokio's does. |
+| Send I/O | Portable operations (`PortableOp`, and `PortableFd` for a descriptor) run on the ring of the thread that polls them, and where no driver is current, on another executor's thread, on the foreign ring the embedder sets, or fail with `ENOSYS` (`Unsupported`) if none is set; `fs::portable`'s file runs its operations as portable ones, and `net::portable`'s sockets and a child's pipes are plain nonblocking descriptors whose reads and writes are system calls made at once, which wait on the polling thread's ring only when there is nothing to read or no room, and on another executor's thread on that executor's reactor, once the embedder sets it as the foreign one (`ruio_compat::TokioReactor` is tokio's); the sockets and files of `net` and `fs` stay with their ring. | Futures that must be `Send`, as `async_trait`'s, hyper-util's client and those spawned onto another core are, could hold no I/O of the ring; a portable operation costs a comparison a poll while it stays on its thread, and a portable socket makes the system calls tokio's does, and on tokio's threads waits as tokio's does. |
 | Minimum kernel | Linux 6.10. Detected by capability, not by version string. | 6.1, the oldest LTS with `DEFER_TASKRUN`, had everything the core needs, but 6.10 adds bundles, which send and receive several provided buffers per request: the network path needs them to beat epoll on large messages (see [Benchmarks](#benchmarks)). It also brings `NO_SQARRAY` (6.6), multishot read (6.7) and socket options through `URING_CMD` (6.7). Distribution kernels backport features, so version numbers mislead. |
 | Bindings | Our own, in `ruio-sys`: written by hand from the kernel's uapi header and tested against it. | Full control of the ABI surface and the hot path, no bindgen at build time, and new kernel features arrive when we need them. |
 | Interop | `futures-io` and `tokio::io` adapters in `ruio-compat`, which hyper and rustls run over, and a connector of portable streams for hyper-util's client. | Ecosystem access matters, but must not shape the core API. |
@@ -478,6 +478,34 @@ runs and as it shuts down.
   did, past one branch; `foreign nop` makes 172k portable no-ops a second
   from a plain thread, each two wakes across cores (see [The runtime
   itself](#the-runtime-itself)).
+- The portable sockets and listeners and a child's pipes need of a ring
+  only their waits for readiness, which another executor's own reactor
+  can give on its threads: once the embedder sets it as the foreign one
+  (`ruio::io::set_foreign_reactor`, `ruio_compat::TokioReactor` for
+  tokio's), such a descriptor polled where no driver is current and the
+  reactor runs registers with it as it first would wait, and waits there
+  from then on, as the executor's own sockets do, with no other thread
+  between the readiness and the task. `Reactor::register` makes the
+  registration, or declines a thread that is none of the executor's;
+  `Registration::poll_io` makes the nonblocking call under the reactor's
+  readiness, which a call that would block clears, as one that moves less
+  than it could does, as tokio's `AsyncFd` guard and `PollEvented` do.
+  A read or write still makes its system call at once, and costs the
+  reactor nothing if it finds what it came for: only one that would block
+  goes through the reactor, and so does the next if the last had to wait,
+  ran as its task woke from a wait, or moved less than it could, as a
+  request whose answer has yet to come does, so that it makes one read
+  that finds nothing, as on tokio, and not two. The reactor keeps one
+  waker each way, as a poll-based reactor does, and many tasks can wait
+  on one descriptor, as concurrent reads and accepts of a shared one do,
+  so each way it is given a waker of the descriptor's own, which wakes
+  every task waiting so; a count of its wakes tells a task that comes to
+  wait just after one that it missed it. Whether the thread is the
+  reactor's (`Registration::is_current`) is asked only as a wait would
+  begin, and elsewhere the wait goes to the foreign ring. The registration
+  is the descriptor's first field, so it leaves the reactor before the
+  descriptor closes or is handed out, and the number is not left
+  registered for a file that takes it next.
 - `PortableFd::poll_op` polls an operation the caller keeps beside the
   descriptor across polls, as a `ReadyWait` keeps its poll, and records the
   ring it queues on, so that the descriptor closes after it: what the
@@ -1277,10 +1305,17 @@ one at a time, and 106k from 16 tasks at once through one client, against
 tokio's 36k and 108k (see [The runtime itself](#the-runtime-itself)).
 
 A thread of another executor's reads and writes a portable socket, or a
-child's pipe, the same way, and its waits go to the foreign ring (see
-[Portable operations](#portable-operations)): from tokio's current-thread
-runtime the round trip runs 44k times a second, against tokio's own
-stream's 50k, each wait a request to the ring's core and a wake back.
+child's pipe, the same way. Its waits go to the foreign ring (see
+[Portable operations](#portable-operations)), each a request to the
+ring's core and a wake back, and from tokio's current-thread runtime the
+round trip runs 42k times a second so, against tokio's own stream's 50k.
+With `ruio_compat::TokioReactor` set as the foreign reactor they go to
+tokio's reactor instead, as a tokio socket's do, and the round trip runs
+50k times a second, as tokio's own; 64 bytes through a `cat`'s pipes and
+back run 386k times a second, against 395k through tokio's pipes, as
+they did through the foreign ring, whose waits that row seldom needs.
+What it costs a thread of tokio's is in [The runtime
+itself](#the-runtime-itself).
 
 ## Files
 
@@ -1298,11 +1333,35 @@ so their futures are `Send`: `read` and `write` open the file as a
 `PortableFd`, read or write it through it to the end, and close it, `write`
 with a close of its own whose result it reports. On the thread that polls
 them they cost what the ring's own operations do: a 4 KiB file is read
-whole 2.79 times as often as through tokio's `fs::read`, its status 2.40
-times as often, and 4 KiB written to a file emptied each time 1.13 times,
-the open that creates and truncates going to an io-wq worker (see [The
-runtime itself](#the-runtime-itself)). A `File` stays with its ring; a
-`ReadDir` and its entries are `Send` and `Sync`, on a `PortableFd`.
+whole 2.70 times as often as through tokio's `fs::read`, a cached 1 MiB
+file 1.51 times, its status 2.40 times as often, and 4 KiB written to a
+file emptied each time 1.13 times, the open that creates and truncates
+going to an io-wq worker (see [The runtime itself](#the-runtime-itself)).
+A `File` stays with its ring; a `ReadDir` and its entries are `Send` and
+`Sync`, on a `PortableFd`.
+
+`read` sizes its buffer from the file, so that one read fills it and the
+kernel's readahead sees the whole file, as under the standard library's
+`fs::read`. It asks the kernel the size with `FIONREAD`, which the kernel
+answers for a regular file from the size in the inode, less the position,
+with no call into the file system: so it never waits on a file server, as
+`lseek(2)` to the end can on NFS or FUSE, and costs 128 ns on the
+development host, whose every system call is audited, against 206 ns for
+`statx(2)`, which copies the whole status out. The read of the whole file
+and one of 32 bytes past it, which finds the end there, go to the kernel
+in one submission, so a cached file is read in one turn of the ring, where
+it took two at least. Should that second read find more, the file having
+grown or being too long for `FIONREAD`'s `int`, a `statx` of the cached
+status (`AT_STATX_DONT_SYNC`) gives its length now and the buffer grows
+once to it; a read that stops short, or a size of 0, as a procfs file's,
+reads on until a read finds nothing, the buffer doubling from 8 KiB. The
+buffer used to start at 8 KiB and double for every file, so readahead saw
+small reads first and grew its window from them: a cold read of a tree
+made 1.63 times the device reads std's made, and now makes as many (see
+[Cold reads of a tree](#cold-reads-of-a-tree)). Read whole in a loop, a
+cached file of 100 bytes takes 2.19 µs where it took 2.37, of 4 KiB 2.26
+µs where it took 2.35, of 16 KiB 2.51 µs where it took 3.03, of 64 KiB
+3.67 µs where it took 5.12, and of 1 MiB 40.2 µs where it took 43.1.
 
 `fs::portable::File` is a file that is `Send` and `Sync`, on a
 `PortableFd`: each of its operations, `read_at` and `write_at` and their
@@ -1625,6 +1684,24 @@ runs on ruio's wrapped in the adapter. The adapter is `Send`, `Sync` and
 `Unpin`, as what it adapts is, and its waits are kept until it is polled
 again, on whichever thread.
 
+With the `tokio-reactor` feature, `ruio_compat::TokioReactor` is tokio's
+reactor as ruio's foreign one (see [Portable
+operations](#portable-operations)): set with `set_foreign_reactor`, the
+portable streams and listeners and a child's pipes polled on the threads
+of a tokio runtime register with that runtime's reactor, as a tokio
+socket does, an `AsyncFd` of the descriptor's number, and make their
+calls under its `poll_read_ready` and `poll_write_ready` through
+`try_io`, clearing the readiness where a call would block or moved less
+than it could, as tokio's `PollEvented` does. A wait so costs what it
+costs a tokio socket, where on the foreign ring it cost two wakes across
+threads. Whether a thread is one of tokio's asks `tokio::task::try_id`,
+a thread-local, and only where it finds no task, as in the future of
+`block_on`, the runtime's handle, whose clone touches a count every
+worker shares. The registration is with the runtime the descriptor first
+waited on, and lasts until it closes; as for a tokio socket, a runtime
+without I/O enabled cannot take it, and making it there panics. The
+feature brings tokio's `net` and `rt`, and is off unless asked for.
+
 With the `client` feature, `ruio_compat::client` runs hyper-util's legacy
 client on them. `Connector` is a `tower::Service<Uri>` that resolves the
 URI's host on the blocking pool, tries its addresses in turn, connects a
@@ -1717,6 +1794,8 @@ Compared against tokio (epoll), monoio, compio and glommio:
 - TCP echo, 1 to 10k connections, 64 B to 64 KiB messages
 - HTTP/1.1 plaintext
 - 4 KiB `O_DIRECT` random reads, compared with fio
+- a cold-cache read of a whole tree of files, compared with the standard
+  library's `fs::read` by the device reads it costs
 - timer churn
 
 Measured: throughput, p99 latency, system calls per operation and CPU time per
@@ -2062,6 +2141,36 @@ reader alone, in turns with the variant it is compared with:
   every policy takes one entry per turn there; they part on a device with
   latency, where the kernel's wait spins without entries and the passes
   cost one each.
+
+### Cold reads of a tree
+
+`ruio-bench cold-read DIR` reads every file of a tree whole from a cold
+cache, with `std::fs::read` on the measuring thread and with
+`ruio::fs::read` on a runtime there, in turns, and counts what each cost
+the block device the tree is on in its `/sys/dev/block/MAJ:MIN/stat`:
+reads completed and merged, sectors, and so the size of a read. Before each
+reader it writes back and drops every file's pages with `fdatasync` and
+`POSIX_FADV_DONTNEED`, so that the device delivers all the data, which the
+report shows, and needs no root nor the global `drop_caches`. Other I/O on
+the device counts too, so it wants a quiet host and several runs.
+
+The kernel's readahead sizes the device's reads from the reads it is asked
+for. The standard library takes the file's size and reads it whole with one
+read, which lets readahead go to its full window from the first page.
+`fs::read` started with an 8 KiB buffer and doubled it, so each file's first
+reads were small and readahead grew its window from them. On a copy of the
+files under 8 MiB of the host's `/usr/lib/x86_64-linux-gnu`, 3,418 files and
+449 MiB on ext4 on an NVMe device with `read_ahead_kb` and `max_sectors_kb`
+at 128, medians of three runs:
+
+| Reader | reads | KiB a read | ms |
+|---|---:|---:|---:|
+| `std::fs::read` | 6,364 | 73.5 | 3,973 |
+| `ruio::fs::read`, doubling from 8 KiB | 10,377 | 45.1 | 5,244 |
+| `ruio::fs::read`, sized from the file | 6,366 | 73.4 | 3,977 |
+
+Sized from the file, as [Files](#files) describes, ruio's read makes the
+reads std's does, of the same size, in the same time.
 
 ### Scaling across cores
 
@@ -2854,6 +2963,39 @@ within the noise, the portable no-ops 1 to 2 percent lower in each pass,
 which may be what the foreign path costs an operation that stays on its
 ring's thread, or the noise.
 
+`read file 1 MiB`, `reactor round trip` and `reactor child pipes`, added
+with the sized whole-file read and the foreign reactor, measure those.
+`read file 1 MiB` reads a cached file of 1 MiB whole by path, which one
+read fills. `reactor round trip` is `foreign round trip` with
+`ruio_compat::TokioReactor` set as the foreign reactor and no foreign ring,
+its waits on tokio's reactor on the thread itself, and `reactor child pipes` is `child
+pipes` polled by tokio's current-thread runtime so, against tokio's own
+pipes: what an MCP server on a child's standard streams costs a tokio
+program. Medians of five runs on CPU 6, with the host quiet (a load
+average of 1.2), the commit before the sized read and the foreign reactor
+beside them:
+
+| Step | tokio | ruio before | ruio |
+|---|---:|---:|---:|
+| read file | 164k | 423k | 443k (2.70×) |
+| read file 1 MiB | 17k | | 26k (1.51×) |
+| child pipes | 398k | 395k | 394k (0.99×) |
+| portable round trip | 51k | 49k | 50k (0.98×) |
+| foreign round trip | 50k | 42k | 42k (0.84×) |
+| reactor round trip | 50k | | 50k (1.00×) |
+| reactor child pipes | 395k | | 386k (0.98×) |
+
+A 4 KiB file's read skips a turn of the ring and pays a `FIONREAD`, and
+reads 5% more often. On tokio's reactor the round trip runs as tokio's
+own stream does, a fifth more than through the foreign ring. The pipes
+run as they did through the foreign ring, 387k to 388k in passes taken in
+turns with this one: `cat` answers on the same CPU before the read looks,
+so their reads seldom wait, and a read that finds data costs the reactor
+nothing. A first version made every read and write under the reactor's
+readiness, and the pipes ran 1.5% slower than through the foreign ring;
+what they lack against tokio's own pipes is ruio's owned-buffer futures
+over the system calls, the same on the foreign ring.
+
 ## Milestones
 
 | # | Scope | Done when |
@@ -3101,7 +3243,7 @@ Since M7:
   thread's current driver, which the runtime enters as it runs, and goes
   back to that ring if its future moves; a `PortableFd` closes in order on
   the ring its operations ran on. The path functions of `ruio::fs` run on
-  them, a file read whole 2.79× as often as through tokio's `fs::read`, and
+  them, a file read whole 2.70× as often as through tokio's `fs::read`, and
   a portable no-op costs what an `Op`'s does alone and 7 ns more with 64 in
   flight (see [Portable operations](#portable-operations) and
   [Files](#files)).
@@ -3132,6 +3274,21 @@ Since M7:
   file does; `io::portable::AsyncFd` is a `Send` `AsyncFd` shaped as
   tokio's; and `read_dir` is `Send` (see [Portable
   operations](#portable-operations), [Files](#files) and
+  [Compatibility](#compatibility)).
+- `fs::read` sizes its buffer from the file, with `FIONREAD`, which never
+  waits on a file server, and reads the file and the end past it in one
+  submission: a cold read of a tree makes the device reads the standard
+  library's does, where it made 1.63 times as many, and a cached file is
+  read in one turn of the ring (see [Files](#files) and [Cold reads of a
+  tree](#cold-reads-of-a-tree)).
+- Portable sockets and pipes wait on another executor's reactor from its
+  threads, once the embedder sets it as the foreign one, with a
+  registration made as a descriptor first would wait, and its calls made
+  under the reactor's readiness only when they would block, or when the
+  last had to wait or stopped short; `ruio_compat::TokioReactor` is
+  tokio's, on which a portable round trip from tokio's runtime runs as
+  tokio's own stream does, where through the foreign ring it kept 0.84 of
+  it (see [Portable operations](#portable-operations) and
   [Compatibility](#compatibility)).
 - The cooperative budget is public as `ruio::coop`, for the primitives of
   other crates that can be ready every time they are polled (see
