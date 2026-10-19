@@ -5,24 +5,34 @@ use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::mem::{self, offset_of};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
-use ruio_driver::Descriptor;
-use ruio_driver::ops::{OpenAt, Statx};
+use ruio_driver::PortableFd;
+use ruio_driver::ops::Statx;
 use ruio_executor::blocking::BlockingHandle;
 
 use super::{FileType, METADATA, Metadata};
-use crate::net::Plain;
 
 /// How many bytes of entries one `getdents64(2)` reads.
 const BATCH: usize = 32 << 10;
 
 /// The entries of the directory at `path`, which [`ReadDir`] reads.
+///
+/// The directory opens with a [`PortableOp`](crate::uring::PortableOp) on
+/// the ring of the thread that polls the future, as the other functions
+/// that take a path open their files, so the future is `Send`, and so are
+/// the reader and its entries.
+///
+/// ```
+/// fn assert_send<T: Send>(_: T) {}
+///
+/// assert_send(ruio::fs::read_dir("."));
+/// ```
 ///
 /// # Errors
 ///
@@ -31,13 +41,9 @@ const BATCH: usize = 32 << 10;
 /// a nul byte.
 pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<ReadDir> {
     let path = path.as_ref();
-    let open = OpenAt::new(path)?.flags(libc::O_RDONLY | libc::O_DIRECTORY);
-    let fd: OwnedFd = match crate::driver().op(open).await? {
-        Descriptor::Plain(fd) => fd,
-        Descriptor::Direct(_) => unreachable!("an open makes a plain descriptor unless asked"),
-    };
+    let fd = super::open_portable(path, libc::O_RDONLY | libc::O_DIRECTORY, 0).await?;
     let dir = Arc::new(Dir {
-        fd: Plain::new(std::fs::File::from(fd)),
+        fd,
         path: path.to_owned(),
     });
     let next = Some(read_batch(&dir, Vec::with_capacity(BATCH)));
@@ -50,9 +56,11 @@ pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<ReadDir> {
     })
 }
 
-/// An open directory, which its reader and entries share.
+/// An open directory, which its reader, its entries and the batch being
+/// read share. The descriptor closes once the last of them is gone, after
+/// the status operations queued on it, on the ring that queued the last.
 struct Dir {
-    fd: Plain<std::fs::File>,
+    fd: PortableFd,
     /// The path it was opened at, which entries' paths start with.
     path: PathBuf,
 }
@@ -68,6 +76,12 @@ struct Dir {
 /// come waits for the pool once, for the first batch. Between batches the
 /// reader lets the thread's other tasks run.
 ///
+/// The reader and its entries are `Send` and `Sync`: the directory is a
+/// plain descriptor, a [`PortableFd`](crate::uring::PortableFd), and an
+/// entry's status is a [`PortableOp`](crate::uring::PortableOp) on the ring
+/// of the thread that polls it, so a task can take some entries on one
+/// thread and the rest on another.
+///
 /// ```no_run
 /// # ruio::Runtime::new().unwrap().block_on(async {
 /// let mut entries = ruio::fs::read_dir(".").await?;
@@ -76,6 +90,13 @@ struct Dir {
 /// }
 /// # Ok::<(), std::io::Error>(())
 /// # }).unwrap();
+/// ```
+///
+/// ```
+/// fn assert_send<T: Send + Sync>() {}
+///
+/// assert_send::<ruio::fs::ReadDir>();
+/// assert_send::<ruio::fs::DirEntry>();
 /// ```
 pub struct ReadDir {
     dir: Arc<Dir>,
@@ -273,7 +294,9 @@ impl DirEntry {
         let stat = Statx::at(self.dir.fd.as_raw_fd(), &self.name)?
             .flags(libc::AT_SYMLINK_NOFOLLOW)
             .mask(METADATA);
-        let stat = crate::driver().op(stat).await?;
+        // Queued through the descriptor, which records the ring it queues
+        // on and stays open until it is queued.
+        let stat = self.dir.fd.op(|_| stat).await?;
         Ok(Metadata { stat: *stat })
     }
 }

@@ -1034,3 +1034,138 @@ async fn read_takes_a_file_to_its_end_whatever_its_size() -> io::Result<()> {
     assert_eq!(err.kind(), ErrorKind::NotFound);
     Ok(())
 }
+
+/// How many of the process's descriptors are open on the directory `dir`,
+/// as `/proc/self/fd` tells: each that links to its path, which is the
+/// scratch directory of one test, so no other test opens it.
+fn opened_on(dir: &std::path::Path) -> usize {
+    let dir = std::fs::canonicalize(dir).unwrap();
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+        .filter(|target| *target == dir)
+        .count()
+}
+
+/// Waits, turning the ring, until no descriptor is open on the directory
+/// `dir`.
+async fn closed_on(dir: &std::path::Path) {
+    within(async {
+        while opened_on(dir) != 0 {
+            ruio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+}
+
+/// A directory is read, and its entries' types and status taken, in a
+/// boxed future that must be `Send`.
+#[ruio::test]
+async fn read_dir_runs_in_a_future_that_must_be_send() -> io::Result<()> {
+    const COUNT: usize = 3000;
+    let scratch = Scratch::new("read-dir-send");
+    for index in 0..COUNT {
+        std::fs::write(scratch.path(&format!("entry-{index:05}")), b"xyz")?;
+    }
+    let work: SendFuture<'_, io::Result<usize>> = Box::pin(async {
+        let mut entries = fs::read_dir(&scratch.0).await?;
+        let mut count = 0;
+        while let Some(entry) = entries.next_entry().await? {
+            assert!(entry.file_type().await?.is_file());
+            assert_eq!(entry.metadata().await?.len(), 3);
+            count += 1;
+        }
+        Ok(count)
+    });
+    assert_eq!(within(work).await?, COUNT);
+    Ok(())
+}
+
+/// A reader started on one core, with an entry taken and its status read
+/// there, moves to another core, which takes the rest of the entries and
+/// their status on its own ring; the directory closes once the reader and
+/// its entries are gone.
+#[test]
+fn a_reader_moves_to_another_core() {
+    const COUNT: usize = 3000;
+    let all = ruio::Cores::all().unwrap();
+    let cores = ruio::Cores::cpus(all.cpu_list().iter().copied().cycle().take(2));
+    let scratch = Scratch::new("read-dir-cores");
+    for index in 0..COUNT {
+        std::fs::write(scratch.path(&format!("entry-{index:05}")), b"xy").unwrap();
+    }
+    let dir = scratch.0.clone();
+    let outputs = cores
+        .run(|core| {
+            let dir = dir.clone();
+            async move {
+                if core.index() != 0 {
+                    return None;
+                }
+                let mut entries = within(fs::read_dir(&dir)).await.unwrap();
+                let first = within(entries.next_entry()).await.unwrap().unwrap();
+                assert_eq!(within(first.metadata()).await.unwrap().len(), 2);
+                let task = ruio::spawn_on(1, async move {
+                    let mut names = vec![first.file_name()];
+                    assert_eq!(within(first.metadata()).await?.len(), 2);
+                    drop(first);
+                    while let Some(entry) = within(entries.next_entry()).await? {
+                        assert_eq!(within(entry.metadata()).await?.len(), 2);
+                        names.push(entry.file_name());
+                    }
+                    drop(entries);
+                    closed_on(&dir).await;
+                    io::Result::Ok((names, ruio::core().unwrap().index()))
+                });
+                Some(task.await.unwrap())
+            }
+        })
+        .unwrap();
+    let (mut names, core) = outputs.into_iter().next().flatten().unwrap().unwrap();
+    assert_eq!(core, 1);
+    names.sort();
+    let expected: Vec<_> = (0..COUNT)
+        .map(|index| std::ffi::OsString::from(format!("entry-{index:05}")))
+        .collect();
+    assert_eq!(names, expected);
+}
+
+/// The directory's descriptor closes once the reader and its entries are
+/// gone: after the status read through it, and after a batch being read
+/// when the reader was dropped.
+#[ruio::test]
+async fn a_directory_closes_once_its_reader_and_entries_are_gone() -> io::Result<()> {
+    const COUNT: usize = 3000;
+    let scratch = Scratch::new("read-dir-close");
+    for index in 0..COUNT {
+        std::fs::File::create(scratch.path(&format!("entry-{index:05}")))?;
+    }
+    assert_eq!(opened_on(&scratch.0), 0);
+
+    // Read to the end, with the status of each entry.
+    let mut entries = within(fs::read_dir(&scratch.0)).await?;
+    assert_eq!(opened_on(&scratch.0), 1);
+    let mut kept = Vec::new();
+    while let Some(entry) = within(entries.next_entry()).await? {
+        within(entry.metadata()).await?;
+        kept.push(entry);
+    }
+    drop(entries);
+    let last = kept.pop().unwrap();
+    drop(kept);
+    assert_eq!(opened_on(&scratch.0), 1, "an entry keeps it open");
+    within(last.metadata()).await?;
+    drop(last);
+    closed_on(&scratch.0).await;
+
+    // Dropped with a batch being read, and no status read.
+    let mut entries = within(fs::read_dir(&scratch.0)).await?;
+    within(entries.next_entry()).await?.unwrap();
+    drop(entries);
+    closed_on(&scratch.0).await;
+
+    // Dropped as soon as it opened.
+    drop(within(fs::read_dir(&scratch.0)).await?);
+    closed_on(&scratch.0).await;
+    Ok(())
+}

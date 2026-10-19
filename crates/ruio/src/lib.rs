@@ -35,11 +35,12 @@
 //! streams through the adapters of the `ruio-compat` crate.
 //!
 //! A file or socket belongs to its thread's ring, and a future that holds
-//! one is not `Send`. The functions of [`fs`] that take a path, but
-//! `read_dir`, and everything in [`process`], run their operations on the
-//! ring of the thread that polls them instead, so their futures are `Send`,
-//! for code whose futures must be, such as `async_trait`'s, at the cost of a
-//! comparison per poll.
+//! one is not `Send`. The functions of [`fs`] that take a path, and
+//! everything in [`process`], run their operations on the ring of the
+//! thread that polls them instead, so their futures are `Send`, for code
+//! whose futures must be, such as `async_trait`'s, at the cost of a
+//! comparison per poll; so are the directory reader `read_dir` makes and
+//! its entries.
 //!
 //! Thread per core: [`Cores`] runs a runtime on each of several CPUs, on a
 //! thread pinned to it, as `#[ruio::main(cores = "all")]` runs `main`.
