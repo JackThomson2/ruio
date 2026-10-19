@@ -97,6 +97,15 @@ impl Payload {
         Self::inline(payload)
     }
 
+    /// A payload of the driver's own small enough to go in place, which
+    /// costs no allocation, as the compiler checks.
+    pub(crate) fn small<P: Orphan + 'static>(payload: P) -> Self {
+        const {
+            assert!(Shape::<P>::FITS, "the payload does not fit in a slot");
+        }
+        Self::inline(payload)
+    }
+
     /// A payload written into the storage, which `P` must fit.
     fn inline<P: Orphan>(payload: P) -> Self {
         debug_assert!(Shape::<P>::FITS, "the payload does not fit in a slot");

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use ruio_sys as sys;
 
 use crate::Probe;
+use crate::foreign::{Relayed, Ticket};
 use crate::link::private::{Linkable, Member};
 use crate::op::{Completion, Op, Operation, Orphan};
 use crate::ops::InstallPolled;
@@ -214,6 +215,8 @@ impl Builder {
             wakers: Vec::new(),
             released: Vec::new(),
             deliveries: Vec::new(),
+            taken_closes: Vec::new(),
+            taken_requests: Vec::new(),
             last_turn: 0,
             stats: Stats::default(),
             shutdown_timeout: self.shutdown_timeout,
@@ -419,6 +422,10 @@ struct Inner {
     released: Vec<(Payload, Completion)>,
     /// Orphaned streams with completions to hand over, likewise.
     deliveries: Vec<u64>,
+    /// The room of what other threads asked of the ring last turn, kept
+    /// for the next; see [`Remote::take`].
+    taken_closes: Vec<u32>,
+    taken_requests: Vec<Request>,
     /// How many completions the last turn delivered; see
     /// [`Driver::completions_last_turn`].
     last_turn: usize,
@@ -872,7 +879,9 @@ impl Driver {
     /// descriptor, before the number is free for another file. Dropping the
     /// descriptor instead closes it at once, and an operation still queued
     /// then reaches the kernel naming no file, or whichever file took the
-    /// number meanwhile.
+    /// number meanwhile. What other threads have asked of the ring, which
+    /// may send it an entry naming the descriptor, is taken first, and goes
+    /// before the close.
     ///
     /// Nothing reports how the close went, as nothing does for dropping the
     /// descriptor; [`ops::Close`](crate::ops::Close) does. If the driver is
@@ -880,6 +889,9 @@ impl Driver {
     /// for the request even after submitting, `fd` is closed at once.
     pub fn close_in_order(&self, fd: OwnedFd) {
         if let Ok(mut inner) = self.inner.state.try_borrow_mut() {
+            // What taking them leaves to deliver goes at the next turn, which
+            // it keeps from waiting.
+            let _ = inner.take_remote();
             // Without room for the request, the descriptor is dropped here.
             let _ = inner.queue_close_fd(fd);
         }
@@ -1804,25 +1816,47 @@ impl Inner {
     }
 
     /// Takes what other threads asked of the ring since its last turn:
-    /// closes of direct descriptors sent here and dropped there, and
-    /// requests for its portable operations and descriptors.
+    /// closes of direct descriptors sent here and dropped there, requests
+    /// for its portable operations and descriptors, and the entries of
+    /// operations they send it.
+    #[inline]
     fn take_remote(&mut self) -> io::Result<()> {
-        let Some((closes, requests)) = self.remote.take() else {
+        // A plain load on every turn of the ring, which almost always finds
+        // nothing.
+        if !self.remote.is_pending() {
             return Ok(());
-        };
-        for request in requests {
+        }
+        self.take_pending()
+    }
+
+    /// Takes and does what other threads asked, as
+    /// [`take_remote`](Inner::take_remote) found them to have, into the
+    /// vectors kept from the last time, which keep their room.
+    #[cold]
+    fn take_pending(&mut self) -> io::Result<()> {
+        let mut closes = mem::take(&mut self.taken_closes);
+        let mut requests = mem::take(&mut self.taken_requests);
+        self.remote.take(&mut closes, &mut requests);
+        for request in requests.drain(..) {
             self.handle(request);
         }
-        for slot in closes {
-            self.queue_close(slot)?;
+        let mut queued = Ok(());
+        for slot in closes.drain(..) {
+            // Without room even after submitting, the rest stay taken.
+            if queued.is_ok() {
+                queued = self.queue_close(slot);
+            }
         }
-        Ok(())
+        self.taken_closes = closes;
+        self.taken_requests = requests;
+        queued
     }
 
     /// Does what another thread asked for a portable operation of the
     /// ring's, whose future left this thread, or for a descriptor whose
-    /// operations ran here; see [`Request`]. What runs code of its own, a
-    /// payload finishing or a waker, waits until the driver is released.
+    /// operations ran here, or queues the entry it sent; see [`Request`].
+    /// What runs code of its own, a payload finishing or a waker, waits
+    /// until the driver is released.
     fn handle(&mut self, request: Request) {
         match request {
             Request::Adopt {
@@ -1858,6 +1892,55 @@ impl Inner {
                 // Without room for the entry, even once what is queued is
                 // submitted, the descriptor closes at once.
                 let _ = self.queue_close_fd(fd);
+            }
+            Request::Submit {
+                sqe,
+                polled,
+                timeout,
+                ticket,
+            } => self.queue_sent(sqe, polled, timeout, &ticket),
+        }
+    }
+
+    /// Queues `sqe`, the entry of an operation another thread prepared, as
+    /// an orphan whose completion goes to `ticket`: its future, which keeps
+    /// the operation, takes the completion there. A future that went before
+    /// the entry was queued has it cancelled at once, as dropping an `Op`
+    /// whose entry is queued does; one refused, for want of room, completes
+    /// with the error once the driver is released.
+    fn queue_sent(
+        &mut self,
+        sqe: sys::io_uring_sqe,
+        polled: bool,
+        timeout: Option<Duration>,
+        ticket: &Arc<Ticket>,
+    ) {
+        let mut refused = None;
+        let queued = ticket.queue(|| {
+            self.queue_entry(
+                Relayed(Arc::clone(ticket)),
+                polled,
+                |_, entry| *entry = sqe,
+                timeout,
+                |table, relayed| table.insert_orphan(Payload::small(relayed)),
+            )
+            .map_err(|(err, relayed)| {
+                refused = Some(relayed);
+                err
+            })
+        });
+        match queued {
+            // The kernel takes no cancellation on the polled ring.
+            Ok((user_data, cancel)) => {
+                if cancel && !polled {
+                    self.cancels.push(user_data);
+                }
+            }
+            Err(err) => {
+                if let Some(relayed) = refused {
+                    let completion = Completion::from_error(&err);
+                    self.released.push((Payload::small(relayed), completion));
+                }
             }
         }
     }
@@ -2029,10 +2112,22 @@ impl Drop for Inner {
         // kernel with everything else queued, closes queued in order among
         // them, which a ring dropped without another turn would lose.
         let _ = self.enter(0, None, None);
-        // Before the ring closes its descriptor, which senders duplicate.
-        for request in self.remote.close() {
-            self.handle(request);
-        }
+        // Before the ring closes its descriptor, which senders duplicate;
+        // what the last requests ask goes to the kernel before any other
+        // thread finds the ring closed, and closes at once a descriptor that
+        // an entry sent here may name.
+        let remote = Arc::clone(&self.remote);
+        remote.close(|requests| {
+            for request in requests {
+                self.handle(request);
+            }
+            if self.ring.queued() > 0 {
+                let _ = self.submit_queued(0, false);
+            }
+            if self.polled.is_some() {
+                let _ = self.submit_queued(0, true);
+            }
+        });
         // What handling the requests replaced, woken for nothing otherwise;
         // and the operations it took over that had completed.
         drop(mem::take(&mut self.wakers));

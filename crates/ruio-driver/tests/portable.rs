@@ -136,10 +136,38 @@ fn a_portable_operation_runs_on_the_current_driver() {
     assert!(block_on(&driver, mapped));
 }
 
+/// Where no driver is current, and no foreign ring is set, as none is in
+/// this test binary, an operation completes at once with `ENOSYS`, which
+/// is `Unsupported`, having reached no kernel: a close's descriptor is
+/// closed as the operation goes, as it would be dropped unsubmitted, and a
+/// wait for a descriptor fails likewise.
 #[test]
-#[should_panic(expected = "current driver")]
-fn a_portable_operation_starts_only_where_a_driver_is_current() {
-    let _ = poll_once(&mut PortableOp::new(Nop));
+fn where_no_driver_is_current_and_no_foreign_ring_is_set_it_is_unsupported() {
+    assert!(ruio_driver::foreign_ring().is_none());
+    let err = match poll_once(&mut PortableOp::new(Nop)) {
+        Poll::Ready(result) => result.unwrap_err(),
+        Poll::Pending => panic!("pending with no ring to run on"),
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
+
+    let (reader, mut writer) = pipe();
+    let close = PortableOp::new(ruio_driver::ops::Close::new(reader.into()));
+    assert!(block_on_away(close).is_err());
+    assert!(reader_closed(&mut writer), "closed as the close went");
+
+    let (reader, _writer) = pipe();
+    let reader = PortableFd::new(reader.into());
+    let mut wait = ReadyWait::new();
+    let ready = block_on_away(poll_fn(|cx| reader.poll_ready(cx, READABLE, &mut wait)));
+    assert_eq!(ready.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    assert!(!wait.is_waiting());
+
+    // A detached operation is dropped, with nothing to run on.
+    let (reader, _writer) = pipe();
+    let (buf, drops) = Counted::new();
+    PortableOp::new(Read::new(reader.as_raw_fd(), buf)).detach();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]

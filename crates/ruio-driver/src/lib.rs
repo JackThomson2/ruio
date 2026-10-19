@@ -15,10 +15,13 @@
 //! queues its operation on the ring of the thread's current driver
 //! ([`Driver::enter`]) when first polled, and a future that moves to another
 //! thread meanwhile hands the operation back to that ring, which finishes
-//! it there. A [`PortableFd`] is a plain descriptor whose operations are
-//! portable ones, and which closes after them on the ring they ran on; a
-//! [`ReadyWait`] waits for one to be ready, so that a nonblocking read or
-//! write can wait for the next attempt.
+//! it there. First polled on a thread with no current driver, one of
+//! another executor's, it sends its entry to the foreign ring the embedder
+//! chose ([`set_foreign_ring`]), and fails with `ENOSYS`, which the standard
+//! library names `Unsupported`, if none is set. A [`PortableFd`] is a plain
+//! descriptor whose operations are portable ones, and which closes after
+//! them on the ring they ran on; a [`ReadyWait`] waits for one to be ready,
+//! so that a nonblocking read or write can wait for the next attempt.
 //!
 //! Operations act on an [`Fd`]: a plain file descriptor, or a direct
 //! descriptor, a slot of the ring's registered file table, which saves the
@@ -57,6 +60,7 @@ pub mod buf;
 mod driver;
 mod fd;
 mod fixed;
+mod foreign;
 #[cfg(feature = "futures")]
 mod futures_impls;
 mod link;
@@ -77,6 +81,7 @@ mod waker;
 
 pub use driver::{Builder, Driver, Entered, Stats, monotonic_now};
 pub use fd::{Descriptor, DirectFd, Fd, PolledFd};
+pub use foreign::{clear_foreign_ring, foreign_ring, set_foreign_ring};
 pub use link::{Chain, Link};
 pub use op::{Completion, Op, Operation};
 pub use portable::{PortableFd, PortableOp, ReadyWait};

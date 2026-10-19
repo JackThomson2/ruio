@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker, ready};
 use std::time::Duration;
 
+use crate::foreign::{self, Left, Ticket};
 use crate::op::{Completion, Operation, Orphan, Seen, seen};
 use crate::ops::PollAdd;
 use crate::remote::{Remote, Request};
@@ -25,7 +26,7 @@ use crate::{Driver, Fd};
 /// across an `.await`.
 ///
 /// It queues the operation on the ring of the thread that first polls it,
-/// whose driver must be the thread's current one ([`Driver::enter`]), as a
+/// whose driver is the thread's current one ([`Driver::enter`]), as a
 /// runtime's is while it runs; that ring is then the operation's. While the
 /// future stays on that thread, as one in a task does, it costs what an
 /// [`Op`](crate::Op) does: a poll finds the ring by comparing its ID with
@@ -37,6 +38,20 @@ use crate::{Driver, Fd};
 /// over; dropped there, the ring's thread takes the operation over and
 /// cancels it, as dropping an `Op` does. Either goes as a request that the
 /// ring takes at its next turn, which the request unparks it for.
+///
+/// First polled on a thread with no current driver, one of another
+/// executor's say, the operation goes to the foreign ring instead, if one
+/// is set ([`set_foreign_ring`](crate::set_foreign_ring)): its entry is
+/// prepared where it is polled and sent to that ring, whose thread queues
+/// it at its next turn and sends its completion back, which wakes the task.
+/// The operation, and the memory the kernel uses, stay with the future, so
+/// it need not be `Send` for that. A future dropped meanwhile has the ring
+/// cancel the operation, which it keeps on its thread until the kernel is
+/// done with it; the thread's next foreign operation, or the next to be
+/// dropped there, then completes it and drops its output. With no foreign
+/// ring, the operation completes at once with `ENOSYS`, which the standard
+/// library names [`io::ErrorKind::Unsupported`], having reached no kernel,
+/// so that the caller can do its I/O another way.
 ///
 /// A ring dropped while the future of one of its operations is away, with
 /// the operation not yet handed back, finishes it as it shuts down, and
@@ -104,6 +119,14 @@ enum State<T, O> {
         home: u64,
         user_data: u64,
     },
+    /// Sent to the foreign ring `home` from a thread with no driver: the
+    /// ring queues the entry and sends the completion to `ticket`.
+    Sent {
+        operation: T,
+        ticket: Arc<Ticket>,
+        home: u64,
+        timed: bool,
+    },
     /// Leaked with its ring, which never finished it: it never completes.
     Lost,
     Done,
@@ -144,14 +167,21 @@ impl<'a, T: Operation> PortableOp<'a, T> {
 
     /// Leaves the operation to finish with nobody waiting for it, as
     /// [`Op::detach`](crate::Op::detach) does: submits it on the thread's
-    /// current driver if it has not been, and hands it to its ring, which
-    /// drops its output once the kernel is done. An operation not yet
-    /// submitted, on a thread with no current driver, is dropped, nothing of
-    /// it having reached a kernel.
+    /// current driver if it has not been, or sends it to the foreign ring
+    /// where none is current, and hands it to its ring, which drops its
+    /// output once the kernel is done. An operation not yet submitted, on a
+    /// thread with no current driver and no foreign ring, is dropped,
+    /// nothing of it having reached a kernel.
     pub fn detach(mut self) {
         match mem::replace(&mut self.state, State::Done) {
             State::Unsubmitted(operation) => {
                 let Some(driver) = Driver::current() else {
+                    self.state = State::Unsubmitted(operation);
+                    let mut cx = Context::from_waker(Waker::noop());
+                    // Refused, the output is dropped as it comes.
+                    if self.send(&mut cx).is_pending() {
+                        self.let_go(false);
+                    }
                     return;
                 };
                 let timed = self.timeout.is_some();
@@ -167,11 +197,22 @@ impl<'a, T: Operation> PortableOp<'a, T> {
         }
     }
 
-    /// Queues the operation on the thread's current driver.
+    /// The ID of the ring the operation queued on, or was sent to, if it
+    /// has been.
+    #[inline]
+    fn ring(&self) -> Option<u64> {
+        match self.state {
+            State::Queued { home, .. } | State::Sent { home, .. } => Some(home),
+            _ => None,
+        }
+    }
+
+    /// Queues the operation on the thread's current driver, or sends it to
+    /// the foreign ring if the thread has none.
     fn submit(&mut self, cx: &mut Context<'_>) -> Poll<T::Output> {
-        let driver = Driver::current().expect(
-            "a `PortableOp` is first polled on a thread with a current driver, as a runtime's is",
-        );
+        let Some(driver) = Driver::current() else {
+            return self.send(cx);
+        };
         let State::Unsubmitted(mut operation) = mem::replace(&mut self.state, State::Done) else {
             unreachable!("only an unsubmitted operation is submitted");
         };
@@ -187,6 +228,34 @@ impl<'a, T: Operation> PortableOp<'a, T> {
                     operation,
                     home,
                     user_data,
+                    timed: self.timeout.is_some(),
+                };
+                Poll::Pending
+            }
+            Err(err) => Poll::Ready(operation.complete(Completion::from_error(&err))),
+        }
+    }
+
+    /// Sends the operation's entry to the foreign ring, from a thread with
+    /// no current driver, keeping the operation; or completes it with
+    /// `ENOSYS` if no foreign ring is open.
+    #[cold]
+    fn send(&mut self, cx: &mut Context<'_>) -> Poll<T::Output> {
+        let State::Unsubmitted(mut operation) = mem::replace(&mut self.state, State::Done) else {
+            unreachable!("only an unsubmitted operation is sent");
+        };
+        // What the thread's earlier foreign operations left, done with first.
+        foreign::settle();
+        match foreign::send(&mut operation, self.timeout, cx.waker()) {
+            Ok((ticket, home)) => {
+                if let Some(ring) = self.ring {
+                    // Relaxed: as in `submit`.
+                    ring.store(home, Ordering::Relaxed);
+                }
+                self.state = State::Sent {
+                    operation,
+                    ticket,
+                    home,
                     timed: self.timeout.is_some(),
                 };
                 Poll::Pending
@@ -298,7 +367,9 @@ impl<'a, T: Operation> PortableOp<'a, T> {
     }
 
     /// Lets go of an operation in flight: hands it to its ring, which
-    /// cancels it if `cancel` says to and keeps it until the kernel is done.
+    /// cancels it if `cancel` says to and keeps it until the kernel is done;
+    /// or, sent from this thread or another with no driver, has its ring
+    /// cancel it and keeps it in a grave of the thread meanwhile.
     fn let_go(&mut self, cancel: bool) {
         match mem::replace(&mut self.state, State::Done) {
             State::Queued {
@@ -329,6 +400,27 @@ impl<'a, T: Operation> PortableOp<'a, T> {
                     let _ = post(home, (), |()| Request::Cancel { user_data });
                 }
             }
+            State::Sent {
+                operation,
+                ticket,
+                home,
+                timed,
+            } => {
+                let timed = timed && !cancel;
+                match ticket.leave(cancel) {
+                    // As the ring would have completed an orphan.
+                    Left::Done(completion) => drop(operation.complete(seen(completion, timed))),
+                    Left::InFlight(user_data) => {
+                        // One the ring has yet to queue it cancels as it
+                        // does; and, as above, a ring that is closing
+                        // cancels everything itself.
+                        if cancel && let Some(user_data) = user_data {
+                            let _ = post(home, (), |()| Request::Cancel { user_data });
+                        }
+                        foreign::bury(operation, ticket, timed);
+                    }
+                }
+            }
             state => self.state = state,
         }
     }
@@ -339,8 +431,7 @@ impl<T: Operation> Future for PortableOp<'_, T> {
 
     /// # Panics
     ///
-    /// If first polled on a thread with no current driver, or polled after
-    /// it completed.
+    /// If polled after it completed.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T::Output> {
         let this = self.get_mut();
         match &this.state {
@@ -362,6 +453,16 @@ impl<T: Operation> Future for PortableOp<'_, T> {
                 this.state = State::Done;
                 Poll::Ready(output)
             }
+            State::Sent { ticket, .. } => {
+                let completion = ready!(ticket.poll(cx.waker()));
+                let State::Sent {
+                    operation, timed, ..
+                } = mem::replace(&mut this.state, State::Done)
+                else {
+                    unreachable!();
+                };
+                Poll::Ready(operation.complete(seen(completion, timed)))
+            }
             State::Lost => Poll::Pending,
             State::Done => panic!("`PortableOp` polled after it completed"),
         }
@@ -370,7 +471,10 @@ impl<T: Operation> Future for PortableOp<'_, T> {
 
 impl<T: Operation<Output = O>, O> Drop for PortableOp<'_, T, O> {
     fn drop(&mut self) {
-        if matches!(self.state, State::Queued { .. } | State::Forwarded { .. }) {
+        if matches!(
+            self.state,
+            State::Queued { .. } | State::Forwarded { .. } | State::Sent { .. }
+        ) {
             self.let_go(true);
         }
     }
@@ -386,6 +490,7 @@ impl<T: Operation> fmt::Debug for PortableOp<'_, T> {
             State::Unsubmitted(_) => "unsubmitted",
             State::Queued { .. } => "queued",
             State::Forwarded { .. } => "forwarded",
+            State::Sent { .. } => "sent",
             State::Lost => "lost",
             State::Done => "done",
         };
@@ -495,12 +600,10 @@ impl PortableFd {
     ///
     /// # Errors
     ///
-    /// What the kernel reports for the poll, such as `EBADF`.
-    ///
-    /// # Panics
-    ///
-    /// If the poll is queued on a thread with no current driver; see
-    /// [`PortableOp`].
+    /// What the kernel reports for the poll, such as `EBADF`; and `ENOSYS`,
+    /// whose kind is [`io::ErrorKind::Unsupported`], if the poll is first
+    /// polled on a thread with no current driver while no foreign ring is
+    /// set; see [`PortableOp`].
     pub fn poll_ready(
         &self,
         cx: &mut Context<'_>,
@@ -523,7 +626,7 @@ impl PortableFd {
         );
         let unsubmitted = matches!(poll.op.state, State::Unsubmitted(_));
         let polled = Pin::new(&mut poll.op).poll(cx);
-        if unsubmitted && let State::Queued { home, .. } = poll.op.state {
+        if unsubmitted && let Some(home) = poll.op.ring() {
             // Relaxed: the descriptor reads it as it is dropped, once this
             // borrow of it is over, which orders the two.
             self.ring.store(home, Ordering::Relaxed);
@@ -648,8 +751,22 @@ impl fmt::Debug for ReadyWait {
 }
 
 /// Asks the ring of the driver with ID `home` for what `make` makes of
-/// `value`, or hands `value` back if the ring is closed or gone.
+/// `value`, or hands `value` back if the ring is closed or gone. The foreign
+/// ring, which the threads that send it operations ask most, is found
+/// through the thread's copy of it, without the registry's lock.
 fn post<V>(home: u64, value: V, make: impl FnOnce(V) -> Request) -> Result<(), V> {
+    let mut parts = Some((value, make));
+    let posted = foreign::with(|foreign| match foreign {
+        Some(remote) if remote.id() == home => {
+            let (value, make) = parts.take().expect("taken once");
+            Some(remote.post_with(value, make))
+        }
+        _ => None,
+    });
+    if let Some(posted) = posted {
+        return posted;
+    }
+    let (value, make) = parts.take().expect("not posted to the foreign ring");
     match Remote::find(home) {
         Some(remote) => remote.post_with(value, make),
         None => Err(value),

@@ -1,7 +1,7 @@
 //! Rings as other threads see them, direct descriptors sent from one
 //! ring's file table to another's with `IORING_OP_MSG_RING`, and what
 //! other threads ask of a ring for the portable operations and descriptors
-//! whose futures took them there.
+//! whose futures took them there, or that they send it to queue.
 
 use std::fmt;
 use std::io;
@@ -9,9 +9,11 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
 
 use ruio_sys as sys;
 
+use crate::foreign::Ticket;
 use crate::op::Orphan;
 use crate::{Completion, DirectFd, Driver, Operation, Unparker};
 
@@ -51,7 +53,8 @@ struct RemoteState {
 
 /// What another thread asks of a ring for a portable operation or
 /// descriptor of the ring's, whose future or owner has left the ring's
-/// thread; see [`PortableOp`](crate::PortableOp).
+/// thread, or for an operation that thread sends the ring to queue; see
+/// [`PortableOp`](crate::PortableOp).
 pub(crate) enum Request {
     /// Take over the operation in slot `user_data`, which `payload`
     /// finishes when it completes, at once if it has; and cancel it, if
@@ -67,6 +70,16 @@ pub(crate) enum Request {
     /// Close the descriptor after everything queued on the ring, which may
     /// name it; see [`PortableFd`](crate::PortableFd).
     Close(OwnedFd),
+    /// Queue `sqe`, the entry of an operation that a thread with no driver
+    /// of its own prepared, on the polled ring if `polled` says to, with a
+    /// linked timeout if `timeout` is set; its completion goes to
+    /// `ticket`, and the operation stays with its future on that thread.
+    Submit {
+        sqe: sys::io_uring_sqe,
+        polled: bool,
+        timeout: Option<Duration>,
+        ticket: Arc<Ticket>,
+    },
 }
 
 impl Remote {
@@ -98,42 +111,58 @@ impl Remote {
             .and_then(|(_, remote)| remote.upgrade())
     }
 
+    /// The ID of the ring's driver.
+    #[inline]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     fn lock(&self) -> MutexGuard<'_, RemoteState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Forgets the ring's descriptor, before the ring closes it: senders
     /// from then on find the ring closed, and so do requests, which come
-    /// back to whoever made them. The requests made before come back to the
-    /// ring.
-    pub(crate) fn close(&self) -> Vec<Request> {
-        let requests = {
+    /// back to whoever made them. `take` takes the requests made before,
+    /// under the lock, so that the ring has done, and submitted, what they
+    /// ask before any other thread can find it closed: such a thread then
+    /// closes at once a descriptor whose entry a request sent.
+    pub(crate) fn close(&self, take: impl FnOnce(Vec<Request>)) {
+        {
             let mut state = self.lock();
+            take(mem::take(&mut state.requests));
             state.fd = None;
             // The ring's file table goes with it.
             state.closes.clear();
-            mem::take(&mut state.requests)
-        };
+        }
         REMOTES
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(known, _)| *known != self.id);
-        requests
     }
 
-    /// The slots that other threads have asked the ring to close, and what
-    /// else they have asked of it, if anything.
+    /// Whether other threads have asked the ring for anything since it last
+    /// took what they asked: a plain load, which almost always finds
+    /// nothing. Anything asked after the check sets the flag again, and
+    /// unparks the ring, whose next turn takes it.
     #[inline]
-    pub(crate) fn take(&self) -> Option<(Vec<u32>, Vec<Request>)> {
-        // A plain load on every turn of the ring, which almost always finds
-        // nothing. Anything queued after the check sets the flag again, and
-        // unparks the ring: its next turn takes it.
-        if !self.pending.load(Ordering::Acquire) {
-            return None;
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    /// Swaps the slots that other threads have asked the ring to close, and
+    /// what else they have asked of it, into `closes` and `requests`, which
+    /// are empty, so that the ring keeps the vectors' room from one time to
+    /// the next; whether there were any.
+    pub(crate) fn take(&self, closes: &mut Vec<u32>, requests: &mut Vec<Request>) -> bool {
+        if !self.is_pending() {
+            return false;
         }
         self.pending.store(false, Ordering::Relaxed);
         let mut state = self.lock();
-        Some((mem::take(&mut state.closes), mem::take(&mut state.requests)))
+        mem::swap(&mut state.closes, closes);
+        mem::swap(&mut state.requests, requests);
+        true
     }
 
     /// Asks the ring to close `slot` at its next turn, unless it is closed.
@@ -169,6 +198,11 @@ impl Remote {
 impl RemoteRing {
     pub(crate) fn new(shared: Arc<Remote>) -> Self {
         Self { shared }
+    }
+
+    /// What the ring shares with other threads.
+    pub(crate) fn shared(&self) -> &Arc<Remote> {
+        &self.shared
     }
 
     /// The ID of the ring's driver; see [`Driver::id`].
