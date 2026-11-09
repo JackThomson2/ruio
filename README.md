@@ -41,7 +41,9 @@ license has been chosen.
 
 ruio needs Linux 6.10 or later, which it checks by capability rather than
 by version, and the Rust toolchain that `rust-toolchain.toml` pins
-(1.97.1).
+(1.97.1). Elsewhere, as on macOS and Windows until they have an I/O engine
+of ruio's, and with `--cfg ruio_engine="park"`, ruio builds with its
+executor alone: runtimes, tasks, timers, channels and locks, and no I/O.
 
 ## Crates
 

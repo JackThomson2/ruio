@@ -1038,8 +1038,8 @@ An engine is a thread's source of events, which the executor turns
 between its tasks and parks on while none is ready: io_uring's ring on
 Linux, and in time kqueue on macOS and an I/O completion port on Windows.
 io_uring stays the engine ruio is measured by, and the others must cost it
-nothing. So far the executor runs on any engine, and the I/O API of `ruio`
-on io_uring alone.
+nothing. So far `ruio` builds on any engine, and its I/O runs on io_uring
+alone: elsewhere it has the executor's API, on the park engine.
 
 - **One engine per build.** The engine is chosen when a binary is built,
   never at run time: io_uring on Linux; the park engine of `ruio-engine`
@@ -1047,13 +1047,13 @@ on io_uring alone.
   with `--cfg ruio_engine="park"`, in `RUSTFLAGS` or the binary's
   `.cargo/config.toml`. A Cargo feature would not do: features unify
   across the dependency graph, so a library that enabled one would move
-  every binary using it off io_uring. `ruio-executor`'s `build.rs` turns
-  the rule into `cfg(ruio_uring)`, and its `Cargo.toml` depends on
-  `ruio-driver` by the same rule, so a build for another engine does not
-  compile the driver at all. Cargo evaluates a `--cfg` of `RUSTFLAGS` in
-  target-specific dependency tables, and a build with another gets a
-  build-script output of its own, so switching never reuses a stale
-  choice.
+  every binary using it off io_uring. The `build.rs` of `ruio-executor`,
+  and `ruio`'s, which repeats it, turn the rule into `cfg(ruio_uring)`,
+  and their `Cargo.toml`s depend on `ruio-driver` by it, so a build for
+  another engine does not compile the driver at all. Cargo evaluates a
+  `--cfg` of `RUSTFLAGS` in target-specific dependency tables, and a
+  build with another gets a build-script output of its own, so switching
+  never reuses a stale choice.
 - **A contract, called by type.** `ruio-engine`, a crate of no
   dependencies, holds what the executor needs of an engine and nothing
   more: `Engine` (a turn without waiting, a park, whether a park would
@@ -1099,7 +1099,9 @@ on io_uring alone.
   smallest engine that keeps the contract, the one to start a new engine
   from, and the one besides io_uring that CI runs the executor's tests
   on, 279 of the 299, the others running io_uring operations, and builds
-  the executor and its tests on for macOS and Windows.
+  the executor and its tests on for macOS and Windows. `ruio` builds on
+  it with the executor's API alone, and CI runs its macro tests there and
+  builds it for macOS and Windows too.
 - **Checking an engine.** `ruio_engine::conformance::check` turns an
   engine through the contract alone and fails where it breaks the
   contract in a way a test with no I/O can see: unparks lost or adding
@@ -1137,16 +1139,33 @@ is the standard library's argument to it, and a shutdown has no timeout
 worth setting. A pool goes on the thread's current engine
 (`BufPool::new(count, size)`), and `BufPool::with_driver` names a ring.
 
-What still names the driver is io_uring's own: `ruio::uring` and
-`ruio::driver`, the `fd()` methods, registered buffers
-(`FixedBuffers::new` and the files' `ReadFixed` and `WriteFixed`), chains
-(`FileOp::link`), the io_uring future types themselves, and
-`ruio-compat`'s adapter, which is built on the ring's operations. In
-order:
+Built without io_uring, `ruio` has none of its I/O: `buf`, `net`, `fs`,
+`io`, `process` and `signal` come with io_uring alone, and so do `uring`
+and `driver`, and the tests that do I/O are kept to that build. Within
+those modules nothing more is gated: they compile with io_uring alone, so
+a gate on one of their methods would only repeat theirs. An engine that
+brings I/O is to offer the modules again, with the API of the first
+column below. The second is io_uring's own, and stays out of the other
+engines' builds, so that code using it fails to compile there rather than
+doing something else; the third depends on the system, not the engine.
 
-1. The parts of `ruio` that only a ring can do, `ruio::uring`, registered
-   buffers, chains, direct descriptors and multishot streams among them,
-   behind `cfg(ruio_uring)`, as the executor's are.
+| Module | Every engine with I/O | io_uring's own | By the system |
+|---|---|---|---|
+| `buf` | `IoBuf`, `IoBufMut`, `IoBufs`, `Slice`, `BufResult`, `AlignedBuf`; `BufPool::new`, `BufLease`, `BufBundle` | `BufPool::with_driver`; registered buffers: `FixedBuffers`, `FixedBuf`, `FixedIoBuf` | |
+| `net` | The TCP, UDP and Unix sockets: binding, connecting, `accept` and `incoming`, `read`, `write`, `read_exact`, `write_all`, `write_all_vectored`, `write_behind`, `flush`, `shutdown`, `recv_stream`, the datagrams' `send_to`, `recv_from` and `recv_from_stream`, the options and addresses, and moving a stream to another core with a plain descriptor; the futures' `timeout`; `ToSocketAddrs` and `lookup_host`; `net::portable` | `fd()`; direct descriptors (`set_direct`, `is_direct`), and moving one to another core's ring; `send_zc`; `recv_stream_incremental` | Unix sockets on Unix |
+| `fs` | `File` and `OpenOptions` as the standard library's; reads and writes at an offset and at the position, `read_exact_at`, `write_all_at`, `sync_all`, `sync_data`, `set_len`, `allocate`, `metadata`, `close` and `read_stream`; the path functions and `read_dir`; `fs::portable` | `fd()`; `read_fixed_at` and `write_fixed_at`; chains (`FileOp::link`); polled I/O (`OpenOptions::polled`); direct descriptors (`OpenOptions::direct_descriptor`); `read_stream_incremental` | `fallocate`, `sync_range`, `start_sync_range` and `advise` on Linux |
+| `io` | `AsyncRead`, `AsyncWrite`, `copy` and the futures built on them; the foreign reactor | | `AsyncFd` and `io::portable::AsyncFd` on Unix; `splice` on Linux |
+| `process`, `signal` | Spawning and waiting for children, their pipes; signals to tasks | | `Child::pidfd` on Linux; the signals Unix has |
+| Futures | The names: `net::Read`, `fs::SyncAll` and the rest | Their types: `SocketOp`, `FileOp`, `FdOp`, `PortableOp` | |
+| Crate root | | `uring`, `driver` | |
+
+`ruio-compat`'s adapter, which is built on the ring's operations, is
+io_uring's too until it is built on the traits of `io`. In order:
+
+1. The buffer traits and the interface of `BufPool` out of `ruio-driver`,
+   into a crate every engine shares, with io_uring's provided-buffer ring
+   behind `BufPool` there, so that another engine's I/O takes the same
+   buffers.
 2. An I/O completion port engine for Windows and a kqueue engine for
    macOS, with owned-buffer I/O on each. A completion port completes an
    operation into the buffer it was given, as io_uring does, so the
@@ -3436,6 +3455,10 @@ Since M7:
   rest), and pools go on the thread's current driver
   (`BufPool::new(count, size)`), so that no signature an engine is to
   offer names an operation of io_uring's (see [Engines](#engines)).
+- `ruio` builds on any engine. Built without io_uring, as on macOS and
+  Windows, it has the executor's API alone; its I/O and io_uring's own API
+  come with io_uring. The API another engine's I/O is to offer, and what
+  stays io_uring's, are set out (see [Engines](#engines)).
 
 ## Open questions
 
