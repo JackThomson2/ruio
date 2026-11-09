@@ -156,7 +156,7 @@ impl<T: AsRawFd + fmt::Debug> fmt::Debug for AsyncFd<T> {
 /// itself, at its position if it has one.
 impl<T: AsRawFd> AsyncRead for AsyncFd<T> {
     type Read<'a, B: IoBufMut>
-        = FdOp<'a, Read<B>>
+        = FdRead<'a, B>
     where
         Self: 'a;
 
@@ -170,7 +170,7 @@ impl<T: AsRawFd> AsyncRead for AsyncFd<T> {
 /// itself, at its position if it has one.
 impl<T: AsRawFd> AsyncWrite for AsyncFd<T> {
     type Write<'a, B: IoBuf>
-        = FdOp<'a, Write<B>>
+        = FdWrite<'a, B>
     where
         Self: 'a;
 
@@ -219,6 +219,16 @@ impl<T: Operation> fmt::Debug for FdOp<'_, T> {
 /// [`AsyncFd::ready`] and its kin: the output is the events the descriptor
 /// has, among those asked for.
 pub type Ready<'a> = FdOp<'a, PollAdd>;
+
+/// A read of an [`AsyncFd`]'s descriptor through the ring, which waits for
+/// it to be readable itself, made by its [`AsyncRead::read`]: it hands the
+/// buffer, an [`IoBufMut`], back with how many bytes it read.
+pub type FdRead<'a, B> = FdOp<'a, Read<B>>;
+
+/// A write of an [`AsyncFd`]'s descriptor through the ring, which waits for
+/// it to be writable itself, made by its [`AsyncWrite::write`]: it hands the
+/// buffer, an [`IoBuf`], back with how many bytes it wrote.
+pub type FdWrite<'a, B> = FdOp<'a, Write<B>>;
 
 /// An [`AsyncFd`]'s readiness, reported each time its descriptor is woken
 /// for the events asked for, by one multishot poll the stream keeps armed;

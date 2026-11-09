@@ -75,7 +75,7 @@ mod nonblocking;
 pub mod portable;
 mod splice;
 
-pub use async_fd::{AsyncFd, FdOp, Readiness, Ready};
+pub use async_fd::{AsyncFd, FdOp, FdRead, FdWrite, Readiness, Ready};
 pub use foreign::{
     Reactor, Registration, clear_foreign_reactor, foreign_reactor, set_foreign_reactor,
 };
