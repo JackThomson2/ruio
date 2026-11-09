@@ -89,11 +89,13 @@ Built for a system that has no I/O engine of ruio's yet, as macOS and
 Windows have not, or with `--cfg ruio_engine="park"`, ruio has the
 executor's API alone, on the park engine of `ruio-engine`, which runs no
 I/O: runtimes, tasks, timers, the channels and locks of [`sync`], the
-blocking pool and [`Cores`], whose threads are not pinned off Linux. The
-I/O and io_uring's own API, `net`, `fs`, `io`, `process`, `signal`, `buf`,
-`uring` and `driver`, come with io_uring alone until such a system has an
-engine of its own. With the `futures` feature, the channels' receivers and
-intervals implement the `Stream` and `FusedStream` of futures-core."#
+blocking pool and [`Cores`], whose threads are not pinned off Linux, and
+the buffer traits of [`buf`], which every engine shares. The I/O and
+io_uring's own API, `net`, `fs`, `io`, `process`, `signal`, the pools and
+registered buffers of `buf`, `uring` and `driver`, come with io_uring
+alone until such a system has an engine of its own. With the `futures`
+feature, the channels' receivers and intervals implement the `Stream` and
+`FusedStream` of futures-core."#
 )]
 
 pub use ruio_executor::{
@@ -104,9 +106,9 @@ pub use ruio_executor::{
 pub use ruio_executor::{blocking, coop, sync, time};
 pub use ruio_macros::{main, test};
 
+pub mod buf;
+
 // The I/O and io_uring's own API, which run on io_uring alone so far.
-#[cfg(ruio_uring)]
-pub use ruio_driver::buf;
 #[cfg(ruio_uring)]
 pub use ruio_executor::driver;
 

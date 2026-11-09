@@ -523,6 +523,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "libc",
+ "ruio-buf",
  "ruio-driver",
  "ruio-executor",
  "ruio-macros",

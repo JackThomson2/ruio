@@ -16,6 +16,7 @@ futures = ["dep:futures-core", "ruio-driver/futures", "ruio-executor/futures"]
 [dependencies]
 futures-core = { workspace = true, optional = true }
 libc.workspace = true
+ruio-buf.workspace = true
 ruio-executor.workspace = true
 ruio-macros.workspace = true
 
