@@ -1136,15 +1136,14 @@ has files and named pipes of its own.
   operation completes at once (each such completion still costs a turn),
   a way to make a turn without a call to the port, and counting the
   executor's wakers rather than cloning them.
-- **Testing the Windows engine.** CI lints it for Windows, and
-  `cargo xwin test --no-run --target x86_64-pc-windows-msvc -p ruio-engine
-  -p ruio-iocp -p ruio-executor -p ruio` links its tests and the
-  executor's on Linux. `cargo-xwin` downloads Microsoft's C runtime and
-  Windows SDK for that, under Microsoft's licence, which using it
-  accepts. The tests run on Windows itself:
+- **Testing the Windows engine.** CI's `windows` job lints and tests the
+  four crates that build on Windows, on a `windows-latest` runner:
   `cargo test -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio`. The
   other crates are Linux's, so `cargo test --workspace` does not build
-  there.
+  there. On Linux, `cargo xwin test --no-run` for
+  `x86_64-pc-windows-msvc` and the same crates links those tests;
+  `cargo-xwin` downloads Microsoft's C runtime and Windows SDK for that,
+  under Microsoft's licence, which using it accepts.
 
 Adding an engine takes:
 

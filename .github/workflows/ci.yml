@@ -38,3 +38,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test under AddressSanitizer
         run: ci/asan.sh
+
+  windows:
+    runs-on: windows-latest
+    # A hung engine would otherwise hold the runner for six hours.
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # The other crates are Linux's, and do not build on Windows.
+      - name: Lint the crates that build on Windows
+        run: cargo clippy -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio --all-targets --all-features --locked -- -D warnings
+      # Every test binary runs, so that one run reports every failure.
+      - name: Test them on the I/O completion port engine
+        run: cargo test -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio --all-features --locked --no-fail-fast
