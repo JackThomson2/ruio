@@ -1,5 +1,7 @@
 //! TCP sockets inside the runtime.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::io::{self, ErrorKind, Write as _};

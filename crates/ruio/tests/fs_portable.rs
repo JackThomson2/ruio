@@ -1,6 +1,8 @@
 //! Files that are `Send`, whose operations run on the ring of whichever
 //! thread polls them.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::future::{Future, poll_fn};

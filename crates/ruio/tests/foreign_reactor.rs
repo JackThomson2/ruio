@@ -4,6 +4,8 @@
 //! does. No foreign ring is set in this test binary, so a wait that went to
 //! one would fail with `ENOSYS` instead.
 
+#![cfg(ruio_uring)]
+
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write as _};

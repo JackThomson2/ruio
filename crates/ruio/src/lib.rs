@@ -21,77 +21,106 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
-//! [`net`] has sockets, which read and write with owned buffers and can
-//! receive into a pool of buffers that the kernel picks from, and [`fs`]
-//! has files, which read and write the same way; [`io`] has the traits
-//! both implement, `copy` and `splice` over them, and `AsyncFd`, which
-//! brings a descriptor of any other kind onto the ring; [`signal`]
-//! delivers signals to tasks; [`process`] spawns child processes, with
-//! pipes to their standard streams, and waits for them on the ring. Their
-//! operations, like all others, run on the thread's ring, which [`driver`]
-//! returns; [`uring`] has the operations and the types for writing new
-//! ones. Libraries that take their I/O through the poll-based traits of
-//! `tokio::io` or futures-io, such as hyper and rustls, run over ruio's
-//! streams through the adapters of the `ruio-compat` crate.
-//!
-//! A file or socket belongs to its thread's ring, and a future that holds
-//! one is not `Send`. The functions of [`fs`] that take a path, and
-//! everything in [`process`], run their operations on the ring of the
-//! thread that polls them instead, so their futures are `Send`, for code
-//! whose futures must be, such as `async_trait`'s, at the cost of a
-//! comparison per poll; so are the directory reader `read_dir` makes and
-//! its entries.
+#![cfg_attr(
+    ruio_uring,
+    doc = r#"[`net`] has sockets, which read and write with owned buffers and can
+receive into a pool of buffers that the kernel picks from, and [`fs`] has
+files, which read and write the same way; [`io`] has the traits both
+implement, `copy` and `splice` over them, and `AsyncFd`, which brings a
+descriptor of any other kind onto the ring; [`signal`] delivers signals
+to tasks; [`process`] spawns child processes, with pipes to their
+standard streams, and waits for them on the ring. Their operations, like
+all others, run on the thread's ring, which [`driver`] returns; [`uring`]
+has the operations and the types for writing new ones. Libraries that
+take their I/O through the poll-based traits of `tokio::io` or
+futures-io, such as hyper and rustls, run over ruio's streams through the
+adapters of the `ruio-compat` crate.
+
+A file or socket belongs to its thread's ring, and a future that holds
+one is not `Send`. The functions of [`fs`] that take a path, and
+everything in [`process`], run their operations on the ring of the
+thread that polls them instead, so their futures are `Send`, for code
+whose futures must be, such as `async_trait`'s, at the cost of a
+comparison per poll; so are the directory reader `read_dir` makes and its
+entries.
+"#
+)]
 //!
 //! Thread per core: [`Cores`] runs a runtime on each of several CPUs, on a
 //! thread pinned to it, as `#[ruio::main(cores = "all")]` runs `main`.
 //! [`spawn_on`] spawns a `Send` future from one core onto another, and the
-//! channels of [`sync`] carry values between cores. A server has a listener
-//! on each core, all bound to one address, and the kernel spreads the
-//! connections among them:
-//!
-//! ```no_run
-//! use ruio::net::TcpListener;
-//!
-//! #[ruio::main(cores = "all")]
-//! async fn main() -> std::io::Result<()> {
-//!     let listener = TcpListener::bind_reuseport("127.0.0.1:7878")?;
-//!     let mut incoming = listener.incoming();
-//!     while let Some(stream) = incoming.next().await {
-//!         let stream = stream?;
-//!         ruio::spawn(async move {
-//!             let (read, buf) = stream.read(Vec::with_capacity(4096)).await;
-//!             if read.is_ok() {
-//!                 let _ = stream.write_all(buf).await;
-//!             }
-//!         });
-//!     }
-//!     Ok(())
-//! }
-//! ```
-//!
-//! With the `futures` feature, the streams here, of connections, of data,
-//! of datagrams, of directory entries, of readiness and of signals, and the
-//! channels' receivers and intervals of the executor, implement the `Stream`
-//! and `FusedStream` of futures-core, each as one call to its own
-//! `poll_next`, so they compose with futures-util's combinators: a server's
-//! connections merge with its shutdown signal through `select`.
+//! channels of [`sync`] carry values between cores.
+#![cfg_attr(
+    ruio_uring,
+    doc = r#"A server has a listener on each core, all bound to one address, and
+the kernel spreads the connections among them:
+
+```no_run
+use ruio::net::TcpListener;
+
+#[ruio::main(cores = "all")]
+async fn main() -> std::io::Result<()> {
+    let listener = TcpListener::bind_reuseport("127.0.0.1:7878")?;
+    let mut incoming = listener.incoming();
+    while let Some(stream) = incoming.next().await {
+        let stream = stream?;
+        ruio::spawn(async move {
+            let (read, buf) = stream.read(Vec::with_capacity(4096)).await;
+            if read.is_ok() {
+                let _ = stream.write_all(buf).await;
+            }
+        });
+    }
+    Ok(())
+}
+```
+
+With the `futures` feature, the streams here, of connections, of data, of
+datagrams, of directory entries, of readiness and of signals, and the
+channels' receivers and intervals of the executor, implement the `Stream`
+and `FusedStream` of futures-core, each as one call to its own
+`poll_next`, so they compose with futures-util's combinators: a server's
+connections merge with its shutdown signal through `select`."#
+)]
+#![cfg_attr(
+    not(ruio_uring),
+    doc = r#"
+Built for a system that has no I/O engine of ruio's yet, as macOS and
+Windows have not, or with `--cfg ruio_engine="park"`, ruio has the
+executor's API alone, on the park engine of `ruio-engine`, which runs no
+I/O: runtimes, tasks, timers, the channels and locks of [`sync`], the
+blocking pool and [`Cores`], whose threads are not pinned off Linux. The
+I/O and io_uring's own API, `net`, `fs`, `io`, `process`, `signal`, `buf`,
+`uring` and `driver`, come with io_uring alone until such a system has an
+engine of its own. With the `futures` feature, the channels' receivers and
+intervals implement the `Stream` and `FusedStream` of futures-core."#
+)]
 
 pub use ruio_executor::{
     AbortHandle, Builder, Core, Cores, Handle, JoinError, JoinHandle, JoinSet, RemoteAbortHandle,
-    RemoteJoinHandle, Runtime, core, core_count, driver, handle, handle_of, spawn, spawn_blocking,
+    RemoteJoinHandle, Runtime, core, core_count, handle, handle_of, spawn, spawn_blocking,
     spawn_on, yield_now,
 };
 pub use ruio_executor::{blocking, coop, sync, time};
 pub use ruio_macros::{main, test};
 
+// The I/O and io_uring's own API, which run on io_uring alone so far.
+#[cfg(ruio_uring)]
 pub use ruio_driver::buf;
+#[cfg(ruio_uring)]
+pub use ruio_executor::driver;
 
+#[cfg(ruio_uring)]
 pub mod fs;
-#[cfg(feature = "futures")]
+#[cfg(all(feature = "futures", ruio_uring))]
 mod futures_impls;
+#[cfg(ruio_uring)]
 pub mod io;
+#[cfg(ruio_uring)]
 pub mod net;
+#[cfg(ruio_uring)]
 pub mod process;
+#[cfg(ruio_uring)]
 pub mod signal;
 
 /// The io_uring driver: operations, the futures that run them, and the types
@@ -135,6 +164,7 @@ pub mod signal;
 /// # Ok(())
 /// # }
 /// ```
+#[cfg(ruio_uring)]
 pub mod uring {
     pub use ruio_driver::{
         BaselineError, Chain, Completion, Descriptor, DirectFd, Driver, Entered, Fd, Link, MultiOp,

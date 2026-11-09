@@ -1,5 +1,7 @@
 //! Files inside the runtime.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::fs::Permissions;

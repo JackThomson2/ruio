@@ -1,5 +1,7 @@
 //! Readiness and I/O on descriptors of any kind, through `AsyncFd`.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::io::{self, ErrorKind, Read as _, Write as _};

@@ -1,6 +1,8 @@
 //! The portable sockets: `Send` and `Sync` streams and listeners, read and
 //! written with system calls made at once on whichever thread polls them.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::future::{Future, poll_fn};

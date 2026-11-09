@@ -1,5 +1,7 @@
 //! The owned-buffer read and write traits, and what is built on them.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::cell::{Cell, RefCell};

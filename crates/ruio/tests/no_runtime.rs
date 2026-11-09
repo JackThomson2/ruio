@@ -3,6 +3,8 @@
 //! `ENOSYS`, whose kind is `Unsupported`, rather than panicking, so that the
 //! caller can do its I/O another way.
 
+#![cfg(ruio_uring)]
+
 use std::io::{self, ErrorKind};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::process::Stdio;

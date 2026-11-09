@@ -3,8 +3,6 @@
 use std::io;
 use std::time::Duration;
 
-use ruio::uring::ops::Nop;
-
 #[ruio::test]
 async fn a_test_runs_on_a_runtime() {
     let task = ruio::spawn(async {
@@ -16,7 +14,7 @@ async fn a_test_runs_on_a_runtime() {
 
 #[ruio::test]
 async fn a_test_can_return_a_result() -> io::Result<()> {
-    ruio::driver().op(Nop).await?;
+    ruio::yield_now().await;
     Ok(())
 }
 
@@ -58,7 +56,7 @@ async fn a_test_runs_on_every_core() {
 #[ruio::test(cores = 1)]
 async fn a_test_on_cores_can_return_a_result() -> io::Result<()> {
     assert_eq!(ruio::core_count(), 1);
-    ruio::driver().op(Nop).await?;
+    ruio::yield_now().await;
     Ok(())
 }
 
@@ -80,7 +78,7 @@ fn main_on_cores_returns_the_first_error() {
 
 #[ruio::test]
 async fn early_returns_leave_the_body() {
-    if ruio::driver().op(Nop).await.is_ok() {
+    if ruio::spawn(async {}).await.is_ok() {
         return;
     }
     unreachable!();

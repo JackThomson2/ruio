@@ -1,5 +1,7 @@
 //! Resolving addresses: literals at once, host names on the blocking pool.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::future::Future;

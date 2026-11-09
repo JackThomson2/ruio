@@ -6,6 +6,8 @@
 //! dispatcher ran again, still hands them on. The test has a binary of its
 //! own, so that no other runtime's read can take the count first.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::sync::mpsc;

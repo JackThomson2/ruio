@@ -16,9 +16,14 @@ futures = ["dep:futures-core", "ruio-driver/futures", "ruio-executor/futures"]
 [dependencies]
 futures-core = { workspace = true, optional = true }
 libc.workspace = true
-ruio-driver.workspace = true
 ruio-executor.workspace = true
 ruio-macros.workspace = true
+
+# The io_uring driver and the kernel's ABI, which the I/O runs on: on Linux,
+# unless built with `--cfg ruio_engine="park"`. build.rs tells the code the
+# same, as `cfg(ruio_uring)`.
+[target.'cfg(all(target_os = "linux", not(ruio_engine = "park")))'.dependencies]
+ruio-driver.workspace = true
 ruio-sys.workspace = true
 
 [dev-dependencies]

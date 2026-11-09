@@ -1,5 +1,7 @@
 //! Buffers and pooled receives inside the runtime.
 
+#![cfg(ruio_uring)]
+
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;

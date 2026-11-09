@@ -1,6 +1,8 @@
 //! Moving bytes between descriptors through a pipe, without a buffer in
 //! user space.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::io::{self, ErrorKind};

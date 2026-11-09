@@ -4,6 +4,8 @@
 //! that counts arrivals listens for a kind of its own, and the kinds the
 //! tests share are only ever asked "has it arrived at all".
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::io::ErrorKind;

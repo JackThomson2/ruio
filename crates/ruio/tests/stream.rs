@@ -2,6 +2,7 @@
 //! readiness and signals through the `Stream` and `FusedStream` traits of
 //! futures-core, and futures-util's combinators over them.
 
+#![cfg(ruio_uring)]
 #![cfg(feature = "futures")]
 
 mod support;

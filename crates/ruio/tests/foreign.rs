@@ -6,6 +6,8 @@
 //! Signal handlers are process-wide and the tests run in parallel, so each
 //! test that listens for a signal listens for a kind of its own.
 
+#![cfg(ruio_uring)]
+
 use std::future::{Future, poll_fn};
 use std::io::{self, Write as _};
 use std::os::unix::net::UnixStream as StdUnixStream;

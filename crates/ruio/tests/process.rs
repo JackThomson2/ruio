@@ -3,6 +3,8 @@
 //! Tests run at once in one process, so each signals and waits for its own
 //! children only.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::future::{Future, poll_fn};

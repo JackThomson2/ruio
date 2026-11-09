@@ -1,6 +1,8 @@
 //! The portable `AsyncFd`: readiness waits with tokio's API, `Send` and
 //! `Sync`, on the ring of the thread that polls them.
 
+#![cfg(ruio_uring)]
+
 mod support;
 
 use std::cell::Cell;
