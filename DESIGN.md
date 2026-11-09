@@ -1120,23 +1120,40 @@ Adding an engine takes:
 3. The I/O API on it, which is the work still ahead.
 
 The I/O API of `ruio` (`net`, `fs`, `io`, `process`, `signal`, `buf`)
-still names the driver's types in its signatures, `SocketOp<'_, Recv<B>>`
-for a read say, and has `ruio::uring` and the `fd()` methods. In order:
+names no operation of the driver's in the signatures every engine is to
+offer. Each method's future has a name of its own in its module, after
+the method: `net`'s `Accept`, `Read`, `Write`, `SendTo` and `RecvFrom`;
+`fs`'s `Read`, `Write`, `SyncAll`, `SyncData`, `SetLen`, `Allocate`,
+`SyncRange` and `Advise`, and the same for `fs::portable`'s file; and
+`io`'s `Ready`, `FdRead` and `FdWrite` for an `AsyncFd`. Each is an alias
+of the io_uring future it was, a `SocketOp`, `FileOp`, `PortableOp` or
+`FdOp`, so the io_uring build compiles the same types and the same code.
+Where a method's name would shadow a name in scope everywhere, the
+future takes the name of the operation it shares: a connected datagram
+socket's `send` and `recv` return `Write` and `Read`, the same send and
+receive as a stream's `write` and `read`, since `Send` is the marker
+trait; and a socket's `shutdown` returns `impl Future`, since `Shutdown`
+is the standard library's argument to it, and a shutdown has no timeout
+worth setting. A pool goes on the thread's current engine
+(`BufPool::new(count, size)`), and `BufPool::with_driver` names a ring.
 
-1. Futures named apart from the driver's operations, as aliases of the
-   io_uring futures in that build, and pools made on the thread's current
-   engine, so that the API can have an implementation per engine. In the
-   io_uring build this changes names alone.
-2. The parts of `ruio` that only a ring can do, `ruio::uring`, registered
+What still names the driver is io_uring's own: `ruio::uring` and
+`ruio::driver`, the `fd()` methods, registered buffers
+(`FixedBuffers::new` and the files' `ReadFixed` and `WriteFixed`), chains
+(`FileOp::link`), the io_uring future types themselves, and
+`ruio-compat`'s adapter, which is built on the ring's operations. In
+order:
+
+1. The parts of `ruio` that only a ring can do, `ruio::uring`, registered
    buffers, chains, direct descriptors and multishot streams among them,
    behind `cfg(ruio_uring)`, as the executor's are.
-3. An I/O completion port engine for Windows and a kqueue engine for
+2. An I/O completion port engine for Windows and a kqueue engine for
    macOS, with owned-buffer I/O on each. A completion port completes an
    operation into the buffer it was given, as io_uring does, so the
    soundness model carries over; kqueue reports readiness, so a read waits
    for its socket to be readable and then reads into the caller's buffer
    itself, and files go to the blocking pool.
-4. Pinning `Cores`' threads on Windows (`SetThreadAffinityMask`); macOS
+3. Pinning `Cores`' threads on Windows (`SetThreadAffinityMask`); macOS
    offers only affinity hints.
 
 ## Networking
@@ -3414,6 +3431,11 @@ Since M7:
   engine, which runs no I/O, off Linux and when built with
   `--cfg ruio_engine="park"`: the first step toward engines for macOS and
   Windows (see [Engines](#engines)).
+- The I/O API names each method's future after the method, as an alias
+  of the io_uring future it was (`net::Read`, `fs::SyncAll` and the
+  rest), and pools go on the thread's current driver
+  (`BufPool::new(count, size)`), so that no signature an engine is to
+  offer names an operation of io_uring's (see [Engines](#engines)).
 
 ## Open questions
 
@@ -3429,10 +3451,6 @@ Since M7:
   system call made at once, and from how many connections, is unmeasured.
 - Portable datagram sockets. `UdpSocket` and `UnixDatagram` have no
   portable form yet.
-- The names of the futures that the methods of `net` and `fs` return,
-  once they no longer name the driver's operations (see
-  [Engines](#engines)): following the methods, `Send` and `Shutdown`
-  would shadow the marker trait and `std::net::Shutdown`.
 - The receive stream's stall. While the ask of a buffer less (see
   [Networking](#networking)) was built, the test of many re-arms once hung
   within a few hundred cycles: a capped receive, issued at submission
