@@ -49,8 +49,9 @@ to io_uring (see [Engines](#engines)).
 crates/
   ruio-sys/       kernel ABI: uapi structures and constants, raw system calls; no policy
   ruio-engine/    the contract between the executor and its I/O engine; the park engine
-  ruio-driver/    one ring: setup, SQ/CQ, operation table, Op<T> futures, buffers,
-                  registered files, capability probe; the io_uring engine
+  ruio-buf/       the buffers every engine shares: IoBuf, IoBufMut, IoBufs, Slice, AlignedBuf
+  ruio-driver/    one ring: setup, SQ/CQ, operation table, Op<T> futures, pools,
+                  registered buffers and files, capability probe; the io_uring engine
   ruio-executor/  per-thread scheduler, tasks, timer wheel, thread-per-core builder
   ruio-macros/    #[ruio::main], #[ruio::test]
   ruio/           public API: runtime, time, uring, buf, net, fs, io, signal, process
@@ -1139,19 +1140,21 @@ is the standard library's argument to it, and a shutdown has no timeout
 worth setting. A pool goes on the thread's current engine
 (`BufPool::new(count, size)`), and `BufPool::with_driver` names a ring.
 
-Built without io_uring, `ruio` has none of its I/O: `buf`, `net`, `fs`,
-`io`, `process` and `signal` come with io_uring alone, and so do `uring`
-and `driver`, and the tests that do I/O are kept to that build. Within
-those modules nothing more is gated: they compile with io_uring alone, so
-a gate on one of their methods would only repeat theirs. An engine that
-brings I/O is to offer the modules again, with the API of the first
-column below. The second is io_uring's own, and stays out of the other
-engines' builds, so that code using it fails to compile there rather than
-doing something else; the third depends on the system, not the engine.
+Built without io_uring, `ruio` has none of its I/O: `net`, `fs`, `io`,
+`process` and `signal` come with io_uring alone, and so do `uring`,
+`driver` and the ring's own buffers in `buf`, whose shared buffers are
+there on every engine; the tests that do I/O are kept to that build.
+Within those modules nothing more is gated: they compile with io_uring
+alone, so a gate on one of their methods would only repeat theirs. An
+engine that brings I/O is to offer the modules again, with the API of
+the first column below. The second is io_uring's own, and stays out of
+the other engines' builds, so that code using it fails to compile there
+rather than doing something else; the third depends on the system, not
+the engine.
 
 | Module | Every engine with I/O | io_uring's own | By the system |
 |---|---|---|---|
-| `buf` | `IoBuf`, `IoBufMut`, `IoBufs`, `Slice`, `BufResult`, `AlignedBuf`; `BufPool::new`, `BufLease`, `BufBundle` | `BufPool::with_driver`; registered buffers: `FixedBuffers`, `FixedBuf`, `FixedIoBuf` | |
+| `buf` | `BufPool::new`, `BufLease`, `BufBundle`, each engine's own types with io_uring's API; and on every engine, I/O or none, `ruio-buf`'s `IoBuf`, `IoBufMut`, `IoBufs`, `Slice`, `BufResult`, `AlignedBuf` | `BufPool::with_driver`; registered buffers: `FixedBuffers`, `FixedBuf`, `FixedIoBuf` | |
 | `net` | The TCP, UDP and Unix sockets: binding, connecting, `accept` and `incoming`, `read`, `write`, `read_exact`, `write_all`, `write_all_vectored`, `write_behind`, `flush`, `shutdown`, `recv_stream`, the datagrams' `send_to`, `recv_from` and `recv_from_stream`, the options and addresses, and moving a stream to another core with a plain descriptor; the futures' `timeout`; `ToSocketAddrs` and `lookup_host`; `net::portable` | `fd()`; direct descriptors (`set_direct`, `is_direct`), and moving one to another core's ring; `send_zc`; `recv_stream_incremental` | Unix sockets on Unix |
 | `fs` | `File` and `OpenOptions` as the standard library's; reads and writes at an offset and at the position, `read_exact_at`, `write_all_at`, `sync_all`, `sync_data`, `set_len`, `allocate`, `metadata`, `close` and `read_stream`; the path functions and `read_dir`; `fs::portable` | `fd()`; `read_fixed_at` and `write_fixed_at`; chains (`FileOp::link`); polled I/O (`OpenOptions::polled`); direct descriptors (`OpenOptions::direct_descriptor`); `read_stream_incremental` | `fallocate`, `sync_range`, `start_sync_range` and `advise` on Linux |
 | `io` | `AsyncRead`, `AsyncWrite`, `copy` and the futures built on them; the foreign reactor | | `AsyncFd` and `io::portable::AsyncFd` on Unix; `splice` on Linux |
@@ -1159,20 +1162,30 @@ doing something else; the third depends on the system, not the engine.
 | Futures | The names: `net::Read`, `fs::SyncAll` and the rest | Their types: `SocketOp`, `FileOp`, `FdOp`, `PortableOp` | |
 | Crate root | | `uring`, `driver` | |
 
+The buffers an operation takes are those of `ruio-buf`, a crate of no
+dependencies that every engine shares: the traits, slices and aligned
+buffers, with their impls for the standard library's buffers, so a
+buffer made for one engine's I/O serves another's, and code generic over
+`IoBuf` builds on every engine. A pool is not shared that way. An engine
+with I/O is to bring a `BufPool`, `BufLease` and `BufBundle` of its own
+types, with the API of io_uring's, and `ruio::buf` re-exports the
+engine's, as the executor names its engine `Native`. io_uring's pool is a
+provided-buffer ring the kernel takes buffers from as data arrives;
+another engine's could be a free list its reads take from once a socket
+is readable. One interface that both sat behind would cost io_uring's
+pool a dynamic call on every lease, or make the shared crate depend on
+the driver, for a choice already made when the program is built.
+
 `ruio-compat`'s adapter, which is built on the ring's operations, is
 io_uring's too until it is built on the traits of `io`. In order:
 
-1. The buffer traits and the interface of `BufPool` out of `ruio-driver`,
-   into a crate every engine shares, with io_uring's provided-buffer ring
-   behind `BufPool` there, so that another engine's I/O takes the same
-   buffers.
-2. An I/O completion port engine for Windows and a kqueue engine for
+1. An I/O completion port engine for Windows and a kqueue engine for
    macOS, with owned-buffer I/O on each. A completion port completes an
    operation into the buffer it was given, as io_uring does, so the
    soundness model carries over; kqueue reports readiness, so a read waits
    for its socket to be readable and then reads into the caller's buffer
    itself, and files go to the blocking pool.
-3. Pinning `Cores`' threads on Windows (`SetThreadAffinityMask`); macOS
+2. Pinning `Cores`' threads on Windows (`SetThreadAffinityMask`); macOS
    offers only affinity hints.
 
 ## Networking
@@ -3459,6 +3472,9 @@ Since M7:
   Windows, it has the executor's API alone; its I/O and io_uring's own API
   come with io_uring. The API another engine's I/O is to offer, and what
   stays io_uring's, are set out (see [Engines](#engines)).
+- The buffer traits, slices and aligned buffers moved out of the driver
+  into `ruio-buf`, which every engine shares, and `ruio::buf` has them on
+  every engine; pools stay each engine's own (see [Engines](#engines)).
 
 ## Open questions
 

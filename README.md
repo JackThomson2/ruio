@@ -53,7 +53,8 @@ executor alone: runtimes, tasks, timers, channels and locks, and no I/O.
 | [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; `Timer`, which gives hyper ruio's timers for its timeouts; `PortableCompat`, which gives the portable streams and a child's pipes those traits with no buffers of its own, and the portable file them and `AsyncSeek`; and, with the `client` feature, a connector that runs hyper-util's client on them |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder, over the I/O engine chosen when the program is built: io_uring on Linux, and the park engine, which runs no I/O, elsewhere |
 | [`ruio-engine`](crates/ruio-engine) | The contract between the executor and its I/O engine, a check that an engine keeps it, and the park engine |
-| [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, buffers and pools, registered files, the capability probe |
+| [`ruio-buf`](crates/ruio-buf) | The buffers an operation takes and hands back, shared by every engine: `IoBuf`, `IoBufMut`, `IoBufs`, slices and aligned buffers |
+| [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, pools and registered buffers, registered files, the capability probe |
 | [`ruio-sys`](crates/ruio-sys) | The kernel's io_uring ABI and system calls |
 | [`ruio-macros`](crates/ruio-macros) | `#[ruio::main]` and `#[ruio::test]` |
 | [`ruio-bench`](crates/ruio-bench) | Benchmarks against tokio and fio |
