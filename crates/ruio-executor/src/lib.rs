@@ -10,9 +10,10 @@
 //!
 //! The engine is the thread's source of events, which the runtime turns
 //! between its tasks and parks on while none is ready: on Linux, the
-//! io_uring ring of `ruio-driver`; elsewhere, until ruio has an engine
-//! there, the park engine of `ruio-engine`, which runs no I/O, and which
-//! building with `--cfg ruio_engine="park"` chooses on Linux too. The
+//! io_uring ring of `ruio-driver`; on Windows, the I/O completion port of
+//! `ruio-iocp`; elsewhere, until ruio has an engine there, the park engine
+//! of `ruio-engine`, which runs no I/O, and which building with
+//! `--cfg ruio_engine="park"` chooses on Linux and Windows too. The
 //! runtime drives its engine through the contract of `ruio-engine` alone,
 //! so the engine is chosen when the crate is built, and no engine pays at
 //! run time for the others being possible.
@@ -82,7 +83,7 @@ use std::task::Poll;
 
 pub use blocking::spawn_blocking;
 pub use cores::{Core, Cores, core, core_count, handle_of, spawn_on};
-// The engine's own API, which the park engine has none of.
+// The engine's own API, which only io_uring's has so far.
 #[cfg(ruio_uring)]
 pub use engine::public::*;
 pub use handle::Handle;
