@@ -8,6 +8,9 @@ env:
   CARGO_TERM_COLOR: always
   # Fail instead of skipping if the ABI test finds no C compiler or header.
   RUIO_REQUIRE_ABI_CHECK: "1"
+  # Fail instead of skipping if a target the executor is built for is not
+  # installed.
+  RUIO_REQUIRE_CROSS_CHECK: "1"
 
 jobs:
   check:
@@ -16,6 +19,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install the toolchain from rust-toolchain.toml
         run: rustup toolchain install
+      - name: Install the targets the executor is built for besides Linux
+        run: rustup target add aarch64-apple-darwin x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - name: Show the kernel
         run: uname -a
