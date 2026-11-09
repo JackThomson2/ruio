@@ -23,6 +23,14 @@
 //! # }
 //! ```
 //!
+//! Each method's future has a name of its own here, after the method:
+//! [`Accept`], [`SendTo`], [`RecvFrom`], and [`Read`] and [`Write`] for a
+//! stream's reads and writes and a connected datagram socket's receives and
+//! sends alike, which are the same operations. So code that names a future
+//! names no operation of the engine's; with io_uring each is a
+//! [`SocketOp`] of the operation the method makes. A shutdown's future has
+//! no name: it has nothing to set.
+//!
 //! [`SocketOp::timeout`], [`WriteAll::timeout`] and
 //! [`ReadExact::timeout`] bound how long the kernel may take with a linked
 //! timeout: an operation cut short fails with
@@ -104,8 +112,11 @@ mod unix;
 
 pub use addr::{ToSocketAddrs, lookup_host};
 pub use behind::{Flush, WriteBehind};
+pub use socket::{
+    Accept, Read, ReadExact, RecvFrom, RecvStream, SendTo, SendZc, SocketOp, Write, WriteAll,
+    WriteAllVectored,
+};
 pub(crate) use socket::{Desc, Sock, ThreadBound};
-pub use socket::{ReadExact, RecvStream, SendZc, SocketOp, WriteAll, WriteAllVectored};
 pub use tcp::{Incoming, SentTcpStream, TcpListener, TcpStream};
 pub use udp::{Datagram, RecvFromStream, UdpSocket};
 pub use unix::{UnixDatagram, UnixListener, UnixStream};

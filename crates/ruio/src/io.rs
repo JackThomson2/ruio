@@ -21,7 +21,7 @@
 //! wait for it to be ready, once or again and again, and read and write it
 //! through the ring.
 //!
-//! The portable sockets of [`net::portable`](crate::net::portable) and a
+//! The portable sockets of [`net::portable`] and a
 //! child's pipes read and write with system calls made at once instead, on
 //! whichever thread polls them, and wait on that thread's ring only when
 //! there is nothing to read or no room to write: their reads and writes are
@@ -65,10 +65,10 @@ use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
 use ruio_driver::buf::{BufResult, IoBuf, IoBufMut, Slice};
-use ruio_driver::ops::{self, Read, Recv, Write};
+use ruio_driver::ops::{Read, Write};
 
 use crate::fs::{File, FileOp};
-use crate::net::{SocketOp, TcpStream, UnixStream};
+use crate::net::{self, TcpStream, UnixStream};
 
 mod async_fd;
 mod foreign;
@@ -164,7 +164,7 @@ pub trait AsyncWrite {
 }
 
 impl AsyncRead for TcpStream {
-    type Read<'a, B: IoBufMut> = SocketOp<'a, Recv<B>>;
+    type Read<'a, B: IoBufMut> = net::Read<'a, B>;
 
     #[inline]
     fn read<B: IoBufMut>(&self, buf: B) -> Self::Read<'_, B> {
@@ -173,7 +173,7 @@ impl AsyncRead for TcpStream {
 }
 
 impl AsyncWrite for TcpStream {
-    type Write<'a, B: IoBuf> = SocketOp<'a, ops::Send<B>>;
+    type Write<'a, B: IoBuf> = net::Write<'a, B>;
 
     #[inline]
     fn write<B: IoBuf>(&self, buf: B) -> Self::Write<'_, B> {
@@ -182,7 +182,7 @@ impl AsyncWrite for TcpStream {
 }
 
 impl AsyncRead for UnixStream {
-    type Read<'a, B: IoBufMut> = SocketOp<'a, Recv<B>>;
+    type Read<'a, B: IoBufMut> = net::Read<'a, B>;
 
     #[inline]
     fn read<B: IoBufMut>(&self, buf: B) -> Self::Read<'_, B> {
@@ -191,7 +191,7 @@ impl AsyncRead for UnixStream {
 }
 
 impl AsyncWrite for UnixStream {
-    type Write<'a, B: IoBuf> = SocketOp<'a, ops::Send<B>>;
+    type Write<'a, B: IoBuf> = net::Write<'a, B>;
 
     #[inline]
     fn write<B: IoBuf>(&self, buf: B) -> Self::Write<'_, B> {

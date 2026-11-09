@@ -8,11 +8,13 @@ use std::net::{self, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::task::{Context, Poll};
 
-use ruio_driver::buf::{BufLease, BufPool, BufResult, IoBuf, IoBufMut};
-use ruio_driver::ops::{self, Recv, RecvFrom, Send, SendTo};
+use ruio_driver::buf::{BufLease, BufPool, IoBuf, IoBufMut};
+use ruio_driver::ops;
 use ruio_driver::{Fd, SockAddr};
 
-use super::socket::{Desc, RecvStream, SendZc, Sock, SocketOp, ThreadBound, bind_reuseport};
+use super::socket::{
+    Desc, Read, RecvFrom, RecvStream, SendTo, SendZc, Sock, ThreadBound, Write, bind_reuseport,
+};
 
 /// A UDP socket.
 ///
@@ -128,27 +130,24 @@ impl UdpSocket {
 
     /// Sends `buf`'s initialized bytes as a datagram to the address the
     /// socket is connected to.
-    pub fn send<B: IoBuf>(&self, buf: B) -> SocketOp<'_, Send<B>> {
+    pub fn send<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
         self.sock.write(buf)
     }
 
     /// Receives a datagram from the address the socket is connected to.
-    pub fn recv<B: IoBufMut>(&self, buf: B) -> SocketOp<'_, Recv<B>> {
+    pub fn recv<B: IoBufMut>(&self, buf: B) -> Read<'_, B> {
         self.sock.read(buf)
     }
 
     /// Sends `buf`'s initialized bytes as a datagram to `addr`.
-    pub fn send_to<B: IoBuf>(&self, buf: B, addr: SocketAddr) -> SocketOp<'_, SendTo<B>> {
-        self.sock.op(|fd| SendTo::new(fd, buf, addr))
+    pub fn send_to<B: IoBuf>(&self, buf: B, addr: SocketAddr) -> SendTo<'_, B> {
+        self.sock.op(|fd| ops::SendTo::new(fd, buf, addr))
     }
 
     /// Receives a datagram, and reports the address it came from.
-    pub fn recv_from<B: IoBufMut>(
-        &self,
-        buf: B,
-    ) -> SocketOp<'_, RecvFrom<B>, BufResult<(usize, SocketAddr), B>> {
+    pub fn recv_from<B: IoBufMut>(&self, buf: B) -> RecvFrom<'_, B> {
         self.sock.op_map(
-            |fd| RecvFrom::new(fd, buf),
+            |fd| ops::RecvFrom::new(fd, buf),
             |(received, buf)| {
                 let received = received.and_then(|(len, from)| Ok((len, inet(from)?)));
                 (received, buf)

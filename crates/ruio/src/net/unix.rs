@@ -11,13 +11,14 @@ use std::os::unix::net::{self, SocketAddr};
 use std::path::Path;
 use std::rc::Rc;
 
-use ruio_driver::buf::{BufPool, BufResult, IoBuf, IoBufMut, IoBufs};
-use ruio_driver::ops::{self, Accept, Connect, Recv, RecvFrom, Send, SendTo, Socket};
+use ruio_driver::buf::{BufPool, IoBuf, IoBufMut, IoBufs};
+use ruio_driver::ops::{self, Connect, Socket};
 use ruio_driver::{Descriptor, Fd, SockAddr};
 
 use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
-    Desc, Plain, ReadExact, RecvStream, Sock, SocketOp, ThreadBound, WriteAll, WriteAllVectored,
+    Accept, Desc, Plain, Read, ReadExact, RecvFrom, RecvStream, SendTo, Sock, SocketOp,
+    ThreadBound, Write, WriteAll, WriteAllVectored,
 };
 use super::tcp::{Incoming, listen};
 
@@ -71,9 +72,9 @@ impl UnixListener {
 
     /// Accepts a connection, with the peer's address, which is usually
     /// unnamed.
-    pub fn accept(&self) -> SocketOp<'_, Accept, io::Result<(UnixStream, SocketAddr)>> {
+    pub fn accept(&self) -> Accept<'_, UnixStream, SocketAddr> {
         let driver = crate::driver();
-        let mut accept = Accept::new(self.socket.as_raw_fd());
+        let mut accept = ops::Accept::new(self.socket.as_raw_fd());
         if self.direct.get() {
             accept = accept.direct(&driver);
         }
@@ -227,7 +228,7 @@ impl UnixStream {
 
     /// Reads into `buf`; see
     /// [`TcpStream::read`](super::TcpStream::read).
-    pub fn read<B: IoBufMut>(&self, buf: B) -> SocketOp<'_, Recv<B>> {
+    pub fn read<B: IoBufMut>(&self, buf: B) -> Read<'_, B> {
         self.sock.read(buf)
     }
 
@@ -237,7 +238,7 @@ impl UnixStream {
     }
 
     /// Writes `buf`'s initialized bytes, or as many as the socket takes.
-    pub fn write<B: IoBuf>(&self, buf: B) -> SocketOp<'_, Send<B>> {
+    pub fn write<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
         self.sock.write(buf).behind(&self.behind)
     }
 
@@ -291,7 +292,7 @@ impl UnixStream {
     }
 
     /// Shuts down the reading or writing half of the connection, or both.
-    pub fn shutdown(&self, how: Shutdown) -> SocketOp<'_, ops::Shutdown> {
+    pub fn shutdown(&self, how: Shutdown) -> impl Future<Output = io::Result<()>> {
         self.sock.shutdown(how).behind(&self.behind)
     }
 }
@@ -396,12 +397,12 @@ impl UnixDatagram {
 
     /// Sends `buf`'s initialized bytes as a datagram to the socket this one
     /// is connected to.
-    pub fn send<B: IoBuf>(&self, buf: B) -> SocketOp<'_, Send<B>> {
+    pub fn send<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
         self.sock.write(buf)
     }
 
     /// Receives a datagram from the socket this one is connected to.
-    pub fn recv<B: IoBufMut>(&self, buf: B) -> SocketOp<'_, Recv<B>> {
+    pub fn recv<B: IoBufMut>(&self, buf: B) -> Read<'_, B> {
         self.sock.read(buf)
     }
 
@@ -412,26 +413,23 @@ impl UnixDatagram {
     /// nul byte, fails the send with `EINVAL`
     /// ([`io::ErrorKind::InvalidInput`]), as the kernel fails a send to the
     /// unnamed address.
-    pub fn send_to<B: IoBuf>(&self, buf: B, path: impl AsRef<Path>) -> SocketOp<'_, SendTo<B>> {
+    pub fn send_to<B: IoBuf>(&self, buf: B, path: impl AsRef<Path>) -> SendTo<'_, B> {
         let addr = SockAddr::unix(path).unwrap_or_else(|_| unnamed());
-        self.sock.op(|fd| SendTo::new(fd, buf, addr))
+        self.sock.op(|fd| ops::SendTo::new(fd, buf, addr))
     }
 
     /// Sends `buf`'s initialized bytes as a datagram to `addr`, such as an
     /// address [`recv_from`](UnixDatagram::recv_from) reported.
-    pub fn send_to_addr<B: IoBuf>(&self, buf: B, addr: &SocketAddr) -> SocketOp<'_, SendTo<B>> {
+    pub fn send_to_addr<B: IoBuf>(&self, buf: B, addr: &SocketAddr) -> SendTo<'_, B> {
         let addr = SockAddr::try_from(addr).unwrap_or_else(|_| unnamed());
-        self.sock.op(|fd| SendTo::new(fd, buf, addr))
+        self.sock.op(|fd| ops::SendTo::new(fd, buf, addr))
     }
 
     /// Receives a datagram, and reports the address it came from, which is
     /// unnamed if the sender has none.
-    pub fn recv_from<B: IoBufMut>(
-        &self,
-        buf: B,
-    ) -> SocketOp<'_, RecvFrom<B>, BufResult<(usize, SocketAddr), B>> {
+    pub fn recv_from<B: IoBufMut>(&self, buf: B) -> RecvFrom<'_, B, SocketAddr> {
         self.sock.op_map(
-            |fd| RecvFrom::new(fd, buf),
+            |fd| ops::RecvFrom::new(fd, buf),
             |(received, buf)| {
                 let received = received.and_then(|(len, from)| Ok((len, unix(from)?)));
                 (received, buf)

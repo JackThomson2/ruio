@@ -630,6 +630,40 @@ impl<T: Operation, U> fmt::Debug for SocketOp<'_, T, U> {
     }
 }
 
+/// The future of a stream socket's `read`, and of a connected datagram
+/// socket's `recv`, the same receive: [`TcpStream::read`](super::TcpStream::read)
+/// and [`UdpSocket::recv`](super::UdpSocket::recv) among them. It hands the
+/// buffer, an [`IoBufMut`], back with how many bytes it read, 0 once the
+/// peer has shut down; [`timeout`](SocketOp::timeout) bounds how long it
+/// may take.
+pub type Read<'a, B> = SocketOp<'a, Recv<B>>;
+
+/// The future of a stream socket's `write`, and of a connected datagram
+/// socket's `send`, the same send: [`TcpStream::write`](super::TcpStream::write)
+/// and [`UdpSocket::send`](super::UdpSocket::send) among them. It hands the
+/// buffer, an [`IoBuf`], back with how many bytes it wrote.
+pub type Write<'a, B> = SocketOp<'a, Send<B>>;
+
+/// The future of a listener's `accept`,
+/// [`TcpListener::accept`](super::TcpListener::accept) and
+/// [`UnixListener::accept`](super::UnixListener::accept): the stream
+/// accepted, an `S`, with its peer's address, an `A`.
+pub type Accept<'a, S, A = net::SocketAddr> = SocketOp<'a, ops::Accept, io::Result<(S, A)>>;
+
+/// The future of a datagram socket's `send_to`,
+/// [`UdpSocket::send_to`](super::UdpSocket::send_to) and
+/// [`UnixDatagram::send_to`](super::UnixDatagram::send_to) among them: it
+/// hands the buffer back with how many bytes it sent.
+pub type SendTo<'a, B> = SocketOp<'a, ops::SendTo<B>>;
+
+/// The future of a datagram socket's `recv_from`,
+/// [`UdpSocket::recv_from`](super::UdpSocket::recv_from) and
+/// [`UnixDatagram::recv_from`](super::UnixDatagram::recv_from): it hands
+/// the buffer back with how many bytes it received, and the address they
+/// came from, an `A`.
+pub type RecvFrom<'a, B, A = net::SocketAddr> =
+    SocketOp<'a, ops::RecvFrom<B>, BufResult<(usize, A), B>>;
+
 /// Moves a whole buffer, one operation at a time, until it is done; what
 /// [`WriteAll`] and [`ReadExact`] share.
 ///

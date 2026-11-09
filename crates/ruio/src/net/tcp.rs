@@ -12,14 +12,14 @@ use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use ruio_driver::buf::{BufPool, IoBuf, IoBufMut, IoBufs};
-use ruio_driver::ops::{self, Accept, AcceptMulti, AcceptStream, Connect, Recv, Send, Socket};
+use ruio_driver::ops::{self, AcceptMulti, AcceptStream, Connect, Socket};
 use ruio_driver::{Descriptor, Driver, Fd};
 
 use super::addr::{ToSocketAddrs, resolve};
 use super::behind::{Behind, Flush, WriteBehind};
 use super::socket::{
-    Plain, ReadExact, RecvStream, SendZc, Sent, Sock, SocketOp, ThreadBound, WriteAll,
-    WriteAllVectored, bind_reuseport,
+    Accept, Plain, Read, ReadExact, RecvStream, SendZc, Sent, Sock, SocketOp, ThreadBound, Write,
+    WriteAll, WriteAllVectored, bind_reuseport,
 };
 
 /// How many connections a listener's backlog holds, as in tokio. The
@@ -125,9 +125,9 @@ impl TcpListener {
     }
 
     /// Accepts a connection, with the peer's address.
-    pub fn accept(&self) -> SocketOp<'_, Accept, io::Result<(TcpStream, SocketAddr)>> {
+    pub fn accept(&self) -> Accept<'_, TcpStream> {
         let driver = crate::driver();
-        let mut accept = Accept::new(self.socket.as_raw_fd());
+        let mut accept = ops::Accept::new(self.socket.as_raw_fd());
         if self.direct.get() {
             accept = accept.direct(&driver);
         }
@@ -480,7 +480,7 @@ impl TcpStream {
     /// Reads into `buf`, from its start up to its
     /// [`bytes_total`](IoBuf::bytes_total); reads 0 bytes once the peer has
     /// shut down.
-    pub fn read<B: IoBufMut>(&self, buf: B) -> SocketOp<'_, Recv<B>> {
+    pub fn read<B: IoBufMut>(&self, buf: B) -> Read<'_, B> {
         self.sock.read(buf)
     }
 
@@ -493,7 +493,7 @@ impl TcpStream {
     ///
     /// Like every write, it waits for a [`write_behind`](Self::write_behind)
     /// in flight, and fails if one failed.
-    pub fn write<B: IoBuf>(&self, buf: B) -> SocketOp<'_, Send<B>> {
+    pub fn write<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
         self.sock.write(buf).behind(&self.behind)
     }
 
@@ -563,7 +563,7 @@ impl TcpStream {
 
     /// Shuts down the reading or writing half of the connection, or both,
     /// once a [`write_behind`](Self::write_behind) in flight has finished.
-    pub fn shutdown(&self, how: Shutdown) -> SocketOp<'_, ops::Shutdown> {
+    pub fn shutdown(&self, how: Shutdown) -> impl Future<Output = io::Result<()>> {
         self.sock.shutdown(how).behind(&self.behind)
     }
 
