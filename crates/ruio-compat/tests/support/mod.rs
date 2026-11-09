@@ -48,7 +48,7 @@ impl Reads {
         match self {
             Reads::Buffer(capacity) => Compat::with_capacity(capacity, stream),
             Reads::Pool(count, size) => {
-                let pool = BufPool::new(&ruio::driver(), count, size).unwrap();
+                let pool = BufPool::new(count, size).unwrap();
                 Compat::with_pool(&pool, stream)
             }
         }

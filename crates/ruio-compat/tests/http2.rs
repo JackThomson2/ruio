@@ -214,7 +214,7 @@ async fn streams_of_one_connection_are_served_side_by_side() -> io::Result<()> {
 /// streams through both ways, in many frames with flow control between.
 #[ruio::test]
 async fn large_bodies_stream_through() -> io::Result<()> {
-    let pool = BufPool::new(&ruio::driver(), 32, 16 << 10)?;
+    let pool = BufPool::new(32, 16 << 10)?;
     let (addr, server) = serve(1, Some(pool), InFlight::default())?;
     let (mut sender, connection) = connect(addr).await?;
     let data = pattern(4 << 20, 9);

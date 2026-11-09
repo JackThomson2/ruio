@@ -1802,7 +1802,7 @@ fn ruio_recv_from_stream(load: &Load) -> io::Result<f64> {
     ruio_runtime()?.block_on(async move {
         let server = ruio::net::UdpSocket::bind("127.0.0.1:0")?;
         let addr = server.local_addr()?;
-        let pool = ruio::buf::BufPool::new(&ruio::driver(), 64, DATAGRAM_ROOM as u32)?;
+        let pool = ruio::buf::BufPool::new(64, DATAGRAM_ROOM as u32)?;
         let echo = ruio::spawn(async move {
             let mut datagrams = server.recv_from_stream(&pool)?;
             while let Some(datagram) = datagrams.next().await {
@@ -1994,7 +1994,7 @@ fn ruio_datagrams_in_stream(load: &Load) -> io::Result<f64> {
     let measure = load.measure;
     ruio_runtime()?.block_on(async move {
         let socket = ruio::net::UdpSocket::bind("127.0.0.1:0")?;
-        let pool = ruio::buf::BufPool::new(&ruio::driver(), 256, DATAGRAM_ROOM as u32)?;
+        let pool = ruio::buf::BufPool::new(256, DATAGRAM_ROOM as u32)?;
         let mut datagrams = socket.recv_from_stream(&pool)?;
         let filler = Filler::start(load, plain_fd(socket.fd()), socket.local_addr()?)?;
         drain_rate(measure, &filler, async || {
@@ -2016,7 +2016,7 @@ fn ruio_datagrams_in_without_senders(load: &Load) -> io::Result<f64> {
     let measure = load.measure;
     ruio_runtime()?.block_on(async move {
         let socket = ruio::net::UdpSocket::bind("127.0.0.1:0")?;
-        let pool = ruio::buf::BufPool::new(&ruio::driver(), 256, DATAGRAM_ROOM as u32)?;
+        let pool = ruio::buf::BufPool::new(256, DATAGRAM_ROOM as u32)?;
         let mut datagrams = socket.recv_stream(&pool);
         let filler = Filler::start(load, plain_fd(socket.fd()), socket.local_addr()?)?;
         drain_rate(measure, &filler, async || {

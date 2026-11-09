@@ -546,7 +546,7 @@ impl Advice {
 ///
 /// let (reader, _writer) = std::io::pipe()?;
 /// let reader = File::from_std(std::os::fd::OwnedFd::from(reader).into());
-/// let pool = BufPool::new(&ruio::driver(), 16, 4096)?;
+/// let pool = BufPool::new(16, 4096)?;
 /// let mut data = reader.read_stream(&pool);
 /// while let Some(chunk) = data.next().await {
 ///     println!("{} bytes", chunk?.len());

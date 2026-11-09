@@ -31,7 +31,7 @@ fn pattern(index: usize) -> u8 {
 #[test]
 fn datagrams_come_with_their_senders_addresses() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 8, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 8, 64).unwrap();
     let socket = udp();
     let to = socket.local_addr().unwrap();
     let senders = [udp(), udp(), udp()];
@@ -60,7 +60,7 @@ fn ipv6_senders_have_their_whole_address() {
         return;
     };
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 64).unwrap();
     let sender = UdpSocket::bind("[::1]:0").unwrap();
     // The room after the header and the address, every byte of it.
     let sent: Vec<u8> = (0..16).map(pattern).collect();
@@ -79,7 +79,7 @@ fn ipv6_senders_have_their_whole_address() {
 #[test]
 fn a_datagram_too_long_for_its_buffer_is_cut_short() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 64).unwrap();
     let socket = udp();
     let sender = udp();
     let to = socket.local_addr().unwrap();
@@ -104,7 +104,7 @@ fn a_datagram_too_long_for_its_buffer_is_cut_short() {
 #[test]
 fn an_empty_datagram_is_one_like_any_other() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 64).unwrap();
     let socket = udp();
     let sender = udp();
     let to = socket.local_addr().unwrap();
@@ -143,7 +143,7 @@ fn unix_senders_come_with_their_addresses() {
     unnamed.send_to_addr(b"unnamed", &to).unwrap();
 
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 256).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 256).unwrap();
     let mut stream =
         RecvFromStream::new(&driver, socket.as_raw_fd(), &pool, libc::AF_UNIX).unwrap();
     let first = block_on(&driver, stream.next()).unwrap().unwrap();
@@ -165,7 +165,7 @@ fn a_pool_without_room_for_a_payload_is_refused() {
     let socket = udp();
     let fd = socket.as_raw_fd();
     let request = |size, family| {
-        let pool = BufPool::new(&driver, 2, size).unwrap();
+        let pool = BufPool::with_driver(&driver, 2, size).unwrap();
         RecvFromMulti::new(fd, &pool, family).map(drop)
     };
     let refused = request(32, libc::AF_INET).unwrap_err();
@@ -184,7 +184,7 @@ fn a_pool_without_room_for_a_payload_is_refused() {
 #[test]
 fn the_payload_is_a_lease_of_its_own() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 64).unwrap();
     let socket = udp();
     let sender = udp();
     sender
@@ -220,7 +220,7 @@ fn the_payload_is_a_lease_of_its_own() {
 #[test]
 fn next_ready_takes_the_datagrams_that_have_arrived() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 8, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 8, 64).unwrap();
     let socket = udp();
     let sender = udp();
     let mut stream =
@@ -247,7 +247,7 @@ fn next_ready_takes_the_datagrams_that_have_arrived() {
 #[test]
 fn the_stream_rearms_once_an_exhausted_pool_has_a_buffer() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 64).unwrap();
     let socket = udp();
     let sender = udp();
     for index in 0..5 {
@@ -296,7 +296,7 @@ fn the_stream_rearms_once_an_exhausted_pool_has_a_buffer() {
 fn no_datagram_is_lost_across_many_rearms() {
     const COUNT: usize = 5_000;
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 256).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 256).unwrap();
     let (socket, peer) = UnixDatagram::pair().unwrap();
     let sender = thread::spawn(move || {
         for index in 0..COUNT {
@@ -331,7 +331,7 @@ fn no_datagram_is_lost_across_many_rearms() {
 #[test]
 fn a_dropped_stream_returns_every_buffer() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 64).unwrap();
     let socket = udp();
     let sender = udp();
     let to = socket.local_addr().unwrap();

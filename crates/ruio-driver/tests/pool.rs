@@ -14,7 +14,7 @@ use support::{block_on, poll_once, settle};
 #[test]
 fn data_arrives_in_a_lease_that_returns_its_buffer() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 64).unwrap();
     assert_eq!(
         (pool.count(), pool.buffer_size(), pool.available()),
         (4, 64, 4)
@@ -40,7 +40,7 @@ fn data_arrives_in_a_lease_that_returns_its_buffer() {
 #[test]
 fn an_exhausted_pool_fails_reads_until_a_buffer_returns() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 64).unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     let mut read = || {
         writer.write_all(b"x").unwrap();
@@ -67,7 +67,7 @@ fn an_exhausted_pool_fails_reads_until_a_buffer_returns() {
 #[test]
 fn the_end_of_the_file_takes_no_buffer() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 64).unwrap();
     let (reader, writer) = io::pipe().unwrap();
     drop(writer);
     let read = block_on(
@@ -81,7 +81,7 @@ fn the_end_of_the_file_takes_no_buffer() {
 #[test]
 fn buffers_are_used_again_and_again() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 16).unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     for round in 0..1000u32 {
         let message = round.to_string();
@@ -100,7 +100,7 @@ fn buffers_are_used_again_and_again() {
 #[test]
 fn a_cancelled_read_takes_no_buffer() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 64).unwrap();
     let (reader, _writer) = io::pipe().unwrap();
     let mut op = driver.op(ReadPooled::new(reader.as_raw_fd(), &pool));
     assert!(poll_once(&mut op).is_pending());
@@ -113,7 +113,7 @@ fn a_cancelled_read_takes_no_buffer() {
 #[test]
 fn a_lease_outlives_its_pool_handle() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 1, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 1, 64).unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     writer.write_all(b"kept").unwrap();
     let lease = block_on(
@@ -129,8 +129,8 @@ fn a_lease_outlives_its_pool_handle() {
 #[test]
 fn pools_of_one_ring_keep_to_their_own_buffers() {
     let driver = Driver::new().unwrap();
-    let small = BufPool::new(&driver, 1, 4).unwrap();
-    let large = BufPool::new(&driver, 1, 64).unwrap();
+    let small = BufPool::with_driver(&driver, 1, 4).unwrap();
+    let large = BufPool::with_driver(&driver, 1, 64).unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     writer.write_all(b"0123456789").unwrap();
 
@@ -150,7 +150,32 @@ fn pools_of_one_ring_keep_to_their_own_buffers() {
 fn pools_need_a_power_of_two_count_and_a_size() {
     let driver = Driver::new().unwrap();
     for (count, size) in [(3, 64), (0, 64), (4, 0)] {
-        let err = BufPool::new(&driver, count, size).unwrap_err();
+        let err = BufPool::with_driver(&driver, count, size).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
+}
+
+/// A pool made without naming a driver goes on the thread's current one,
+/// on whose ring a read then takes its buffers.
+#[test]
+fn a_pool_goes_on_the_current_driver() {
+    let _other = Driver::new().unwrap();
+    let driver = Driver::new().unwrap();
+    let pool = {
+        let _current = driver.enter();
+        BufPool::new(2, 64).unwrap()
+    };
+    let (reader, mut writer) = io::pipe().unwrap();
+    writer.write_all(b"current").unwrap();
+    let lease = block_on(
+        &driver,
+        driver.op(ReadPooled::new(reader.as_raw_fd(), &pool)),
+    );
+    assert_eq!(&*lease.unwrap().unwrap(), b"current");
+}
+
+#[test]
+#[should_panic(expected = "needs a current driver")]
+fn a_pool_needs_a_current_driver() {
+    let _pool = BufPool::new(2, 64);
 }

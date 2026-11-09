@@ -639,7 +639,7 @@ async fn files_are_copied_and_trees_removed() -> io::Result<()> {
 async fn a_read_stream_takes_what_arrives_on_a_pipe() -> io::Result<()> {
     let (reader, writer) = io::pipe()?;
     let reader = File::from_std(std::os::fd::OwnedFd::from(reader).into());
-    let pool = ruio::buf::BufPool::new(&ruio::driver(), 4, 1024)?;
+    let pool = ruio::buf::BufPool::new(4, 1024)?;
     let sent = pattern(100_000);
     let writer = std::thread::spawn({
         let sent = sent.clone();
@@ -680,7 +680,7 @@ async fn a_read_stream_takes_what_arrives_on_a_fifo() -> io::Result<()> {
     .await?;
     // With the reader there, the writer opens at once.
     let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
-    let pool = ruio::buf::BufPool::new(&ruio::driver(), 2, 64)?;
+    let pool = ruio::buf::BufPool::new(2, 64)?;
     let mut stream = fifo.read_stream(&pool);
     io::Write::write_all(&mut writer, b"through ")?;
     let first = within(stream.next()).await.unwrap()?;

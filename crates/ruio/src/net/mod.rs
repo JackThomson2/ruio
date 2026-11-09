@@ -38,7 +38,7 @@
 //! #[ruio::main]
 //! async fn main() -> std::io::Result<()> {
 //!     let listener = TcpListener::bind("127.0.0.1:7878")?;
-//!     let pool = BufPool::new(&ruio::driver(), 1024, 4096)?;
+//!     let pool = BufPool::new(1024, 4096)?;
 //!     let mut incoming = listener.incoming();
 //!     while let Some(stream) = incoming.next().await {
 //!         let stream = stream?;

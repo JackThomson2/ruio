@@ -107,7 +107,7 @@ fn main() -> io::Result<()> {
         let address = address.clone();
         async move {
             let listener = TcpListener::bind_reuseport(address)?;
-            let pool = BufPool::new(&ruio::driver(), 256, 4096)?;
+            let pool = BufPool::new(256, 4096)?;
             let mut http = http1::Builder::new();
             http.timer(Timer::new());
             let mut incoming = listener.incoming();

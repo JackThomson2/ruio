@@ -20,7 +20,7 @@ use support::{Counter, block_on, settle};
 #[test]
 fn a_restarted_request_loses_nothing() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 8, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 8, 16).unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
     let mut stream = driver.stream(RecvMulti::new(socket.as_raw_fd(), &pool));
     peer.write_all(b"first").unwrap();
@@ -66,7 +66,7 @@ fn pattern(index: usize) -> u8 {
 #[test]
 fn data_arrives_until_the_peer_shuts_down() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 64).unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
     let mut stream = RecvStream::new(&driver, socket.as_raw_fd(), &pool);
 
@@ -91,7 +91,7 @@ fn data_arrives_until_the_peer_shuts_down() {
 #[test]
 fn a_receive_fills_as_many_buffers_as_it_needs() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 8, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 8, 16).unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
     let sent: Vec<u8> = (0..40).map(pattern).collect();
     peer.write_all(&sent).unwrap();
@@ -124,7 +124,7 @@ fn a_receive_fills_as_many_buffers_as_it_needs() {
 #[test]
 fn next_ready_takes_what_has_arrived_without_waiting() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 8, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 8, 16).unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
     let mut stream = RecvStream::new(&driver, socket.as_raw_fd(), &pool);
     assert!(stream.next_ready().is_none(), "nothing is even submitted");
@@ -158,7 +158,7 @@ fn next_ready_takes_what_has_arrived_without_waiting() {
 #[test]
 fn bundles_come_out_right_whatever_order_buffers_return_in() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 8, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 8, 16).unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
     let mut stream = RecvStream::new(&driver, socket.as_raw_fd(), &pool);
     let mut kept: Vec<BufLease> = Vec::new();
@@ -196,7 +196,7 @@ fn bundles_come_out_right_whatever_order_buffers_return_in() {
 #[test]
 fn the_stream_rearms_once_an_exhausted_pool_has_a_buffer() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 16).unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
     let sent: Vec<u8> = (0..64).map(pattern).collect();
     peer.write_all(&sent).unwrap();
@@ -248,7 +248,7 @@ fn the_stream_rearms_once_an_exhausted_pool_has_a_buffer() {
 #[test]
 fn a_returning_buffer_wakes_one_waiting_stream() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 16).unwrap();
     let (first_socket, mut first_peer) = UnixStream::pair().unwrap();
     let (second_socket, mut second_peer) = UnixStream::pair().unwrap();
     let mut first = RecvStream::new(&driver, first_socket.as_raw_fd(), &pool);
@@ -304,7 +304,7 @@ fn a_returning_buffer_wakes_one_waiting_stream() {
 fn no_data_is_lost_across_many_rearms() {
     const TOTAL: usize = 20_000;
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 8).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 8).unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
     let producer = thread::spawn(move || {
         let data: Vec<u8> = (0..TOTAL).map(pattern).collect();
@@ -349,7 +349,7 @@ fn no_data_is_lost_across_many_rearms() {
 #[test]
 fn a_dropped_stream_returns_every_buffer() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 16).unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
     let mut stream = RecvStream::new(&driver, socket.as_raw_fd(), &pool);
     peer.write_all(&[7; 16]).unwrap();

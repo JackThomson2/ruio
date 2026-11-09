@@ -89,7 +89,7 @@ async fn recv_stream_folds_a_connections_data() -> io::Result<()> {
         }
     });
     let (server, _) = within(listener.accept()).await?;
-    let pool = BufPool::new(&ruio::driver(), 16, 16 << 10)?;
+    let pool = BufPool::new(16, 16 << 10)?;
     let mut received = server.recv_stream(&pool);
     assert!(!received.is_terminated());
     let (bytes, checksum) = within(StreamExt::fold(
@@ -131,7 +131,7 @@ async fn recv_from_stream_maps_datagrams_to_their_senders() -> io::Result<()> {
             .await
             .0?;
     }
-    let pool = BufPool::new(&ruio::driver(), 4, 64)?;
+    let pool = BufPool::new(4, 64)?;
     let mut datagrams = receiver.recv_from_stream(&pool)?;
     let from: Vec<SocketAddr> = within(StreamExt::collect(StreamExt::take(
         StreamExt::map(&mut datagrams, |datagram| datagram.unwrap().from()),
@@ -148,7 +148,7 @@ async fn recv_from_stream_maps_datagrams_to_their_senders() -> io::Result<()> {
 async fn read_stream_collects_a_pipe_to_its_end() -> io::Result<()> {
     let (reader, mut writer) = io::pipe()?;
     let reader = File::from_std(OwnedFd::from(reader).into());
-    let pool = BufPool::new(&ruio::driver(), 8, 4096)?;
+    let pool = BufPool::new(8, 4096)?;
     let mut data = reader.read_stream(&pool);
     let sent = pattern(50_000);
     let feeder = std::thread::spawn({

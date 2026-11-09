@@ -12,7 +12,7 @@ use ruio::uring::ops::{RecvStream, Write};
 #[ruio::test]
 async fn a_task_receives_what_another_sends() -> io::Result<()> {
     let driver = ruio::driver();
-    let pool = BufPool::new(&driver, 2, 16)?;
+    let pool = BufPool::new(2, 16)?;
     let (socket, peer) = UnixStream::pair()?;
 
     let receiver = ruio::spawn({

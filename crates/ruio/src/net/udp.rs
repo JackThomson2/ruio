@@ -194,7 +194,7 @@ impl UdpSocket {
     ///
     /// # async fn echo() -> std::io::Result<()> {
     /// let socket = UdpSocket::bind("127.0.0.1:7878")?;
-    /// let pool = BufPool::new(&ruio::driver(), 256, 2048)?;
+    /// let pool = BufPool::new(256, 2048)?;
     /// let mut datagrams = socket.recv_from_stream(&pool)?;
     /// while let Some(datagram) = datagrams.next().await {
     ///     let (data, from) = datagram?.into_parts();

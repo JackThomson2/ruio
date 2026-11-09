@@ -86,7 +86,7 @@ fn ruio(addr: SocketAddr, buffers: u16, spin: Duration, direct: bool) -> io::Res
         let listener = ruio::net::TcpListener::bind(addr)?;
         sys::set_nodelay(listener.as_raw_fd())?;
         listener.set_direct(direct);
-        let pool = BufPool::new(&ruio::driver(), buffers, BUFFER_SIZE)?;
+        let pool = BufPool::new(buffers, BUFFER_SIZE)?;
         serve_ruio(listener, pool).await;
         Ok(())
     })

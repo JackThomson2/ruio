@@ -77,7 +77,7 @@ async fn a_recv_stream_takes_datagram_after_datagram() -> io::Result<()> {
     let receiver = UdpSocket::bind("127.0.0.1:0")?;
     let sender = UdpSocket::bind("127.0.0.1:0")?;
     // Fewer buffers than datagrams: the pool runs dry and refills.
-    let pool = BufPool::new(&ruio::driver(), 4, 64)?;
+    let pool = BufPool::new(4, 64)?;
     for size in 1..=10 {
         let datagram = vec![size as u8; size];
         within(sender.send_to(datagram, receiver.local_addr()?))
@@ -110,7 +110,7 @@ async fn a_recv_from_stream_answers_each_sender() -> io::Result<()> {
                 .0?;
         }
     }
-    let pool = BufPool::new(&ruio::driver(), 8, 2048)?;
+    let pool = BufPool::new(8, 2048)?;
     let mut datagrams = server.recv_from_stream(&pool)?;
     let mut answered = 0;
     while answered < 6 {
@@ -144,7 +144,7 @@ async fn a_recv_from_stream_cuts_short_what_its_buffers_cannot_hold() -> io::Res
     let receiver = UdpSocket::bind("127.0.0.1:0")?;
     let sender = UdpSocket::bind("127.0.0.1:0")?;
     // Of each buffer's 64 bytes, the header and an IPv4 address take 32.
-    let pool = BufPool::new(&ruio::driver(), 4, 64)?;
+    let pool = BufPool::new(4, 64)?;
     within(sender.send_to(vec![7; 33], receiver.local_addr()?))
         .await
         .0?;
@@ -166,10 +166,10 @@ async fn a_recv_from_stream_cuts_short_what_its_buffers_cannot_hold() -> io::Res
 #[ruio::test]
 async fn a_recv_from_stream_needs_room_for_a_payload() -> io::Result<()> {
     let v4 = UdpSocket::bind("127.0.0.1:0")?;
-    let small = BufPool::new(&ruio::driver(), 2, 32)?;
+    let small = BufPool::new(2, 32)?;
     let err = v4.recv_from_stream(&small).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidInput);
-    let pool = BufPool::new(&ruio::driver(), 2, 48)?;
+    let pool = BufPool::new(2, 48)?;
     assert!(v4.recv_from_stream(&pool).is_ok());
 
     let Ok(v6) = UdpSocket::bind("[::1]:0") else {
@@ -180,7 +180,7 @@ async fn a_recv_from_stream_needs_room_for_a_payload() -> io::Result<()> {
     assert_eq!(err.kind(), ErrorKind::InvalidInput);
     let sender = UdpSocket::bind("[::1]:0")?;
     within(sender.send_to("six", v6.local_addr()?)).await.0?;
-    let pool = BufPool::new(&ruio::driver(), 2, 64)?;
+    let pool = BufPool::new(2, 64)?;
     let mut datagrams = v6.recv_from_stream(&pool)?;
     let datagram = within(datagrams.next()).await.unwrap()?;
     assert_eq!(

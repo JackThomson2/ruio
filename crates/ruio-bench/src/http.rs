@@ -115,7 +115,7 @@ fn ruio(protocol: Protocol, addr: SocketAddr, buffers: Option<u16>) -> io::Resul
             let listener = ruio::net::TcpListener::bind(addr)?;
             sys::set_nodelay(listener.as_raw_fd())?;
             let pool = buffers
-                .map(|count| BufPool::new(&ruio::driver(), count, BUFFER_SIZE))
+                .map(|count| BufPool::new(count, BUFFER_SIZE))
                 .transpose()?;
             let mut incoming = listener.incoming();
             while let Some(stream) = incoming.next().await {

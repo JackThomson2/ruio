@@ -154,7 +154,7 @@ async fn hyper_serves_hyper_through_the_adapters() -> io::Result<()> {
 /// receiving into one pool, which holds less than they send.
 #[ruio::test]
 async fn connections_are_served_side_by_side() -> io::Result<()> {
-    let pool = BufPool::new(&ruio::driver(), 16, 4096)?;
+    let pool = BufPool::new(16, 4096)?;
     let (addr, server) = serve(8, Some(pool))?;
     let mut clients = Vec::new();
     for client in 0..8 {

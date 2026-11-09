@@ -126,7 +126,7 @@ fn a_direct_connection_carries_data() {
 
     // A multishot receive into a pool, and a send of what it received.
     client.write_all(b"hello").unwrap();
-    let pool = BufPool::new(&driver, 4, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 64).unwrap();
     let mut stream = RecvStream::new(&driver, server.fd(), &pool);
     let bundle = block_on(&driver, stream.next()).unwrap().unwrap();
     assert_eq!(bundle.to_vec(), b"hello");
@@ -165,7 +165,7 @@ fn vectored_sends_send_buffers_one_after_another() {
     peer.read_exact(&mut received).unwrap();
     assert_eq!(&received, b"e two threethree");
 
-    let pool = BufPool::new(&driver, 8, 4).unwrap();
+    let pool = BufPool::with_driver(&driver, 8, 4).unwrap();
     let data: Vec<u8> = (0..20).collect();
     peer.write_all(&data).unwrap();
     let mut stream = RecvStream::new(&driver, socket.as_raw_fd(), &pool);
@@ -194,7 +194,7 @@ fn a_bundle_of_several_buffers_goes_out_in_one_send() {
 
     // Three buffers' worth, all there before the receive is armed, so that
     // one receive gathers it into a bundle of several buffers.
-    let pool = BufPool::new(&driver, 8, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 8, 16).unwrap();
     let data: Vec<u8> = (0..44).collect();
     peer.write_all(&data).unwrap();
     let mut stream = RecvStream::new(&driver, socket.as_raw_fd(), &pool);

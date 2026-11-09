@@ -32,7 +32,7 @@ fn read_all(driver: &Driver, stream: &mut ReadStream) -> Vec<u8> {
 #[test]
 fn data_arrives_until_the_writer_closes() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 64).unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     let mut stream = ReadStream::new(&driver, reader.as_raw_fd(), &pool);
 
@@ -56,7 +56,7 @@ fn data_arrives_until_the_writer_closes() {
 #[test]
 fn a_file_that_cannot_be_polled_is_refused() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 64).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 64).unwrap();
     let file = std::fs::File::open("/proc/self/exe").unwrap();
     let mut stream = ReadStream::new(&driver, file.as_raw_fd(), &pool);
     let err = block_on(&driver, stream.next()).unwrap().unwrap_err();
@@ -71,7 +71,7 @@ fn a_file_that_cannot_be_polled_is_refused() {
 #[test]
 fn the_stream_rearms_once_an_exhausted_pool_has_a_buffer() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 16).unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     let sent: Vec<u8> = (0..64).map(pattern).collect();
     writer.write_all(&sent).unwrap();
@@ -121,7 +121,7 @@ fn the_stream_rearms_once_an_exhausted_pool_has_a_buffer() {
 fn no_data_is_lost_across_many_rearms() {
     const TOTAL: usize = 20_000;
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 2, 8).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 8).unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     let producer = thread::spawn(move || {
         let data: Vec<u8> = (0..TOTAL).map(pattern).collect();
@@ -156,7 +156,7 @@ fn no_data_is_lost_across_many_rearms() {
 #[test]
 fn next_ready_takes_what_has_been_read() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 8, 4).unwrap();
+    let pool = BufPool::with_driver(&driver, 8, 4).unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     let mut stream = ReadStream::new(&driver, reader.as_raw_fd(), &pool);
     assert!(stream.next_ready().is_none(), "nothing is even submitted");
@@ -187,7 +187,7 @@ fn next_ready_takes_what_has_been_read() {
 #[test]
 fn a_dropped_stream_returns_every_buffer() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 16).unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     let mut stream = ReadStream::new(&driver, reader.as_raw_fd(), &pool);
     writer.write_all(&[7; 16]).unwrap();

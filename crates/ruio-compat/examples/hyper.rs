@@ -61,7 +61,7 @@ async fn main() -> io::Result<()> {
             ruio::core_count()
         );
     }
-    let pool = BufPool::new(&ruio::driver(), 256, 4096)?;
+    let pool = BufPool::new(256, 4096)?;
     let mut http = http1::Builder::new();
     http.timer(Timer::new());
     let mut incoming = listener.incoming();

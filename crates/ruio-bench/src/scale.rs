@@ -62,7 +62,7 @@ async fn ruio_core(load: Load) -> io::Result<u64> {
     let addr = listener.local_addr()?;
     // A buffer per connection, as the echo benchmark gives its server.
     let buffers = load.connections.clamp(64, 1 << 15).next_power_of_two() as u16;
-    let pool = BufPool::new(&ruio::driver(), buffers, BUFFER_SIZE)?;
+    let pool = BufPool::new(buffers, BUFFER_SIZE)?;
     let _server = ruio::spawn(server::serve_ruio(listener, pool));
     let from = Instant::now() + load.warmup;
     let until = from + load.measure;

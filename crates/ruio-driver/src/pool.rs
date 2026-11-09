@@ -97,13 +97,31 @@ struct Pool {
 
 impl BufPool {
     /// Maps `count` buffers of `size` bytes each, zeroed, and registers them
-    /// as a provided-buffer ring of the driver's.
+    /// as a provided-buffer ring of the thread's current driver: inside a
+    /// runtime, the runtime's (see [`Driver::current`]).
+    ///
+    /// # Errors
+    ///
+    /// As for [`BufPool::with_driver`].
+    ///
+    /// # Panics
+    ///
+    /// If the thread has no current driver, as outside a runtime;
+    /// [`BufPool::with_driver`] names the driver instead.
+    pub fn new(count: u16, size: u32) -> io::Result<Self> {
+        let driver = Driver::current()
+            .expect("`BufPool::new` needs a current driver, as inside a ruio runtime");
+        Self::with_driver(&driver, count, size)
+    }
+
+    /// Maps `count` buffers of `size` bytes each, zeroed, and registers them
+    /// as a provided-buffer ring of `driver`'s.
     ///
     /// # Errors
     ///
     /// `InvalidInput` unless `count` is a power of two up to 32768 and
     /// `size` is above zero, and what `mmap` and the kernel report.
-    pub fn new(driver: &Driver, count: u16, size: u32) -> io::Result<Self> {
+    pub fn with_driver(driver: &Driver, count: u16, size: u32) -> io::Result<Self> {
         Self::with(driver, count, size, 0)
     }
 
@@ -115,7 +133,7 @@ impl BufPool {
     ///
     /// # Errors
     ///
-    /// `Unsupported` if the kernel cannot, and as for [`BufPool::new`].
+    /// `Unsupported` if the kernel cannot, and as for [`BufPool::with_driver`].
     pub(crate) fn incremental(driver: &Driver, count: u16, size: u32) -> io::Result<Self> {
         if !Probe::current()?.supports_incremental_buffers() {
             return Err(io::Error::new(
@@ -864,7 +882,7 @@ mod tests {
     #[test]
     fn slots_are_reused_only_once_every_take_before_them_is_reported() {
         let driver = Driver::new().unwrap();
-        let pool = BufPool::new(&driver, 4, 8).unwrap();
+        let pool = BufPool::with_driver(&driver, 4, 8).unwrap();
         let state = &*pool.pool;
 
         // The kernel took the buffers at positions 0 and 1, and the second
@@ -899,7 +917,7 @@ mod tests {
     #[test]
     fn bundles_follow_the_lengths_the_kernel_left_in_the_ring() {
         let driver = Driver::new().unwrap();
-        let pool = BufPool::new(&driver, 4, 8).unwrap();
+        let pool = BufPool::with_driver(&driver, 4, 8).unwrap();
         let state = &*pool.pool;
         let len = state
             .ring
@@ -917,7 +935,7 @@ mod tests {
     #[test]
     fn appended_bundles_keep_their_order() {
         let driver = Driver::new().unwrap();
-        let pool = BufPool::new(&driver, 4, 8).unwrap();
+        let pool = BufPool::with_driver(&driver, 4, 8).unwrap();
         let mut data = pool.bundle(buffer(0), 12).unwrap();
         data.append(pool.bundle(buffer(2), 5).unwrap());
         assert_eq!(bids(&data), [0, 1, 2]);
@@ -929,7 +947,7 @@ mod tests {
     #[test]
     fn a_completion_without_data_takes_one_buffer() {
         let driver = Driver::new().unwrap();
-        let pool = BufPool::new(&driver, 4, 8).unwrap();
+        let pool = BufPool::with_driver(&driver, 4, 8).unwrap();
         let bundle = pool.bundle(buffer(0), -libc::ECONNRESET).unwrap();
         assert_eq!((bids(&bundle), bundle.len()), (vec![0], 0));
         assert!(pool.bundle(0, 0).is_none(), "no buffer reported");
@@ -939,7 +957,7 @@ mod tests {
     #[should_panic(expected = "not in the ring")]
     fn a_leased_buffer_cannot_be_reported_again() {
         let driver = Driver::new().unwrap();
-        let pool = BufPool::new(&driver, 4, 8).unwrap();
+        let pool = BufPool::with_driver(&driver, 4, 8).unwrap();
         let _lease = pool.lease(buffer(0), 8);
         let _again = pool.lease(buffer(0), 8);
     }
@@ -950,7 +968,7 @@ mod tests {
     #[should_panic(expected = "more than its buffers after it in the ring hold")]
     fn a_bundle_cannot_run_past_the_tail() {
         let driver = Driver::new().unwrap();
-        let pool = BufPool::new(&driver, 4, 8).unwrap();
+        let pool = BufPool::with_driver(&driver, 4, 8).unwrap();
         let _bundle = pool.bundle(buffer(2), 17);
     }
 

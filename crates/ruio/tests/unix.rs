@@ -120,7 +120,7 @@ async fn connecting_to_nothing_fails() {
 #[ruio::test]
 async fn a_pair_streams_into_a_pool() -> io::Result<()> {
     let (a, b) = UnixStream::pair()?;
-    let pool = BufPool::new(&ruio::driver(), 2, 4)?;
+    let pool = BufPool::new(2, 4)?;
     within(a.write_all("0123456789")).await.0?;
     drop(a);
     let mut received = Vec::new();

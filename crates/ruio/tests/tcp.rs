@@ -29,7 +29,7 @@ async fn pair() -> io::Result<(TcpStream, TcpStream)> {
 /// behind.
 fn serve_echo(listener: TcpListener) -> ruio::JoinHandle<()> {
     ruio::spawn(async move {
-        let pool = BufPool::new(&ruio::driver(), 16, 1024).unwrap();
+        let pool = BufPool::new(16, 1024).unwrap();
         let mut incoming = listener.incoming();
         while let Some(stream) = incoming.next().await {
             let stream = stream.unwrap();
@@ -196,7 +196,7 @@ async fn a_receive_asks_for_the_buffers_its_messages_take() -> io::Result<()> {
     });
     let (server, _) = within(listener.accept()).await?;
     let driver = ruio::driver();
-    let pool = BufPool::new(&driver, 16, 1024)?;
+    let pool = BufPool::new(16, 1024)?;
     let mut received = server.recv_stream(&pool);
     let before = driver.stats().operations;
     let mut shapes = Vec::new();

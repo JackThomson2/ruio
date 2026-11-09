@@ -67,7 +67,7 @@ fn operations_reach_a_direct_socket_through_the_table() {
         driver.op(Read::new(socket, Vec::with_capacity(16))),
     );
     assert_eq!(read.unwrap_err().raw_os_error(), Some(libc::ENOTCONN));
-    let pool = BufPool::new(&driver, 2, 16).unwrap();
+    let pool = BufPool::with_driver(&driver, 2, 16).unwrap();
     let read = block_on(&driver, driver.op(ReadPooled::new(socket, &pool)));
     assert_eq!(read.unwrap_err().raw_os_error(), Some(libc::ENOTCONN));
     assert_eq!(pool.available(), 2);

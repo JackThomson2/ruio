@@ -54,7 +54,7 @@ fn a_poll_stream_is_a_stream_that_never_ends() {
 #[test]
 fn a_recv_stream_ends_when_the_peer_shuts_down_and_says_so() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 8, 4096).unwrap();
+    let pool = BufPool::with_driver(&driver, 8, 4096).unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
     let mut received = RecvStream::new(&driver, socket.as_raw_fd(), &pool);
     assert!(!received.is_terminated());
@@ -80,7 +80,7 @@ fn a_recv_stream_ends_when_the_peer_shuts_down_and_says_so() {
 #[test]
 fn a_read_stream_ends_at_the_end_of_the_file_and_says_so() {
     let driver = Driver::new().unwrap();
-    let pool = BufPool::new(&driver, 4, 4096).unwrap();
+    let pool = BufPool::with_driver(&driver, 4, 4096).unwrap();
     let (reader, mut writer) = io::pipe().unwrap();
     let mut data = ReadStream::new(&driver, reader.as_raw_fd(), &pool);
     let sent = pattern(10_000);

@@ -114,7 +114,7 @@ async fn read_lines(reads: Reads) -> io::Result<()> {
 #[ruio::test]
 async fn a_read_takes_what_several_buffers_hold() -> io::Result<()> {
     let (client, server) = pair(false).await?;
-    let pool = BufPool::new(&ruio::driver(), 8, 100)?;
+    let pool = BufPool::new(8, 100)?;
     let (mut client, mut server) = (Compat::new(client), Compat::with_pool(&pool, server));
     let message = pattern(500, 4);
     within(client.write_all(&message[..100])).await?;
@@ -137,7 +137,7 @@ async fn a_read_takes_what_several_buffers_hold() -> io::Result<()> {
 #[ruio::test]
 async fn a_dropped_adapter_gives_its_buffers_back() -> io::Result<()> {
     let (client, server) = pair(false).await?;
-    let pool = BufPool::new(&ruio::driver(), 8, 64)?;
+    let pool = BufPool::new(8, 64)?;
     let (mut client, mut server) = (Compat::new(client), Compat::with_pool(&pool, server));
     within(client.write_all(&pattern(4096, 5))).await?;
     let mut first = [0; 1];

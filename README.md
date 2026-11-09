@@ -12,7 +12,7 @@ use ruio::net::TcpListener;
 async fn main() -> std::io::Result<()> {
     // A listener on each core, all bound to one address.
     let listener = TcpListener::bind_reuseport("127.0.0.1:7878")?;
-    let pool = BufPool::new(&ruio::driver(), 1024, 4096)?;
+    let pool = BufPool::new(1024, 4096)?;
     let mut incoming = listener.incoming(); // one multishot accept
     while let Some(stream) = incoming.next().await {
         let stream = stream?;
