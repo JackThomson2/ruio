@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
+use ruio_engine::LocalWaker;
 use ruio_sys as sys;
 
 use crate::Probe;
@@ -31,7 +32,6 @@ use crate::ring::Ring;
 use crate::stream::{MultiOp, Multishot, Stranded};
 use crate::table::{IGNORED, Outcome, Table, Wake};
 use crate::unpark::{Notify, Unparker};
-use crate::waker::LocalWaker;
 
 /// The `user_data` of the poll on the eventfd that unparkers write to.
 const WAKE: u64 = IGNORED - 1;

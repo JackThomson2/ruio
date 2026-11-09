@@ -571,6 +571,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "libc",
+ "ruio-engine",
  "ruio-sys",
 ]
 

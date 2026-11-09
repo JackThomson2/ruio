@@ -10,10 +10,10 @@ use std::mem;
 use std::ptr;
 use std::task::Waker;
 
+use ruio_engine::LocalWaker;
 use ruio_sys as sys;
 
 use crate::op::Completion;
-use crate::waker::LocalWaker;
 
 /// The `user_data` of internal requests, such as cancellations, whose
 /// completions are ignored.

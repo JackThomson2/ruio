@@ -35,6 +35,10 @@
 //! the `Stream` and `FusedStream` of futures-core, each as one call to its
 //! own `poll_next`, so they compose with futures-util's combinators.
 //!
+//! On Linux the driver is the executor's engine: it implements the
+//! contract of `ruio-engine`, [`Engine`](ruio_engine::Engine), through which
+//! the executor parks on it, unparks it and arms its timer.
+//!
 //! ```
 //! use std::pin::Pin;
 //! use std::task::{Context, Poll, Waker};
@@ -58,6 +62,7 @@
 mod aligned;
 pub mod buf;
 mod driver;
+mod engine;
 mod fd;
 mod fixed;
 mod foreign;
@@ -77,7 +82,8 @@ mod sockaddr;
 mod stream;
 mod table;
 mod unpark;
-mod waker;
+
+pub use ruio_engine::LocalWaker;
 
 pub use driver::{Builder, Driver, Entered, Stats, monotonic_now};
 pub use fd::{Descriptor, DirectFd, Fd, PolledFd};
@@ -90,4 +96,3 @@ pub use remote::{RemoteRing, SentFd};
 pub use sockaddr::SockAddr;
 pub use stream::{MultiOp, Multishot};
 pub use unpark::Unparker;
-pub use waker::LocalWaker;
