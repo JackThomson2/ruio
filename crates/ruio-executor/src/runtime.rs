@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use ruio_driver::Driver;
-
+use crate::engine::{Build, Engine, NativeBuilder};
 use crate::handle::Handle;
 use crate::scheduler::Scheduler;
 use crate::task::{JoinHandle, Main};
@@ -19,7 +18,7 @@ use crate::{context, coop};
 /// Configures and creates a [`Runtime`].
 #[derive(Clone, Debug, Default)]
 pub struct Builder {
-    driver: ruio_driver::Builder,
+    pub(crate) engine: NativeBuilder,
     spin: Duration,
 }
 
@@ -29,28 +28,13 @@ impl Builder {
         Self::default()
     }
 
-    /// Sets the size of the ring's submission queue; see
-    /// [`ruio_driver::Builder::entries`].
-    pub fn entries(mut self, entries: u32) -> Self {
-        self.driver = self.driver.entries(entries);
-        self
-    }
-
-    /// Sets the number of slots in the ring's registered file table, which
-    /// holds direct descriptors; see [`ruio_driver::Builder::files`].
-    pub fn files(mut self, slots: u32) -> Self {
-        self.driver = self.driver.files(slots);
-        self
-    }
-
     /// Sets how long dropping the runtime waits for the kernel to finish
     /// with the operations of its tasks, which the drop cancels, before it
-    /// leaks what the kernel still holds and closes the ring; see
-    /// [`ruio_driver::Builder::shutdown_timeout`]. The default is one
-    /// second. Through [`Cores::builder`](crate::Cores::builder) it bounds
-    /// the shutdown of every core's runtime.
+    /// leaks what the kernel still holds and closes the engine. The default
+    /// is one second. Through [`Cores::builder`](crate::Cores::builder) it
+    /// bounds the shutdown of every core's runtime.
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
-        self.driver = self.driver.shutdown_timeout(timeout);
+        self.engine = Build::shutdown_timeout(self.engine, timeout);
         self
     }
 
@@ -76,33 +60,34 @@ impl Builder {
         self
     }
 
-    /// Creates the runtime.
+    /// Creates the runtime, and its engine on the calling thread.
     ///
     /// # Errors
     ///
-    /// As for [`ruio_driver::Builder::build`].
+    /// If the engine cannot be created: with io_uring, as for
+    /// `ruio_driver::Builder::build`.
     pub fn build(&self) -> io::Result<Runtime> {
-        let driver = self.driver.build()?;
+        let engine = Build::build(&self.engine)?;
         Ok(Runtime {
-            scheduler: Rc::new(Scheduler::new(driver, self.spin)),
+            scheduler: Rc::new(Scheduler::new(engine, self.spin)),
         })
     }
 }
 
-/// Runs futures on the thread that created it, with an io_uring ring for
+/// Runs futures on the thread that created it, with its I/O engine for
 /// their I/O.
 ///
 /// [`Runtime::block_on`] runs a future to completion, and runs the tasks
 /// spawned meanwhile. Dropping the runtime drops the futures of the tasks
-/// that have not finished, then closes the ring once the kernel is done with
-/// their operations.
+/// that have not finished, then closes its engine once the kernel is done
+/// with their operations.
 ///
 /// ```compile_fail
 /// fn assert_send<T: Send>() {}
 /// assert_send::<ruio_executor::Runtime>();
 /// ```
 pub struct Runtime {
-    scheduler: Rc<Scheduler>,
+    pub(crate) scheduler: Rc<Scheduler>,
 }
 
 impl Runtime {
@@ -121,7 +106,7 @@ impl Runtime {
     }
 
     /// Runs `future` to completion on this thread, running spawned tasks and
-    /// the ring meanwhile, and returns its output.
+    /// the engine meanwhile, and returns its output.
     ///
     /// # Panics
     ///
@@ -130,7 +115,7 @@ impl Runtime {
         let _enter = context::enter(Rc::clone(&self.scheduler));
         // Portable operations first polled here queue on the runtime's ring,
         // and find it again with one comparison while they stay.
-        let _current = self.scheduler.driver().enter();
+        let _current = Engine::enter(self.scheduler.engine());
         // Wakers of the future name it as a task's name the task, so that
         // waking it on this thread takes no atomic operation.
         let main = Main::new(&self.scheduler);
@@ -156,11 +141,6 @@ impl Runtime {
         self.scheduler.spawn(future)
     }
 
-    /// The runtime's io_uring driver.
-    pub fn driver(&self) -> &Driver {
-        self.scheduler.driver()
-    }
-
     /// A handle that spawns tasks onto this runtime from any thread; see
     /// [`Handle`].
     pub fn handle(&self) -> Handle {
@@ -174,7 +154,7 @@ impl Drop for Runtime {
         // inside the runtime, and drops the portable operations of its tasks,
         // which so find their ring at hand.
         let _enter = context::enter_if_idle(Rc::clone(&self.scheduler));
-        let _current = self.scheduler.driver().enter();
+        let _current = Engine::enter(self.scheduler.engine());
         self.scheduler.shutdown();
     }
 }

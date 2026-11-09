@@ -587,6 +587,7 @@ dependencies = [
  "futures-util",
  "libc",
  "ruio-driver",
+ "ruio-engine",
 ]
 
 [[package]]

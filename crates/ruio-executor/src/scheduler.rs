@@ -1,5 +1,5 @@
 //! The scheduler of one thread: the tasks it owns, the queue of those ready to
-//! run, and the loop that runs them and turns the ring.
+//! run, and the loop that runs them and turns the engine.
 
 use std::alloc::{self, Layout};
 use std::cell::{Cell, RefCell};
@@ -12,13 +12,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use ruio_driver::{Driver, RemoteRing, Unparker};
-
+use crate::engine::{self, Engine, Native};
 use crate::task::{self, JoinHandle, LocalRef, Main, RemoteRef, Task};
 use crate::time::Timers;
 use crate::wheel::Key;
 
-/// How many tasks run between turns of the ring, so that a flood of ready
+/// How many tasks run between turns of the engine, so that a flood of ready
 /// tasks cannot hold up completions.
 const BUDGET: usize = 64;
 
@@ -73,17 +72,17 @@ impl TaskCache {
 }
 
 /// The part of a scheduler that other threads reach: the tasks woken there,
-/// the timers dropped there, and the unparker of the scheduler's ring.
+/// the timers dropped there, and what they reach of the scheduler's engine.
 pub(crate) struct Shared {
-    /// The runtime's id, unique in the process: its driver's.
+    /// The runtime's id, unique in the process: its engine's.
     id: u64,
     remote: Mutex<Remote>,
     /// Set once anything is queued in `remote`, so that the scheduler takes
     /// the lock only when there may be something to take.
     pending: AtomicBool,
-    unparker: Unparker,
-    /// The ring, for other rings to send descriptors to.
-    ring: RemoteRing,
+    /// What other threads reach of the engine: its unparker, and what
+    /// else the engine offers them.
+    pub(crate) engine: engine::Remote,
     /// What holds the part from the runtime's thread; see [`Holds`].
     holds: Holds,
 }
@@ -139,7 +138,7 @@ impl Shared {
             Some(task) => drop(task),
             None => {
                 self.pending.store(true, Ordering::Release);
-                self.unparker.unpark();
+                self.engine.unpark();
             }
         }
     }
@@ -160,7 +159,7 @@ impl Shared {
             remote.spawns.push(task);
         }
         self.pending.store(true, Ordering::Release);
-        self.unparker.unpark();
+        self.engine.unpark();
         Ok(())
     }
 
@@ -180,13 +179,8 @@ impl Shared {
         };
         if queued {
             self.pending.store(true, Ordering::Release);
-            self.unparker.unpark();
+            self.engine.unpark();
         }
-    }
-
-    /// The scheduler's ring, as other threads see it.
-    pub(crate) fn ring(&self) -> &RemoteRing {
-        &self.ring
     }
 
     /// The runtime's id, unique in the process.
@@ -284,9 +278,9 @@ impl Tasks {
     }
 }
 
-/// Runs the tasks of one thread, and its ring.
+/// Runs the tasks of one thread, and its engine.
 pub(crate) struct Scheduler {
-    driver: Driver,
+    engine: Native,
     shared: Arc<Shared>,
     /// Tasks ready to run, in the order they were woken.
     queue: RefCell<VecDeque<LocalRef>>,
@@ -317,8 +311,8 @@ pub(crate) struct Scheduler {
     tasks_freed: Box<RefCell<TaskCache>>,
 }
 impl Scheduler {
-    pub(crate) fn new(driver: Driver, spin: Duration) -> Self {
-        let id = driver.id();
+    pub(crate) fn new(engine: Native, spin: Duration) -> Self {
+        let id = Engine::id(&engine);
         let shared = Arc::new(Shared {
             id,
             remote: Mutex::new(Remote {
@@ -328,8 +322,7 @@ impl Scheduler {
                 closed: false,
             }),
             pending: AtomicBool::new(false),
-            unparker: driver.unparker(),
-            ring: driver.remote(),
+            engine: engine::Remote::new(&engine),
             holds: Holds(Cell::new(0)),
         });
         // SAFETY: this is the runtime's thread. The scheduler lets go of its
@@ -340,13 +333,13 @@ impl Scheduler {
             .unwrap_or_else(PoisonError::into_inner)
             .push((id, Arc::downgrade(&shared)));
         // SAFETY: the retain counts a local reference only to a task of the
-        // runtime running on this thread, the driver's, which keeps the task
+        // runtime running on this thread, the engine's, which keeps the task
         // alive until the release or the wake that lets go of it, on this
         // thread; and the wakes queue the task on its scheduler, or on its
-        // remote queue, without using the driver.
-        unsafe { driver.set_local_waker(task::LOCAL_WAKER) };
+        // remote queue, without using the engine.
+        unsafe { Engine::set_local_waker(&engine, task::LOCAL_WAKER) };
         Self {
-            driver,
+            engine,
             shared,
             queue: RefCell::new(VecDeque::new()),
             lifo: RefCell::new(None),
@@ -420,8 +413,8 @@ impl Scheduler {
     }
 
     #[inline]
-    pub(crate) fn driver(&self) -> &Driver {
-        &self.driver
+    pub(crate) fn engine(&self) -> &Native {
+        &self.engine
     }
 
     #[inline]
@@ -494,13 +487,13 @@ impl Scheduler {
     }
 
     /// Runs up to [`BUDGET`] ready tasks and fires the due timers, then turns
-    /// the ring: without waiting if anything is ready to run, otherwise
+    /// the engine: without waiting if anything is ready to run, otherwise
     /// parking until a completion arrives, another thread wakes a task, or the
     /// next timer is due.
     ///
     /// # Panics
     ///
-    /// If the driver fails, which means completions were lost.
+    /// If the engine fails, which means events were lost.
     pub(crate) fn tick(&self, main: &Main) {
         for _ in 0..BUDGET {
             let Some(task) = self.next_task() else {
@@ -512,21 +505,21 @@ impl Scheduler {
         }
         self.take_remote();
         self.fire_timers();
-        // The ring's own timer wakes it for the earliest timer, so a park
+        // The engine's own timer wakes it for the earliest timer, so a park
         // needs no timeout, and no turn needs the time until a timer is due.
         let turned = self
             .timers
             .next_deadline()
-            .map_or(Ok(()), |deadline| self.driver.wake_at(deadline))
+            .map_or(Ok(()), |deadline| Engine::wake_at(&self.engine, deadline))
             .and_then(|()| {
                 if !self.has_ready_tasks() && !main.is_woken() {
                     self.wait(main)
                 } else {
-                    self.driver.submit()
+                    Engine::submit(&self.engine)
                 }
             });
         if let Err(err) = turned {
-            panic!("the io_uring driver failed: {err}");
+            panic!("the I/O engine failed: {err}");
         }
         self.take_remote();
         self.fire_timers();
@@ -534,20 +527,20 @@ impl Scheduler {
         self.now.set(None);
     }
 
-    /// Waits for work: a completion, the ring's timer, or a task woken or
+    /// Waits for work: a completion, the engine's timer, or a task woken or
     /// spawned on another thread. Parks the thread, unless the scheduler
     /// spins and its last wait was short enough for spinning to have caught
     /// what ended it: then it polls for the work first, with the thread
     /// awake, for up to the spin budget.
     fn wait(&self, main: &Main) -> io::Result<()> {
         if self.spin.is_zero() {
-            return self.driver.park(None);
+            return Engine::park(&self.engine, None);
         }
         let started = Instant::now();
         let waited = if self.last_wait.get() <= self.spin {
             self.spin_then_park(main)
         } else {
-            self.driver.park(None)
+            Engine::park(&self.engine, None)
         };
         self.last_wait.set(started.elapsed());
         waited
@@ -559,32 +552,32 @@ impl Scheduler {
         // What the pass queued goes to the kernel first, as a park would
         // send it: what is waited for may be a reply to it. A completion
         // this delivers ends the wait before it begins.
-        self.driver.submit()?;
+        Engine::submit(&self.engine)?;
         if self.has_ready_tasks() || main.is_woken() {
             return Ok(());
         }
         let started = Instant::now();
         loop {
-            if self.driver.has_work() {
+            if Engine::has_work(&self.engine) {
                 // Something the park takes at once: the kernel's work,
                 // posted completions, or an unpark, which it consumes.
-                return self.driver.park(None);
+                return Engine::park(&self.engine, None);
             }
             if self.shared.pending.load(Ordering::Acquire) {
                 // Work from another thread, which the pass takes next.
                 return Ok(());
             }
             if started.elapsed() >= self.spin {
-                return self.driver.park(None);
+                return Engine::park(&self.engine, None);
             }
             hint::spin_loop();
         }
     }
 
-    /// Fires the timers due, once the ring's timer has said some may be.
+    /// Fires the timers due, once the engine's timer has said some may be.
     #[inline]
     fn fire_timers(&self) {
-        if self.driver.timer_fired() {
+        if Engine::timer_fired(&self.engine) {
             // Read anew, however stale the pass's reading, and kept for the
             // timers armed as the woken tasks run.
             let now = Instant::now();
@@ -737,7 +730,7 @@ mod tests {
     #[test]
     fn a_runtime_is_found_by_its_id_while_it_lives() {
         let runtime = Runtime::new().unwrap();
-        let id = runtime.driver().id();
+        let id = Engine::id(runtime.scheduler.engine());
         let found = Shared::find(id).expect("a live runtime is registered");
         assert_eq!(found.id(), id);
         drop(found);

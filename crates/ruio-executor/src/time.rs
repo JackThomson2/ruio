@@ -1,7 +1,7 @@
 //! Timers: waiting for a deadline, and bounding how long a future may take.
 //!
 //! Timers live in each runtime's timing wheel, in user space, with a
-//! resolution of a millisecond. The kernel sees a single timeout: how long the
+//! resolution of a millisecond. The engine sees a single timer: how long the
 //! runtime may park before the wheel's next deadline.
 //!
 //! A [`Sleep`] is `Send` and `Sync`, although its timer is in the wheel of
@@ -25,6 +25,7 @@ use std::time::Duration;
 pub use std::time::Instant;
 
 use crate::context;
+use crate::engine::{Engine, Native};
 use crate::scheduler::{Scheduler, Shared};
 use crate::task::HeldWaker;
 use crate::wheel::{Key, Wheel};
@@ -43,9 +44,9 @@ pub(crate) struct Timers {
     /// When the wheel next has work, as its last change left it, or `None`
     /// if it has none: firing the timers before then has nothing to do.
     next: Cell<Option<Instant>>,
-    /// `start`, as near as can be, on `CLOCK_MONOTONIC`, which the ring's
-    /// timer takes deadlines on: read after `start`, so that a deadline it
-    /// gives the ring is not early.
+    /// `start`, as near as can be, on the engine's clock, which its timer
+    /// takes deadlines on: read after `start`, so that a deadline it gives
+    /// the engine is not early.
     start_monotonic: Duration,
 }
 
@@ -57,12 +58,12 @@ impl Timers {
             wheel: RefCell::new(Wheel::new()),
             fired: RefCell::new(Vec::new()),
             next: Cell::new(None),
-            start_monotonic: ruio_driver::monotonic_now(),
+            start_monotonic: <Native as Engine>::monotonic_now(),
         }
     }
 
-    /// When the wheel next has work, on `CLOCK_MONOTONIC`: the deadline to
-    /// wake the ring at.
+    /// When the wheel next has work, on the engine's clock: the deadline to
+    /// wake the engine at.
     #[inline]
     pub(crate) fn next_deadline(&self) -> Option<Duration> {
         let next = self.next.get()?;

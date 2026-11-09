@@ -4,8 +4,6 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
-use ruio_driver::RemoteRing;
-
 use crate::scheduler::Shared;
 use crate::task::{RemoteJoinHandle, RemoteTask};
 
@@ -14,7 +12,7 @@ use crate::task::{RemoteJoinHandle, RemoteTask};
 /// [`Runtime::handle`](crate::Runtime::handle) or [`handle`](crate::handle).
 #[derive(Clone)]
 pub struct Handle {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
 }
 
 impl Handle {
@@ -50,13 +48,6 @@ impl Handle {
         F::Output: Send + 'static,
     {
         RemoteTask::spawn(make, &self.shared)
-    }
-
-    /// The runtime's ring, as other threads see it: where to send direct
-    /// descriptors for the runtime's tasks to use; see
-    /// [`DirectFd::send_to`](ruio_driver::DirectFd::send_to).
-    pub fn ring(&self) -> &RemoteRing {
-        self.shared.ring()
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! A task is one allocation, referred to in two ways. References from its
 //! own thread, which the scheduler's table, the run queue, the join handle
-//! and the driver's registrations hold, are counted in a plain cell: taking
+//! and the engine's registrations hold, are counted in a plain cell: taking
 //! and dropping one costs no atomic operation, and nearly every reference a
 //! task is held by is one of these. References that may be anywhere, which
 //! the wakers and the remote queue hold, are counted atomically, and one of
@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker, ready};
 
-use ruio_driver::LocalWaker;
+use ruio_engine::LocalWaker;
 
 use crate::scheduler::{Scheduler, Shared};
 use crate::{context, coop};
@@ -87,7 +87,7 @@ pub(crate) struct Header {
     /// for every local one while there is any.
     strong: AtomicUsize,
     /// References on the task's own thread: the scheduler's table entry, the
-    /// run queue's, the join handle's and the driver's. A plain cell, as all
+    /// run queue's, the join handle's and the engine's. A plain cell, as all
     /// of them come and go on that thread.
     local: Cell<usize>,
     /// Whether another thread has queued the task on its scheduler's remote
@@ -174,7 +174,7 @@ impl Header {
 
 /// A reference to a task from its own thread, counted without atomic
 /// operations: what the scheduler, the run queue, the join handle and the
-/// driver hold.
+/// engine hold.
 pub(crate) struct LocalRef {
     header: NonNull<Header>,
     /// Keeps the reference on its thread.
@@ -557,7 +557,7 @@ unsafe fn wake_by_ref(header: *const Header) {
 }
 
 /// The vtable of every task's wakers, whatever the task's future: one, so
-/// that the driver can tell a task's waker by it and hold it by a counted
+/// that the engine can tell a task's waker by it and hold it by a counted
 /// reference rather than a clone (see [`LOCAL_WAKER`]). A waker's data is
 /// the task's header, and the waker holds one atomic reference, except for
 /// the ones a run lends its poll and `block_on` its future's polls, which
@@ -594,8 +594,8 @@ unsafe fn drop_waker(header: *const ()) {
     unsafe { release(header.cast()) };
 }
 
-/// How the driver of a task's thread holds the task's wakers: by a local
-/// reference, for a task of the runtime running on the driver's thread.
+/// How the engine of a task's thread holds the task's wakers: by a local
+/// reference, for a task of the runtime running on the engine's thread.
 pub(crate) const LOCAL_WAKER: LocalWaker = LocalWaker {
     vtable: &WAKER,
     retain: retain_local,
@@ -604,15 +604,15 @@ pub(crate) const LOCAL_WAKER: LocalWaker = LocalWaker {
     wake_release: wake_release_local,
 };
 
-/// Counts a local reference to the task at `header` for the driver, if it is
+/// Counts a local reference to the task at `header` for the engine, if it is
 /// a task of the runtime running on this thread, the only thread that may
-/// touch its local count: every task's wakers share the vtable the driver
+/// touch its local count: every task's wakers share the vtable the engine
 /// knows them by, and a waker sent to another thread can be used to poll an
 /// operation there.
 #[inline]
 unsafe fn retain_local(header: *const ()) -> bool {
     let header = header.cast::<Header>();
-    // SAFETY: the waker the driver was given holds a reference, or borrows
+    // SAFETY: the waker the engine was given holds a reference, or borrows
     // a run's, so the task is alive.
     let owner = unsafe { (*header).owner() };
     context::with_owner(owner, |_| {
@@ -718,7 +718,7 @@ unsafe fn dealloc_main(header: *const Header) {
 }
 
 /// The header of the future given to `block_on`, which its wakers name as a
-/// task's wakers name the task. They share the tasks' vtable, so the driver
+/// task's wakers name the task. They share the tasks' vtable, so the engine
 /// holds them by a local reference rather than a clone, and a wake on the
 /// runtime's thread marks the future to poll with the plain flag that marks
 /// a task queued, without queueing anything or an atomic operation. A wake
