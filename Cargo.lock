@@ -601,7 +601,9 @@ dependencies = [
 name = "ruio-iocp"
 version = "0.0.0"
 dependencies = [
+ "ruio-buf",
  "ruio-engine",
+ "ruio-executor",
 ]
 
 [[package]]
