@@ -19,7 +19,8 @@ park=(env RUSTFLAGS='--cfg ruio_engine="park"' CARGO_TARGET_DIR=target/park)
 "${park[@]}" cargo test -p ruio-executor -p ruio --all-features --locked
 "${park[@]}" RUSTDOCFLAGS="-D warnings" cargo doc -p ruio-executor -p ruio --all-features --no-deps --locked
 
-# The executor and ruio on systems with no I/O engine yet, which get the park engine:
+# The executor and ruio off Linux: the park engine on macOS, which has no I/O
+# engine yet, and the I/O completion port engine of ruio-iocp on Windows,
 # built, not run, for want of the systems. A target that is not installed
 # is skipped, or fails with RUIO_REQUIRE_CROSS_CHECK=1, as CI sets;
 # `rustup target add` installs one.
@@ -33,6 +34,6 @@ for target in aarch64-apple-darwin x86_64-pc-windows-msvc; do
         echo "skipped: the $target target is not installed" >&2
         continue
     fi
-    CARGO_TARGET_DIR=target/cross cargo clippy -p ruio-executor -p ruio --all-targets \
+    CARGO_TARGET_DIR=target/cross cargo clippy -p ruio-executor -p ruio -p ruio-iocp --all-targets \
         --all-features --locked --target "$target" -- -D warnings
 done
