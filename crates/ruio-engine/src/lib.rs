@@ -19,6 +19,13 @@
 //!
 //! [`LocalWaker`] lets an engine hold the wakers of the executor's tasks
 //! by a reference the executor counts itself, rather than by a clone.
+//!
+//! [`park`] has the smallest engine that keeps the contract, which runs no
+//! I/O, for the systems ruio has no I/O engine for yet; [`conformance`]
+//! checks an engine against the contract, for the engine's own tests.
+
+pub mod conformance;
+pub mod park;
 
 use std::fmt;
 use std::io;
