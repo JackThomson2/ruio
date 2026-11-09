@@ -83,7 +83,7 @@ use std::ptr;
 use std::task::{Context, Poll, ready};
 
 use ruio_driver::buf::{BufResult, IoBuf, IoBufMut, Slice};
-use ruio_driver::ops::{self, Fallocate, Fsync, Ftruncate, Read, Statx, Write};
+use ruio_driver::ops::{self, Fallocate, Fsync, Ftruncate, Statx};
 use ruio_driver::{PortableFd, PortableOp};
 
 use super::{METADATA, Metadata, OpenOptions};
@@ -164,14 +164,14 @@ impl File {
 
     /// Reads into `buf`, up to its capacity, from `offset` on. Fewer bytes
     /// come back only at the end of the file, where none do.
-    pub fn read_at<B: IoBufMut>(&self, buf: B, offset: u64) -> PortableOp<'_, Read<B>> {
-        self.fd.op(|fd| Read::at(fd, buf, offset))
+    pub fn read_at<B: IoBufMut>(&self, buf: B, offset: u64) -> Read<'_, B> {
+        self.fd.op(|fd| ops::Read::at(fd, buf, offset))
     }
 
     /// Writes `buf`'s initialized bytes, from `offset` on, or as many as the
     /// file takes.
-    pub fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> PortableOp<'_, Write<B>> {
-        self.fd.op(|fd| Write::at(fd, buf, offset))
+    pub fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> Write<'_, B> {
+        self.fd.op(|fd| ops::Write::at(fd, buf, offset))
     }
 
     /// Fills `buf` to its capacity, after the bytes it holds already, from
@@ -186,7 +186,7 @@ impl File {
             let start = buf.bytes_init();
             let (read, rest) = self
                 .fd
-                .op(|fd| Read::at(fd, buf.slice(start..), offset + done))
+                .op(|fd| ops::Read::at(fd, buf.slice(start..), offset + done))
                 .await;
             buf = rest.into_inner();
             match read {
@@ -209,7 +209,7 @@ impl File {
         while done < total {
             let (written, rest) = self
                 .fd
-                .op(|fd| Write::at(fd, buf.slice(done..), offset + done as u64))
+                .op(|fd| ops::Write::at(fd, buf.slice(done..), offset + done as u64))
                 .await;
             buf = rest.into_inner();
             match written {
@@ -225,38 +225,38 @@ impl File {
     ///
     /// Nothing orders reads and writes at the position that run at once, so
     /// they must not overlap; ones at offsets may.
-    pub fn read<B: IoBufMut>(&self, buf: B) -> PortableOp<'_, Read<B>> {
-        self.fd.op(|fd| Read::new(fd, buf))
+    pub fn read<B: IoBufMut>(&self, buf: B) -> Read<'_, B> {
+        self.fd.op(|fd| ops::Read::new(fd, buf))
     }
 
     /// Writes `buf`'s initialized bytes at the file's position, which the
     /// write advances, or at its end if it was opened to append; see
     /// [`read`](File::read).
-    pub fn write<B: IoBuf>(&self, buf: B) -> PortableOp<'_, Write<B>> {
-        self.fd.op(|fd| Write::new(fd, buf))
+    pub fn write<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
+        self.fd.op(|fd| ops::Write::new(fd, buf))
     }
 
     /// Flushes the file's data and metadata to its device, as `fsync(2)`
     /// does.
-    pub fn sync_all(&self) -> PortableOp<'_, Fsync> {
+    pub fn sync_all(&self) -> SyncAll<'_> {
         self.fd.op(Fsync::new)
     }
 
     /// Flushes the file's data, and only the metadata needed to read it
     /// back, as `fdatasync(2)` does.
-    pub fn sync_data(&self) -> PortableOp<'_, Fsync> {
+    pub fn sync_data(&self) -> SyncData<'_> {
         self.fd.op(|fd| Fsync::new(fd).data_only())
     }
 
     /// Makes the file `len` bytes long, cutting it short or padding it with
     /// zeroes, as `ftruncate(2)` does.
-    pub fn set_len(&self, len: u64) -> PortableOp<'_, Ftruncate> {
+    pub fn set_len(&self, len: u64) -> SetLen<'_> {
         self.fd.op(|fd| Ftruncate::new(fd, len))
     }
 
     /// Allocates space for `len` bytes of the file from `offset`, growing
     /// it if they reach past its end, as `fallocate(2)` does.
-    pub fn allocate(&self, offset: u64, len: u64) -> PortableOp<'_, Fallocate> {
+    pub fn allocate(&self, offset: u64, len: u64) -> Allocate<'_> {
         self.fd.op(|fd| Fallocate::new(fd, offset, len))
     }
 
@@ -326,7 +326,8 @@ impl File {
             room.clear();
             room.reserve(want);
             polling.pos = 0;
-            polling.busy = Busy::Reading(PortableOp::new(Read::new(fd.fd(), room.slice(..want))));
+            polling.busy =
+                Busy::Reading(PortableOp::new(ops::Read::new(fd.fd(), room.slice(..want))));
         }
         let Busy::Reading(read) = &mut polling.busy else {
             unreachable!("a read is in flight");
@@ -375,7 +376,7 @@ impl File {
         data.clear();
         data.extend_from_slice(&buf[..len]);
         polling.busy = Busy::Writing {
-            write: PortableOp::new(Write::new(fd.fd(), data.slice(..))),
+            write: PortableOp::new(ops::Write::new(fd.fd(), data.slice(..))),
             done: 0,
         };
         // Polled once, to be on its way; one that fails at once takes
@@ -460,7 +461,7 @@ impl fmt::Debug for File {
 /// Reads at the file's position, which each read advances, as
 /// [`File::read`] does.
 impl AsyncRead for File {
-    type Read<'a, B: IoBufMut> = PortableOp<'a, Read<B>>;
+    type Read<'a, B: IoBufMut> = self::Read<'a, B>;
 
     #[inline]
     fn read<B: IoBufMut>(&self, buf: B) -> Self::Read<'_, B> {
@@ -471,13 +472,33 @@ impl AsyncRead for File {
 /// Writes at the file's position, which each write advances, as
 /// [`File::write`] does.
 impl AsyncWrite for File {
-    type Write<'a, B: IoBuf> = PortableOp<'a, Write<B>>;
+    type Write<'a, B: IoBuf> = self::Write<'a, B>;
 
     #[inline]
     fn write<B: IoBuf>(&self, buf: B) -> Self::Write<'_, B> {
         File::write(self, buf)
     }
 }
+
+/// The future of a portable file's [`read_at`](File::read_at) and
+/// [`read`](File::read), which is `Send`; see [`fs::Read`](super::Read).
+pub type Read<'a, B> = PortableOp<'a, ops::Read<B>>;
+
+/// The future of a portable file's [`write_at`](File::write_at) and
+/// [`write`](File::write), which is `Send`; see [`fs::Write`](super::Write).
+pub type Write<'a, B> = PortableOp<'a, ops::Write<B>>;
+
+/// The future of [`File::sync_all`], which is `Send`.
+pub type SyncAll<'a> = PortableOp<'a, Fsync>;
+
+/// The future of [`File::sync_data`], which is `Send`.
+pub type SyncData<'a> = PortableOp<'a, Fsync>;
+
+/// The future of [`File::set_len`], which is `Send`.
+pub type SetLen<'a> = PortableOp<'a, Ftruncate>;
+
+/// The future of [`File::allocate`], which is `Send`.
+pub type Allocate<'a> = PortableOp<'a, Fallocate>;
 
 /// What the poll methods of a [`File`] keep from one call to the next.
 struct Polling {
@@ -496,11 +517,11 @@ struct Polling {
 enum Busy {
     Idle,
     /// A read into the buffer, from its start.
-    Reading(PortableOp<'static, Read<Slice<Vec<u8>>>>),
+    Reading(PortableOp<'static, ops::Read<Slice<Vec<u8>>>>),
     /// A write of the buffer's bytes from `done` on, those before it being
     /// written.
     Writing {
-        write: PortableOp<'static, Write<Slice<Vec<u8>>>>,
+        write: PortableOp<'static, ops::Write<Slice<Vec<u8>>>>,
         done: usize,
     },
 }
@@ -555,7 +576,7 @@ impl Polling {
                     match written {
                         Ok(written) if written > 0 && done + written < data.len() => {
                             let done = done + written;
-                            let rest = Write::new(fd.fd(), data.slice(done..));
+                            let rest = ops::Write::new(fd.fd(), data.slice(done..));
                             self.busy = Busy::Writing {
                                 write: PortableOp::new(rest),
                                 done,

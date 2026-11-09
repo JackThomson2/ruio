@@ -65,9 +65,8 @@ use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
 use ruio_driver::buf::{BufResult, IoBuf, IoBufMut, Slice};
-use ruio_driver::ops::{Read, Write};
 
-use crate::fs::{File, FileOp};
+use crate::fs::{self, File};
 use crate::net::{self, TcpStream, UnixStream};
 
 mod async_fd;
@@ -202,7 +201,7 @@ impl AsyncWrite for UnixStream {
 /// Reads at the file's position, which each read advances, as
 /// [`File::read`] does.
 impl AsyncRead for File {
-    type Read<'a, B: IoBufMut> = FileOp<'a, Read<B>>;
+    type Read<'a, B: IoBufMut> = fs::Read<'a, B>;
 
     #[inline]
     fn read<B: IoBufMut>(&self, buf: B) -> Self::Read<'_, B> {
@@ -213,7 +212,7 @@ impl AsyncRead for File {
 /// Writes at the file's position, which each write advances, as
 /// [`File::write`] does.
 impl AsyncWrite for File {
-    type Write<'a, B: IoBuf> = FileOp<'a, Write<B>>;
+    type Write<'a, B: IoBuf> = fs::Write<'a, B>;
 
     #[inline]
     fn write<B: IoBuf>(&self, buf: B) -> Self::Write<'_, B> {

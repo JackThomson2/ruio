@@ -8,6 +8,12 @@
 //! on a pipe, a FIFO or a character device into a pool of buffers, with
 //! one multishot read.
 //!
+//! Each method's future has a name of its own here, after the method:
+//! [`Read`] and [`Write`] for the reads and writes at an offset and at the
+//! position alike, [`SyncAll`], [`SetLen`] and the others. So code that
+//! names a future names no operation of the engine's; with io_uring each
+//! is a [`FileOp`] of the operation the method makes.
+//!
 //! ```no_run
 //! # ruio::Runtime::new().unwrap().block_on(async {
 //! use ruio::fs::File;
@@ -97,8 +103,8 @@ use std::time::{Duration, SystemTime};
 
 use ruio_driver::buf::{BufLease, BufPool, BufResult, FixedIoBuf, IoBuf, IoBufMut, Slice};
 use ruio_driver::ops::{
-    self, Fadvise, Fallocate, Fsync, Ftruncate, InstallFd, LinkAt, Map, MkdirAt, OpenAt, Read,
-    ReadFixed, RenameAt, Statx, SymlinkAt, SyncFileRange, UnlinkAt, Write, WriteFixed,
+    self, Fadvise, Fallocate, Fsync, Ftruncate, InstallFd, LinkAt, Map, MkdirAt, OpenAt, RenameAt,
+    Statx, SymlinkAt, SyncFileRange, UnlinkAt,
 };
 use ruio_driver::{
     Chain, Descriptor, Driver, Fd, Link, Op, Operation, PolledFd, PortableFd, PortableOp,
@@ -232,14 +238,14 @@ impl File {
 
     /// Reads into `buf`, up to its capacity, from `offset` on. Fewer bytes
     /// come back only at the end of the file, where none do.
-    pub fn read_at<B: IoBufMut>(&self, buf: B, offset: u64) -> FileOp<'_, Read<B>> {
-        self.io_op(|fd, polled| Read::at(fd, buf, offset).polled(polled))
+    pub fn read_at<B: IoBufMut>(&self, buf: B, offset: u64) -> Read<'_, B> {
+        self.io_op(|fd, polled| ops::Read::at(fd, buf, offset).polled(polled))
     }
 
     /// Writes `buf`'s initialized bytes, from `offset` on, or as many as the
     /// file takes.
-    pub fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> FileOp<'_, Write<B>> {
-        self.io_op(|fd, polled| Write::at(fd, buf, offset).polled(polled))
+    pub fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> Write<'_, B> {
+        self.io_op(|fd, polled| ops::Write::at(fd, buf, offset).polled(polled))
     }
 
     /// Fills `buf` to its capacity from `offset` on; see [`ReadExactAt`].
@@ -264,37 +270,29 @@ impl File {
     /// Reads into a registered buffer from `offset` on, as
     /// [`read_at`](File::read_at) does, but without mapping its memory for
     /// the read.
-    pub fn read_fixed_at<B: IoBufMut + FixedIoBuf>(
-        &self,
-        buf: B,
-        offset: u64,
-    ) -> FileOp<'_, ReadFixed<B>> {
-        self.io_op(|fd, polled| ReadFixed::at(fd, buf, offset).polled(polled))
+    pub fn read_fixed_at<B: IoBufMut + FixedIoBuf>(&self, buf: B, offset: u64) -> ReadFixed<'_, B> {
+        self.io_op(|fd, polled| ops::ReadFixed::at(fd, buf, offset).polled(polled))
     }
 
     /// Writes a registered buffer's initialized bytes from `offset` on; see
     /// [`read_fixed_at`](File::read_fixed_at).
-    pub fn write_fixed_at<B: IoBuf + FixedIoBuf>(
-        &self,
-        buf: B,
-        offset: u64,
-    ) -> FileOp<'_, WriteFixed<B>> {
-        self.io_op(|fd, polled| WriteFixed::at(fd, buf, offset).polled(polled))
+    pub fn write_fixed_at<B: IoBuf + FixedIoBuf>(&self, buf: B, offset: u64) -> WriteFixed<'_, B> {
+        self.io_op(|fd, polled| ops::WriteFixed::at(fd, buf, offset).polled(polled))
     }
 
     /// Reads into `buf` at the file's position, which the read advances.
     ///
     /// Nothing orders reads and writes at the position that run at once, so
     /// they must not overlap; ones at offsets may.
-    pub fn read<B: IoBufMut>(&self, buf: B) -> FileOp<'_, Read<B>> {
-        self.io_op(|fd, polled| Read::new(fd, buf).polled(polled))
+    pub fn read<B: IoBufMut>(&self, buf: B) -> Read<'_, B> {
+        self.io_op(|fd, polled| ops::Read::new(fd, buf).polled(polled))
     }
 
     /// Writes `buf`'s initialized bytes at the file's position, which the
     /// write advances, or at its end if it was opened to append; see
     /// [`read`](File::read).
-    pub fn write<B: IoBuf>(&self, buf: B) -> FileOp<'_, Write<B>> {
-        self.io_op(|fd, polled| Write::new(fd, buf).polled(polled))
+    pub fn write<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
+        self.io_op(|fd, polled| ops::Write::new(fd, buf).polled(polled))
     }
 
     /// The data arriving on the file, read into `pool`, which must belong
@@ -339,26 +337,26 @@ impl File {
 
     /// Flushes the file's data and metadata to its device, as `fsync(2)`
     /// does.
-    pub fn sync_all(&self) -> FileOp<'_, Fsync> {
+    pub fn sync_all(&self) -> SyncAll<'_> {
         self.op(Fsync::new)
     }
 
     /// Flushes the file's data, and only the metadata needed to read it
     /// back, as `fdatasync(2)` does.
-    pub fn sync_data(&self) -> FileOp<'_, Fsync> {
+    pub fn sync_data(&self) -> SyncData<'_> {
         self.op(|fd| Fsync::new(fd).data_only())
     }
 
     /// Makes the file `len` bytes long, cutting it short or padding it with
     /// zeroes, as `ftruncate(2)` does.
-    pub fn set_len(&self, len: u64) -> FileOp<'_, Ftruncate> {
+    pub fn set_len(&self, len: u64) -> SetLen<'_> {
         self.op(|fd| Ftruncate::new(fd, len))
     }
 
     /// Allocates space for `len` bytes of the file from `offset`, growing
     /// it if they reach past its end, as `fallocate(2)` does: a write there
     /// then finds its blocks, and cannot run out of space.
-    pub fn allocate(&self, offset: u64, len: u64) -> FileOp<'_, Fallocate> {
+    pub fn allocate(&self, offset: u64, len: u64) -> Allocate<'_> {
         self.op(|fd| Fallocate::new(fd, offset, len))
     }
 
@@ -369,7 +367,7 @@ impl File {
     /// `FALLOC_FL_ZERO_RANGE` zeroes them, and `FALLOC_FL_COLLAPSE_RANGE` and
     /// `FALLOC_FL_INSERT_RANGE` cut the range out or make room for it. The
     /// file system decides which it supports.
-    pub fn fallocate(&self, offset: u64, len: u64, mode: i32) -> FileOp<'_, Fallocate> {
+    pub fn fallocate(&self, offset: u64, len: u64, mode: i32) -> Allocate<'_> {
         self.op(|fd| Fallocate::new(fd, offset, len).mode(mode))
     }
 
@@ -382,7 +380,7 @@ impl File {
     /// with dirty pages for the kernel to write back whenever it chooses.
     /// The kernel takes the length in 32 bits, so a longer range takes more
     /// than one call.
-    pub fn sync_range(&self, offset: u64, len: u32) -> FileOp<'_, SyncFileRange> {
+    pub fn sync_range(&self, offset: u64, len: u32) -> SyncRange<'_> {
         self.op(|fd| SyncFileRange::new(fd, offset, len))
     }
 
@@ -392,14 +390,14 @@ impl File {
     /// what was started. Starting the write-back of each chunk as the next
     /// is written, and waiting for a chunk only when it is the one before
     /// last, keeps the device writing while the task does.
-    pub fn start_sync_range(&self, offset: u64, len: u32) -> FileOp<'_, SyncFileRange> {
+    pub fn start_sync_range(&self, offset: u64, len: u32) -> SyncRange<'_> {
         self.op(|fd| SyncFileRange::new(fd, offset, len).flags(libc::SYNC_FILE_RANGE_WRITE))
     }
 
     /// Tells the kernel how `len` bytes of the file from `offset`, or
     /// through its end if `len` is 0, are about to be used, as
     /// `posix_fadvise(2)` does; see [`Advice`].
-    pub fn advise(&self, offset: u64, len: u64, advice: Advice) -> FileOp<'_, Fadvise> {
+    pub fn advise(&self, offset: u64, len: u64, advice: Advice) -> Advise<'_> {
         self.op(|fd| Fadvise::new(fd, offset, len, advice.raw()))
     }
 
@@ -701,6 +699,41 @@ impl<T: Operation> fmt::Debug for FileOp<'_, T> {
     }
 }
 
+/// The future of a file's [`read_at`](File::read_at) and
+/// [`read`](File::read): it hands the buffer, an [`IoBufMut`], back with how
+/// many bytes it read, 0 at the end of the file.
+/// [`timeout`](FileOp::timeout) bounds how long it may take.
+pub type Read<'a, B> = FileOp<'a, ops::Read<B>>;
+
+/// The future of a file's [`write_at`](File::write_at) and
+/// [`write`](File::write): it hands the buffer, an [`IoBuf`], back with how
+/// many bytes it wrote.
+pub type Write<'a, B> = FileOp<'a, ops::Write<B>>;
+
+/// The future of [`File::read_fixed_at`], a read into a registered buffer.
+pub type ReadFixed<'a, B> = FileOp<'a, ops::ReadFixed<B>>;
+
+/// The future of [`File::write_fixed_at`], a write of a registered buffer.
+pub type WriteFixed<'a, B> = FileOp<'a, ops::WriteFixed<B>>;
+
+/// The future of [`File::sync_all`].
+pub type SyncAll<'a> = FileOp<'a, Fsync>;
+
+/// The future of [`File::sync_data`].
+pub type SyncData<'a> = FileOp<'a, Fsync>;
+
+/// The future of [`File::set_len`].
+pub type SetLen<'a> = FileOp<'a, Ftruncate>;
+
+/// The future of [`File::allocate`] and [`File::fallocate`].
+pub type Allocate<'a> = FileOp<'a, Fallocate>;
+
+/// The future of [`File::sync_range`] and [`File::start_sync_range`].
+pub type SyncRange<'a> = FileOp<'a, SyncFileRange>;
+
+/// The future of [`File::advise`].
+pub type Advise<'a> = FileOp<'a, Fadvise>;
+
 /// A transfer that takes as many operations as it needs.
 struct Transfer<T: Operation, B> {
     driver: Driver,
@@ -748,7 +781,7 @@ impl<T: Operation, B> Transfer<T, B> {
 /// the buffer holds what was read.
 #[must_use = "a read does nothing until polled"]
 pub struct ReadExactAt<'a, B: IoBufMut> {
-    transfer: Transfer<Read<Slice<B>>, B>,
+    transfer: Transfer<ops::Read<Slice<B>>, B>,
     _file: PhantomData<&'a File>,
 }
 
@@ -760,7 +793,7 @@ impl<B: IoBufMut> Future for ReadExactAt<'_, B> {
         let polled = transfer.polled;
         let read = |fd, buf: B, offset| {
             let done = buf.bytes_init();
-            Read::at(fd, buf.slice(done..), offset).polled(polled)
+            ops::Read::at(fd, buf.slice(done..), offset).polled(polled)
         };
         loop {
             match mem::replace(&mut transfer.state, TransferState::Finished) {
@@ -808,7 +841,7 @@ impl<B: IoBufMut> fmt::Debug for ReadExactAt<'_, B> {
 /// error that stopped the writes, `WriteZero` if the file took none.
 #[must_use = "a write does nothing until polled"]
 pub struct WriteAllAt<'a, B: IoBuf> {
-    transfer: Transfer<Write<Slice<B>>, B>,
+    transfer: Transfer<ops::Write<Slice<B>>, B>,
     _file: PhantomData<&'a File>,
 }
 
@@ -825,7 +858,7 @@ impl<B: IoBuf> Future for WriteAllAt<'_, B> {
                 }
                 TransferState::Start(buf) => {
                     transfer.start(buf, 0, |fd, buf, offset| {
-                        Write::at(fd, buf.slice(..), offset).polled(polled)
+                        ops::Write::at(fd, buf.slice(..), offset).polled(polled)
                     });
                 }
                 TransferState::Moving { mut op, done } => {
@@ -843,7 +876,7 @@ impl<B: IoBuf> Future for WriteAllAt<'_, B> {
                         return Poll::Ready((Ok(()), buf));
                     }
                     transfer.start(buf, done, |fd, buf, offset| {
-                        Write::at(fd, buf.slice(done..), offset).polled(polled)
+                        ops::Write::at(fd, buf.slice(done..), offset).polled(polled)
                     });
                 }
                 TransferState::Finished => panic!("`WriteAllAt` polled after it completed"),
@@ -1468,7 +1501,7 @@ async fn read_whole(file: &PortableFd, size: usize) -> io::Result<Vec<u8>> {
         }
         let len = data.len();
         let (read, rest) = file
-            .op(|fd| Read::at(fd, data.slice(len..), len as u64))
+            .op(|fd| ops::Read::at(fd, data.slice(len..), len as u64))
             .await;
         data = rest.into_inner();
         if read? == 0 {
@@ -1532,8 +1565,8 @@ fn status_size(file: &PortableFd) -> usize {
 /// read's bytes after the first's if it found more, for the caller to read
 /// on from.
 async fn read_sized(file: &PortableFd, data: Vec<u8>, size: usize) -> io::Result<(Vec<u8>, bool)> {
-    let mut whole = file.op(|fd| Read::at(fd, data, 0));
-    let mut probe = file.op(|fd| Read::at(fd, Vec::with_capacity(PROBE), size as u64));
+    let mut whole = file.op(|fd| ops::Read::at(fd, data, 0));
+    let mut probe = file.op(|fd| ops::Read::at(fd, Vec::with_capacity(PROBE), size as u64));
     let (mut whole_read, mut probe_read) = (None, None);
     poll_fn(|cx| {
         if whole_read.is_none()
@@ -1603,7 +1636,7 @@ pub async fn write<B: IoBuf>(path: impl AsRef<Path>, contents: B) -> io::Result<
     let (mut contents, mut done) = (contents, 0);
     while done < total {
         let (written, rest) = file
-            .op(|fd| Write::at(fd, contents.slice(done..), done as u64))
+            .op(|fd| ops::Write::at(fd, contents.slice(done..), done as u64))
             .await;
         contents = rest.into_inner();
         match written? {
