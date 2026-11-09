@@ -13,10 +13,14 @@ use std::time::{Duration, Instant};
 
 use ruio_engine::{Build, Engine, LocalWaker, Unpark};
 
-use crate::sys;
+use crate::{op, sys};
 
 /// The completion key of the packets unparks post.
 const WAKE: usize = 0;
+
+/// The completion key of the handles associated with the port, under which
+/// their operations complete.
+const IO: usize = 1;
 
 /// The most completions a turn takes from the port at once.
 const BATCH: usize = 64;
@@ -35,8 +39,10 @@ thread_local! {
 
 /// An engine on an I/O completion port; see the [crate] documentation.
 ///
-/// Like any engine, it belongs to the thread that made it. A clone is the
-/// same engine.
+/// Like any engine, it belongs to the thread that made it, and so do the
+/// files and pipes whose handles are associated with its port. A clone is
+/// the same engine. Dropping the last clone, once those files and pipes
+/// are gone, waits for the operations still in flight to complete.
 ///
 /// ```compile_fail
 /// fn assert_send<T: Send>() {}
@@ -57,6 +63,13 @@ struct Inner {
     armed: Cell<Option<Duration>>,
     /// Whether the timer has fired since `timer_fired` last asked.
     fired: Cell<bool>,
+    /// How many operations the system has taken whose completions have not
+    /// been delivered.
+    in_flight: Cell<usize>,
+    /// Whether the engine is being dropped, when completions wake nothing.
+    closing: Cell<bool>,
+    /// How long dropping the engine waits for the operations in flight.
+    shutdown_timeout: Duration,
 }
 
 /// What an engine shares with its unparkers: the port, which the last of
@@ -121,7 +134,7 @@ fn milliseconds_until(deadline: Duration) -> u32 {
 }
 
 impl Iocp {
-    fn new() -> io::Result<Self> {
+    fn new(builder: &Builder) -> io::Result<Self> {
         // SAFETY: given no file and no port, this makes a port, for one
         // thread, or fails and returns null.
         let port = unsafe {
@@ -140,6 +153,9 @@ impl Iocp {
                 stash: RefCell::default(),
                 armed: Cell::new(None),
                 fired: Cell::new(false),
+                in_flight: Cell::new(0),
+                closing: Cell::new(false),
+                shutdown_timeout: builder.shutdown_timeout,
             }),
         })
     }
@@ -151,6 +167,24 @@ impl Iocp {
             .try_with(|current| current.borrow().clone())
             .ok()
             .flatten()
+    }
+
+    /// Associates `handle`, opened for overlapped I/O, with the port, so
+    /// that its operations complete there.
+    pub(crate) fn associate(&self, handle: sys::Handle) -> io::Result<()> {
+        // SAFETY: the handle and the port are open. A handle can be
+        // associated with one port at most, and the system refuses another.
+        let port = unsafe { sys::CreateIoCompletionPort(handle, self.inner.shared.port, IO, 0) };
+        if port.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Counts an operation the system took, whose completion is to come.
+    pub(crate) fn started(&self) {
+        let in_flight = &self.inner.in_flight;
+        in_flight.set(in_flight.get() + 1);
     }
 }
 
@@ -187,8 +221,17 @@ impl Inner {
     /// Delivers completions taken from the port.
     fn deliver(&self, entries: &[sys::OverlappedEntry]) {
         for entry in entries {
-            if entry.completion_key == WAKE {
-                self.shared.notified.store(false, Ordering::SeqCst);
+            match entry.completion_key {
+                WAKE => self.shared.notified.store(false, Ordering::SeqCst),
+                IO => {
+                    self.in_flight.set(self.in_flight.get() - 1);
+                    // SAFETY: a completion under the key of the handles is
+                    // that of an operation `op` started on one, which the
+                    // port hands back once.
+                    unsafe { op::complete(entry, !self.closing.get()) };
+                }
+                // Nothing posts under another key.
+                _ => {}
             }
         }
     }
@@ -227,6 +270,23 @@ impl Inner {
         {
             self.armed.set(None);
             self.fired.set(true);
+        }
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The operations still in flight are those whose futures were
+        // dropped, which cancelled them, and those forgotten. A completion
+        // frees the slot of an operation whose future was dropped, buffer
+        // and all; one that has not come by the timeout leaves its slot
+        // leaked, as the system may still write to its buffer.
+        self.closing.set(true);
+        let deadline = now().saturating_add(self.shutdown_timeout);
+        while self.in_flight.get() > 0 && now() < deadline {
+            if self.turn(Some(deadline)).is_err() {
+                break;
+            }
         }
     }
 }
@@ -314,14 +374,15 @@ impl fmt::Debug for Iocp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Iocp")
             .field("id", &self.inner.id)
+            .field("in_flight", &self.inner.in_flight.get())
             .finish_non_exhaustive()
     }
 }
 
 /// Configures and creates an [`Iocp`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Builder {
-    _private: (),
+    shutdown_timeout: Duration,
 }
 
 impl Builder {
@@ -331,17 +392,27 @@ impl Builder {
     }
 }
 
+impl Default for Builder {
+    fn default() -> Self {
+        Self {
+            shutdown_timeout: Duration::from_secs(1),
+        }
+    }
+}
+
 impl Build for Builder {
     type Engine = Iocp;
 
-    /// Changes nothing yet: the engine has no operations in flight to wait
-    /// for.
-    fn shutdown_timeout(self, _timeout: Duration) -> Self {
+    /// Sets how long dropping the engine waits for the operations still in
+    /// flight, which the drops of their futures cancelled, to complete,
+    /// before it leaks their buffers. The default is one second.
+    fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
         self
     }
 
     fn build(&self) -> io::Result<Iocp> {
-        Iocp::new()
+        Iocp::new(self)
     }
 }
 
