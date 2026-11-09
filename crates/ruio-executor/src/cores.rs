@@ -100,8 +100,9 @@ pub fn handle_of(index: usize) -> Handle {
 ///
 /// On Linux each core's thread is pinned to its CPU. Elsewhere ruio cannot
 /// pin threads yet: a core's CPU is a number, from 0 up to the parallelism
-/// the standard library finds, and its thread runs where the system puts
-/// it.
+/// the standard library finds, and a run refuses one beyond it, as Linux's
+/// refuses a CPU the process may not run on; the thread runs where the
+/// system puts it.
 ///
 /// ```
 /// # fn main() -> std::io::Result<()> {
@@ -516,7 +517,7 @@ mod affinity {
 
 /// The CPUs the process may run on, and pinning a thread to one, where ruio
 /// cannot pin threads yet: as many CPUs as the standard library finds the
-/// process can use, and no pinning.
+/// process can use, and no pinning, though a CPU beyond them is refused.
 #[cfg(not(target_os = "linux"))]
 mod affinity {
     use std::io;
@@ -527,8 +528,16 @@ mod affinity {
         Ok((0..thread::available_parallelism()?.get()).collect())
     }
 
-    /// Leaves the thread where the system puts it.
-    pub(super) fn pin(_cpu: usize) -> io::Result<()> {
+    /// Leaves the thread where the system puts it, once `cpu` is one of
+    /// those [`allowed_cpus`] numbers.
+    pub(super) fn pin(cpu: usize) -> io::Result<()> {
+        let count = thread::available_parallelism()?.get();
+        if cpu >= count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no CPU {cpu}, of the {count} the process can use"),
+            ));
+        }
         Ok(())
     }
 }
