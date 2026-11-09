@@ -6,12 +6,11 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::slice;
 
-use crate::buf::{IoBuf, IoBufMut};
+use crate::{IoBuf, IoBufMut};
 
 /// A heap buffer whose memory starts at a multiple of an alignment, as
 /// direct I/O (`O_DIRECT`) needs: the file's `dio_mem_align`, commonly 512 or
-/// 4096 bytes, which [`Statx`](crate::ops::Statx) reports with
-/// `STATX_DIOALIGN`.
+/// 4096 bytes, which Linux's `statx` reports with `STATX_DIOALIGN`.
 ///
 /// It is a byte vector of fixed capacity: a read fills it up to its
 /// capacity, and a write sends the bytes it holds. Direct I/O also needs the

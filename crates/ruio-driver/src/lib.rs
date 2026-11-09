@@ -59,7 +59,6 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-mod aligned;
 pub mod buf;
 mod driver;
 mod engine;

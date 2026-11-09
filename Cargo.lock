@@ -547,6 +547,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruio-buf"
+version = "0.0.0"
+
+[[package]]
 name = "ruio-compat"
 version = "0.0.0"
 dependencies = [
@@ -571,6 +575,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "libc",
+ "ruio-buf",
  "ruio-engine",
  "ruio-sys",
 ]

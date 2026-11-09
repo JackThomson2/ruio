@@ -17,7 +17,7 @@ use std::vec;
 
 use ruio_sys as sys;
 
-use crate::buf::{IoBuf, IoBufMut};
+use crate::buf::{IoBuf, IoBufMut, IoBufs};
 use crate::driver::WeakDriver;
 use crate::mem::Mapping;
 use crate::{Driver, Probe};
@@ -833,6 +833,21 @@ impl BufBundle {
             data.extend_from_slice(lease);
         }
         data
+    }
+}
+
+// SAFETY: each lease is an `IoBuf`, whose memory lies in its pool's mapping
+// wherever the lease is.
+unsafe impl IoBufs for BufBundle {
+    #[inline]
+    fn buf_count(&self) -> usize {
+        self.buffers()
+    }
+
+    #[inline]
+    fn buf(&self, index: usize) -> (*const u8, usize) {
+        let lease = self.lease(index);
+        (lease.stable_ptr(), lease.bytes_init())
     }
 }
 
