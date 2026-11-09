@@ -123,6 +123,7 @@ fn dropped_and_endless_sleeps_do_not_hold_the_runtime() {
     assert!(start.elapsed() < Duration::from_millis(10) + SLACK);
 }
 
+#[cfg(ruio_uring)]
 #[test]
 fn timers_cost_the_kernel_one_timeout() {
     let runtime = Runtime::new().unwrap();

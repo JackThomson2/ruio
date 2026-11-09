@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use ruio_executor::sync::{mpsc, oneshot};
 use ruio_executor::time::sleep;
-use ruio_executor::{Core, Cores, JoinSet, Runtime, core, core_count, handle_of, spawn, spawn_on};
+use ruio_executor::{Core, Cores, core, spawn, spawn_on};
+// What the tests that look at the CPUs use besides.
+#[cfg(target_os = "linux")]
+use ruio_executor::{JoinSet, Runtime, core_count};
 
 /// A few cores, however many CPUs the machine has: on one with fewer, some
 /// share a CPU.
@@ -18,7 +21,9 @@ fn few() -> Cores {
     Cores::cpus(all.cpu_list().iter().copied().cycle().take(4))
 }
 
-/// The CPU the calling thread is on.
+/// The CPU the calling thread is on. Only Linux pins a core's thread to
+/// its CPU so far, so the tests that look are Linux's.
+#[cfg(target_os = "linux")]
 fn current_cpu() -> usize {
     // SAFETY: sched_getcpu reads the thread's CPU and changes nothing.
     usize::try_from(unsafe { libc::sched_getcpu() }).unwrap()
@@ -42,6 +47,7 @@ fn cores_are_cpus_the_process_may_run_on() {
     assert!(seen.iter().all(|cpus| cpus == all.cpu_list()), "{seen:?}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn each_core_runs_main_pinned_to_its_cpu() {
     let cores = few();
@@ -72,6 +78,7 @@ fn each_core_runs_main_pinned_to_its_cpu() {
 }
 
 /// Each core spawns onto the next, which runs the task as itself.
+#[cfg(ruio_uring)]
 #[test]
 fn cores_spawn_onto_each_other() {
     let cores = few();
@@ -79,7 +86,7 @@ fn cores_spawn_onto_each_other() {
     let answers = cores
         .run(|me: Core| async move {
             // A core's handle names its ring.
-            let ring = handle_of(me.index()).ring().id();
+            let ring = ruio_executor::handle_of(me.index()).ring().id();
             assert_eq!(ring, ruio_executor::driver().id());
             let next = (me.index() + 1) % count;
             let there = spawn_on(next, async { (core().unwrap(), current_cpu()) })
@@ -96,6 +103,7 @@ fn cores_spawn_onto_each_other() {
 
 /// A set spawns onto every core of the run, and the outputs come as those of
 /// the set's own tasks do.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_set_spawns_onto_other_cores() {
     let cores = few();

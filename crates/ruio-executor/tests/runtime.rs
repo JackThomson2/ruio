@@ -1,17 +1,28 @@
 //! The executor: running, spawning, joining, waking and shutting down.
+//!
+//! Those that run operations need an engine with I/O, io_uring's, so they
+//! run only where the executor has it (`cfg(ruio_uring)`).
 
 use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Poll, Waker};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use ruio_driver::ops::{Nop, Timeout};
 use ruio_executor::{Runtime, spawn, yield_now};
 
+// What the tests that run operations use besides.
+#[cfg(ruio_uring)]
+use {
+    ruio_driver::ops::{Nop, Timeout},
+    std::pin::Pin,
+    std::task::Context,
+    std::time::Instant,
+};
+
+#[cfg(ruio_uring)]
 #[test]
 fn the_builder_sizes_the_file_table() {
     let runtime = Runtime::builder().files(3).build().unwrap();
@@ -23,6 +34,7 @@ fn the_builder_sizes_the_file_table() {
 /// The shutdown timeout reaches the driver's builder, and a runtime built
 /// with a short one still drains cleanly: its drop cancels what is in
 /// flight, and the kernel finishes with it well within the bound.
+#[cfg(ruio_uring)]
 #[test]
 fn the_builder_sets_the_shutdown_timeout() {
     let builder = Runtime::builder().shutdown_timeout(Duration::from_millis(10));
@@ -110,12 +122,15 @@ impl Slot {
 fn block_on_returns_the_output() {
     let runtime = Runtime::new().unwrap();
     assert_eq!(runtime.block_on(async { 7 }), 7);
+    #[cfg(ruio_uring)]
     runtime.block_on(runtime.driver().op(Nop)).unwrap();
 }
 
 /// Records, when dropped, the ID of the driver the thread finds then.
+#[cfg(ruio_uring)]
 struct FindsDriver(Rc<Cell<Option<u64>>>);
 
+#[cfg(ruio_uring)]
 impl Drop for FindsDriver {
     fn drop(&mut self) {
         self.0
@@ -125,6 +140,7 @@ impl Drop for FindsDriver {
 
 /// Code inside a runtime finds its driver, destructors that the runtime
 /// runs as it drops unfinished tasks included, and code outside finds none.
+#[cfg(ruio_uring)]
 #[test]
 fn the_thread_finds_its_runtimes_driver_only_inside_it() {
     assert!(ruio_executor::try_driver().is_none());
@@ -146,6 +162,7 @@ fn the_thread_finds_its_runtimes_driver_only_inside_it() {
     assert!(ruio_executor::try_driver().is_none());
 }
 
+#[cfg(ruio_uring)]
 #[test]
 fn spawned_tasks_run_and_are_joined() {
     let runtime = Runtime::new().unwrap();
@@ -180,6 +197,7 @@ fn tasks_need_not_be_send() {
     assert_eq!(*shared.borrow(), ["task"]);
 }
 
+#[cfg(ruio_uring)]
 #[test]
 fn tasks_wait_on_io_concurrently() {
     let runtime = Runtime::new().unwrap();
@@ -202,6 +220,7 @@ fn tasks_wait_on_io_concurrently() {
     assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
 }
 
+#[cfg(ruio_uring)]
 #[test]
 fn detached_tasks_keep_running() {
     let runtime = Runtime::new().unwrap();
@@ -232,6 +251,7 @@ fn a_panicking_task_is_reported_and_the_others_run_on() {
     });
 }
 
+#[cfg(ruio_uring)]
 #[test]
 fn an_aborted_task_is_cancelled_and_its_future_dropped() {
     let runtime = Runtime::new().unwrap();
@@ -305,6 +325,7 @@ fn another_thread_can_wake_a_task() {
 /// since the task's count of references from its own thread is not another
 /// thread's to touch, and the operation's completion wakes the task from
 /// there.
+#[cfg(ruio_uring)]
 #[test]
 fn a_waker_polled_on_another_threads_ring_wakes_its_task() {
     let runtime = Runtime::new().unwrap();
@@ -428,6 +449,7 @@ fn yielding_lets_other_tasks_run() {
     assert_eq!(*log.borrow(), "ababab");
 }
 
+#[cfg(ruio_uring)]
 #[test]
 fn io_completes_while_tasks_keep_yielding() {
     let runtime = Runtime::new().unwrap();
@@ -449,6 +471,7 @@ fn io_completes_while_tasks_keep_yielding() {
     });
 }
 
+#[cfg(ruio_uring)]
 #[test]
 fn many_tasks() {
     let runtime = Runtime::new().unwrap();
@@ -462,6 +485,7 @@ fn many_tasks() {
     });
 }
 
+#[cfg(ruio_uring)]
 #[test]
 fn dropping_the_runtime_cancels_unfinished_tasks() {
     let runtime = Runtime::new().unwrap();

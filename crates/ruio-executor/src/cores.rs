@@ -5,7 +5,6 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::mem;
 use std::panic;
-use std::process;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
 use std::thread;
@@ -13,6 +12,8 @@ use std::thread;
 use crate::handle::Handle;
 use crate::runtime::Builder;
 use crate::task::RemoteJoinHandle;
+
+use affinity::{allowed_cpus, pin};
 
 /// A core of a [`Cores`] run: its index among the run's cores, and the CPU
 /// its thread is pinned to.
@@ -75,8 +76,8 @@ where
 }
 
 /// The handle of core `index` of the thread's run: to spawn onto it, with a
-/// future made there if need be ([`Handle::spawn_with`]), and to send it
-/// direct descriptors ([`Handle::ring`]).
+/// future made there if need be ([`Handle::spawn_with`]), and, with
+/// io_uring, to send it direct descriptors (`Handle::ring`).
 ///
 /// # Panics
 ///
@@ -96,6 +97,11 @@ pub fn handle_of(index: usize) -> Handle {
 }
 
 /// A set of CPUs to run on, a runtime on each: thread per core.
+///
+/// On Linux each core's thread is pinned to its CPU. Elsewhere ruio cannot
+/// pin threads yet: a core's CPU is a number, from 0 up to the parallelism
+/// the standard library finds, and its thread runs where the system puts
+/// it.
 ///
 /// ```
 /// # fn main() -> std::io::Result<()> {
@@ -126,7 +132,7 @@ impl Cores {
     ///
     /// # Errors
     ///
-    /// What `sched_getaffinity(2)` reports.
+    /// On Linux, what `sched_getaffinity(2)` reports.
     pub fn all() -> io::Result<Self> {
         Ok(Self::cpus(allowed_cpus()?))
     }
@@ -135,8 +141,8 @@ impl Cores {
     ///
     /// # Errors
     ///
-    /// What `sched_getaffinity(2)` reports, and `InvalidInput` if `count` is
-    /// zero or the process may run on fewer CPUs.
+    /// On Linux, what `sched_getaffinity(2)` reports, and `InvalidInput` if
+    /// `count` is zero or the process may run on fewer CPUs.
     pub fn first(count: usize) -> io::Result<Self> {
         let cpus = allowed_cpus()?;
         if count == 0 || count > cpus.len() {
@@ -454,46 +460,75 @@ impl Drop for Clear {
     }
 }
 
-/// The CPUs the process may run on, in order: those of its main thread,
-/// whose ID is the process's, since the thread asking may be a core's, which
-/// may run on its own CPU alone.
-fn allowed_cpus() -> io::Result<Vec<usize>> {
-    // Linux's process IDs are `pid_t`s.
-    let main = process::id() as libc::pid_t;
-    // SAFETY: all zeroes is an empty CPU set.
-    let mut set: libc::cpu_set_t = unsafe { mem::zeroed() };
-    // SAFETY: sched_getaffinity writes at most the set's size into it.
-    let ret = unsafe { libc::sched_getaffinity(main, mem::size_of::<libc::cpu_set_t>(), &mut set) };
-    if ret != 0 {
-        return Err(io::Error::last_os_error());
+/// The CPUs the process may run on, and pinning a thread to one, through
+/// Linux's affinity masks.
+#[cfg(target_os = "linux")]
+mod affinity {
+    use std::io;
+    use std::mem;
+    use std::process;
+
+    /// The CPUs the process may run on, in order: those of its main thread,
+    /// whose ID is the process's, since the thread asking may be a core's,
+    /// which may run on its own CPU alone.
+    pub(super) fn allowed_cpus() -> io::Result<Vec<usize>> {
+        // Linux's process IDs are `pid_t`s.
+        let main = process::id() as libc::pid_t;
+        // SAFETY: all zeroes is an empty CPU set.
+        let mut set: libc::cpu_set_t = unsafe { mem::zeroed() };
+        // SAFETY: sched_getaffinity writes at most the set's size into it.
+        let ret =
+            unsafe { libc::sched_getaffinity(main, mem::size_of::<libc::cpu_set_t>(), &mut set) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let cpus = (0..libc::CPU_SETSIZE as usize)
+            // SAFETY: the index is below the set's size.
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+            .collect();
+        Ok(cpus)
     }
-    let cpus = (0..libc::CPU_SETSIZE as usize)
-        // SAFETY: the index is below the set's size.
-        .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
-        .collect();
-    Ok(cpus)
+
+    /// Pins the calling thread to `cpu`.
+    pub(super) fn pin(cpu: usize) -> io::Result<()> {
+        if cpu >= libc::CPU_SETSIZE as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no CPU {cpu}"),
+            ));
+        }
+        // SAFETY: all zeroes is an empty CPU set.
+        let mut set: libc::cpu_set_t = unsafe { mem::zeroed() };
+        // SAFETY: the CPU is below the set's size.
+        unsafe { libc::CPU_SET(cpu, &mut set) };
+        // SAFETY: sched_setaffinity reads the one set it is given.
+        let ret = unsafe { libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set) };
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            return Err(io::Error::new(
+                err.kind(),
+                format!("pinning to CPU {cpu}: {err}"),
+            ));
+        }
+        Ok(())
+    }
 }
 
-/// Pins the calling thread to `cpu`.
-fn pin(cpu: usize) -> io::Result<()> {
-    if cpu >= libc::CPU_SETSIZE as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("no CPU {cpu}"),
-        ));
+/// The CPUs the process may run on, and pinning a thread to one, where ruio
+/// cannot pin threads yet: as many CPUs as the standard library finds the
+/// process can use, and no pinning.
+#[cfg(not(target_os = "linux"))]
+mod affinity {
+    use std::io;
+    use std::thread;
+
+    /// CPUs numbered from 0, as many as the process can use.
+    pub(super) fn allowed_cpus() -> io::Result<Vec<usize>> {
+        Ok((0..thread::available_parallelism()?.get()).collect())
     }
-    // SAFETY: all zeroes is an empty CPU set.
-    let mut set: libc::cpu_set_t = unsafe { mem::zeroed() };
-    // SAFETY: the CPU is below the set's size.
-    unsafe { libc::CPU_SET(cpu, &mut set) };
-    // SAFETY: sched_setaffinity reads the one set it is given.
-    let ret = unsafe { libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set) };
-    if ret != 0 {
-        let err = io::Error::last_os_error();
-        return Err(io::Error::new(
-            err.kind(),
-            format!("pinning to CPU {cpu}: {err}"),
-        ));
+
+    /// Leaves the thread where the system puts it.
+    pub(super) fn pin(_cpu: usize) -> io::Result<()> {
+        Ok(())
     }
-    Ok(())
 }

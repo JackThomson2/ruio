@@ -1,6 +1,8 @@
 //! Portable operations under runtimes: queued on the ring of the runtime
 //! that first polls them, and carried by `Send` futures between cores.
 
+#![cfg(ruio_uring)]
+
 use std::future::{Future, poll_fn};
 use std::io::{PipeReader, PipeWriter, Write as _};
 use std::os::fd::AsRawFd;

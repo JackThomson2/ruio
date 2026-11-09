@@ -13,9 +13,17 @@ futures = ["dep:futures-core"]
 
 [dependencies]
 futures-core = { workspace = true, optional = true }
-libc.workspace = true
-ruio-driver.workspace = true
 ruio-engine.workspace = true
+
+# The io_uring engine, which the executor runs on on Linux unless it is
+# built with `--cfg ruio_engine="park"`. build.rs tells the code the same,
+# as `cfg(ruio_uring)`.
+[target.'cfg(all(target_os = "linux", not(ruio_engine = "park")))'.dependencies]
+ruio-driver.workspace = true
+
+# For pinning threads to CPUs, which ruio does on Linux alone so far.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false }
