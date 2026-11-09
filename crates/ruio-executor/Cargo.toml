@@ -21,6 +21,12 @@ ruio-engine.workspace = true
 [target.'cfg(all(target_os = "linux", not(ruio_engine = "park")))'.dependencies]
 ruio-driver.workspace = true
 
+# The I/O completion port engine, which the executor runs on on Windows
+# unless it is built with `--cfg ruio_engine="park"`. build.rs tells the
+# code the same, as `cfg(ruio_iocp)`.
+[target.'cfg(all(windows, not(ruio_engine = "park")))'.dependencies]
+ruio-iocp.workspace = true
+
 # For pinning threads to CPUs, which ruio does on Linux alone so far.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

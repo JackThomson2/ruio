@@ -594,6 +594,7 @@ dependencies = [
  "libc",
  "ruio-driver",
  "ruio-engine",
+ "ruio-iocp",
 ]
 
 [[package]]
