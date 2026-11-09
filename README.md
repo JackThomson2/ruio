@@ -41,9 +41,11 @@ license has been chosen.
 
 ruio needs Linux 6.10 or later, which it checks by capability rather than
 by version, and the Rust toolchain that `rust-toolchain.toml` pins
-(1.97.1). Elsewhere, as on macOS and Windows until they have an I/O engine
-of ruio's, and with `--cfg ruio_engine="park"`, ruio builds with its
-executor alone: runtimes, tasks, timers, channels and locks, and no I/O.
+(1.97.1). Elsewhere ruio builds with its executor alone, with runtimes,
+tasks, timers, channels and locks and no I/O: on Windows, on an I/O
+completion port, whose files and named pipes are a proof of concept in
+`ruio-iocp`; on macOS, and with `--cfg ruio_engine="park"`, on the park
+engine.
 
 ## Crates
 
@@ -51,8 +53,9 @@ executor alone: runtimes, tasks, timers, channels and locks, and no I/O.
 |---|---|
 | [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, which holds tasks of other cores too, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, `signal`, and `process`, which spawns child processes and waits for them on the ring; the path functions of `fs`, `read_dir` among them, everything in `process`, the sockets of `net::portable`, the file of `fs::portable`, which also reads, writes and seeks through poll methods as tokio's file does, and `io::portable::AsyncFd`, shaped as tokio's, are `Send`, running on the ring of whichever thread polls them, and where no runtime runs, on a tokio worker say, on the foreign ring `uring::set_foreign_ring` sets, failing with `Unsupported` if none is set, while the portable sockets and a child's pipes wait there on the executor's own reactor once `io::set_foreign_reactor` sets one, as `ruio-compat`'s `TokioReactor`; with the `futures` feature, every stream implements futures-core's `Stream` |
 | [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; `Timer`, which gives hyper ruio's timers for its timeouts; `PortableCompat`, which gives the portable streams and a child's pipes those traits with no buffers of its own, and the portable file them and `AsyncSeek`; and, with the `client` feature, a connector that runs hyper-util's client on them |
-| [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder, over the I/O engine chosen when the program is built: io_uring on Linux, and the park engine, which runs no I/O, elsewhere |
+| [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder, over the I/O engine chosen when the program is built: io_uring on Linux, an I/O completion port on Windows, and the park engine, which runs no I/O, elsewhere |
 | [`ruio-engine`](crates/ruio-engine) | The contract between the executor and its I/O engine, a check that an engine keeps it, and the park engine |
+| [`ruio-iocp`](crates/ruio-iocp) | The I/O completion port engine of Windows, and files and named pipes that read and write through it with owned buffers: a proof of concept |
 | [`ruio-buf`](crates/ruio-buf) | The buffers an operation takes and hands back, shared by every engine: `IoBuf`, `IoBufMut`, `IoBufs`, slices and aligned buffers |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, pools and registered buffers, registered files, the capability probe |
 | [`ruio-sys`](crates/ruio-sys) | The kernel's io_uring ABI and system calls |
