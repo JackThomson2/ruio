@@ -66,7 +66,7 @@ impl Header {
     fn new<T>(offset: u64, waker: Waker) -> Self {
         Self {
             overlapped: UnsafeCell::new(sys::Overlapped {
-                internal: 0,
+                internal: sys::STATUS_PENDING as usize,
                 internal_high: 0,
                 offset: offset as u32,
                 offset_high: (offset >> 32) as u32,
@@ -210,18 +210,25 @@ impl<'a, T> Op<'a, T> {
         // `OVERLAPPED`, stays where it is until the completion is delivered,
         // the future's until then, or the engine's.
         let started = unsafe { start(self.target.handle, payload, overlapped) };
+        // A call that fails at once may have completed the operation all the
+        // same, with a warning, and then its completion is queued too.
+        // SAFETY: the slot is allocated, and the call has returned, so
+        // nothing writes the `OVERLAPPED` while its status is read.
+        let queued = started.is_ok() || completed(unsafe { (*overlapped).internal });
         match started {
-            Ok(()) => {
-                self.target.engine.started();
-                self.state = OpState::Started(slot);
-                Poll::Pending
-            }
-            Err(err) => {
+            Err(err) if !queued => {
                 // SAFETY: the system did not take the operation, so nothing
                 // will come through the port for it, and the slot is the
                 // future's alone.
                 let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
                 Poll::Ready((Err(err), payload))
+            }
+            // The outcome, an error included, is read once the completion
+            // has been delivered.
+            _ => {
+                self.target.engine.started();
+                self.state = OpState::Started(slot);
+                Poll::Pending
             }
         }
     }
@@ -283,6 +290,25 @@ impl<T> Drop for Op<'_, T> {
         // already, when the call does nothing.
         unsafe { sys::CancelIoEx(self.target.handle, header.overlapped.get()) };
     }
+}
+
+/// Whether the system completed an operation whose call failed at once, and
+/// so queued its completion to the port, going by the status that the call
+/// left in its `OVERLAPPED`.
+///
+/// The system queues the completion of an operation that completes during
+/// the call unless it fails with an error status, and writes the status to
+/// the `OVERLAPPED` in the same cases. A warning status is no error to it,
+/// yet the call that started the operation reports it as one: a datagram
+/// longer than its buffer fails `WSARecvFrom` with `WSAEMSGSIZE`, and its
+/// completion comes through the port all the same. An `OVERLAPPED` starts
+/// as pending, so a status that is neither that nor an error is one the
+/// system wrote, with a completion behind it.
+fn completed(status: usize) -> bool {
+    // The status is the low half of `Internal`; errors have its top two bits
+    // set.
+    let status = status as u32;
+    status != sys::STATUS_PENDING && status >> 30 != 0b11
 }
 
 /// The outcome of an operation that completed with `status`, the
@@ -499,7 +525,7 @@ impl<B: IoBuf> fmt::Debug for Write<'_, B> {
 
 #[cfg(test)]
 mod tests {
-    use super::result;
+    use super::{completed, result};
 
     #[test]
     fn statuses_become_windows_errors() {
@@ -510,5 +536,20 @@ mod tests {
         // STATUS_CANCELLED, as a cancelled operation completes.
         let cancelled = result(0xC000_0120, 0).unwrap_err();
         assert_eq!(cancelled.raw_os_error(), Some(995));
+    }
+
+    #[test]
+    fn a_failed_call_completed_its_operation_unless_pending_or_an_error() {
+        // STATUS_PENDING: the system never set a status.
+        assert!(!completed(0x103));
+        // STATUS_BUFFER_OVERFLOW, a warning, as a datagram longer than its
+        // buffer completes.
+        assert!(completed(0x8000_0005));
+        assert!(completed(0));
+        // STATUS_PIPE_BROKEN and STATUS_CONNECTION_RESET, errors.
+        assert!(!completed(0xC000_014B));
+        assert!(!completed(0xC000_020D));
+        // Only the low half of `Internal` is the status.
+        assert!(!completed(0xFFFF_FFFF_0000_0103_u64 as usize));
     }
 }

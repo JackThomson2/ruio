@@ -31,6 +31,11 @@ pub(crate) const ERROR_BROKEN_PIPE: u32 = 109;
 /// `ERROR_IO_PENDING`: the system took an operation, which completes later.
 pub(crate) const ERROR_IO_PENDING: u32 = 997;
 
+/// `STATUS_PENDING`: the status in the `OVERLAPPED` of an operation that
+/// has not completed, which the calls that start one set before they ask
+/// the system for it.
+pub(crate) const STATUS_PENDING: u32 = 0x0000_0103;
+
 /// `FILE_FLAG_OVERLAPPED`: a handle opened for overlapped I/O, whose
 /// operations may complete after the calls that start them return.
 pub(crate) const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
