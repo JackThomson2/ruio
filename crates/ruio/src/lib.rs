@@ -83,20 +83,37 @@ and `FusedStream` of futures-core, each as one call to its own
 connections merge with its shutdown signal through `select`."#
 )]
 #![cfg_attr(
-    not(ruio_uring),
+    ruio_iocp,
+    doc = r#"
+Built for Windows, ruio runs on the I/O completion port engine of
+`ruio-iocp`, and has part of its I/O there, a proof of concept. [`net`]
+has TCP and UDP sockets, which read and write with owned buffers as they
+do on io_uring, under the same names and with the same signatures, so
+that code written to them builds for both. Beside it is the executor's
+API: runtimes, tasks, timers, the channels and locks of [`sync`], the
+blocking pool and [`Cores`], whose threads are not pinned off Linux, and
+the buffer traits of [`buf`], which every engine shares. The rest of the
+I/O and io_uring's own API, `fs`, `io`, `process`, `signal`, the pools
+and registered buffers of `buf`, `uring` and `driver`, come with io_uring
+alone so far. With the `futures` feature, a listener's connections and
+the channels' receivers and intervals implement the `Stream` and
+`FusedStream` of futures-core."#
+)]
+#![cfg_attr(
+    not(any(ruio_uring, ruio_iocp)),
     doc = r#"
 Built for a system whose engine ruio offers no I/O on yet, ruio has the
-executor's API alone: on Windows, on the I/O completion port engine of
-`ruio-iocp`, and on macOS, or wherever it is built with
+executor's API alone: on macOS, or wherever it is built with
 `--cfg ruio_engine="park"`, on the park engine of `ruio-engine`, which
 runs no I/O. That is runtimes, tasks, timers, the channels and locks of
 [`sync`], the blocking pool and [`Cores`], whose threads are not pinned
 off Linux, and the buffer traits of [`buf`], which every engine shares.
 The I/O and io_uring's own API, `net`, `fs`, `io`, `process`, `signal`,
 the pools and registered buffers of `buf`, `uring` and `driver`, come with
-io_uring alone until such a system's engine offers them. With the `futures`
-feature, the channels' receivers and intervals implement the `Stream` and
-`FusedStream` of futures-core."#
+an engine that offers them: io_uring, and for part of `net` the I/O
+completion port of Windows. With the `futures` feature, the channels'
+receivers and intervals implement the `Stream` and `FusedStream` of
+futures-core."#
 )]
 
 pub use ruio_executor::{
@@ -109,7 +126,8 @@ pub use ruio_macros::{main, test};
 
 pub mod buf;
 
-// The I/O and io_uring's own API, which run on io_uring alone so far.
+// The I/O, which runs on io_uring and, in part, on the I/O completion port,
+// and io_uring's own API.
 #[cfg(ruio_uring)]
 pub use ruio_executor::driver;
 
@@ -120,6 +138,10 @@ mod futures_impls;
 #[cfg(ruio_uring)]
 pub mod io;
 #[cfg(ruio_uring)]
+pub mod net;
+// The completion port engine's part of `net`, under io_uring's names.
+#[cfg(ruio_iocp)]
+#[path = "iocp/net.rs"]
 pub mod net;
 #[cfg(ruio_uring)]
 pub mod process;

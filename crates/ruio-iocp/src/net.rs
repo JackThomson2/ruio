@@ -567,6 +567,34 @@ impl TcpStream {
         self.stream.io().nodelay()
     }
 
+    /// Sets the time to live of the packets the stream sends (`IP_TTL`).
+    ///
+    /// # Errors
+    ///
+    /// What the system reports.
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.stream.io().set_ttl(ttl)
+    }
+
+    /// The time to live of the packets the stream sends.
+    ///
+    /// # Errors
+    ///
+    /// What the system reports.
+    pub fn ttl(&self) -> io::Result<u32> {
+        self.stream.io().ttl()
+    }
+
+    /// Takes the error the socket holds (`SO_ERROR`), if it holds one,
+    /// which clears it.
+    ///
+    /// # Errors
+    ///
+    /// What asking for it reports.
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        self.stream.io().take_error()
+    }
+
     /// Shuts down the reading or the writing half of the connection, or
     /// both. The peer's reads find the end of the stream once the writing
     /// half is shut down.

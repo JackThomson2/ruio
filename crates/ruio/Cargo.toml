@@ -27,6 +27,12 @@ ruio-macros.workspace = true
 ruio-driver.workspace = true
 ruio-sys.workspace = true
 
+# The I/O completion port engine's files and sockets, which the I/O runs on
+# on Windows, unless built with `--cfg ruio_engine="park"`. build.rs tells
+# the code the same, as `cfg(ruio_iocp)`.
+[target.'cfg(all(windows, not(ruio_engine = "park")))'.dependencies]
+ruio-iocp.workspace = true
+
 [dev-dependencies]
 # For the tests and examples of portable I/O polled where no runtime runs:
 # `futures::executor::block_on` on a plain thread, and tokio's own
