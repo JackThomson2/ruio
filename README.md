@@ -43,9 +43,9 @@ ruio needs Linux 6.10 or later, which it checks by capability rather than
 by version, and the Rust toolchain that `rust-toolchain.toml` pins
 (1.97.1). Elsewhere ruio builds with its executor alone, with runtimes,
 tasks, timers, channels and locks and no I/O: on Windows, on an I/O
-completion port, whose files and named pipes are a proof of concept in
-`ruio-iocp`; on macOS, and with `--cfg ruio_engine="park"`, on the park
-engine.
+completion port, whose files, named pipes and TCP sockets are a proof of
+concept in `ruio-iocp`; on macOS, and with `--cfg ruio_engine="park"`, on
+the park engine.
 
 ## Crates
 
@@ -55,7 +55,7 @@ engine.
 | [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; `Timer`, which gives hyper ruio's timers for its timeouts; `PortableCompat`, which gives the portable streams and a child's pipes those traits with no buffers of its own, and the portable file them and `AsyncSeek`; and, with the `client` feature, a connector that runs hyper-util's client on them |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder, over the I/O engine chosen when the program is built: io_uring on Linux, an I/O completion port on Windows, and the park engine, which runs no I/O, elsewhere |
 | [`ruio-engine`](crates/ruio-engine) | The contract between the executor and its I/O engine, a check that an engine keeps it, and the park engine |
-| [`ruio-iocp`](crates/ruio-iocp) | The I/O completion port engine of Windows, and files and named pipes that read and write through it with owned buffers: a proof of concept |
+| [`ruio-iocp`](crates/ruio-iocp) | The I/O completion port engine of Windows, and files, named pipes and TCP sockets that read and write through it with owned buffers: a proof of concept |
 | [`ruio-buf`](crates/ruio-buf) | The buffers an operation takes and hands back, shared by every engine: `IoBuf`, `IoBufMut`, `IoBufs`, slices and aligned buffers |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, pools and registered buffers, registered files, the capability probe |
 | [`ruio-sys`](crates/ruio-sys) | The kernel's io_uring ABI and system calls |

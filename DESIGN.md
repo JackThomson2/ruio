@@ -50,7 +50,7 @@ crates/
   ruio-sys/       kernel ABI: uapi structures and constants, raw system calls; no policy
   ruio-engine/    the contract between the executor and its I/O engine; the park engine
   ruio-buf/       the buffers every engine shares: IoBuf, IoBufMut, IoBufs, Slice, AlignedBuf
-  ruio-iocp/      the I/O completion port engine of Windows, files and named pipes; a proof of concept
+  ruio-iocp/      the I/O completion port engine of Windows; files, named pipes and TCP sockets; a proof of concept
   ruio-driver/    one ring: setup, SQ/CQ, operation table, Op<T> futures, pools,
                   registered buffers and files, capability probe; the io_uring engine
   ruio-executor/  per-thread scheduler, tasks, timer wheel, thread-per-core builder
@@ -1042,7 +1042,7 @@ Linux, an I/O completion port on Windows, and in time kqueue on macOS.
 io_uring stays the engine ruio is measured by, and the others must cost it
 nothing. So far `ruio` builds on any engine, and its I/O runs on io_uring
 alone: elsewhere it has the executor's API, and on Windows `ruio-iocp`
-has files and named pipes of its own.
+has files, named pipes and TCP sockets of its own.
 
 - **One engine per build.** The engine is chosen when a binary is built,
   never at run time: io_uring on Linux; an I/O completion port on
@@ -1122,20 +1122,28 @@ has files and named pipes of its own.
   the engine shares with its unparkers, so that one after the engine is
   gone posts to a port nothing reads rather than to a closed handle. A
   check for work takes what the port has without waiting and keeps it for
-  the next turn. Its files (`fs::File`) and named pipes
-  (`pipe::NamedPipe`) read and write with owned buffers: an operation's
-  buffer moves into a slot on the heap that begins with its `OVERLAPPED`,
-  whose address the port hands back with the completion; a future
-  dropped first cancels its operation with `CancelIoEx` and leaves the
-  slot to the engine, which frees it, buffer and all, once the
-  cancellation's completion comes, as the driver does with an orphaned
-  operation; and dropping the engine waits for those, up to its shutdown
-  timeout. Its bindings are written by hand from the SDK's headers, as
-  `ruio-sys`'s are. What it lacks so far: sockets, ruio's own `net` and
-  `fs` on it, a pool of its own, handles that skip the port when an
-  operation completes at once (each such completion still costs a turn),
-  a way to make a turn without a call to the port, and counting the
-  executor's wakers rather than cloning them.
+  the next turn. Its files (`fs::File`), named pipes (`pipe::NamedPipe`)
+  and TCP sockets (`net::TcpListener`, `net::TcpStream`) read and write
+  with owned buffers: an operation's buffer moves into a slot on the heap
+  that begins with its `OVERLAPPED`, whose address the port hands back
+  with the completion; a future dropped first cancels its operation with
+  `CancelIoEx` and leaves the slot to the engine, which frees it, buffer
+  and all, once the cancellation's completion comes, as the driver does
+  with an orphaned operation; and dropping the engine waits for those, up
+  to its shutdown timeout. A listener accepts with `AcceptEx`, onto a
+  socket made as the accept starts and kept in the slot, so that a
+  dropped accept closes a connection it had accepted by then, and a
+  stream connects with `ConnectEx`, which wants its socket bound first;
+  Winsock's provider hands both out as function pointers. A socket's
+  operation reports its outcome through `WSAGetOverlappedResult`, so its
+  errors are those the standard library's sockets give, and what needs no
+  waiting, binding, addresses and options, goes through the standard
+  library's sockets, which the types hold. Its bindings are written by
+  hand from the SDK's headers, as `ruio-sys`'s are. What it lacks so far:
+  UDP, ruio's own `net` and `fs` on it, a pool of its own, handles that
+  skip the port when an operation completes at once (each such completion
+  still costs a turn), a way to make a turn without a call to the port,
+  and counting the executor's wakers rather than cloning them.
 - **Testing the Windows engine.** CI's `windows` job lints and tests the
   four crates that build on Windows, on a `windows-latest` runner:
   `cargo test -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio`. The
@@ -1217,10 +1225,9 @@ the driver, for a choice already made when the program is built.
 io_uring's too until it is built on the traits of `io`. In order:
 
 1. The I/O completion port engine from a proof of concept to ruio's I/O
-   on Windows: sockets (`AcceptEx`, `ConnectEx`, `WSARecv`, `WSASend`),
-   `ruio`'s `net`, `fs` and `io` on it, with the API of the table above,
-   a `BufPool` of its own, and timers finer than the tick of Windows'
-   timer.
+   on Windows: `ruio`'s `net`, `fs` and `io` on its files and sockets,
+   with the API of the table above, UDP, a `BufPool` of its own, and
+   timers finer than the tick of Windows' timer.
 2. A kqueue engine for macOS, with owned-buffer I/O. kqueue reports
    readiness, so a read waits for its socket to be readable and then reads
    into the caller's buffer itself, and files go to the blocking pool.
@@ -3516,8 +3523,9 @@ Since M7:
   into `ruio-buf`, which every engine shares, and `ruio::buf` has them on
   every engine; pools stay each engine's own (see [Engines](#engines)).
 - The executor runs on an I/O completion port on Windows, and
-  `ruio-iocp` reads and writes files and named pipes through it with owned
-  buffers: a proof of concept, built here and to be run on Windows (see
+  `ruio-iocp` reads and writes files, named pipes and TCP sockets through
+  it with owned buffers, accepting with `AcceptEx` and connecting with
+  `ConnectEx`: a proof of concept, which CI runs on Windows (see
   [Engines](#engines)).
 
 ## Open questions
