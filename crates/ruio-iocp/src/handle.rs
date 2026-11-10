@@ -36,8 +36,24 @@ impl<T: Raw> IoHandle<T> {
         let engine = Iocp::current().ok_or_else(|| {
             io::Error::other("the thread has no ruio runtime for the handle's I/O to run on")
         })?;
+        Self::on(io, engine)
+    }
+
+    /// Associates `io`'s handle, opened for overlapped I/O, with the port of
+    /// `engine`, on whose thread this is.
+    pub(crate) fn on(io: T, engine: Iocp) -> io::Result<Self> {
         engine.associate(io.raw())?;
         Ok(Self { io, engine })
+    }
+
+    /// What owns the handle.
+    pub(crate) fn io(&self) -> &T {
+        &self.io
+    }
+
+    /// The engine whose port the handle is associated with.
+    pub(crate) fn engine(&self) -> &Iocp {
+        &self.engine
     }
 
     pub(crate) fn raw(&self) -> sys::Handle {

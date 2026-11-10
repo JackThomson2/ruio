@@ -1,7 +1,7 @@
 //! The Windows functions and structures the engine uses, declared by hand
 //! from the Windows SDK's headers (`minwinbase.h`, `ioapiset.h`,
-//! `fileapi.h`, `namedpipeapi.h`, `handleapi.h`, `winternl.h`), as
-//! `ruio-sys` declares io_uring's.
+//! `fileapi.h`, `namedpipeapi.h`, `handleapi.h`, `winternl.h`, `winsock2.h`,
+//! `mswsock.h`), as `ruio-sys` declares io_uring's.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -44,6 +44,65 @@ pub(crate) const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
 /// `PIPE_REJECT_REMOTE_CLIENTS`: a pipe only this machine connects to. With
 /// no other mode flag, the pipe carries bytes rather than messages.
 pub(crate) const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
+
+/// `SOCKET`.
+pub(crate) type Socket = usize;
+
+/// `INVALID_SOCKET`, which `WSASocketW` returns on failure.
+pub(crate) const INVALID_SOCKET: Socket = usize::MAX;
+
+/// `WSA_IO_PENDING`: Winsock took an operation, which completes later.
+pub(crate) const WSA_IO_PENDING: i32 = 997;
+
+/// `AF_INET`: the address family of IPv4.
+pub(crate) const AF_INET: u16 = 2;
+
+/// `AF_INET6`: the address family of IPv6.
+pub(crate) const AF_INET6: u16 = 23;
+
+/// `SOCK_STREAM`: a stream socket.
+pub(crate) const SOCK_STREAM: i32 = 1;
+
+/// `IPPROTO_TCP`.
+pub(crate) const IPPROTO_TCP: i32 = 6;
+
+/// `WSA_FLAG_OVERLAPPED`: a socket for overlapped I/O.
+pub(crate) const WSA_FLAG_OVERLAPPED: u32 = 0x01;
+
+/// `WSA_FLAG_NO_HANDLE_INHERIT`: a socket that child processes do not
+/// inherit.
+pub(crate) const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
+
+/// `SOL_SOCKET`: the level of the options of sockets themselves.
+pub(crate) const SOL_SOCKET: i32 = 0xffff;
+
+/// `SO_UPDATE_ACCEPT_CONTEXT`: makes a socket that `AcceptEx` accepted a
+/// connection on a connected socket in full, given the listener's socket.
+pub(crate) const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
+
+/// `SO_UPDATE_CONNECT_CONTEXT`: the same for a socket that `ConnectEx`
+/// connected.
+pub(crate) const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
+
+/// `SIO_GET_EXTENSION_FUNCTION_POINTER`: the `WSAIoctl` that asks a
+/// socket's provider for the function a `GUID` names.
+pub(crate) const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
+
+/// `WSAID_ACCEPTEX`: names `AcceptEx`.
+pub(crate) const WSAID_ACCEPTEX: Guid = Guid {
+    data1: 0xb536_7df1,
+    data2: 0xcbac,
+    data3: 0x11cf,
+    data4: [0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92],
+};
+
+/// `WSAID_CONNECTEX`: names `ConnectEx`.
+pub(crate) const WSAID_CONNECTEX: Guid = Guid {
+    data1: 0x25a2_07b9,
+    data2: 0xddf3,
+    data3: 0x4660,
+    data4: [0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e],
+};
 
 /// `OVERLAPPED`: an operation's state, which the system fills in as it
 /// runs, and where in a file it reads or writes.
@@ -89,10 +148,66 @@ impl OverlappedEntry {
     };
 }
 
+/// `GUID`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Guid {
+    pub(crate) data1: u32,
+    pub(crate) data2: u16,
+    pub(crate) data3: u16,
+    pub(crate) data4: [u8; 8],
+}
+
+/// `WSABUF`: a buffer that a socket's operation reads into or sends.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WsaBuf {
+    /// `len`: how many bytes it has.
+    pub(crate) len: u32,
+    /// `buf`: where they are.
+    pub(crate) buf: *mut u8,
+}
+
+/// `LPFN_ACCEPTEX`: starts an accept on `listener` of a connection onto
+/// `accepted`, a socket made for it, and writes the connection's local and
+/// remote addresses to `output`, which needs `local_len` and `remote_len`
+/// bytes for them, each 16 more than the largest address. True if it
+/// completed at once, false with `WSA_IO_PENDING` if it completes later.
+pub(crate) type AcceptEx = unsafe extern "system" fn(
+    listener: Socket,
+    accepted: Socket,
+    output: *mut c_void,
+    receive_len: u32,
+    local_len: u32,
+    remote_len: u32,
+    received: *mut u32,
+    overlapped: *mut Overlapped,
+) -> Bool;
+
+/// `LPFN_CONNECTEX`: starts connecting `socket`, which must be bound, to
+/// `name`, sending `send` with the connection if it is not null. True if it
+/// completed at once, false with `WSA_IO_PENDING` if it completes later.
+pub(crate) type ConnectEx = unsafe extern "system" fn(
+    socket: Socket,
+    name: *const u8,
+    name_len: i32,
+    send: *const c_void,
+    send_len: u32,
+    sent: *mut u32,
+    overlapped: *mut Overlapped,
+) -> Bool;
+
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<Overlapped>() == 32 && size_of::<OverlappedEntry>() == 32);
+const _: () = assert!(
+    size_of::<Overlapped>() == 32
+        && size_of::<OverlappedEntry>() == 32
+        && size_of::<WsaBuf>() == 16
+);
 #[cfg(target_pointer_width = "32")]
-const _: () = assert!(size_of::<Overlapped>() == 20 && size_of::<OverlappedEntry>() == 16);
+const _: () = assert!(
+    size_of::<Overlapped>() == 20 && size_of::<OverlappedEntry>() == 16 && size_of::<WsaBuf>() == 8
+);
+const _: () = assert!(size_of::<Guid>() == 16);
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -176,4 +291,87 @@ unsafe extern "system" {
     /// The Windows error that an `NTSTATUS`, as an operation's `OVERLAPPED`
     /// holds, stands for.
     pub(crate) safe fn RtlNtStatusToDosError(status: i32) -> u32;
+}
+
+#[link(name = "ws2_32")]
+unsafe extern "system" {
+    /// Starts Winsock for the process, at `version`, and describes it in
+    /// `data`, a `WSADATA`. Returns zero, or the error.
+    pub(crate) fn WSAStartup(version: u16, data: *mut c_void) -> i32;
+
+    /// Makes a socket, or returns `INVALID_SOCKET`.
+    pub(crate) fn WSASocketW(
+        family: i32,
+        kind: i32,
+        protocol: i32,
+        protocol_info: *const c_void,
+        group: u32,
+        flags: u32,
+    ) -> Socket;
+
+    /// Binds `socket` to the address `name`. Zero on success.
+    pub(crate) fn bind(socket: Socket, name: *const u8, name_len: i32) -> i32;
+
+    /// Sets an option of `socket`. Zero on success.
+    pub(crate) fn setsockopt(
+        socket: Socket,
+        level: i32,
+        name: i32,
+        value: *const u8,
+        value_len: i32,
+    ) -> i32;
+
+    /// Controls `socket`: here, asks its provider for a function. Zero on
+    /// success.
+    pub(crate) fn WSAIoctl(
+        socket: Socket,
+        code: u32,
+        input: *const c_void,
+        input_len: u32,
+        output: *mut c_void,
+        output_len: u32,
+        returned: *mut u32,
+        overlapped: *mut Overlapped,
+        completion: *const c_void,
+    ) -> i32;
+
+    /// Starts a receive on `socket` into `buffers`, which it copies before
+    /// it returns. Zero if it completed at once, or `SOCKET_ERROR` with
+    /// `WSA_IO_PENDING` if it completes later; either way its completion
+    /// goes to the socket's port.
+    pub(crate) fn WSARecv(
+        socket: Socket,
+        buffers: *mut WsaBuf,
+        count: u32,
+        received: *mut u32,
+        flags: *mut u32,
+        overlapped: *mut Overlapped,
+        completion: *const c_void,
+    ) -> i32;
+
+    /// Starts a send of `buffers` on `socket`, as `WSARecv` starts a
+    /// receive.
+    pub(crate) fn WSASend(
+        socket: Socket,
+        buffers: *const WsaBuf,
+        count: u32,
+        sent: *mut u32,
+        flags: u32,
+        overlapped: *mut Overlapped,
+        completion: *const c_void,
+    ) -> i32;
+
+    /// The outcome of the operation on `socket` that `overlapped` names:
+    /// true and how many bytes it transferred, or false, with its error as
+    /// the thread's last Winsock error.
+    pub(crate) fn WSAGetOverlappedResult(
+        socket: Socket,
+        overlapped: *const Overlapped,
+        transferred: *mut u32,
+        wait: Bool,
+        flags: *mut u32,
+    ) -> Bool;
+
+    /// The calling thread's last Winsock error.
+    pub(crate) safe fn WSAGetLastError() -> i32;
 }

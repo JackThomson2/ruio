@@ -40,8 +40,8 @@ thread_local! {
 /// An engine on an I/O completion port; see the [crate] documentation.
 ///
 /// Like any engine, it belongs to the thread that made it, and so do the
-/// files and pipes whose handles are associated with its port. A clone is
-/// the same engine. Dropping the last clone, once those files and pipes
+/// files, pipes and sockets associated with its port. A clone is the same
+/// engine. Dropping the last clone, once those files, pipes and sockets
 /// are gone, waits for the operations still in flight to complete.
 ///
 /// ```compile_fail

@@ -374,10 +374,12 @@ fn is_end(err: &io::Error) -> bool {
 }
 
 /// The future of a read through the port:
-/// [`File::read_at`](crate::fs::File::read_at) and
-/// [`NamedPipe::read`](crate::pipe::NamedPipe::read). It hands the buffer,
+/// [`File::read_at`](crate::fs::File::read_at),
+/// [`NamedPipe::read`](crate::pipe::NamedPipe::read) and
+/// [`TcpStream::read`](crate::net::TcpStream::read). It hands the buffer,
 /// an [`IoBufMut`], back with how many bytes it read: 0 at the end of a
-/// file, or of a pipe whose other end has closed.
+/// file, of a pipe whose other end has closed, or of a stream whose peer
+/// has shut down.
 ///
 /// It starts the read when first polled. Dropping it before the read
 /// completes cancels the read, and the buffer is dropped once the
@@ -440,8 +442,9 @@ impl<B: IoBufMut> fmt::Debug for Read<'_, B> {
 }
 
 /// The future of a write through the port:
-/// [`File::write_at`](crate::fs::File::write_at) and
-/// [`NamedPipe::write`](crate::pipe::NamedPipe::write). It hands the buffer,
+/// [`File::write_at`](crate::fs::File::write_at),
+/// [`NamedPipe::write`](crate::pipe::NamedPipe::write) and
+/// [`TcpStream::write`](crate::net::TcpStream::write). It hands the buffer,
 /// an [`IoBuf`], back with how many bytes it wrote.
 ///
 /// It starts the write when first polled. Dropping it before the write
