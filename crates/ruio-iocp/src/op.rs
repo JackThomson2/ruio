@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::ptr::{self, NonNull};
 use std::task::{Context, Poll, Waker, ready};
 
-use ruio_buf::{BufResult, IoBuf, IoBufMut};
+use ruio_buf::{BufResult, IoBuf, IoBufMut, Slice};
 
 use crate::handle::Target;
 use crate::sys;
@@ -522,6 +522,219 @@ impl<B: IoBuf> fmt::Debug for Write<'_, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Write")
             .field("offset", &self.op.offset)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where the transfer of a whole buffer has got to.
+enum Whole<F, B> {
+    /// Not started yet: the buffer.
+    Start(B),
+    /// A read or a write of the rest of the buffer, in flight.
+    Moving(F),
+    /// Finished, the buffer handed back.
+    Finished,
+}
+
+/// The future of a read that fills its buffer, in as many reads as that
+/// takes: [`TcpStream::read_exact`](crate::net::TcpStream::read_exact) and
+/// [`File::read_exact_at`](crate::fs::File::read_exact_at). It hands the
+/// buffer, an [`IoBufMut`], back with `Ok(())` once the buffer is full, up
+/// to its `bytes_total`, with [`io::ErrorKind::UnexpectedEof`] if the
+/// stream or the file ends first, or with the error that stopped the
+/// reads. What was read is marked initialized either way.
+///
+/// A stream's fills the buffer from its start, and a file's after the
+/// buffer's contents, as ruio's do on io_uring.
+///
+/// Dropping it cancels the read in flight, and the buffer is dropped once
+/// the cancellation has completed.
+#[must_use = "futures do nothing unless polled"]
+pub struct ReadExact<'a, B: IoBufMut> {
+    target: Target<'a>,
+    start: Start<Slice<B>>,
+    outcome: Outcome,
+    /// Where in a file the next read is from, which a stream's ignores.
+    offset: u64,
+    /// How much of the buffer is filled.
+    done: usize,
+    state: Whole<Read<'a, Slice<B>>, B>,
+}
+
+// Nothing is pinned: the buffer is only ever moved.
+impl<B: IoBufMut> Unpin for ReadExact<'_, B> {}
+
+impl<'a, B: IoBufMut> ReadExact<'a, B> {
+    /// A read of a file that fills `buf` after its contents, from `offset`.
+    pub(crate) fn at(target: Target<'a>, buf: B, offset: u64) -> Self {
+        let done = buf.bytes_init();
+        let start = start_read::<Slice<B>>;
+        Self::with(target, buf, done, offset, start, status_outcome)
+    }
+
+    /// A read that fills `buf` from `done` on, with reads that `start`
+    /// starts and whose outcomes `outcome` reads.
+    pub(crate) fn with(
+        target: Target<'a>,
+        buf: B,
+        done: usize,
+        offset: u64,
+        start: Start<Slice<B>>,
+        outcome: Outcome,
+    ) -> Self {
+        Self {
+            target,
+            start,
+            outcome,
+            offset,
+            done,
+            state: Whole::Start(buf),
+        }
+    }
+}
+
+impl<B: IoBufMut> Future for ReadExact<'_, B> {
+    type Output = BufResult<(), B>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            let buf = match mem::replace(&mut this.state, Whole::Finished) {
+                Whole::Start(buf) => buf,
+                Whole::Moving(mut read) => {
+                    let Poll::Ready((result, rest)) = Pin::new(&mut read).poll(cx) else {
+                        this.state = Whole::Moving(read);
+                        return Poll::Pending;
+                    };
+                    let buf = rest.into_inner();
+                    match result {
+                        Ok(0) => {
+                            let err = io::ErrorKind::UnexpectedEof.into();
+                            return Poll::Ready((Err(err), buf));
+                        }
+                        Ok(read) => {
+                            this.done += read;
+                            this.offset += read as u64;
+                        }
+                        Err(err) => return Poll::Ready((Err(err), buf)),
+                    }
+                    buf
+                }
+                Whole::Finished => panic!("`ReadExact` polled after it completed"),
+            };
+            if this.done >= buf.bytes_total() {
+                return Poll::Ready((Ok(()), buf));
+            }
+            let rest = buf.slice(this.done..);
+            let read = Read::with(this.target, rest, this.offset, this.start, this.outcome);
+            this.state = Whole::Moving(read);
+        }
+    }
+}
+
+impl<B: IoBufMut> fmt::Debug for ReadExact<'_, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadExact")
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The future of a write of a whole buffer, in as many writes as that
+/// takes: [`TcpStream::write_all`](crate::net::TcpStream::write_all) and
+/// [`File::write_all_at`](crate::fs::File::write_all_at). It hands the
+/// buffer, an [`IoBuf`], back with `Ok(())` once all of its initialized
+/// bytes are written, or with the error that stopped the writes:
+/// [`io::ErrorKind::WriteZero`] if one wrote nothing.
+///
+/// Dropping it cancels the write in flight, which may have written some of
+/// the buffer by then, and the buffer is dropped once the cancellation has
+/// completed.
+#[must_use = "futures do nothing unless polled"]
+pub struct WriteAll<'a, B: IoBuf> {
+    target: Target<'a>,
+    start: Start<Slice<B>>,
+    outcome: Outcome,
+    /// Where in a file the next write is to, which a stream's ignores.
+    offset: u64,
+    /// How much of the buffer is written.
+    done: usize,
+    state: Whole<Write<'a, Slice<B>>, B>,
+}
+
+// Nothing is pinned: the buffer is only ever moved.
+impl<B: IoBuf> Unpin for WriteAll<'_, B> {}
+
+impl<'a, B: IoBuf> WriteAll<'a, B> {
+    /// A write of all of `buf` to a file, from `offset` on.
+    pub(crate) fn at(target: Target<'a>, buf: B, offset: u64) -> Self {
+        let start = start_write::<Slice<B>>;
+        Self::with(target, buf, offset, start, status_outcome)
+    }
+
+    /// A write of all of `buf`, with writes that `start` starts and whose
+    /// outcomes `outcome` reads.
+    pub(crate) fn with(
+        target: Target<'a>,
+        buf: B,
+        offset: u64,
+        start: Start<Slice<B>>,
+        outcome: Outcome,
+    ) -> Self {
+        Self {
+            target,
+            start,
+            outcome,
+            offset,
+            done: 0,
+            state: Whole::Start(buf),
+        }
+    }
+}
+
+impl<B: IoBuf> Future for WriteAll<'_, B> {
+    type Output = BufResult<(), B>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            let buf = match mem::replace(&mut this.state, Whole::Finished) {
+                Whole::Start(buf) => buf,
+                Whole::Moving(mut write) => {
+                    let Poll::Ready((result, rest)) = Pin::new(&mut write).poll(cx) else {
+                        this.state = Whole::Moving(write);
+                        return Poll::Pending;
+                    };
+                    let buf = rest.into_inner();
+                    match result {
+                        Ok(0) => {
+                            let err = io::ErrorKind::WriteZero.into();
+                            return Poll::Ready((Err(err), buf));
+                        }
+                        Ok(written) => {
+                            this.done += written;
+                            this.offset += written as u64;
+                        }
+                        Err(err) => return Poll::Ready((Err(err), buf)),
+                    }
+                    buf
+                }
+                Whole::Finished => panic!("`WriteAll` polled after it completed"),
+            };
+            if this.done >= buf.bytes_init() {
+                return Poll::Ready((Ok(()), buf));
+            }
+            let rest = buf.slice(this.done..);
+            let write = Write::with(this.target, rest, this.offset, this.start, this.outcome);
+            this.state = Whole::Moving(write);
+        }
+    }
+}
+
+impl<B: IoBuf> fmt::Debug for WriteAll<'_, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WriteAll")
+            .field("done", &self.done)
             .finish_non_exhaustive()
     }
 }

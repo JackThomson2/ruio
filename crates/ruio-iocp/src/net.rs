@@ -23,10 +23,10 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::task::{Context, Poll, ready};
 
-use ruio_buf::{IoBuf, IoBufMut};
+use ruio_buf::{IoBuf, IoBufMut, Slice};
 
 use crate::handle::{IoHandle, Raw};
-use crate::op::{Op, Read, Write};
+use crate::op::{Op, Read, ReadExact, Write, WriteAll};
 use crate::sys;
 
 mod udp;
@@ -514,6 +514,20 @@ impl TcpStream {
     /// Writes `buf`'s bytes to the peer; see [`Write`].
     pub fn write<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
         Write::with(self.stream.target(), buf, 0, start_send::<B>, outcome)
+    }
+
+    /// Fills `buf` from its start, up to its `bytes_total`, with what the
+    /// peer sends, in as many reads as that takes; see [`ReadExact`].
+    pub fn read_exact<B: IoBufMut>(&self, buf: B) -> ReadExact<'_, B> {
+        let target = self.stream.target();
+        ReadExact::with(target, buf, 0, 0, start_recv::<Slice<B>>, outcome)
+    }
+
+    /// Writes all of `buf`'s bytes to the peer, in as many writes as that
+    /// takes; see [`WriteAll`].
+    pub fn write_all<B: IoBuf>(&self, buf: B) -> WriteAll<'_, B> {
+        let target = self.stream.target();
+        WriteAll::with(target, buf, 0, start_send::<Slice<B>>, outcome)
     }
 
     /// The address of this end of the connection.

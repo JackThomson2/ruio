@@ -29,4 +29,4 @@ pub mod pipe;
 mod sys;
 
 pub use engine::{Builder, Entered, Iocp, Unparker};
-pub use op::{Read, Write};
+pub use op::{Read, ReadExact, Write, WriteAll};

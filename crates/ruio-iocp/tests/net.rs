@@ -353,6 +353,41 @@ fn a_runtime_dropped_with_an_accept_in_flight_waits_for_its_cancellation() -> io
 }
 
 #[test]
+fn a_stream_fills_a_buffer_whole_and_writes_all_of_one() -> io::Result<()> {
+    const LEN: usize = 300 * 1024;
+    Runtime::new()?.block_on(async {
+        let (_listener, client, server) = pair().await?;
+        let data: Vec<u8> = (0..LEN).map(|i| (i % 253) as u8).collect();
+        let reading = ruio_executor::spawn(async move {
+            // A stream's read fills the buffer from its start, over what it
+            // held.
+            let mut buf = Vec::with_capacity(LEN);
+            buf.extend_from_slice(b"old");
+            let (read, buf) = server.read_exact(buf.slice(..LEN)).await;
+            read.map(|()| buf.into_inner())
+        });
+        let (written, data) = client.write_all(data).await;
+        written?;
+        assert!(reading.await.unwrap()? == data, "what is read was written");
+        Ok(())
+    })
+}
+
+#[test]
+fn a_read_that_cannot_fill_its_buffer_says_the_stream_ended() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let (_listener, client, server) = pair().await?;
+        let (written, _) = client.write_all(b"abc".to_vec()).await;
+        written?;
+        drop(client);
+        let (read, buf) = server.read_exact(Vec::with_capacity(8)).await;
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(buf, b"abc");
+        Ok(())
+    })
+}
+
+#[test]
 fn a_listener_binds_only_where_a_runtime_runs() {
     let err = TcpListener::bind(loopback()).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Other);

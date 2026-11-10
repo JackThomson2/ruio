@@ -10,7 +10,7 @@ use std::path::Path;
 use ruio_buf::{IoBuf, IoBufMut};
 
 use crate::handle::IoHandle;
-use crate::op::{Read, Write};
+use crate::op::{Read, ReadExact, Write, WriteAll};
 use crate::sys;
 
 /// A file opened for overlapped I/O, whose reads and writes complete to the
@@ -67,6 +67,18 @@ impl File {
     /// Writes `buf`'s bytes at `offset`; see [`Write`].
     pub fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> Write<'_, B> {
         Write::new(self.handle.target(), buf, offset)
+    }
+
+    /// Fills `buf` after its contents, up to its `bytes_total`, from
+    /// `offset` on, in as many reads as that takes; see [`ReadExact`].
+    pub fn read_exact_at<B: IoBufMut>(&self, buf: B, offset: u64) -> ReadExact<'_, B> {
+        ReadExact::at(self.handle.target(), buf, offset)
+    }
+
+    /// Writes all of `buf`'s bytes from `offset` on, in as many writes as
+    /// that takes; see [`WriteAll`].
+    pub fn write_all_at<B: IoBuf>(&self, buf: B, offset: u64) -> WriteAll<'_, B> {
+        WriteAll::at(self.handle.target(), buf, offset)
     }
 }
 

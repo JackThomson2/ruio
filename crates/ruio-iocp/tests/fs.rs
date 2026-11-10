@@ -5,6 +5,7 @@ use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use ruio_buf::IoBuf;
 use ruio_executor::Runtime;
 use ruio_iocp::fs::File;
 
@@ -80,6 +81,36 @@ fn reads_in_flight_at_once_each_get_their_part() -> io::Result<()> {
             assert_eq!(read?, 16);
             assert_eq!(buf, data[part * 16..][..16]);
         }
+        Ok(())
+    })
+}
+
+#[test]
+fn a_buffer_is_written_whole_and_filled_whole_at_an_offset() -> io::Result<()> {
+    const LEN: usize = 200_000;
+    let scratch = Scratch::new("whole");
+    Runtime::new()?.block_on(async {
+        let file = File::create(&scratch.0)?;
+        let data: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let (written, data) = file.write_all_at(data, 10).await;
+        written?;
+        drop(file);
+
+        let file = File::open(&scratch.0)?;
+        // A file's read fills the buffer after what it holds.
+        let mut buf = Vec::with_capacity(1004);
+        buf.extend_from_slice(b"head");
+        let (read, buf) = file.read_exact_at(buf.slice(..1004), 10 + 500).await;
+        read?;
+        let buf = buf.into_inner();
+        assert_eq!(&buf[..4], b"head");
+        assert_eq!(buf[4..], data[500..1500]);
+
+        // The file ends before this buffer is full.
+        let end = (10 + LEN - 5) as u64;
+        let (read, buf) = file.read_exact_at(Vec::with_capacity(64), end).await;
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(buf, data[LEN - 5..]);
         Ok(())
     })
 }
