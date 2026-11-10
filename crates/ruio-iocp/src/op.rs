@@ -1,6 +1,7 @@
 //! Operations through the port: the slot that an operation's `OVERLAPPED`
-//! begins, which holds its buffer while the system has it, and the futures
-//! that start operations and wait for their completions.
+//! begins, which holds what the system uses while it has the operation, a
+//! read's or a write's buffer say, and the futures that start operations
+//! and wait for their completions.
 //!
 //! A future starts its operation when first polled, moving its buffer into
 //! a slot on the heap that begins with the operation's `OVERLAPPED`, whose
@@ -22,7 +23,7 @@ use std::task::{Context, Poll, Waker, ready};
 
 use ruio_buf::{BufResult, IoBuf, IoBufMut};
 
-use crate::handle::IoHandle;
+use crate::handle::Target;
 use crate::sys;
 
 /// What the system, the engine and an operation's future share: the start
@@ -53,15 +54,16 @@ enum State {
     Orphaned,
 }
 
-/// An operation's slot: its header, and the buffer the system uses.
+/// An operation's slot: its header, and what the system uses while it has
+/// the operation, such as the buffer of a read.
 #[repr(C)]
-struct Slot<B> {
+struct Slot<T> {
     header: Header,
-    buf: B,
+    payload: T,
 }
 
 impl Header {
-    fn new<B>(offset: u64, waker: Waker) -> Self {
+    fn new<T>(offset: u64, waker: Waker) -> Self {
         Self {
             overlapped: UnsafeCell::new(sys::Overlapped {
                 internal: 0,
@@ -73,21 +75,21 @@ impl Header {
             state: Cell::new(State::Waiting),
             waker: Cell::new(Some(waker)),
             bytes: Cell::new(0),
-            free: free::<B>,
+            free: free::<T>,
         }
     }
 }
 
-/// Frees the slot of a buffer of type `B` that `header` begins.
+/// Frees the slot of a payload of type `T` that `header` begins.
 ///
 /// # Safety
 ///
-/// `header` must begin a `Slot<B>` that `Box::leak` gave, which nothing uses
+/// `header` must begin a `Slot<T>` that `Box::leak` gave, which nothing uses
 /// again.
-unsafe fn free<B>(header: *mut Header) {
+unsafe fn free<T>(header: *mut Header) {
     // SAFETY: the caller's promise; a slot begins with its header, as it is
     // `repr(C)`.
-    drop(unsafe { Box::from_raw(header.cast::<Slot<B>>()) });
+    drop(unsafe { Box::from_raw(header.cast::<Slot<T>>()) });
 }
 
 /// Records the completion of the operation whose `OVERLAPPED` `entry` hands
@@ -121,72 +123,96 @@ pub(crate) unsafe fn complete(entry: &sys::OverlappedEntry, wake: bool) {
     }
 }
 
-/// Starts an operation on `handle` with `buf`, under `overlapped`, and says
-/// whether the system took it, in which case its completion is to come
+/// Starts an operation on `handle` with `payload`, under `overlapped`, and
+/// says whether the system took it, in which case its completion is to come
 /// through the port.
 ///
 /// # Safety
 ///
-/// `handle` must be open and associated with a port, and `buf`'s memory and
-/// `overlapped` must stay valid and in place until the completion is
-/// delivered.
-type Start<B> = unsafe fn(sys::Handle, &mut B, *mut sys::Overlapped) -> io::Result<()>;
+/// `handle` must be open and associated with a port, and `payload`, with
+/// the memory it names, and `overlapped` must stay valid and in place until
+/// the completion is delivered.
+pub(crate) type Start<T> = unsafe fn(sys::Handle, &mut T, *mut sys::Overlapped) -> io::Result<()>;
 
-/// An operation on a handle of the port, and its buffer.
-struct Op<'a, B: IoBuf> {
-    handle: &'a IoHandle,
+/// Reads the outcome of an operation on `handle` that has completed from
+/// its `overlapped`: how many bytes it transferred, of which the last
+/// argument is the count the port gave, or the error it failed with.
+///
+/// # Safety
+///
+/// `handle` must be open, and `overlapped` that of an operation on it whose
+/// completion has been delivered, still where the operation was started
+/// with it.
+pub(crate) type Outcome = unsafe fn(sys::Handle, *const sys::Overlapped, u32) -> io::Result<u32>;
+
+/// An operation on a handle of the port, and what the system uses for it.
+pub(crate) struct Op<'a, T> {
+    target: Target<'a>,
     offset: u64,
-    state: OpState<B>,
+    state: OpState<T>,
 }
 
-enum OpState<B> {
-    /// Not started yet: the buffer.
-    Unstarted(B),
+enum OpState<T> {
+    /// Not started yet: what the operation is to use.
+    Unstarted(T),
     /// Started: the slot, which the system and the engine may use.
-    Started(NonNull<Slot<B>>),
-    /// Finished, its buffer handed back.
+    Started(NonNull<Slot<T>>),
+    /// Finished, what it used handed back.
     Finished,
 }
 
-// The buffer is never pinned: it moves into the slot, and out of it.
-impl<B: IoBuf> Unpin for Op<'_, B> {}
+// What an operation uses is never pinned: it moves into the slot, and out
+// of it.
+impl<T> Unpin for Op<'_, T> {}
 
-impl<'a, B: IoBuf> Op<'a, B> {
-    fn new(handle: &'a IoHandle, buf: B, offset: u64) -> Self {
+impl<'a, T> Op<'a, T> {
+    /// An operation on `target` that uses `payload`, at `offset` if the
+    /// handle is a file's.
+    pub(crate) fn new(target: Target<'a>, payload: T, offset: u64) -> Self {
         Self {
-            handle,
+            target,
             offset,
-            state: OpState::Unstarted(buf),
+            state: OpState::Unstarted(payload),
         }
     }
 
     /// Polls the operation, which `start` starts on the first poll, for how
-    /// many bytes it transferred, and the buffer.
-    fn poll_with(&mut self, cx: &mut Context<'_>, start: Start<B>) -> Poll<BufResult<u32, B>> {
+    /// many bytes it transferred, as `outcome` reads it, and what it used.
+    pub(crate) fn poll_with(
+        &mut self,
+        cx: &mut Context<'_>,
+        start: Start<T>,
+        outcome: Outcome,
+    ) -> Poll<(io::Result<u32>, T)> {
         match mem::replace(&mut self.state, OpState::Finished) {
-            OpState::Unstarted(buf) => self.start(cx, buf, start),
-            OpState::Started(slot) => self.poll_started(cx, slot),
+            OpState::Unstarted(payload) => self.start(cx, payload, start),
+            OpState::Started(slot) => self.poll_started(cx, slot, outcome),
             OpState::Finished => panic!("an operation polled after it finished"),
         }
     }
 
-    fn start(&mut self, cx: &mut Context<'_>, buf: B, start: Start<B>) -> Poll<BufResult<u32, B>> {
+    fn start(
+        &mut self,
+        cx: &mut Context<'_>,
+        payload: T,
+        start: Start<T>,
+    ) -> Poll<(io::Result<u32>, T)> {
         let slot = NonNull::from(Box::leak(Box::new(Slot {
-            header: Header::new::<B>(self.offset, cx.waker().clone()),
-            buf,
+            header: Header::new::<T>(self.offset, cx.waker().clone()),
+            payload,
         })));
         // SAFETY: the slot was just made, and is the future's alone.
-        let buf = unsafe { &mut (*slot.as_ptr()).buf };
-        // SAFETY: as above; the `OVERLAPPED` lies apart from the buffer.
+        let payload = unsafe { &mut (*slot.as_ptr()).payload };
+        // SAFETY: as above; the `OVERLAPPED` lies apart from the payload.
         let overlapped = unsafe { (*slot.as_ptr()).header.overlapped.get() };
         // SAFETY: the handle is open and associated with the port, as the
-        // future borrows it; the slot, which holds the buffer and the
+        // future borrows it; the slot, which holds the payload and the
         // `OVERLAPPED`, stays where it is until the completion is delivered,
         // the future's until then, or the engine's.
-        let started = unsafe { start(self.handle.raw(), buf, overlapped) };
+        let started = unsafe { start(self.target.handle, payload, overlapped) };
         match started {
             Ok(()) => {
-                self.handle.engine().started();
+                self.target.engine.started();
                 self.state = OpState::Started(slot);
                 Poll::Pending
             }
@@ -194,8 +220,8 @@ impl<'a, B: IoBuf> Op<'a, B> {
                 // SAFETY: the system did not take the operation, so nothing
                 // will come through the port for it, and the slot is the
                 // future's alone.
-                let Slot { buf, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
-                Poll::Ready((Err(err), buf))
+                let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
+                Poll::Ready((Err(err), payload))
             }
         }
     }
@@ -203,29 +229,39 @@ impl<'a, B: IoBuf> Op<'a, B> {
     fn poll_started(
         &mut self,
         cx: &mut Context<'_>,
-        slot: NonNull<Slot<B>>,
-    ) -> Poll<BufResult<u32, B>> {
+        slot: NonNull<Slot<T>>,
+        outcome: Outcome,
+    ) -> Poll<(io::Result<u32>, T)> {
         // SAFETY: the slot is allocated while the future has it, and only
         // this thread uses it.
-        let waiting = unsafe { &slot.as_ref().header };
-        if waiting.state.get() == State::Waiting {
-            let waker = match waiting.waker.take() {
+        let header = unsafe { &slot.as_ref().header };
+        if header.state.get() == State::Waiting {
+            let waker = match header.waker.take() {
                 Some(waker) if waker.will_wake(cx.waker()) => waker,
                 _ => cx.waker().clone(),
             };
-            waiting.waker.set(Some(waker));
+            header.waker.set(Some(waker));
             self.state = OpState::Started(slot);
             return Poll::Pending;
         }
+        // SAFETY: the handle is open, as the future borrows it, and the
+        // operation's completion has been delivered, its `OVERLAPPED` still
+        // in the slot it was started with.
+        let result = unsafe {
+            outcome(
+                self.target.handle,
+                header.overlapped.get(),
+                header.bytes.get(),
+            )
+        };
         // SAFETY: the operation is done, so the system and the engine have
         // finished with the slot, which is the future's alone again.
-        let Slot { header, buf } = *unsafe { Box::from_raw(slot.as_ptr()) };
-        let status = header.overlapped.into_inner().internal;
-        Poll::Ready((result(status, header.bytes.get()), buf))
+        let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
+        Poll::Ready((result, payload))
     }
 }
 
-impl<B: IoBuf> Drop for Op<'_, B> {
+impl<T> Drop for Op<'_, T> {
     fn drop(&mut self) {
         let OpState::Started(slot) = &self.state else {
             return;
@@ -245,7 +281,7 @@ impl<B: IoBuf> Drop for Op<'_, B> {
         // SAFETY: the handle is open, as the future borrows it, and the
         // `OVERLAPPED` names the operation, which may have completed
         // already, when the call does nothing.
-        unsafe { sys::CancelIoEx(self.handle.raw(), header.overlapped.get()) };
+        unsafe { sys::CancelIoEx(self.target.handle, header.overlapped.get()) };
     }
 }
 
@@ -259,6 +295,23 @@ fn result(status: usize, bytes: u32) -> io::Result<u32> {
     }
     let code = sys::RtlNtStatusToDosError(status);
     Err(io::Error::from_raw_os_error(code as i32))
+}
+
+/// Reads the outcome of an operation on a file or a pipe from the status in
+/// its `OVERLAPPED`, as [`Outcome`] says.
+///
+/// # Safety
+///
+/// As for [`Outcome`].
+unsafe fn status_outcome(
+    _handle: sys::Handle,
+    overlapped: *const sys::Overlapped,
+    bytes: u32,
+) -> io::Result<u32> {
+    // SAFETY: the caller's promise: the operation has completed, so the
+    // system writes its `OVERLAPPED` no more, and the slot still holds it.
+    let status = unsafe { (*overlapped).internal };
+    result(status, bytes)
 }
 
 /// Whether the system took an operation that its call returned `ok` for. A
@@ -332,12 +385,28 @@ fn is_end(err: &io::Error) -> bool {
 #[must_use = "futures do nothing unless polled"]
 pub struct Read<'a, B: IoBufMut> {
     op: Op<'a, B>,
+    start: Start<B>,
+    outcome: Outcome,
 }
 
 impl<'a, B: IoBufMut> Read<'a, B> {
-    pub(crate) fn new(handle: &'a IoHandle, buf: B, offset: u64) -> Self {
+    /// A read of a file, from `offset`, or of a pipe.
+    pub(crate) fn new(target: Target<'a>, buf: B, offset: u64) -> Self {
+        Self::with(target, buf, offset, start_read::<B>, status_outcome)
+    }
+
+    /// A read that `start` starts, and whose outcome `outcome` reads.
+    pub(crate) fn with(
+        target: Target<'a>,
+        buf: B,
+        offset: u64,
+        start: Start<B>,
+        outcome: Outcome,
+    ) -> Self {
         Self {
-            op: Op::new(handle, buf, offset),
+            op: Op::new(target, buf, offset),
+            start,
+            outcome,
         }
     }
 }
@@ -346,7 +415,8 @@ impl<B: IoBufMut> Future for Read<'_, B> {
     type Output = BufResult<usize, B>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (result, mut buf) = ready!(self.op.poll_with(cx, start_read::<B>));
+        let (start, outcome) = (self.start, self.outcome);
+        let (result, mut buf) = ready!(self.op.poll_with(cx, start, outcome));
         let result = match result {
             Ok(read) => {
                 // SAFETY: the system wrote the bytes it reports reading from
@@ -380,12 +450,28 @@ impl<B: IoBufMut> fmt::Debug for Read<'_, B> {
 #[must_use = "futures do nothing unless polled"]
 pub struct Write<'a, B: IoBuf> {
     op: Op<'a, B>,
+    start: Start<B>,
+    outcome: Outcome,
 }
 
 impl<'a, B: IoBuf> Write<'a, B> {
-    pub(crate) fn new(handle: &'a IoHandle, buf: B, offset: u64) -> Self {
+    /// A write to a file, at `offset`, or to a pipe.
+    pub(crate) fn new(target: Target<'a>, buf: B, offset: u64) -> Self {
+        Self::with(target, buf, offset, start_write::<B>, status_outcome)
+    }
+
+    /// A write that `start` starts, and whose outcome `outcome` reads.
+    pub(crate) fn with(
+        target: Target<'a>,
+        buf: B,
+        offset: u64,
+        start: Start<B>,
+        outcome: Outcome,
+    ) -> Self {
         Self {
-            op: Op::new(handle, buf, offset),
+            op: Op::new(target, buf, offset),
+            start,
+            outcome,
         }
     }
 }
@@ -394,7 +480,8 @@ impl<B: IoBuf> Future for Write<'_, B> {
     type Output = BufResult<usize, B>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (result, buf) = ready!(self.op.poll_with(cx, start_write::<B>));
+        let (start, outcome) = (self.start, self.outcome);
+        let (result, buf) = ready!(self.op.poll_with(cx, start, outcome));
         Poll::Ready((result.map(|written| written as usize), buf))
     }
 }

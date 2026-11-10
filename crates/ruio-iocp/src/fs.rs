@@ -21,7 +21,7 @@ use crate::sys;
 /// ruio's I/O does on io_uring, and always names its offset: the file keeps
 /// no position.
 pub struct File {
-    handle: IoHandle,
+    handle: IoHandle<OwnedHandle>,
 }
 
 impl File {
@@ -61,12 +61,12 @@ impl File {
     /// Reads into `buf`, up to its `bytes_total`, from `offset`; see
     /// [`Read`].
     pub fn read_at<B: IoBufMut>(&self, buf: B, offset: u64) -> Read<'_, B> {
-        Read::new(&self.handle, buf, offset)
+        Read::new(self.handle.target(), buf, offset)
     }
 
     /// Writes `buf`'s bytes at `offset`; see [`Write`].
     pub fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> Write<'_, B> {
-        Write::new(&self.handle, buf, offset)
+        Write::new(self.handle.target(), buf, offset)
     }
 }
 

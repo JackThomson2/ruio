@@ -23,7 +23,7 @@ const BUFFER: u32 = 64 * 1024;
 /// writes complete to the port of the engine current where it was opened,
 /// and which belongs to that engine's thread.
 pub struct NamedPipe {
-    handle: IoHandle,
+    handle: IoHandle<OwnedHandle>,
 }
 
 impl NamedPipe {
@@ -83,12 +83,12 @@ impl NamedPipe {
     /// Reads into `buf`, up to its `bytes_total`, what the other end has
     /// written; see [`Read`].
     pub fn read<B: IoBufMut>(&self, buf: B) -> Read<'_, B> {
-        Read::new(&self.handle, buf, 0)
+        Read::new(self.handle.target(), buf, 0)
     }
 
     /// Writes `buf`'s bytes for the other end to read; see [`Write`].
     pub fn write<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
-        Write::new(&self.handle, buf, 0)
+        Write::new(self.handle.target(), buf, 0)
     }
 }
 
