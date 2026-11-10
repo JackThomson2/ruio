@@ -59,6 +59,10 @@ pub(crate) const INVALID_SOCKET: Socket = usize::MAX;
 /// `WSA_IO_PENDING`: Winsock took an operation, which completes later.
 pub(crate) const WSA_IO_PENDING: i32 = 997;
 
+/// `WSAEMSGSIZE`: a datagram was longer than the buffer it was received
+/// into, which holds its start.
+pub(crate) const WSAEMSGSIZE: i32 = 10040;
+
 /// `AF_INET`: the address family of IPv4.
 pub(crate) const AF_INET: u16 = 2;
 
@@ -92,6 +96,11 @@ pub(crate) const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
 /// `SIO_GET_EXTENSION_FUNCTION_POINTER`: the `WSAIoctl` that asks a
 /// socket's provider for the function a `GUID` names.
 pub(crate) const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
+
+/// `SIO_UDP_CONNRESET`: the `WSAIoctl` that sets whether a UDP socket's
+/// receives fail with a reset once a datagram it sent found nobody at its
+/// port.
+pub(crate) const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
 
 /// `WSAID_ACCEPTEX`: names `AcceptEx`.
 pub(crate) const WSAID_ACCEPTEX: Guid = Guid {
@@ -362,6 +371,35 @@ unsafe extern "system" {
         count: u32,
         sent: *mut u32,
         flags: u32,
+        overlapped: *mut Overlapped,
+        completion: *const c_void,
+    ) -> i32;
+
+    /// Starts a send of `buffers` on `socket` to the address `to`, as
+    /// `WSASend` starts one to the socket's peer.
+    pub(crate) fn WSASendTo(
+        socket: Socket,
+        buffers: *const WsaBuf,
+        count: u32,
+        sent: *mut u32,
+        flags: u32,
+        to: *const u8,
+        to_len: i32,
+        overlapped: *mut Overlapped,
+        completion: *const c_void,
+    ) -> i32;
+
+    /// Starts a receive on `socket` into `buffers`, as `WSARecv` does, and
+    /// writes the sender's address to `from` and its length to `from_len`,
+    /// both of which it uses until the operation completes.
+    pub(crate) fn WSARecvFrom(
+        socket: Socket,
+        buffers: *mut WsaBuf,
+        count: u32,
+        received: *mut u32,
+        flags: *mut u32,
+        from: *mut u8,
+        from_len: *mut i32,
         overlapped: *mut Overlapped,
         completion: *const c_void,
     ) -> i32;

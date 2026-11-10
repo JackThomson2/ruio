@@ -8,8 +8,9 @@
 //! it, and the engine's one deadline timer is the park's timeout, which
 //! Windows counts in milliseconds and ends at a tick of its timer.
 //!
-//! Files (`fs::File`), named pipes (`pipe::NamedPipe`) and TCP sockets
-//! (`net::TcpListener`, `net::TcpStream`) read and write through the port
+//! Files (`fs::File`), named pipes (`pipe::NamedPipe`) and TCP and UDP
+//! sockets (`net::TcpListener`, `net::TcpStream`, `net::UdpSocket`) read
+//! and write through the port
 //! with owned buffers, as ruio's I/O does on io_uring: an operation takes
 //! its buffer and hands it back with the result, and the system may use the
 //! buffer until the operation's completion comes, so a dropped operation is

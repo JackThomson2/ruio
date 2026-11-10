@@ -447,10 +447,13 @@ impl<B: IoBufMut> Future for Read<'_, B> {
         let (result, mut buf) = ready!(self.op.poll_with(cx, start, outcome));
         let result = match result {
             Ok(read) => {
+                // A count beyond the buffer would be the length of a datagram
+                // that did not fit, of which the buffer holds what did.
+                let read = (read as usize).min(buf.bytes_total());
                 // SAFETY: the system wrote the bytes it reports reading from
                 // the start of the buffer, within its `bytes_total`.
-                unsafe { buf.set_init(read as usize) };
-                Ok(read as usize)
+                unsafe { buf.set_init(read) };
+                Ok(read)
             }
             Err(err) if is_end(&err) => Ok(0),
             Err(err) => Err(err),

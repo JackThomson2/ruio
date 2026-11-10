@@ -1,4 +1,5 @@
-//! TCP sockets, which accept, connect, read and write through the port.
+//! TCP and UDP sockets, which accept, connect, read and write, send and
+//! receive through the port.
 //!
 //! A listener accepts with `AcceptEx` and a stream connects with
 //! `ConnectEx`, the calls of Winsock that complete to a port, which a
@@ -13,7 +14,9 @@ use std::ffi::c_void;
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::net::{self, IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, ToSocketAddrs};
+use std::net::{
+    self, IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, ToSocketAddrs,
+};
 use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
 use std::pin::Pin;
 use std::ptr;
@@ -25,6 +28,10 @@ use ruio_buf::{IoBuf, IoBufMut};
 use crate::handle::{IoHandle, Raw};
 use crate::op::{Op, Read, Write};
 use crate::sys;
+
+mod udp;
+
+pub use udp::{RecvFrom, SendTo, UdpSocket};
 
 /// Room for one of the two addresses `AcceptEx` writes: the largest address
 /// there is, and the 16 bytes more that it asks for.
@@ -143,6 +150,40 @@ impl RawAddr {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         };
         Self::new(&SocketAddr::new(ip, 0))
+    }
+
+    /// Room for the system to write an address of either family to, and
+    /// how much room it is.
+    fn room() -> Self {
+        Self {
+            bytes: [0; 28],
+            len: 28,
+        }
+    }
+
+    /// The address the system wrote.
+    fn to_socket_addr(&self) -> io::Result<SocketAddr> {
+        let bytes = &self.bytes;
+        let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
+        let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+        match (family, self.len) {
+            (sys::AF_INET, 16..) => {
+                let ip = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+                Ok(SocketAddr::new(IpAddr::V4(ip), port))
+            }
+            (sys::AF_INET6, 28..) => {
+                let flowinfo = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                let mut ip = [0; 16];
+                ip.copy_from_slice(&bytes[8..24]);
+                let scope_id = u32::from_ne_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+                let addr = SocketAddrV6::new(Ipv6Addr::from(ip), port, flowinfo, scope_id);
+                Ok(SocketAddr::V6(addr))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "an address that is neither IPv4's nor IPv6's",
+            )),
+        }
     }
 }
 
@@ -672,5 +713,18 @@ mod tests {
         let v6 = RawAddr::any_for(&"[2001:db8::1]:80".parse().unwrap());
         assert_eq!((v6.len, v6.bytes[0]), (28, 23));
         assert_eq!(v6.bytes[2..], [0; 26]);
+    }
+
+    #[test]
+    fn an_address_the_system_wrote_reads_back() {
+        for addr in ["127.0.0.1:8080", "[::1]:443", "[fe80::1%7]:9"] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            assert_eq!(RawAddr::new(&addr).to_socket_addr().unwrap(), addr);
+        }
+        let flow = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1, 0x1234, 0);
+        let read = RawAddr::new(&SocketAddr::V6(flow)).to_socket_addr();
+        assert_eq!(read.unwrap(), SocketAddr::V6(flow));
+        // Nothing written: no family.
+        assert!(RawAddr::room().to_socket_addr().is_err());
     }
 }
