@@ -24,6 +24,9 @@
 //!   that do not wait, as a nonblocking descriptor is read on Unix, keeping
 //!   a read and a write of its own in flight, whose completions make it
 //!   ready.
+//! - [`Socket`] reads and writes a TCP socket that no port has, made
+//!   nonblocking, with Winsock's calls made at once, and connects and
+//!   accepts the same way; a [`ReadyWait`] waits for it to be ready.
 //!
 //! Polled on a thread with no engine current, a wait fails with
 //! [`io::ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported), as one
@@ -32,9 +35,11 @@
 mod overlapped;
 mod pipe;
 pub(crate) mod ready;
+mod socket;
 pub(crate) mod wait;
 
 pub use overlapped::{ReadAt, WriteAt, read_at, write_at};
 pub use pipe::Pipe;
 pub use ready::{ReadyWait, base_socket, events};
+pub use socket::Socket;
 pub use wait::HandleWait;

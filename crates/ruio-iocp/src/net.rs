@@ -151,7 +151,7 @@ fn socket_of(handle: sys::Handle) -> sys::Socket {
 }
 
 /// The calling thread's last Winsock error.
-fn last_error() -> io::Error {
+pub(crate) fn last_error() -> io::Error {
     io::Error::from_raw_os_error(sys::WSAGetLastError())
 }
 
@@ -173,7 +173,7 @@ fn startup() -> io::Result<()> {
 }
 
 /// The address family of `addr`.
-fn family(addr: &SocketAddr) -> u16 {
+pub(crate) fn family(addr: &SocketAddr) -> u16 {
     if addr.is_ipv6() {
         sys::AF_INET6
     } else {
@@ -182,7 +182,7 @@ fn family(addr: &SocketAddr) -> u16 {
 }
 
 /// A TCP socket of `family`, unbound, as [`open_socket`] makes it.
-fn new_socket(family: u16) -> io::Result<OwnedSocket> {
+pub(crate) fn new_socket(family: u16) -> io::Result<OwnedSocket> {
     open_socket(family, sys::SOCK_STREAM, sys::IPPROTO_TCP)
 }
 
@@ -269,16 +269,80 @@ fn first_bound<T>(
     }))
 }
 
+/// A TCP socket bound to `addr`, or to the first address it resolves to
+/// that it can be bound to, as [`first_bound`] binds, and listening, with
+/// the backlog of the standard library's listeners.
+pub(crate) fn listening(addr: impl ToSocketAddrs) -> io::Result<OwnedSocket> {
+    first_bound(addr, |addr| {
+        let socket = new_socket(family(addr))?;
+        bind_to(&socket, addr)?;
+        // SAFETY: the socket is open and bound.
+        let failed = unsafe { sys::listen(socket.as_raw_socket() as sys::Socket, BACKLOG) };
+        if failed != 0 {
+            return Err(last_error());
+        }
+        Ok(socket)
+    })
+}
+
+/// Sets `SO_LINGER` of `socket`, an open socket: for how long closing it
+/// waits for what it has left to send to go, in whole seconds, or `None`
+/// for not at all.
+pub(crate) fn set_linger_of(socket: sys::Socket, linger: Option<Duration>) -> io::Result<()> {
+    let value = sys::Linger {
+        onoff: u16::from(linger.is_some()),
+        linger: linger.map_or(0, |linger| {
+            u16::try_from(linger.as_secs()).unwrap_or(u16::MAX)
+        }),
+    };
+    // SAFETY: the caller has the socket open, and the value is read during
+    // the call.
+    let failed = unsafe {
+        sys::setsockopt(
+            socket,
+            sys::SOL_SOCKET,
+            sys::SO_LINGER,
+            ptr::from_ref(&value).cast(),
+            size_of::<sys::Linger>() as i32,
+        )
+    };
+    if failed != 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// `SO_LINGER` of `socket`, an open socket.
+pub(crate) fn linger_of(socket: sys::Socket) -> io::Result<Option<Duration>> {
+    let mut value = sys::Linger::default();
+    let mut len = size_of::<sys::Linger>() as i32;
+    // SAFETY: the caller has the socket open, and the value has room for as
+    // many bytes as the length says, which are written during the call.
+    let failed = unsafe {
+        sys::getsockopt(
+            socket,
+            sys::SOL_SOCKET,
+            sys::SO_LINGER,
+            ptr::from_mut(&mut value).cast(),
+            &mut len,
+        )
+    };
+    if failed != 0 {
+        return Err(last_error());
+    }
+    Ok((value.onoff != 0).then(|| Duration::from_secs(value.linger.into())))
+}
+
 /// A socket address as Winsock takes it: the bytes of a `sockaddr_in` or of
 /// a `sockaddr_in6`, and how many they are.
 #[repr(C, align(4))]
-struct RawAddr {
-    bytes: [u8; 28],
-    len: i32,
+pub(crate) struct RawAddr {
+    pub(crate) bytes: [u8; 28],
+    pub(crate) len: i32,
 }
 
 impl RawAddr {
-    fn new(addr: &SocketAddr) -> Self {
+    pub(crate) fn new(addr: &SocketAddr) -> Self {
         let mut bytes = [0; 28];
         bytes[2..4].copy_from_slice(&addr.port().to_be_bytes());
         let len = match addr {
@@ -490,16 +554,7 @@ impl TcpListener {
     /// kind `Other` if the thread has no current engine, as outside a
     /// runtime.
     pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
-        let listener = first_bound(addr, |addr| {
-            let socket = new_socket(family(addr))?;
-            bind_to(&socket, addr)?;
-            // SAFETY: the socket is open and bound.
-            let failed = unsafe { sys::listen(socket.as_raw_socket() as sys::Socket, BACKLOG) };
-            if failed != 0 {
-                return Err(last_error());
-            }
-            Ok(net::TcpListener::from(socket))
-        })?;
+        let listener = net::TcpListener::from(listening(addr)?);
         let family = family(&listener.local_addr()?);
         Ok(Self {
             listener: IoHandle::new(listener)?,
@@ -887,26 +942,7 @@ impl TcpStream {
     ///
     /// What the system reports.
     pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
-        let value = sys::Linger {
-            onoff: u16::from(linger.is_some()),
-            linger: linger.map_or(0, |linger| {
-                u16::try_from(linger.as_secs()).unwrap_or(u16::MAX)
-            }),
-        };
-        // SAFETY: the socket is open, and the value is read during the call.
-        let failed = unsafe {
-            sys::setsockopt(
-                socket_of(self.stream.raw()),
-                sys::SOL_SOCKET,
-                sys::SO_LINGER,
-                ptr::from_ref(&value).cast(),
-                size_of::<sys::Linger>() as i32,
-            )
-        };
-        if failed != 0 {
-            return Err(last_error());
-        }
-        Ok(())
+        set_linger_of(socket_of(self.stream.raw()), linger)
     }
 
     /// For how long closing the stream waits for what it has left to send
@@ -916,23 +952,7 @@ impl TcpStream {
     ///
     /// What the system reports.
     pub fn linger(&self) -> io::Result<Option<Duration>> {
-        let mut value = sys::Linger::default();
-        let mut len = size_of::<sys::Linger>() as i32;
-        // SAFETY: the socket is open, and the value has room for as many
-        // bytes as the length says, which are written during the call.
-        let failed = unsafe {
-            sys::getsockopt(
-                socket_of(self.stream.raw()),
-                sys::SOL_SOCKET,
-                sys::SO_LINGER,
-                ptr::from_mut(&mut value).cast(),
-                &mut len,
-            )
-        };
-        if failed != 0 {
-            return Err(last_error());
-        }
-        Ok((value.onoff != 0).then(|| Duration::from_secs(value.linger.into())))
+        linger_of(socket_of(self.stream.raw()))
     }
 
     /// Takes the error the socket holds (`SO_ERROR`), if it holds one,

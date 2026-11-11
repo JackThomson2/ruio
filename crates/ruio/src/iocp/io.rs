@@ -5,7 +5,8 @@
 //! far, a proof of concept, under the names and with the signatures it has
 //! on io_uring, so that code written to it builds for both: the traits,
 //! which a [`TcpStream`] and a [`File`] at its position implement, the
-//! futures that come with them, and [`copy`].
+//! futures that come with them, and [`copy`]; and the reads and writes of
+//! the portable sockets.
 //!
 //! [`AsyncRead::read`] and [`AsyncWrite::write`] take a buffer by value and
 //! hand it back with the result, as the sockets' and the files' own methods
@@ -26,6 +27,13 @@
 //! call on a stream reaches them, and the traits' through a generic bound
 //! only.
 //!
+//! The portable sockets of [`net::portable`] read and write with calls of
+//! Winsock's made at once instead, on whichever thread polls them, and wait
+//! on that thread's port only when there is nothing to read or no room to
+//! write: their reads and writes are [`PortableRead`]s and
+//! [`PortableWrite`]s, which are `Send` and `Sync`, and spend a step of the
+//! task's budget ([`coop`](crate::coop)) each time they move data.
+//!
 //! ```no_run
 //! use ruio::io::{AsyncRead, AsyncWrite};
 //!
@@ -39,17 +47,22 @@
 //! ```
 //!
 //! Not here yet, of what `io` has on io_uring: `splice`, which moves data
-//! through a pipe in the kernel, `AsyncFd` and the foreign reactor, which
-//! wait for a descriptor to be ready, and the portable reads and writes of
-//! the `Send` sockets.
+//! through a pipe in the kernel, and `AsyncFd` and the foreign reactor,
+//! which wait for a descriptor to be ready.
 
 use crate::buf::{IoBuf, IoBufMut};
 use crate::fs::{self, File};
 use crate::net::{self, TcpStream};
 
+#[path = "io/nonblocking.rs"]
+mod nonblocking;
 #[path = "../io/traits.rs"]
 mod traits;
 
+pub(crate) use nonblocking::{Nonblocking, READABLE, WRITABLE};
+pub use nonblocking::{
+    PortableRead, PortableReadExact, PortableWrite, PortableWriteAll, PortableWriteAllVectored,
+};
 pub use traits::{AsyncRead, AsyncWrite, Copy, ReadExact, ReadToEnd, WriteAll, copy};
 
 impl AsyncRead for TcpStream {

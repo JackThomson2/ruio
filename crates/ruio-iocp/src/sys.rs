@@ -125,6 +125,19 @@ pub(crate) const WSAEMSGSIZE: i32 = 10040;
 /// down.
 pub(crate) const WSAESHUTDOWN: i32 = 10058;
 
+/// `WSAEWOULDBLOCK`: a call on a nonblocking socket that would have had to
+/// wait: for data, for room, for a connection to accept, or for one to be
+/// made.
+pub(crate) const WSAEWOULDBLOCK: i32 = 10035;
+
+/// `WSAECONNRESET`: the peer reset the connection; for an accept, one
+/// that the peer gave up before it was taken.
+pub(crate) const WSAECONNRESET: i32 = 10054;
+
+/// `FIONBIO`: the `ioctlsocket` that makes a socket nonblocking, given a
+/// `u_long` that is not zero, or blocking again, given zero.
+pub(crate) const FIONBIO: i32 = 0x8004_667E_u32 as i32;
+
 /// `AF_INET`: the address family of IPv4.
 pub(crate) const AF_INET: u16 = 2;
 
@@ -710,6 +723,17 @@ unsafe extern "system" {
     /// system queues up to `backlog` until they are accepted. Zero on
     /// success.
     pub(crate) fn listen(socket: Socket, backlog: i32) -> i32;
+
+    /// Connects `socket` to the address `name`. Zero on success; on a
+    /// nonblocking socket, `SOCKET_ERROR` with `WSAEWOULDBLOCK` if the
+    /// connection is being made, which makes the socket writable once it
+    /// is, or has failed, as `SO_ERROR` then says.
+    pub(crate) fn connect(socket: Socket, name: *const u8, name_len: i32) -> i32;
+
+    /// Controls `socket` as `command` says, with the `u_long` at
+    /// `argument`: here, makes it nonblocking or blocking again. Zero on
+    /// success.
+    pub(crate) fn ioctlsocket(socket: Socket, command: i32, argument: *mut u32) -> i32;
 
     /// Sets an option of `socket`. Zero on success.
     pub(crate) fn setsockopt(

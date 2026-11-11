@@ -242,11 +242,14 @@ impl ReadyWait {
         Self { slot: None }
     }
 
-    /// Whether the wait has started, and its poll has not completed.
+    /// Whether the wait has started and has not been ready since: its poll
+    /// is in flight, or has completed with what the next
+    /// [`poll_ready`](ReadyWait::poll_ready) returns, which so goes on with
+    /// it rather than ask the socket.
     pub fn is_waiting(&self) -> bool {
-        self.slot
-            .as_ref()
-            .is_some_and(|slot| matches!(*slot.lock(), PollState::Polling { .. }))
+        self.slot.as_ref().is_some_and(|slot| {
+            matches!(*slot.lock(), PollState::Polling { .. } | PollState::Done(_))
+        })
     }
 
     /// Waits for `socket`, a base socket as [`base_socket`] gives it, to have

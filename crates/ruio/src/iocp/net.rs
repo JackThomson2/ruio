@@ -86,11 +86,17 @@
 //! assert_send::<ruio::net::TcpStream>();
 //! ```
 //!
+//! The sockets of [`portable`] are `Send` and `Sync`, for code whose
+//! futures must be: TCP streams and listeners, which no port has, read and
+//! written with calls made at once on whichever thread polls them, which
+//! wait on that thread's port only when there is nothing to read or no
+//! room to write.
+//!
 //! Not here yet, of what `net` has on io_uring: datagrams received into a
 //! pool (`recv_stream` and `recv_from_stream` of a UDP socket), the
 //! futures' timeouts, sockets taken from the standard library (`from_std`),
-//! `bind_reuseport`, moving a stream to another core, and the `Send`
-//! sockets of `portable`. Unix sockets are Unix's.
+//! `bind_reuseport`, and moving a stream to another core. Unix sockets are
+//! Unix's.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -107,6 +113,8 @@ use crate::buf::{BufBundle, BufPool, IoBuf, IoBufMut, IoBufs};
 
 #[path = "../net/addr.rs"]
 mod addr;
+#[path = "net/portable.rs"]
+pub mod portable;
 
 use addr::resolve;
 
