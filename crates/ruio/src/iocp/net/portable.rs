@@ -17,7 +17,10 @@
 //! nothing.
 //!
 //! A thread where no runtime runs, one of another executor's say, reads and
-//! writes a portable socket the same way; a wait there, which has no port
+//! writes a portable socket the same way. Its waits go to the foreign
+//! reactor ([`set_foreign_reactor`](crate::io::set_foreign_reactor)) where
+//! the thread is one of its, which then says when the socket may be ready,
+//! as for that executor's own sockets. With none, a wait, which has no port
 //! to run on, fails with an error of kind [`io::ErrorKind::Unsupported`],
 //! so the caller can do its I/O another way.
 //!
@@ -130,8 +133,9 @@ impl TcpStream {
     ///
     /// What resolving `addr` reports, the error of the last address tried,
     /// or `InvalidInput` if `addr` resolves to no address; and, for a
-    /// connection that is not made at once where no runtime runs, an error
-    /// of kind [`io::ErrorKind::Unsupported`].
+    /// connection that is not made at once where no runtime runs and the
+    /// foreign reactor does not take the wait, an error of kind
+    /// [`io::ErrorKind::Unsupported`].
     pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
         let mut last = None;
         for addr in resolve(&addr).await? {
@@ -330,8 +334,9 @@ impl TcpStream {
     ///
     /// # Errors
     ///
-    /// What Winsock reports, and, for a wait where no runtime runs, an
-    /// error of kind [`io::ErrorKind::Unsupported`].
+    /// What Winsock reports, and, for a wait where no runtime runs and the
+    /// foreign reactor does not take it, an error of kind
+    /// [`io::ErrorKind::Unsupported`].
     pub fn poll_read(
         &mut self,
         cx: &mut Context<'_>,
@@ -409,8 +414,9 @@ impl TcpStream {
     ///
     /// # Errors
     ///
-    /// What the system reports for the poll, and, where no runtime runs, an
-    /// error of kind [`io::ErrorKind::Unsupported`].
+    /// What the system reports for the poll, and, where no runtime runs and
+    /// the foreign reactor does not take the wait, an error of kind
+    /// [`io::ErrorKind::Unsupported`].
     pub async fn readable(&self) -> io::Result<()> {
         self.stream.io.ready(READABLE).await.map(drop)
     }
@@ -566,8 +572,9 @@ impl TcpListener {
     /// # Errors
     ///
     /// What `accept` reports, bar a connection reset before it was taken,
-    /// which the next replaces; and, for a wait where no runtime runs, an
-    /// error of kind [`io::ErrorKind::Unsupported`].
+    /// which the next replaces; and, for a wait where no runtime runs and the
+    /// foreign reactor does not take it, an error of kind
+    /// [`io::ErrorKind::Unsupported`].
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let mut wait = ReadyWait::new();
         let taken = poll_fn(|cx| self.io.poll_take(cx, READABLE, &mut wait, try_accept)).await;

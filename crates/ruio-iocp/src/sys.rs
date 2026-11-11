@@ -138,6 +138,27 @@ pub(crate) const WSAECONNRESET: i32 = 10054;
 /// `u_long` that is not zero, or blocking again, given zero.
 pub(crate) const FIONBIO: i32 = 0x8004_667E_u32 as i32;
 
+/// `POLLRDNORM`: data to receive, a connection to accept, or the end, for
+/// `WSAPoll`.
+pub(crate) const POLLRDNORM: i16 = 0x0100;
+
+/// `POLLRDBAND`: out-of-band data to receive, for `WSAPoll`.
+pub(crate) const POLLRDBAND: i16 = 0x0200;
+
+/// `POLLWRNORM`: room to send, for `WSAPoll`.
+pub(crate) const POLLWRNORM: i16 = 0x0010;
+
+/// `POLLERR`: an error, which `WSAPoll` reports whether asked for or not.
+pub(crate) const POLLERR: i16 = 0x0001;
+
+/// `POLLHUP`: the connection ended, which `WSAPoll` reports whether asked
+/// for or not.
+pub(crate) const POLLHUP: i16 = 0x0002;
+
+/// `POLLNVAL`: no socket, which `WSAPoll` reports whether asked for or
+/// not.
+pub(crate) const POLLNVAL: i16 = 0x0004;
+
 /// `AF_INET`: the address family of IPv4.
 pub(crate) const AF_INET: u16 = 2;
 
@@ -289,6 +310,19 @@ pub(crate) struct WsaBuf {
     pub(crate) len: u32,
     /// `buf`: where they are.
     pub(crate) buf: *mut u8,
+}
+
+/// `WSAPOLLFD`: a socket that `WSAPoll` polls, the events it asks for, and
+/// those it found.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WsaPollFd {
+    /// `fd`.
+    pub(crate) fd: Socket,
+    /// `events`: the `POLL*` events asked for.
+    pub(crate) events: i16,
+    /// `revents`: the `POLL*` events found.
+    pub(crate) revents: i16,
 }
 
 /// `LINGER`: the value of `SO_LINGER`.
@@ -734,6 +768,11 @@ unsafe extern "system" {
     /// `argument`: here, makes it nonblocking or blocking again. Zero on
     /// success.
     pub(crate) fn ioctlsocket(socket: Socket, command: i32, argument: *mut u32) -> i32;
+
+    /// Polls the `count` sockets of `sockets` for the events each asks
+    /// for, waiting up to `timeout` milliseconds for one to have some, and
+    /// writes those each has: how many have some, or `SOCKET_ERROR`.
+    pub(crate) fn WSAPoll(sockets: *mut WsaPollFd, count: u32, timeout: i32) -> i32;
 
     /// Sets an option of `socket`. Zero on success.
     pub(crate) fn setsockopt(

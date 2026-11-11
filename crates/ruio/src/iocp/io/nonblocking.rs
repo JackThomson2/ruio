@@ -29,14 +29,23 @@
 //! task's budget ([`coop`]), and once the budget is spent the task yields.
 //!
 //! Polled where no runtime runs, by another executor's task say, a read or
-//! a write is the same call; a wait, which has no port to run on there,
-//! fails with [`io::ErrorKind::Unsupported`].
+//! a write is the same call. A wait goes to the foreign reactor
+//! ([`set_foreign_reactor`](super::set_foreign_reactor)) where the thread
+//! is one of its: the socket is registered with it as it first waits
+//! there, and a call that finds the socket not ready is made again under
+//! the reactor's readiness, which then says when it is worth making, with
+//! no other thread in between, as that executor's own sockets wait. A call
+//! that finds what it came for costs the reactor nothing: the next one this
+//! way goes through the reactor first only if this one had to wait, or was
+//! made as its task woke from a wait, or moved less than it was to, as a
+//! request whose answer has yet to come does. Elsewhere a wait, which has
+//! no port to run on, fails with [`io::ErrorKind::Unsupported`].
 
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io::{self, IoSlice};
 use std::mem::MaybeUninit;
-use std::os::windows::io::{AsRawSocket, OwnedSocket};
+use std::os::windows::io::{AsRawSocket, AsSocket, OwnedSocket};
 use std::pin::Pin;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +53,7 @@ use std::task::{Context, Poll, ready};
 
 use ruio_iocp::portable::{ReadyWait, Socket, events};
 
+use super::foreign::{Foreign, interest, level};
 use crate::buf::{BufResult, IoBuf, IoBufMut, IoBufs};
 use crate::coop;
 
@@ -63,8 +73,13 @@ const OWNED_IOVECS: usize = 64;
 const MAX_SLICE: usize = u32::MAX as usize;
 
 /// A socket made nonblocking, read and written with calls made at once,
-/// which waits with polls on the port of the thread that polls each wait.
+/// which waits with polls on the port of the thread that polls each wait,
+/// or on the foreign reactor where that thread is one of its.
 pub(crate) struct Nonblocking {
+    /// The socket's registration with the foreign reactor, if it has waited
+    /// on one of its threads: first, so that it leaves the reactor before
+    /// the socket closes.
+    foreign: Foreign,
     socket: Socket,
     /// What the last reads found.
     read: Hint,
@@ -77,14 +92,20 @@ pub(crate) struct Nonblocking {
 #[derive(Debug, Default)]
 struct Hint {
     /// Whether the next transfer this way waits first: the last moved less
-    /// than it was to, and so drained the socket or filled it.
+    /// than it was to, and so drained the socket or filled it; or, on the
+    /// foreign reactor, it had to wait, or was made as the task woke from
+    /// such a wait, so that the next is likely to wait too.
     first: AtomicBool,
+    /// Whether the last transfer this way waited on the foreign reactor, so
+    /// that the one made as the task wakes keeps `first` set.
+    waited: AtomicBool,
 }
 
 impl Nonblocking {
     /// Takes over `socket`, nonblocking already, as a [`Socket`] is.
     pub(crate) fn new(socket: Socket) -> Self {
         Self {
+            foreign: Foreign::new(),
             socket,
             read: Hint::default(),
             write: Hint::default(),
@@ -99,7 +120,12 @@ impl Nonblocking {
 
     /// The socket, blocking again, as the standard library's sockets are.
     pub(crate) fn into_owned_socket(self) -> OwnedSocket {
-        self.socket.into_socket()
+        let Self {
+            foreign, socket, ..
+        } = self;
+        // Out of the reactor while the socket is still this one's.
+        drop(foreign);
+        socket.into_socket()
     }
 
     /// Reads into `buf` with one call, made at once: what has arrived, 0 at
@@ -160,7 +186,9 @@ impl Nonblocking {
     }
 
     /// Waits with `wait` for the socket to have any of `events`, as
-    /// [`Socket::poll_ready`] does.
+    /// [`Socket::poll_ready`] does; or, where the socket waits on the
+    /// foreign reactor, until the reactor says it may, and one `WSAPoll`
+    /// that does not wait finds it does.
     #[inline]
     pub(crate) fn poll_ready(
         &self,
@@ -168,6 +196,14 @@ impl Nonblocking {
         events: u32,
         wait: &mut ReadyWait,
     ) -> Poll<io::Result<u32>> {
+        if !wait.is_waiting()
+            && let Some(registered) = self.foreign.here(self.socket.as_socket())
+            && let Some(polled) =
+                registered.poll_io(cx, interest(events), 0, &mut || level(&self.socket, events))
+        {
+            // The AFD bits, which fit a `u32`.
+            return polled.map_ok(|events| events as u32);
+        }
         self.socket.poll_ready(cx, events, wait)
     }
 
@@ -217,8 +253,11 @@ impl Nonblocking {
     /// Runs `call`, a call made at once that is to move `len` bytes, and
     /// that moved as many as `moved` says of its output, waiting with `wait`
     /// for `events` while it finds the socket not ready; where `hint` says
-    /// the socket is likely not ready, it waits first. Each call that
-    /// succeeds spends a step of the task's budget.
+    /// the socket is likely not ready, it waits first. On a thread of the
+    /// foreign reactor's, a call that finds the socket not ready, or one that
+    /// would wait first, is made under the reactor's readiness instead, and
+    /// waits on the reactor. Each call that succeeds spends a step of the
+    /// task's budget.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn poll_call<T>(
@@ -236,6 +275,9 @@ impl Nonblocking {
         // comes first.
         if !wait.is_waiting() && hint.is_some_and(|hint| hint.first.swap(false, Ordering::Relaxed))
         {
+            if let Some(polled) = self.poll_registered(cx, events, hint, len, &mut call, &moved) {
+                return progressed(polled, proceed);
+            }
             ready!(self.socket.poll_ready(cx, events, wait))?;
         }
         loop {
@@ -255,11 +297,63 @@ impl Nonblocking {
                     return Poll::Ready(Ok(made));
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if let Some(polled) =
+                        self.poll_registered(cx, events, hint, len, &mut call, &moved)
+                    {
+                        return progressed(polled, proceed);
+                    }
                     ready!(self.socket.poll_ready(cx, events, wait))?;
                 }
                 Err(err) => return Poll::Ready(Err(err)),
             }
         }
+    }
+
+    /// Makes `call` once the foreign reactor says the socket may be ready
+    /// for `events`, as [`Registration::poll_io`](super::Registration::poll_io)
+    /// does, on a thread of the reactor's, where no runtime of ruio's runs
+    /// and the socket is registered with the reactor, or can be; `None`
+    /// elsewhere, for the wait to go to a port. A call that has to wait
+    /// leaves `hint` so that the next this way waits first, as does the call
+    /// made as the task wakes from that wait, and one that moved less than
+    /// it was to, whose readiness the reactor has cleared.
+    fn poll_registered<T>(
+        &self,
+        cx: &mut Context<'_>,
+        events: u32,
+        hint: Option<&Hint>,
+        len: usize,
+        call: &mut impl FnMut(&Self) -> io::Result<T>,
+        moved: &impl Fn(&T) -> usize,
+    ) -> Option<Poll<io::Result<T>>> {
+        let registered = self.foreign.here(self.socket.as_socket())?;
+        let mut made = None;
+        let mut through = || {
+            let output = call(self)?;
+            let done = moved(&output);
+            made = Some(output);
+            Ok(done)
+        };
+        let polled = registered.poll_io(cx, interest(events), len, &mut through)?;
+        Some(match polled {
+            Poll::Ready(Ok(done)) => {
+                if let Some(hint) = hint {
+                    let woke = hint.waited.swap(false, Ordering::Relaxed);
+                    if woke || short(done, len) {
+                        hint.first.store(true, Ordering::Relaxed);
+                    }
+                }
+                Poll::Ready(Ok(made.expect("a call that succeeded made its output")))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => {
+                if let Some(hint) = hint {
+                    hint.first.store(true, Ordering::Relaxed);
+                    hint.waited.store(true, Ordering::Relaxed);
+                }
+                Poll::Pending
+            }
+        })
     }
 
     /// Reads into `buf`, up to its capacity, what has arrived, waiting for
@@ -325,6 +419,7 @@ impl fmt::Debug for Nonblocking {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Nonblocking")
             .field("socket", &self.socket.as_raw_socket())
+            .field("foreign", &self.foreign)
             .finish()
     }
 }
@@ -377,6 +472,15 @@ fn short(done: usize, len: usize) -> bool {
     0 < done && done < len
 }
 
+/// `polled`, having spent `proceed` if it made something.
+#[inline]
+fn progressed<T>(polled: Poll<io::Result<T>>, proceed: coop::Proceed) -> Poll<io::Result<T>> {
+    if let Poll::Ready(Ok(_)) = polled {
+        proceed.made_progress();
+    }
+    polled
+}
+
 /// A read of a socket with a call made at once, which waits on the port of
 /// the thread that polls it only if nothing has arrived: made by the `read`
 /// of the portable sockets. The output is how many bytes were read, 0 at
@@ -386,9 +490,10 @@ fn short(done: usize, len: usize) -> bool {
 /// It spends a step of the task's budget ([`coop`]) when it reads, so a
 /// socket that always has something to read cannot hold up the thread.
 /// Dropped while it waits, it lets go of its poll; nothing is read but what
-/// it returns, so nothing is lost. Where no runtime runs, a read that finds
-/// nothing fails with [`io::ErrorKind::Unsupported`], as its wait has no
-/// port to run on.
+/// it returns, so nothing is lost. Its wait runs on the foreign reactor
+/// where the thread is one of its; where no runtime runs and the reactor
+/// does not take it, a read that finds nothing fails with
+/// [`io::ErrorKind::Unsupported`], as its wait has no port to run on.
 ///
 /// # Panics
 ///

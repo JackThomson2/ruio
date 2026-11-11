@@ -29,7 +29,7 @@ use std::slice;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use super::{ReadyWait, base_socket};
+use super::{ReadyWait, base_socket, events};
 use crate::net::{RawAddr, family, last_error, linger_of, listening, new_socket, set_linger_of};
 use crate::sys;
 
@@ -247,6 +247,54 @@ impl Socket {
         wait.poll_ready(cx, base, events)
     }
 
+    /// The events of `events`, the bits of [`events`](super::events), that
+    /// the socket has now, found with one `WSAPoll` that does not wait, and
+    /// any end or error it has: data or a connection waiting as
+    /// [`RECEIVE`](events::RECEIVE), out-of-band data as
+    /// [`RECEIVE_EXPEDITED`](events::RECEIVE_EXPEDITED), room as
+    /// [`SEND`](events::SEND), the end as
+    /// [`DISCONNECT`](events::DISCONNECT), an error as
+    /// [`ABORT`](events::ABORT), and no socket as
+    /// [`LOCAL_CLOSE`](events::LOCAL_CLOSE); 0 if it has none of them.
+    ///
+    /// # Errors
+    ///
+    /// What `WSAPoll` reports.
+    pub fn ready_now(&self, events: u32) -> io::Result<u32> {
+        let mut asked = 0;
+        if events & (events::RECEIVE | events::ACCEPT | events::DISCONNECT) != 0 {
+            asked |= sys::POLLRDNORM;
+        }
+        if events & events::RECEIVE_EXPEDITED != 0 {
+            asked |= sys::POLLRDBAND;
+        }
+        if events & events::SEND != 0 {
+            asked |= sys::POLLWRNORM;
+        }
+        let mut poll = sys::WsaPollFd {
+            fd: self.raw(),
+            events: asked,
+            revents: 0,
+        };
+        // SAFETY: the socket is open, and the call reads and writes the one
+        // `WSAPOLLFD` it is given, and waits for nothing.
+        if unsafe { sys::WSAPoll(&raw mut poll, 1, 0) } < 0 {
+            return Err(last_error());
+        }
+        let found = [
+            (sys::POLLRDNORM, events::RECEIVE),
+            (sys::POLLRDBAND, events::RECEIVE_EXPEDITED),
+            (sys::POLLWRNORM, events::SEND),
+            (sys::POLLHUP, events::DISCONNECT),
+            (sys::POLLERR, events::ABORT),
+            (sys::POLLNVAL, events::LOCAL_CLOSE),
+        ];
+        Ok(found
+            .into_iter()
+            .filter(|&(bit, _)| poll.revents & bit != 0)
+            .fold(0, |events, (_, event)| events | event))
+    }
+
     /// Sets `SO_LINGER`: for how long closing the socket waits for what it
     /// has left to send to go, in whole seconds, or `None` for not at all,
     /// which is the default.
@@ -450,6 +498,20 @@ mod tests {
         let error = with_stream(&client, net::TcpStream::take_error).unwrap();
         let error = error.expect("the connection's error");
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    #[test]
+    fn a_socket_is_found_ready_now_without_waiting() {
+        let (ours, mut peer) = pair();
+        assert_eq!(ours.ready_now(events::READABLE).unwrap(), 0);
+        let found = ours.ready_now(events::WRITABLE).unwrap();
+        assert_eq!(found, events::SEND, "found {found:#x}");
+        peer.write_all(b"x").unwrap();
+        let started = Instant::now();
+        while ours.ready_now(events::READABLE).unwrap() & events::RECEIVE == 0 {
+            assert!(started.elapsed() < Duration::from_secs(5), "never readable");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
