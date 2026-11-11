@@ -104,8 +104,22 @@ pub(crate) const AF_INET6: u16 = 23;
 /// `SOCK_STREAM`: a stream socket.
 pub(crate) const SOCK_STREAM: i32 = 1;
 
+/// `SOCK_DGRAM`: a datagram socket.
+pub(crate) const SOCK_DGRAM: i32 = 2;
+
 /// `IPPROTO_TCP`.
 pub(crate) const IPPROTO_TCP: i32 = 6;
+
+/// `IPPROTO_UDP`.
+pub(crate) const IPPROTO_UDP: i32 = 17;
+
+/// `IPPROTO_IPV6`: the level of the options of IPv6 sockets.
+pub(crate) const IPPROTO_IPV6: i32 = 41;
+
+/// `IPV6_V6ONLY`: whether an IPv6 socket reaches IPv6 addresses alone,
+/// rather than IPv4 ones too, in their IPv6 form; a `DWORD`, which Windows
+/// sets by default.
+pub(crate) const IPV6_V6ONLY: i32 = 27;
 
 /// `WSA_FLAG_OVERLAPPED`: a socket for overlapped I/O.
 pub(crate) const WSA_FLAG_OVERLAPPED: u32 = 0x01;
@@ -490,6 +504,11 @@ unsafe extern "system" {
 
     /// Binds `socket` to the address `name`. Zero on success.
     pub(crate) fn bind(socket: Socket, name: *const u8, name_len: i32) -> i32;
+
+    /// Makes `socket`, which is bound, listen for connections, of which the
+    /// system queues up to `backlog` until they are accepted. Zero on
+    /// success.
+    pub(crate) fn listen(socket: Socket, backlog: i32) -> i32;
 
     /// Sets an option of `socket`. Zero on success.
     pub(crate) fn setsockopt(

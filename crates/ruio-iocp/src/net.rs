@@ -6,8 +6,11 @@
 //! socket's provider hands out as function pointers; a stream reads with
 //! `WSARecv` and writes with `WSASend`. An operation's outcome is read with
 //! `WSAGetOverlappedResult`, which gives Winsock's own errors, those the
-//! standard library's sockets report. What needs no waiting, binding a
-//! listener, addresses and options, goes through the standard library's
+//! standard library's sockets report. A socket is made here, opened for
+//! overlapped I/O, and bound here too, so that one of IPv6 reaches IPv4
+//! addresses as well, in their IPv6 form, as it does on Linux, where
+//! Windows makes it reach IPv6 addresses alone. What needs no waiting
+//! besides, addresses and options, goes through the standard library's
 //! sockets, which the types here hold.
 //!
 //! A stream also receives into a pool of buffers, as a `RecvStream`, which
@@ -61,6 +64,10 @@ pub use write_behind::{Flush, WriteBehind};
 /// Room for one of the two addresses `AcceptEx` writes: the largest address
 /// there is, and the 16 bytes more that it asks for.
 const ADDR_ROOM: usize = 128 + 16;
+
+/// How many connections the system queues for a listener until they are
+/// accepted, as for the standard library's listeners.
+const BACKLOG: i32 = 128;
 
 impl Raw for net::TcpListener {
     fn raw(&self) -> sys::Handle {
@@ -174,16 +181,23 @@ fn family(addr: &SocketAddr) -> u16 {
     }
 }
 
-/// A TCP socket of `family`, unbound, opened for overlapped I/O and not
-/// inherited by child processes, as the standard library's are.
+/// A TCP socket of `family`, unbound, as [`open_socket`] makes it.
 fn new_socket(family: u16) -> io::Result<OwnedSocket> {
+    open_socket(family, sys::SOCK_STREAM, sys::IPPROTO_TCP)
+}
+
+/// A socket of `family`, `kind` and `protocol`, unbound, opened for
+/// overlapped I/O and not inherited by child processes, as the standard
+/// library's are. One of IPv6 reaches IPv4 addresses too, in their IPv6
+/// form, `::ffff:` and the IPv4 address, as it does on Linux.
+fn open_socket(family: u16, kind: i32, protocol: i32) -> io::Result<OwnedSocket> {
     startup()?;
     // SAFETY: the call is given no protocol information, and so no memory.
     let socket = unsafe {
         sys::WSASocketW(
             i32::from(family),
-            sys::SOCK_STREAM,
-            sys::IPPROTO_TCP,
+            kind,
+            protocol,
             ptr::null(),
             0,
             sys::WSA_FLAG_OVERLAPPED | sys::WSA_FLAG_NO_HANDLE_INHERIT,
@@ -193,7 +207,66 @@ fn new_socket(family: u16) -> io::Result<OwnedSocket> {
         return Err(last_error());
     }
     // SAFETY: the socket was just opened, and nothing else owns it.
-    Ok(unsafe { OwnedSocket::from_raw_socket(socket as RawSocket) })
+    let socket = unsafe { OwnedSocket::from_raw_socket(socket as RawSocket) };
+    if family == sys::AF_INET6 {
+        let only: u32 = 0;
+        // SAFETY: the socket is open, and the option's value, a `DWORD`, is
+        // read during the call.
+        let failed = unsafe {
+            sys::setsockopt(
+                socket.as_raw_socket() as sys::Socket,
+                sys::IPPROTO_IPV6,
+                sys::IPV6_V6ONLY,
+                ptr::from_ref(&only).cast(),
+                size_of::<u32>() as i32,
+            )
+        };
+        if failed != 0 {
+            return Err(last_error());
+        }
+    }
+    Ok(socket)
+}
+
+/// Binds `socket` to `addr`.
+fn bind_to(socket: &OwnedSocket, addr: &SocketAddr) -> io::Result<()> {
+    let addr = RawAddr::new(addr);
+    // SAFETY: the socket is open, and the address is read during the call.
+    let failed = unsafe {
+        sys::bind(
+            socket.as_raw_socket() as sys::Socket,
+            addr.bytes.as_ptr(),
+            addr.len,
+        )
+    };
+    if failed != 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// What `make` makes of the first of the addresses `addr` resolves to that
+/// it makes something of, as the standard library's sockets bind: a host
+/// name is resolved on the calling thread, which waits for it. If it makes
+/// nothing, the error of the last address, or one of kind `InvalidInput` if
+/// `addr` resolves to none.
+fn first_bound<T>(
+    addr: impl ToSocketAddrs,
+    make: impl Fn(&SocketAddr) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut last = None;
+    for addr in addr.to_socket_addrs()? {
+        match make(&addr) {
+            Ok(made) => return Ok(made),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "could not resolve to any addresses",
+        )
+    }))
 }
 
 /// A socket address as Winsock takes it: the bytes of a `sockaddr_in` or of
@@ -404,16 +477,29 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    /// Binds a listener to `addr`, as `std::net::TcpListener::bind` does:
-    /// a host name is resolved on the calling thread, which waits for it.
+    /// Binds a listener to `addr`, or to the first address it resolves to
+    /// that it can be bound to, as `std::net::TcpListener::bind` does: a
+    /// host name is resolved on the calling thread, which waits for it. A
+    /// listener on an IPv6 address accepts connections from IPv4 addresses
+    /// too, as on Linux, whose peers it reports in their IPv6 form.
     ///
     /// # Errors
     ///
-    /// What binding reports, as when the address is in use, and an error of
+    /// What binding and listening report, as when the address is in use,
+    /// `InvalidInput` if `addr` resolves to no address, and an error of
     /// kind `Other` if the thread has no current engine, as outside a
     /// runtime.
     pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
-        let listener = net::TcpListener::bind(addr)?;
+        let listener = first_bound(addr, |addr| {
+            let socket = new_socket(family(addr))?;
+            bind_to(&socket, addr)?;
+            // SAFETY: the socket is open and bound.
+            let failed = unsafe { sys::listen(socket.as_raw_socket() as sys::Socket, BACKLOG) };
+            if failed != 0 {
+                return Err(last_error());
+            }
+            Ok(net::TcpListener::from(socket))
+        })?;
         let family = family(&listener.local_addr()?);
         Ok(Self {
             listener: IoHandle::new(listener)?,

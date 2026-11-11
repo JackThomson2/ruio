@@ -185,6 +185,37 @@ fn datagrams_go_over_ipv6() -> io::Result<()> {
 }
 
 #[test]
+fn an_ipv6_socket_hears_and_answers_ipv4_addresses() -> io::Result<()> {
+    if let Err(err) = std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)) {
+        eprintln!("skipped: no IPv6 loopback: {err}");
+        return Ok(());
+    }
+    Runtime::new()?.block_on(async {
+        // The IPv6 form of the IPv4 loopback address, which only a socket
+        // that reaches IPv4 addresses binds to.
+        let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        let six = UdpSocket::bind((mapped, 0))?;
+        let four = UdpSocket::bind(loopback())?;
+        let port = six.local_addr()?.port();
+        let (sent, _) = four
+            .send_to(b"four".to_vec(), (Ipv4Addr::LOCALHOST, port).into())
+            .await;
+        assert_eq!(sent?, 4);
+        let (received, buf) = six.recv_from(Vec::with_capacity(8)).await;
+        let (len, from) = received?;
+        // The sender, in the IPv6 form of its address, which is answered.
+        assert_eq!(from, SocketAddr::from((mapped, four.local_addr()?.port())));
+        assert_eq!((len, &buf[..]), (4, &b"four"[..]));
+        let (sent, _) = six.send_to(b"six".to_vec(), from).await;
+        assert_eq!(sent?, 3);
+        let (received, buf) = four.recv_from(Vec::with_capacity(8)).await;
+        assert_eq!(received?, (3, (Ipv4Addr::LOCALHOST, port).into()));
+        assert_eq!(buf, b"six");
+        Ok(())
+    })
+}
+
+#[test]
 fn a_socket_keeps_the_option_to_broadcast() -> io::Result<()> {
     Runtime::new()?.block_on(async {
         let socket = UdpSocket::bind(loopback())?;

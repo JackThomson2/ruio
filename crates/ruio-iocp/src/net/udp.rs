@@ -13,7 +13,10 @@ use std::task::{Context, Poll, ready};
 
 use ruio_buf::{BufResult, IoBuf, IoBufMut};
 
-use super::{RawAddr, handle_of, last_error, outcome, socket_of, start_recv, start_send, taken};
+use super::{
+    RawAddr, bind_to, family, first_bound, handle_of, last_error, open_socket, outcome, socket_of,
+    start_recv, start_send, taken,
+};
 use crate::handle::{IoHandle, Raw};
 use crate::op::{Op, Read, Started, Write};
 use crate::sys;
@@ -39,16 +42,23 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
-    /// Binds a socket to `addr`, as `std::net::UdpSocket::bind` does: a
-    /// host name is resolved on the calling thread, which waits for it.
+    /// Binds a socket to `addr`, or to the first address it resolves to
+    /// that it can be bound to, as `std::net::UdpSocket::bind` does: a host
+    /// name is resolved on the calling thread, which waits for it. A socket
+    /// on an IPv6 address sends to and receives from IPv4 addresses too, as
+    /// on Linux, in their IPv6 form.
     ///
     /// # Errors
     ///
-    /// What binding reports, as when the address is in use, and an error of
-    /// kind `Other` if the thread has no current engine, as outside a
-    /// runtime.
+    /// What binding reports, as when the address is in use, `InvalidInput`
+    /// if `addr` resolves to no address, and an error of kind `Other` if
+    /// the thread has no current engine, as outside a runtime.
     pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
-        let socket = net::UdpSocket::bind(addr)?;
+        let socket = first_bound(addr, |addr| {
+            let socket = open_socket(family(addr), sys::SOCK_DGRAM, sys::IPPROTO_UDP)?;
+            bind_to(&socket, addr)?;
+            Ok(net::UdpSocket::from(socket))
+        })?;
         // By default, a datagram that finds nobody at its port has Windows
         // fail the sender's receives with a reset, until one reports it.
         let report: u32 = 0;

@@ -252,6 +252,67 @@ fn sockets_speak_ipv6() -> io::Result<()> {
     })
 }
 
+/// Whether the system has an IPv6 loopback address, which says so where it
+/// has none.
+fn has_ipv6() -> bool {
+    match std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("skipped: no IPv6 loopback: {err}");
+            false
+        }
+    }
+}
+
+#[test]
+fn an_ipv6_listener_accepts_connections_from_ipv4_addresses() -> io::Result<()> {
+    if !has_ipv6() {
+        return Ok(());
+    }
+    Runtime::new()?.block_on(async {
+        // The IPv6 form of the IPv4 loopback address, which only a socket
+        // that reaches IPv4 addresses binds to.
+        let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        let listener = TcpListener::bind((mapped, 0))?;
+        let port = listener.local_addr()?.port();
+        let client = TcpStream::connect((Ipv4Addr::LOCALHOST, port).into()).await?;
+        let (server, peer) = listener.accept().await?;
+        // The peer is the client, in the IPv6 form of its address.
+        let from = client.local_addr()?;
+        assert_eq!(from.ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(peer, SocketAddr::from((mapped, from.port())));
+        let (written, _) = client.write(b"four".to_vec()).await;
+        assert_eq!(written?, 4);
+        let (read, buf) = server.read(Vec::with_capacity(8)).await;
+        assert_eq!(read?, 4);
+        assert_eq!(buf, b"four");
+        Ok(())
+    })
+}
+
+#[test]
+fn a_stream_reaches_an_ipv4_listener_at_the_ipv6_form_of_its_address() -> io::Result<()> {
+    if !has_ipv6() {
+        return Ok(());
+    }
+    Runtime::new()?.block_on(async {
+        let listener = TcpListener::bind(loopback())?;
+        let port = listener.local_addr()?.port();
+        let mapped = SocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), port));
+        let client = TcpStream::connect(mapped).await?;
+        let (server, peer) = listener.accept().await?;
+        assert_eq!(client.peer_addr()?, mapped);
+        assert_eq!(peer.ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(peer.port(), client.local_addr()?.port());
+        let (written, _) = server.write(b"six".to_vec()).await;
+        assert_eq!(written?, 3);
+        let (read, buf) = client.read(Vec::with_capacity(8)).await;
+        assert_eq!(read?, 3);
+        assert_eq!(buf, b"six");
+        Ok(())
+    })
+}
+
 #[test]
 fn a_stream_shut_down_for_writing_still_reads() -> io::Result<()> {
     Runtime::new()?.block_on(async {
