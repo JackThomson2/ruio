@@ -22,6 +22,9 @@ const WAKE: usize = 0;
 /// their operations complete.
 const IO: usize = 1;
 
+/// The completion key of the packets the engine's fine timer posts.
+const TIMER: usize = 2;
+
 /// The most completions a turn takes from the port at once.
 const BATCH: usize = 64;
 
@@ -63,6 +66,9 @@ struct Inner {
     armed: Cell<Option<Duration>>,
     /// Whether the timer has fired since `timer_fired` last asked.
     fired: Cell<bool>,
+    /// The timer that wakes the port when a wait's deadline comes, where
+    /// the system has one finer than the tick its own waits end at.
+    fine: Option<FineTimer>,
     /// How many operations the system has taken whose completions have not
     /// been delivered.
     in_flight: Cell<usize>,
@@ -136,6 +142,141 @@ fn milliseconds_until(deadline: Duration) -> u32 {
     u32::try_from(left).map_or(sys::INFINITE - 1, |ms| ms.min(sys::INFINITE - 1))
 }
 
+/// A timer that ends a wait on the port when its deadline comes, rather
+/// than at the tick of Windows' timer after it, which may be 15 ms later:
+/// a high-resolution waitable timer, and the wait completion packet
+/// through which its expiry is posted to the port.
+///
+/// The packet waits for the timer, not for a deadline, so a timer that is
+/// set anew while the packet waits takes one call. Once the timer has
+/// expired, the packet lies in the port until a turn takes it, and is then
+/// associated again the next time the timer is set.
+struct FineTimer {
+    timer: sys::Handle,
+    packet: sys::Handle,
+    /// The deadline the timer is set for, while the packet waits for it or
+    /// lies in the port: `None` before the timer is first set, and once a
+    /// turn has taken the packet.
+    set: Cell<Option<Duration>>,
+}
+
+impl FineTimer {
+    /// A timer of the finest kind the system has, and a packet for it, or
+    /// `None` where the system has not both, as before Windows 10's
+    /// version 1803: waits there end at the ticks of Windows' timer.
+    fn new() -> Option<Self> {
+        // SAFETY: a timer with no name and the default security.
+        let timer = unsafe {
+            sys::CreateWaitableTimerExW(
+                ptr::null(),
+                ptr::null(),
+                sys::CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                sys::TIMER_ALL_ACCESS,
+            )
+        };
+        if timer.is_null() {
+            return None;
+        }
+        let mut packet = ptr::null_mut();
+        // SAFETY: the handle is written to `packet` during the call, and
+        // the packet gets the default attributes.
+        let status = unsafe {
+            sys::NtCreateWaitCompletionPacket(&mut packet, sys::GENERIC_ALL, ptr::null())
+        };
+        if status < sys::STATUS_SUCCESS || packet.is_null() {
+            // SAFETY: the timer was just made, and nothing else has it.
+            unsafe { sys::CloseHandle(timer) };
+            return None;
+        }
+        Some(Self {
+            timer,
+            packet,
+            set: Cell::new(None),
+        })
+    }
+
+    /// Sets the timer to post a packet to `port` at `deadline`, a time on
+    /// the engines' clock, unless it is set for it already, and says
+    /// whether the deadline came as it did, when no packet follows. A timer
+    /// the system fails to set is left as it was: the wait then ends by its
+    /// own timeout.
+    fn set(&self, port: sys::Handle, deadline: Duration) -> bool {
+        let waits = match self.set.get() {
+            Some(at) if at == deadline => return false,
+            // The packet waits for the timer, or lies in the port, where
+            // the next turn takes it, and the timer is then set again.
+            Some(_) => true,
+            None => false,
+        };
+        // In units of 100 ns, of which a timer from now takes one at least.
+        let left = deadline.saturating_sub(now()).as_nanos().div_ceil(100);
+        let due = -i64::try_from(left).unwrap_or(i64::MAX).max(1);
+        // SAFETY: the timer is open, and the time is read during the call;
+        // it has no period, no completion routine, and wakes no system.
+        let set =
+            unsafe { sys::SetWaitableTimer(self.timer, &due, 0, ptr::null(), ptr::null(), 0) };
+        if set == 0 {
+            return false;
+        }
+        if waits {
+            self.set.set(Some(deadline));
+            return false;
+        }
+        let mut signaled = 0;
+        // SAFETY: the packet, the port and the timer are open; the key is
+        // no pointer, and the packet carries nothing else; and `signaled`
+        // is written during the call.
+        let status = unsafe {
+            sys::NtAssociateWaitCompletionPacket(
+                self.packet,
+                port,
+                self.timer,
+                ptr::without_provenance_mut(TIMER),
+                ptr::null_mut(),
+                sys::STATUS_SUCCESS,
+                0,
+                &mut signaled,
+            )
+        };
+        if status < sys::STATUS_SUCCESS {
+            return false;
+        }
+        if signaled != 0 {
+            // The timer expired between the two calls. The packet it may
+            // have posted is taken back, so that the packet is free for
+            // the next deadline whether it was posted or not.
+            self.cancel();
+            return true;
+        }
+        self.set.set(Some(deadline));
+        false
+    }
+    /// Ends the packet's wait for the timer, and takes the packet it posted
+    /// out of the port, if no turn has taken it.
+    fn cancel(&self) {
+        // SAFETY: the packet is open. One that neither waits nor lies in a
+        // port is left as it is.
+        unsafe { sys::NtCancelWaitCompletionPacket(self.packet, 1) };
+    }
+
+    /// Records that a turn took the packet the timer posted, which is the
+    /// engine's to associate again.
+    fn taken(&self) {
+        self.set.set(None);
+    }
+}
+
+impl Drop for FineTimer {
+    fn drop(&mut self) {
+        // The packet waits for the timer no more before either is closed.
+        self.cancel();
+        // SAFETY: the packet is open, and the engine's alone.
+        unsafe { sys::CloseHandle(self.packet) };
+        // SAFETY: as for the packet.
+        unsafe { sys::CloseHandle(self.timer) };
+    }
+}
+
 impl Iocp {
     fn new(builder: &Builder) -> io::Result<Self> {
         // SAFETY: given no file and no port, this makes a port, for one
@@ -156,6 +297,7 @@ impl Iocp {
                 stash: RefCell::default(),
                 armed: Cell::new(None),
                 fired: Cell::new(false),
+                fine: FineTimer::new(),
                 in_flight: Cell::new(0),
                 detached: op::DetachedOps::default(),
                 closing: Cell::new(false),
@@ -227,8 +369,10 @@ impl Inner {
         }
     }
 
-    /// Delivers completions taken from the port.
-    fn deliver(&self, entries: &[sys::OverlappedEntry]) {
+    /// Delivers completions taken from the port, and says how many there
+    /// were besides the fine timer's own packets.
+    fn deliver(&self, entries: &[sys::OverlappedEntry]) -> usize {
+        let mut delivered = entries.len();
         for entry in entries {
             match entry.completion_key {
                 WAKE => self.shared.notified.store(false, Ordering::SeqCst),
@@ -239,10 +383,17 @@ impl Inner {
                     // port hands back once.
                     unsafe { op::complete(entry, &self.detached, !self.closing.get()) };
                 }
+                TIMER => {
+                    if let Some(fine) = &self.fine {
+                        fine.taken();
+                    }
+                    delivered -= 1;
+                }
                 // Nothing posts under another key.
                 _ => {}
             }
         }
+        delivered
     }
 
     /// Delivers what a check for work took from the port and what the port
@@ -260,11 +411,22 @@ impl Inner {
         let mut entries = [sys::OverlappedEntry::EMPTY; BATCH];
         loop {
             let milliseconds = deadline.map_or(sys::INFINITE, milliseconds_until);
+            // A wait with a deadline ends by the fine timer's packet when
+            // the deadline comes; its own timeout, which Windows counts in
+            // milliseconds from a tick of its timer, stands behind that.
+            if milliseconds > 0
+                && let (Some(fine), Some(deadline)) = (&self.fine, deadline)
+                && fine.set(self.shared.port, deadline)
+            {
+                continue;
+            }
             let taken = self.dequeue(&mut entries, milliseconds)?;
-            self.deliver(&entries[..taken]);
-            // A wait may end a little before its timeout, at a tick of
-            // Windows' timer, so one that took nothing waits out the rest.
-            if taken > 0 || milliseconds == 0 {
+            let delivered = self.deliver(&entries[..taken]);
+            // A wait may end a little before its deadline, at a tick of
+            // Windows' timer, or by a packet of the fine timer's from when
+            // it was set for another, so one that delivered nothing waits
+            // out the rest.
+            if delivered > 0 || milliseconds == 0 {
                 break;
             }
         }
@@ -331,11 +493,16 @@ impl Engine for Iocp {
         match inner.dequeue(&mut entries, 0) {
             Ok(0) => false,
             Ok(taken) => {
-                inner
-                    .stash
-                    .borrow_mut()
-                    .extend_from_slice(&entries[..taken]);
-                true
+                let mut stash = inner.stash.borrow_mut();
+                for entry in &entries[..taken] {
+                    match (&inner.fine, entry.completion_key) {
+                        // The timer's packet is no work of its own: the
+                        // deadline it was set for is, once it has come.
+                        (Some(fine), TIMER) => fine.taken(),
+                        _ => stash.push(*entry),
+                    }
+                }
+                !stash.is_empty() || inner.armed.get().is_some_and(|deadline| deadline <= now())
             }
             // The next turn meets the error again, and reports it.
             Err(_) => true,
@@ -523,5 +690,111 @@ mod tests {
         assert_eq!(Iocp::current().map(|e| e.id()), Some(outer.id()));
         drop(entered);
         assert!(Iocp::current().is_none());
+    }
+
+    /// Whether `engine` has a timer finer than the ticks of Windows' own,
+    /// which a system before Windows 10's version 1803 does not give it:
+    /// its parks then end at those ticks, and the tests of when they end
+    /// have nothing to test.
+    fn has_fine_timer(engine: &Iocp) -> bool {
+        let fine = engine.inner.fine.is_some();
+        if !fine {
+            eprintln!("skipped: the system has no high-resolution timer");
+        }
+        fine
+    }
+
+    /// How long `parks` parks of `each` take: the least of three tries, as
+    /// what else runs on the machine can only make them longer.
+    fn parks(engine: &Iocp, parks: u32, each: Duration) -> Duration {
+        (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                for _ in 0..parks {
+                    let before = Instant::now();
+                    engine.park(Some(each)).unwrap();
+                    assert!(before.elapsed() >= each, "a park ended early");
+                }
+                started.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    #[test]
+    fn parks_end_at_their_deadlines_and_not_at_the_ticks_after() {
+        let engine = Builder::new().build().unwrap();
+        if !has_fine_timer(&engine) {
+            return;
+        }
+        // Each park's packet is taken, and the timer's packet associated
+        // again for the next. Waits that end at the ticks of Windows'
+        // timer, 15.6 ms apart, would take 300 ms.
+        let took = parks(&engine, 20, Duration::from_millis(2));
+        assert!(
+            took < Duration::from_millis(150),
+            "20 parks of 2 ms took {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_timer_set_for_another_deadline_ends_the_park_at_the_new_one() {
+        let engine = Builder::new().build().unwrap();
+        if !has_fine_timer(&engine) {
+            return;
+        }
+        for _ in 0..3 {
+            // The park sets the timer for an hour from now, and is woken at
+            // once, with the packet still waiting for the timer.
+            engine.unparker().unpark();
+            engine.park(Some(Duration::from_secs(3600))).unwrap();
+            let took = parks(&engine, 1, Duration::from_millis(3));
+            assert!(
+                took < Duration::from_millis(15),
+                "a park of 3 ms took {took:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_packet_of_an_earlier_deadline_does_not_end_a_later_park() {
+        let engine = Builder::new().build().unwrap();
+        if !has_fine_timer(&engine) {
+            return;
+        }
+        // The park sets the timer for a millisecond from now and is woken
+        // at once; the timer then expires with no turn to take its packet.
+        engine.unparker().unpark();
+        engine.park(Some(Duration::from_millis(1))).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let started = Instant::now();
+        engine.park(Some(Duration::from_millis(40))).unwrap();
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(40), "the park took {took:?}");
+        // Long before the tick after it, which is as late as a wait that
+        // the timer does not end can be.
+        assert!(took < Duration::from_millis(50), "the park took {took:?}");
+    }
+
+    #[test]
+    fn the_timer_wakes_a_park_without_a_timeout_when_it_is_due() {
+        let engine = Builder::new().build().unwrap();
+        if !has_fine_timer(&engine) {
+            return;
+        }
+        let took = (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                engine
+                    .wake_at(Iocp::monotonic_now() + Duration::from_millis(3))
+                    .unwrap();
+                engine.park(None).unwrap();
+                assert!(engine.timer_fired());
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(took >= Duration::from_millis(3), "the park took {took:?}");
+        assert!(took < Duration::from_millis(15), "the park took {took:?}");
     }
 }

@@ -5,8 +5,12 @@
 //! the handles associated with it, as io_uring's completion queue holds
 //! those of the ring's on Linux. A park waits on the port with
 //! `GetQueuedCompletionStatusEx`, an unpark posts a packet of its own to
-//! it, and the engine's one deadline timer is the park's timeout, which
-//! Windows counts in milliseconds and ends at a tick of its timer.
+//! it, and the engine's one deadline timer is a high-resolution waitable
+//! timer, whose expiry a wait completion packet posts to the port, so
+//! that a park ends within a fraction of a millisecond of its deadline.
+//! The park's own timeout stands behind it, which Windows counts in
+//! milliseconds and ends at a tick of its timer, some 15 ms apart, and
+//! stands alone before Windows 10's version 1803.
 //!
 //! Files (`fs::File`), named pipes (`pipe::NamedPipe`) and TCP and UDP
 //! sockets (`net::TcpListener`, `net::TcpStream`, `net::UdpSocket`) read

@@ -1,7 +1,9 @@
 //! The Windows functions and structures the engine uses, declared by hand
 //! from the Windows SDK's headers (`minwinbase.h`, `ioapiset.h`,
-//! `fileapi.h`, `namedpipeapi.h`, `handleapi.h`, `winternl.h`, `winsock2.h`,
-//! `mswsock.h`), as `ruio-sys` declares io_uring's.
+//! `fileapi.h`, `namedpipeapi.h`, `handleapi.h`, `synchapi.h`,
+//! `winternl.h`, `winsock2.h`, `mswsock.h`), as `ruio-sys` declares
+//! io_uring's; and the wait completion packets of `ntdll`, which the
+//! headers do not declare.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -35,6 +37,20 @@ pub(crate) const ERROR_IO_PENDING: u32 = 997;
 /// has not completed, which the calls that start one set before they ask
 /// the system for it.
 pub(crate) const STATUS_PENDING: u32 = 0x0000_0103;
+
+/// `STATUS_SUCCESS`.
+pub(crate) const STATUS_SUCCESS: i32 = 0;
+
+/// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`: a timer that expires when it
+/// is due rather than at the next tick of the system's timer, which
+/// Windows 10 has from its version 1803.
+pub(crate) const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
+
+/// `TIMER_ALL_ACCESS`: every right to a timer.
+pub(crate) const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+
+/// `GENERIC_ALL`: every right to an object.
+pub(crate) const GENERIC_ALL: u32 = 0x1000_0000;
 
 /// `FILE_FLAG_OVERLAPPED`: a handle opened for overlapped I/O, whose
 /// operations may complete after the calls that start them return.
@@ -314,6 +330,27 @@ unsafe extern "system" {
     /// Closes a handle.
     pub(crate) fn CloseHandle(handle: Handle) -> Bool;
 
+    /// Creates a waitable timer with no name, as `flags` say and with the
+    /// rights of `access`, or returns null.
+    pub(crate) fn CreateWaitableTimerExW(
+        attributes: *const c_void,
+        name: *const u16,
+        flags: u32,
+        access: u32,
+    ) -> Handle;
+
+    /// Sets `timer` to expire at `due`, in units of 100 ns: a time from now
+    /// if negative. A timer that was set is set anew, and is not signaled
+    /// meanwhile, so that what waits for it still does.
+    pub(crate) fn SetWaitableTimer(
+        timer: Handle,
+        due: *const i64,
+        period: i32,
+        completion: *const c_void,
+        completion_arg: *const c_void,
+        resume: Bool,
+    ) -> Bool;
+
     /// The calling thread's last error.
     pub(crate) safe fn GetLastError() -> u32;
 }
@@ -323,6 +360,45 @@ unsafe extern "system" {
     /// The Windows error that an `NTSTATUS`, as an operation's `OVERLAPPED`
     /// holds, stands for.
     pub(crate) safe fn RtlNtStatusToDosError(status: i32) -> u32;
+}
+
+// By name from the library itself, as the SDK's import library need not
+// have what its headers do not declare.
+#[cfg_attr(
+    target_arch = "x86",
+    link(name = "ntdll", kind = "raw-dylib", import_name_type = "undecorated")
+)]
+#[cfg_attr(not(target_arch = "x86"), link(name = "ntdll", kind = "raw-dylib"))]
+unsafe extern "system" {
+    /// Creates a wait completion packet, which posts a packet to a port
+    /// once an object it is associated with is signaled, and writes its
+    /// handle to `packet`. An `NTSTATUS`: negative on failure.
+    pub(crate) fn NtCreateWaitCompletionPacket(
+        packet: *mut Handle,
+        access: u32,
+        attributes: *const c_void,
+    ) -> i32;
+
+    /// Has `packet` post a packet to `port`, under `key` and with
+    /// `overlapped`, `status` and `information`, once `target` is signaled:
+    /// once, after which it can be associated again. `signaled` is set if
+    /// the target was signaled already. An `NTSTATUS`: negative on failure,
+    /// as when the packet is associated already, or lies in a port.
+    pub(crate) fn NtAssociateWaitCompletionPacket(
+        packet: Handle,
+        port: Handle,
+        target: Handle,
+        key: *mut c_void,
+        overlapped: *mut c_void,
+        status: i32,
+        information: usize,
+        signaled: *mut u8,
+    ) -> i32;
+
+    /// Ends `packet`'s wait for the object it is associated with, and takes
+    /// the packet it posted out of its port if `remove_signaled` is not
+    /// zero and no turn has taken it yet. An `NTSTATUS`.
+    pub(crate) fn NtCancelWaitCompletionPacket(packet: Handle, remove_signaled: u8) -> i32;
 }
 
 #[link(name = "ws2_32")]
