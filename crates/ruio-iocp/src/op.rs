@@ -1261,6 +1261,32 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_that_does_not_wait_delivers_what_has_completed() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let name = pipe_name("submitted");
+        let handle = IoHandle::new(server(&name)?)?;
+        let mut writer = client(&name)?;
+        probe(&handle, 3, &told).map_err(|(err, _)| err)?;
+        // The read is in flight, so a turn asks the port, which has nothing
+        // until the client writes.
+        engine.submit()?;
+        assert!(told.borrow().is_empty());
+        writer.write_all(b"data")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while told.borrow().is_empty() && Instant::now() < deadline {
+            engine.submit()?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(*told.borrow(), [(3, Ok(b"data".to_vec()), true)]);
+        // With nothing in flight again, a turn has nothing to ask for.
+        engine.submit()?;
+        assert!(!engine.has_work());
+        Ok(())
+    }
+
+    #[test]
     fn an_engine_dropped_cancels_what_was_left_to_finish_by_itself() -> io::Result<()> {
         // Long enough that only the read's cancellation, not the timeout,
         // ends the wait in time.

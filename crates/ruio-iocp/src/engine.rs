@@ -421,16 +421,22 @@ impl Inner {
     /// Delivers what a check for work took from the port and what the port
     /// has, waiting for a completion until `deadline`, a time on the
     /// engines' clock, or for ever if there is none, unless the check took
-    /// some already.
+    /// some already. A turn that would not wait asks the port for nothing
+    /// when the port can hold nothing for it.
     fn turn(&self, deadline: Option<Duration>) -> io::Result<()> {
         self.at_once.set(0);
-        let stashed = mem::take(&mut *self.stash.borrow_mut());
-        let deadline = if stashed.is_empty() {
-            deadline
-        } else {
+        let mut deadline = deadline;
+        if !self.stash.borrow().is_empty() {
+            let stashed = mem::take(&mut *self.stash.borrow_mut());
             self.deliver(&stashed);
-            Some(Duration::ZERO)
-        };
+            deadline = Some(Duration::ZERO);
+        }
+        // The clock is not read for a turn that asks for no wait at all,
+        // which is what the executor makes between its tasks.
+        if self.idle() && deadline.is_some_and(|deadline| deadline.is_zero() || deadline <= now()) {
+            self.check_timer();
+            return Ok(());
+        }
         let mut entries = [sys::OverlappedEntry::EMPTY; BATCH];
         loop {
             let milliseconds = deadline.map_or(sys::INFINITE, milliseconds_until);
@@ -455,6 +461,14 @@ impl Inner {
         }
         self.check_timer();
         Ok(())
+    }
+
+    /// Whether the port holds nothing for a turn to deliver: no operation
+    /// is in flight, and no unpark has posted a packet. A packet of the
+    /// fine timer's may lie there, which is no work, and which the next
+    /// turn that waits takes.
+    fn idle(&self) -> bool {
+        self.in_flight.get() == 0 && !self.shared.notified.load(Ordering::SeqCst)
     }
 
     /// Records that the timer fired, if its deadline has passed.
@@ -511,6 +525,11 @@ impl Engine for Iocp {
             || inner.armed.get().is_some_and(|deadline| deadline <= now())
         {
             return true;
+        }
+        // No unpark has posted, so with no operation in flight the port
+        // holds no work, and is not asked.
+        if inner.in_flight.get() == 0 {
+            return false;
         }
         let mut entries = [sys::OverlappedEntry::EMPTY; BATCH];
         match inner.dequeue(&mut entries, 0) {
@@ -685,6 +704,46 @@ mod tests {
         let started = Instant::now();
         engine.park(Some(Duration::from_millis(20))).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn a_turn_that_does_not_wait_takes_the_packet_of_an_unpark() {
+        let engine = Builder::new().build().unwrap();
+        // Nothing is in flight and no unpark has posted: nothing to take.
+        engine.submit().unwrap();
+        assert!(!engine.has_work());
+        engine.unparker().unpark();
+        assert!(engine.has_work());
+        engine.submit().unwrap();
+        assert!(!engine.has_work());
+        // The packet is gone, so a park waits out its timeout.
+        let started = Instant::now();
+        engine.park(Some(Duration::from_millis(20))).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn a_turn_that_asks_the_port_for_nothing_still_notices_the_timer() {
+        let engine = Builder::new().build().unwrap();
+        engine.wake_at(Iocp::monotonic_now()).unwrap();
+        engine.submit().unwrap();
+        assert!(engine.timer_fired());
+        assert!(!engine.timer_fired());
+
+        // One that is due later is noticed once it is.
+        engine
+            .wake_at(Iocp::monotonic_now() + Duration::from_millis(5))
+            .unwrap();
+        engine.submit().unwrap();
+        assert!(!engine.timer_fired());
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(engine.has_work());
+        engine.submit().unwrap();
+        assert!(engine.timer_fired());
+        // A park whose timeout has passed is such a turn too.
+        engine.wake_at(Iocp::monotonic_now()).unwrap();
+        engine.park(Some(Duration::ZERO)).unwrap();
+        assert!(engine.timer_fired());
     }
 
     #[test]
