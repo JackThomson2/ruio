@@ -1,7 +1,7 @@
 //! hyper serves HTTP/2 through the adapters, with ruio's executor running
 //! the streams, to hyper's own client through them too.
 
-#![cfg(feature = "hyper")]
+#![cfg(all(feature = "hyper", ruio_compat_ring))]
 
 mod support;
 

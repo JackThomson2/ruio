@@ -1,7 +1,7 @@
 //! hyper-util's client on ruio: its connections are portable TCP streams,
 //! its tasks and timers ruio's, and one client serves tasks on every core.
 
-#![cfg(all(feature = "client", feature = "tokio"))]
+#![cfg(all(feature = "client", feature = "tokio", ruio_uring))]
 
 mod support;
 

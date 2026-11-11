@@ -3,7 +3,7 @@
 //! tokio's reactor. No foreign ring is set in this test binary, so a wait
 //! that went to one would fail with `Unsupported` instead.
 
-#![cfg(feature = "tokio-reactor")]
+#![cfg(all(feature = "tokio-reactor", ruio_uring))]
 
 use std::future::Future;
 use std::io;

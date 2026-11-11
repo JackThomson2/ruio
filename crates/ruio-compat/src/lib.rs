@@ -45,6 +45,46 @@ Like the streams, an adapter belongs to its thread, whose runtime's ring
 runs its I/O."#
 )]
 #![cfg_attr(
+    ruio_compat_generic,
+    doc = r#"
+[`Compat`] bridges the two with buffers of its own, for a
+[`TcpStream`](ruio::net::TcpStream) or a [`File`](ruio::fs::File) at its
+position, with the stream's own reads and writes, which the traits of
+[`ruio::io`] give it, and a stream socket's own `write_all`:
+
+- A read goes into the adapter's buffer, and copies out as much as the
+  caller's takes; the rest waits for the next read, and `AsyncBufRead`
+  lends it out as it is. A read stays in flight from one poll to the
+  next, however long the caller takes to poll again, so nothing it reads
+  is lost; dropping the adapter cancels it.
+- A write copies the caller's bytes and starts the stream's write of
+  them, which for a socket sees them all out by itself: it is done, as
+  far as the caller can tell, once the write is on its way, and the next
+  write waits for it to finish. How the write went comes out later: a
+  failure fails the writes, flushes and closes after it. Dropping the
+  adapter leaves the write to finish, in a task of its own, and the
+  stream closes after it; dropped outside a runtime, where no task would
+  run, the adapter cancels the write instead.
+- A flush has nothing to wait for, since the adapter holds nothing back:
+  it reports a failure if one is known, as a socket's flush would. Were
+  it to wait for the write to finish, each flush would cost its task
+  another wake-up.
+- Closing waits for the write in flight, then shuts down the writing half
+  of a connection; a file has no half to shut.
+
+The stream's reads and writes borrow the stream, so the adapter keeps it
+where they can, shared, for as long as it lives: it lends the stream out
+with [`get_ref`](Compat::get_ref), and has no way to hand it back. Like
+the streams, an adapter belongs to its thread, whose runtime runs its
+I/O.
+
+This is the adapter of every engine but io_uring, which has one built on
+the ring's own operations, with nothing shared and a pool to receive
+into. A build for io_uring has this one instead when it asks for it with
+`--cfg ruio_compat="generic"`, as the tests of this adapter do, and then
+it adapts a `UnixStream` too."#
+)]
+#![cfg_attr(
     ruio_uring,
     doc = r#"
 [`PortableCompat`] adapts ruio's portable streams, of
@@ -67,12 +107,19 @@ rather than on the foreign ring, where each wait cost two wakes across
 threads."#
 )]
 #![cfg_attr(
-    not(ruio_uring),
+    ruio_iocp,
     doc = r#"
-The adapters are built on io_uring's operations, and come with that
-engine alone so far: built for another, the crate has what asks nothing
-of an engine, [`Executor`] and [`Timer`], and the features that name an
-adapter add nothing."#
+`PortableCompat`, the `client` module and `TokioReactor` are made of
+io_uring's portable streams and of descriptors, and come with that engine
+alone: the `client` and `tokio-reactor` features add nothing here."#
+)]
+#![cfg_attr(
+    not(any(ruio_uring, ruio_iocp)),
+    doc = r#"
+Built for an engine ruio offers no I/O on, as the park engine is, the
+crate has no stream to adapt: it has what asks nothing of an engine,
+[`Executor`] and [`Timer`], and the features that name an adapter add
+nothing."#
 )]
 //!
 //! With the `hyper` feature, on by default, an adapter has hyper's own I/O
@@ -82,7 +129,7 @@ adapter add nothing."#
 //! gives hyper ruio's timers, which its timeouts need: that for reading a
 //! request's head, say.
 #![cfg_attr(
-    ruio_compat_ring,
+    any(ruio_compat_ring, ruio_compat_generic),
     doc = r#"
 ```no_run
 use ruio::net::TcpStream;
@@ -112,9 +159,11 @@ family's, or call through the trait, as in
 pub mod client;
 #[cfg(feature = "hyper")]
 mod executor;
-#[cfg(all(feature = "futures-io", ruio_compat_ring))]
+#[cfg(all(feature = "futures-io", any(ruio_compat_ring, ruio_compat_generic)))]
 mod futures_impls;
-#[cfg(all(feature = "hyper", ruio_compat_ring))]
+#[cfg(ruio_compat_generic)]
+mod generic;
+#[cfg(all(feature = "hyper", any(ruio_compat_ring, ruio_compat_generic)))]
 mod hyper_impls;
 #[cfg(ruio_uring)]
 mod portable;
@@ -122,13 +171,15 @@ mod portable;
 mod ring;
 #[cfg(feature = "hyper")]
 mod timer;
-#[cfg(all(feature = "tokio", ruio_compat_ring))]
+#[cfg(all(feature = "tokio", any(ruio_compat_ring, ruio_compat_generic)))]
 mod tokio_impls;
 #[cfg(all(feature = "tokio-reactor", ruio_uring))]
 mod tokio_reactor;
 
 #[cfg(feature = "hyper")]
 pub use executor::Executor;
+#[cfg(ruio_compat_generic)]
+pub use generic::{Adaptable, Compat};
 #[cfg(ruio_uring)]
 pub use portable::{PortableCompat, PortableReader, PortableStream, PortableWriter};
 #[cfg(ruio_compat_ring)]

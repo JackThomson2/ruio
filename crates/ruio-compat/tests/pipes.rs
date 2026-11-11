@@ -1,7 +1,12 @@
 //! The adapter for a child's pipes: tokio's, futures-io's and hyper's
 //! traits over the pipes of a `cat`, each pipe with its own direction.
 
-#![cfg(all(feature = "tokio", feature = "futures-io", feature = "hyper"))]
+#![cfg(all(
+    feature = "tokio",
+    feature = "futures-io",
+    feature = "hyper",
+    ruio_uring
+))]
 
 mod support;
 

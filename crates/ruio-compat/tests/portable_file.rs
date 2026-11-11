@@ -5,7 +5,7 @@
 //! ruio runtime, and from the workers of tokio's runtime, whose waits go to
 //! a ruio runtime's ring set as the foreign one.
 
-#![cfg(all(feature = "tokio", feature = "futures-io"))]
+#![cfg(all(feature = "tokio", feature = "futures-io", ruio_uring))]
 
 mod support;
 

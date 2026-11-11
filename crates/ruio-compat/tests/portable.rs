@@ -3,7 +3,12 @@
 //! writing from them; hyper over HTTP/1.1 and HTTP/2 and over TLS through it,
 //! and a connection that moves between cores.
 
-#![cfg(all(feature = "hyper", feature = "tokio", feature = "futures-io"))]
+#![cfg(all(
+    feature = "hyper",
+    feature = "tokio",
+    feature = "futures-io",
+    ruio_uring
+))]
 
 mod support;
 
