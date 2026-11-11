@@ -9,7 +9,7 @@ use std::task::{Context, Poll, Waker, ready};
 
 use crate::buf::{BufBundle, BufLease, BufPool, Claim};
 use crate::handle::IoHandle;
-use crate::op::Op;
+use crate::op::{Op, Started};
 use crate::sys;
 
 use super::{Socket, outcome, socket_of, taken};
@@ -207,23 +207,24 @@ unsafe fn start_wait(
     socket: sys::Handle,
     byte: &mut u8,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let mut buffer = sys::WsaBuf { len: 0, buf: byte };
     let mut flags = 0;
+    let mut received = 0;
     // SAFETY: the caller's promise for the socket and the `OVERLAPPED`; the
     // buffer is none of the byte it starts at, which the slot keeps in place
-    // all the same; and Winsock copies the `WSABUF` and reads the flags
-    // before the call returns.
+    // all the same; and Winsock copies the `WSABUF`, reads the flags and
+    // writes the count before the call returns.
     let failed = unsafe {
         sys::WSARecv(
             socket_of(socket),
             &mut buffer,
             1,
-            std::ptr::null_mut(),
+            &mut received,
             &mut flags,
             overlapped,
             std::ptr::null(),
         )
     };
-    taken(failed == 0)
+    taken(failed == 0, received)
 }

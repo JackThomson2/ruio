@@ -22,6 +22,17 @@ impl Raw for Arc<fs::File> {
     fn raw(&self) -> sys::Handle {
         self.as_raw_handle()
     }
+
+    /// A file on a disk may: a read or a write of one succeeds or fails
+    /// outright. Of another kind of file, a pipe or a device, one may end
+    /// with a warning, which the call that started it reports as a failure
+    /// though the operation completed, and it is then not plain from the
+    /// call whether a completion follows.
+    fn may_skip_port(&self) -> bool {
+        // SAFETY: the handle is open, as the file is borrowed.
+        let kind = unsafe { sys::GetFileType(self.raw()) };
+        kind == sys::FILE_TYPE_DISK
+    }
 }
 
 /// A file opened for overlapped I/O, whose reads and writes complete to the

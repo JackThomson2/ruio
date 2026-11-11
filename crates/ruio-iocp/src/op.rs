@@ -17,6 +17,15 @@
 //! completion comes the engine hands what the slot holds the outcome. No
 //! future's drop cancels such an operation, so the engine keeps those in
 //! flight, and cancels them as it is dropped.
+//!
+//! A handle may have asked the system to queue no completion for an
+//! operation that succeeds during the call that starts it, as a read of
+//! data that has arrived does. Such an operation is finished by the poll
+//! that started it, or told how it went there and then if it was left to
+//! finish by itself, and costs no turn of the port. So that a task whose
+//! operations all finish so does not keep the thread from the others, and
+//! the port from being turned, only so many may between two turns: past
+//! that, an operation waits for the next turn to start.
 
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::fmt;
@@ -159,16 +168,27 @@ pub(crate) unsafe fn complete(entry: &sys::OverlappedEntry, detached: &DetachedO
     }
 }
 
+/// How the system took an operation that a call started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Started {
+    /// To complete later.
+    Later,
+    /// Completed during the call, having transferred as many bytes.
+    AtOnce(u32),
+}
+
 /// Starts an operation on `handle` with `payload`, under `overlapped`, and
-/// says whether the system took it, in which case its completion is to come
-/// through the port.
+/// says how the system took it, if it did. Its completion is to come
+/// through the port, unless it completed during the call and the handle
+/// asked the system to queue none for such.
 ///
 /// # Safety
 ///
 /// `handle` must be open and associated with a port, and `payload`, with
 /// the memory it names, and `overlapped` must stay valid and in place until
 /// the completion is delivered.
-pub(crate) type Start<T> = unsafe fn(sys::Handle, &mut T, *mut sys::Overlapped) -> io::Result<()>;
+pub(crate) type Start<T> =
+    unsafe fn(sys::Handle, &mut T, *mut sys::Overlapped) -> io::Result<Started>;
 
 /// Reads the outcome of an operation on `handle` that has completed from
 /// its `overlapped`: how many bytes it transferred, of which the last
@@ -220,6 +240,11 @@ impl<'a, T> Op<'a, T> {
         start: Start<T>,
         outcome: Outcome,
     ) -> Poll<(io::Result<u32>, T)> {
+        // An operation that may finish as it starts waits for the port to
+        // be turned once as many have as may between two turns.
+        if matches!(self.state, OpState::Unstarted(_)) && self.target.defers(cx) {
+            return Poll::Pending;
+        }
         match mem::replace(&mut self.state, OpState::Finished) {
             OpState::Unstarted(payload) => self.start(cx, payload, start),
             OpState::Started(slot) => self.poll_started(cx, slot, outcome),
@@ -233,29 +258,36 @@ impl<'a, T> Op<'a, T> {
         payload: T,
         start: Start<T>,
     ) -> Poll<(io::Result<u32>, T)> {
-        let waker = Some(cx.waker().clone());
-        let header = Header::new(self.offset, State::Waiting, waker, free::<T>);
+        let header = Header::new(self.offset, State::Waiting, None, free::<T>);
         let slot = NonNull::from(Box::leak(Box::new(Slot { header, payload })));
         // SAFETY: the handle is open and associated with the port, as the
         // future borrows it; the slot was just made, and stays where it is
         // until the completion is delivered, the future's until then, or the
         // engine's.
-        match unsafe { launch(self.target.handle, slot, start) } {
-            Err(err) => {
-                // SAFETY: the system did not take the operation, so nothing
-                // will come through the port for it, and the slot is the
-                // future's alone.
-                let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
-                Poll::Ready((Err(err), payload))
-            }
+        let result = match unsafe { launch(self.target, slot, start) } {
             // The outcome, an error included, is read once the completion
-            // has been delivered.
-            Ok(()) => {
+            // has been delivered, which only a turn on this thread does: the
+            // waker is in the slot before that.
+            Ok(Launched::Queued) => {
+                // SAFETY: the slot is allocated until its completion is
+                // delivered, and only this thread uses it.
+                let header = unsafe { &slot.as_ref().header };
+                header.waker.set(Some(cx.waker().clone()));
                 self.target.engine.started();
                 self.state = OpState::Started(slot);
-                Poll::Pending
+                return Poll::Pending;
             }
-        }
+            Ok(Launched::Done(bytes)) => {
+                self.target.engine.finished_at_once();
+                Ok(bytes)
+            }
+            Err(err) => Err(err),
+        };
+        // SAFETY: the system did not take the operation, or has finished
+        // with it, and nothing will come through the port for it either
+        // way, so the slot is the future's alone.
+        let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
+        Poll::Ready((result, payload))
     }
 
     fn poll_started(
@@ -345,20 +377,29 @@ impl<T> Drop for Op<'_, T> {
     }
 }
 
-/// Starts the operation of `slot` on `handle` with `start`, and says whether
-/// the system took it, in which case its completion is to come through the
-/// port: if not, with the error, and nothing comes.
+/// What became of an operation that the system took.
+enum Launched {
+    /// Its completion is to come through the port.
+    Queued,
+    /// It completed during the call that started it, having transferred as
+    /// many bytes, and nothing comes through the port for it.
+    Done(u32),
+}
+
+/// Starts the operation of `slot` on `target` with `start`, and says what
+/// became of it if the system took it: if not, with the error, and nothing
+/// comes through the port.
 ///
 /// # Safety
 ///
-/// `handle` must be open and associated with a port, and `slot` one that
-/// `Box::leak` gave and nothing else uses, which stays where it is until
-/// the completion is delivered, if the system took the operation.
+/// The handle of `target` must be open and associated with a port, and
+/// `slot` one that `Box::leak` gave and nothing else uses, which stays
+/// where it is until the completion is delivered, if one is to come.
 unsafe fn launch<T>(
-    handle: sys::Handle,
+    target: Target<'_>,
     slot: NonNull<Slot<T>>,
     start: Start<T>,
-) -> io::Result<()> {
+) -> io::Result<Launched> {
     // SAFETY: the slot is allocated, and the caller's alone.
     let payload = unsafe { &mut (*slot.as_ptr()).payload };
     // SAFETY: as above; the `OVERLAPPED` lies apart from the payload.
@@ -366,15 +407,25 @@ unsafe fn launch<T>(
     // SAFETY: the caller's promise for the handle; the slot, which holds the
     // payload and the `OVERLAPPED`, stays where it is until the completion
     // is delivered.
-    let started = unsafe { start(handle, payload, overlapped) };
-    // A call that fails at once may have completed the operation all the
-    // same, with a warning, and then its completion is queued too.
-    // SAFETY: the slot is allocated, and the call has returned, so
-    // nothing writes the `OVERLAPPED` while its status is read.
-    let queued = started.is_ok() || completed(unsafe { (*overlapped).internal });
-    match started {
-        Err(err) if !queued => Err(err),
-        _ => Ok(()),
+    match unsafe { start(target.handle, payload, overlapped) } {
+        // The system queues no completion for a call that succeeded on a
+        // handle that asked it not to.
+        Ok(Started::AtOnce(bytes)) if target.skips => Ok(Launched::Done(bytes)),
+        Ok(_) => Ok(Launched::Queued),
+        Err(err) => {
+            // A call that fails at once may have completed the operation all
+            // the same, with a warning, and then its completion is queued
+            // too, whatever the handle asked: the call did not succeed.
+            // SAFETY: the slot is allocated, and the call has returned
+            // without leaving an operation to complete later, so nothing
+            // writes the `OVERLAPPED` while its status is read.
+            let status = unsafe { (*overlapped).internal };
+            if completed(status) {
+                Ok(Launched::Queued)
+            } else {
+                Err(err)
+            }
+        }
     }
 }
 
@@ -392,6 +443,12 @@ pub(crate) trait Detached: Sized {
     /// completion has been delivered, still where the operation was started
     /// with it, and valid until the call returns.
     unsafe fn complete(self, overlapped: *const sys::Overlapped, bytes: u32, wake: bool);
+
+    /// Takes the outcome of the operation where it completed during the
+    /// call that started it, having transferred `bytes`: nothing comes
+    /// through the port for it. The task that started it is running, and
+    /// tasks may be woken.
+    fn done(self, bytes: u32);
 }
 
 /// Hands the payload of type `T` in the slot that `header` begins the
@@ -416,9 +473,11 @@ unsafe fn settle<T: Detached>(header: *mut Header, bytes: u32, wake: bool) {
 
 /// Starts an operation on `target` that uses `payload`, at `offset` if the
 /// handle is a file's, and leaves it to finish by itself: no future waits
-/// for it, and `payload` is told how it went when its completion comes; see
-/// [`Detached`]. The engine cancels the operation as it is dropped, which
-/// it can for as long as `payload` keeps the handle open.
+/// for it, and `payload` is told how it went when its completion comes, or
+/// before this returns if it completed as it started on a handle whose
+/// such operations come through no port; see [`Detached`]. The engine
+/// cancels the operation as it is dropped, which it can for as long as
+/// `payload` keeps the handle open.
 ///
 /// # Errors
 ///
@@ -435,18 +494,24 @@ pub(crate) fn detach<T: Detached>(
     // SAFETY: the handle is open and associated with the port, as `target`
     // borrows it; the slot was just made, and stays where it is until the
     // completion is delivered, when the engine releases it.
-    match unsafe { launch(target.handle, slot, start) } {
-        Err(err) => {
-            // SAFETY: the system did not take the operation, so nothing will
-            // come through the port for it, and nothing else has the slot.
-            let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
-            Err((err, payload))
-        }
-        Ok(()) => {
-            target.engine.started();
-            target.engine.detached().add(target.handle, slot.cast());
+    let launched = unsafe { launch(target, slot, start) };
+    if matches!(launched, Ok(Launched::Queued)) {
+        target.engine.started();
+        target.engine.detached().add(target.handle, slot.cast());
+        return Ok(());
+    }
+    // SAFETY: the system did not take the operation, or has finished with
+    // it, and nothing will come through the port for it either way, so
+    // nothing else has the slot.
+    let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
+    match launched {
+        Ok(Launched::Done(bytes)) => {
+            target.engine.finished_at_once();
+            payload.done(bytes);
             Ok(())
         }
+        Ok(Launched::Queued) => unreachable!("the slot of a queued operation is the engine's"),
+        Err(err) => Err((err, payload)),
     }
 }
 
@@ -548,15 +613,16 @@ unsafe fn status_outcome(
     result(status, bytes)
 }
 
-/// Whether the system took an operation that its call returned `ok` for. A
-/// call that succeeded completed the operation at once, and its completion
-/// is queued to the port all the same.
-fn taken(ok: sys::Bool) -> io::Result<()> {
+/// How the system took an operation whose call returned `ok`, having
+/// transferred `bytes` if that is true: the call then completed the
+/// operation, whose completion is queued to the port all the same unless
+/// the handle asked for none.
+fn taken(ok: sys::Bool, bytes: u32) -> io::Result<Started> {
     if ok != 0 {
-        return Ok(());
+        return Ok(Started::AtOnce(bytes));
     }
     match sys::GetLastError() {
-        sys::ERROR_IO_PENDING => Ok(()),
+        sys::ERROR_IO_PENDING => Ok(Started::Later),
         code => Err(io::Error::from_raw_os_error(code as i32)),
     }
 }
@@ -570,14 +636,15 @@ unsafe fn start_read<B: IoBufMut>(
     handle: sys::Handle,
     buf: &mut B,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let len = u32::try_from(buf.bytes_total()).unwrap_or(u32::MAX);
     let ptr = buf.stable_mut_ptr();
+    let mut read = 0;
     // SAFETY: the caller's promise for the handle, the buffer and the
     // `OVERLAPPED`; the buffer is writable for `len` bytes, as `IoBufMut`
-    // promises.
-    let ok = unsafe { sys::ReadFile(handle, ptr.cast(), len, ptr::null_mut(), overlapped) };
-    taken(ok)
+    // promises; and the count is written before the call returns.
+    let ok = unsafe { sys::ReadFile(handle, ptr.cast(), len, &mut read, overlapped) };
+    taken(ok, read)
 }
 
 /// Starts a write of `buf`'s bytes, as [`Start`] says.
@@ -589,14 +656,15 @@ unsafe fn start_write<B: IoBuf>(
     handle: sys::Handle,
     buf: &mut B,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let len = u32::try_from(buf.bytes_init()).unwrap_or(u32::MAX);
     let ptr = buf.stable_ptr();
+    let mut written = 0;
     // SAFETY: the caller's promise for the handle, the buffer and the
     // `OVERLAPPED`; the buffer holds `len` initialized bytes, as `IoBuf`
-    // promises.
-    let ok = unsafe { sys::WriteFile(handle, ptr.cast(), len, ptr::null_mut(), overlapped) };
-    taken(ok)
+    // promises; and the count is written before the call returns.
+    let ok = unsafe { sys::WriteFile(handle, ptr.cast(), len, &mut written, overlapped) };
+    taken(ok, written)
 }
 
 /// Whether a read's error means that there is nothing more to read: the end
@@ -1042,6 +1110,14 @@ mod tests {
             };
             self.told.borrow_mut().push((self.id, read, wake));
         }
+
+        fn done(mut self, bytes: u32) {
+            // SAFETY: the system wrote that many bytes from the start of
+            // the buffer, within its capacity.
+            unsafe { self.buf.set_len(bytes as usize) };
+            let read = Ok(mem::take(&mut self.buf));
+            self.told.borrow_mut().push((self.id, read, true));
+        }
     }
 
     /// Starts a probe's read, as `Start` says.
@@ -1053,7 +1129,7 @@ mod tests {
         pipe: sys::Handle,
         probe: &mut Probe,
         overlapped: *mut sys::Overlapped,
-    ) -> io::Result<()> {
+    ) -> io::Result<Started> {
         // SAFETY: the caller's promise.
         unsafe { start_read(pipe, &mut probe.buf, overlapped) }
     }

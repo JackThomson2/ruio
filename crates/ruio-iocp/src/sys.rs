@@ -1,9 +1,9 @@
 //! The Windows functions and structures the engine uses, declared by hand
-//! from the Windows SDK's headers (`minwinbase.h`, `ioapiset.h`,
-//! `fileapi.h`, `namedpipeapi.h`, `handleapi.h`, `synchapi.h`,
-//! `winternl.h`, `winsock2.h`, `mswsock.h`), as `ruio-sys` declares
-//! io_uring's; and the wait completion packets of `ntdll`, which the
-//! headers do not declare.
+//! from the Windows SDK's headers (`minwinbase.h`, `winbase.h`,
+//! `ioapiset.h`, `fileapi.h`, `namedpipeapi.h`, `handleapi.h`,
+//! `synchapi.h`, `winternl.h`, `winsock2.h`, `mswsock.h`), as `ruio-sys`
+//! declares io_uring's; and the wait completion packets of `ntdll`, which
+//! the headers do not declare.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -55,6 +55,18 @@ pub(crate) const GENERIC_ALL: u32 = 0x1000_0000;
 /// `FILE_FLAG_OVERLAPPED`: a handle opened for overlapped I/O, whose
 /// operations may complete after the calls that start them return.
 pub(crate) const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+/// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`: no completion is queued to the
+/// port for an operation on the handle that succeeds during the call that
+/// starts it.
+pub(crate) const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
+
+/// `FILE_SKIP_SET_EVENT_ON_HANDLE`: the handle is not signaled as its
+/// operations complete, which nothing of the engine's waits for.
+pub(crate) const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
+
+/// `FILE_TYPE_DISK`: a file on a disk.
+pub(crate) const FILE_TYPE_DISK: u32 = 0x0001;
 
 /// `PIPE_ACCESS_DUPLEX`: a pipe that both ends read and write.
 pub(crate) const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
@@ -116,6 +128,14 @@ pub(crate) const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
 /// `SO_LINGER`: whether closing a socket waits for what it has left to
 /// send, and for how long; its value is a [`Linger`].
 pub(crate) const SO_LINGER: i32 = 0x0080;
+
+/// `SO_PROTOCOL_INFOW`: what the socket's provider is, as a
+/// [`ProtocolInfo`].
+pub(crate) const SO_PROTOCOL_INFOW: i32 = 0x2005;
+
+/// `XP1_IFS_HANDLES`: a provider whose sockets are handles of the system's
+/// own, with no layer between that would have to see their completions.
+pub(crate) const XP1_IFS_HANDLES: u32 = 0x0002_0000;
 
 /// `SIO_GET_EXTENSION_FUNCTION_POINTER`: the `WSAIoctl` that asks a
 /// socket's provider for the function a `GUID` names.
@@ -215,6 +235,26 @@ pub(crate) struct Linger {
     /// `l_linger`: for how many seconds it does.
     pub(crate) linger: u16,
 }
+
+/// `WSAPROTOCOL_INFOW`: what a socket's provider is and can do, of which
+/// the engine reads the first of its flags.
+#[repr(C)]
+pub(crate) struct ProtocolInfo {
+    /// `dwServiceFlags1`.
+    pub(crate) service_flags1: u32,
+    /// The rest of it.
+    rest: [u8; 624],
+}
+
+impl ProtocolInfo {
+    /// One for the system to fill in.
+    pub(crate) const EMPTY: Self = Self {
+        service_flags1: 0,
+        rest: [0; 624],
+    };
+}
+
+const _: () = assert!(size_of::<ProtocolInfo>() == 628);
 
 /// `LPFN_ACCEPTEX`: starts an accept on `listener` of a connection onto
 /// `accepted`, a socket made for it, and writes the connection's local and
@@ -329,6 +369,14 @@ unsafe extern "system" {
 
     /// Closes a handle.
     pub(crate) fn CloseHandle(handle: Handle) -> Bool;
+
+    /// Sets how the completions of `handle`'s operations are reported, as
+    /// `modes` say: `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`,
+    /// `FILE_SKIP_SET_EVENT_ON_HANDLE`, or both. False on failure.
+    pub(crate) fn SetFileCompletionNotificationModes(handle: Handle, modes: u8) -> Bool;
+
+    /// What kind of file `handle` is: `FILE_TYPE_DISK`, or another.
+    pub(crate) fn GetFileType(handle: Handle) -> u32;
 
     /// Creates a waitable timer with no name, as `flags` say and with the
     /// rights of `access`, or returns null.

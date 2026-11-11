@@ -13,7 +13,7 @@ use ruio_buf::{BufResult, IoBufs};
 use crate::behind::{Behind, poll_gate};
 use crate::gather::Gather;
 use crate::handle::Target;
-use crate::op::Op;
+use crate::op::{Op, Started};
 use crate::sys;
 
 use super::{outcome, socket_of, taken};
@@ -38,7 +38,7 @@ pub(super) unsafe fn start_send_vectored<V: IoBufs>(
     socket: sys::Handle,
     gather: &mut Gather<V>,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let mut few = [EMPTY; FEW];
     let mut many = Vec::new();
     let count = gather.bufs.buf_count();
@@ -49,6 +49,7 @@ pub(super) unsafe fn start_send_vectored<V: IoBufs>(
         &mut many[..]
     };
     let mut used = 0;
+    let mut sent = 0;
     gather.rest(u32::MAX as usize, |ptr, len| {
         buffers[used] = sys::WsaBuf {
             len: len as u32,
@@ -59,19 +60,19 @@ pub(super) unsafe fn start_send_vectored<V: IoBufs>(
     // SAFETY: the caller's promise for the socket, the buffers and the
     // `OVERLAPPED`; each part named holds that many initialized bytes, as
     // `IoBufs` promises, which a send only reads; and Winsock copies the
-    // `WSABUF`s before the call returns.
+    // `WSABUF`s and writes the count before the call returns.
     let failed = unsafe {
         sys::WSASend(
             socket_of(socket),
             buffers.as_ptr(),
             used as u32,
-            ptr::null_mut(),
+            &mut sent,
             0,
             overlapped,
             ptr::null(),
         )
     };
-    taken(failed == 0)
+    taken(failed == 0, sent)
 }
 
 /// The future of

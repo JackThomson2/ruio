@@ -12,7 +12,7 @@ use ruio_buf::IoBufs;
 use crate::behind::Behind;
 use crate::gather::Gather;
 use crate::handle::Raw;
-use crate::op::{Detached, detach};
+use crate::op::{Detached, Started, detach};
 use crate::sys;
 
 use super::vectored::start_send_vectored;
@@ -33,11 +33,10 @@ struct SendBehind<V> {
     socket: Rc<Socket>,
 }
 
-impl<V: IoBufs> Detached for SendBehind<V> {
-    unsafe fn complete(self, overlapped: *const sys::Overlapped, bytes: u32, wake: bool) {
-        // SAFETY: the caller's promise for the `OVERLAPPED`, and the socket
-        // is open, as the send holds it.
-        let sent = unsafe { outcome(self.socket.raw(), overlapped, bytes) };
+impl<V: IoBufs> SendBehind<V> {
+    /// Records how the send went, having `sent` as many bytes or failed,
+    /// and lets go of what it held. Tasks are woken only if `wake`.
+    fn finish(self, sent: io::Result<u32>, wake: bool) {
         let error = match sent {
             Ok(sent) if sent as usize == self.len => None,
             // The system sends all of what it takes, short of an error.
@@ -58,6 +57,19 @@ impl<V: IoBufs> Detached for SendBehind<V> {
     }
 }
 
+impl<V: IoBufs> Detached for SendBehind<V> {
+    unsafe fn complete(self, overlapped: *const sys::Overlapped, bytes: u32, wake: bool) {
+        // SAFETY: the caller's promise for the `OVERLAPPED`, and the socket
+        // is open, as the send holds it.
+        let sent = unsafe { outcome(self.socket.raw(), overlapped, bytes) };
+        self.finish(sent, wake);
+    }
+
+    fn done(self, bytes: u32) {
+        self.finish(Ok(bytes), true);
+    }
+}
+
 /// Starts a send left behind a stream, as `op`'s `Start` says.
 ///
 /// # Safety
@@ -67,7 +79,7 @@ unsafe fn start_send_behind<V: IoBufs>(
     socket: sys::Handle,
     send: &mut SendBehind<V>,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     // SAFETY: the caller's promise.
     unsafe { start_send_vectored(socket, &mut send.gather, overlapped) }
 }
@@ -79,7 +91,8 @@ unsafe fn start_send_behind<V: IoBufs>(
 /// engine drops them once the system is done with them. The future
 /// resolves once the send is on its way: at once, unless an earlier write
 /// behind is still in flight, as writes to a stream go one at a time, in
-/// order. It fails with the error an earlier write behind failed with, or
+/// order, or the port is due a turn, when it yields to it first.
+/// It fails with the error an earlier write behind failed with, or
 /// the one the system refused this send with, and the buffers are then
 /// dropped unsent; the stream's writes after it fail with that error too.
 ///
@@ -111,6 +124,13 @@ impl<V: IoBufs> Future for WriteBehind<'_, V> {
         let this = self.get_mut();
         let behind = &this.stream.behind;
         ready!(behind.poll_done(cx))?;
+        // A send that the system's buffer takes is finished as it starts,
+        // so a task that only writes behind would never let the port be
+        // turned: it waits for the turn once enough have.
+        let target = this.stream.stream.target();
+        if target.defers(cx) {
+            return Poll::Pending;
+        }
         let bufs = this
             .bufs
             .take()
@@ -132,7 +152,6 @@ impl<V: IoBufs> Future for WriteBehind<'_, V> {
             socket: Rc::clone(this.stream.stream.io()),
         };
         behind.started();
-        let target = this.stream.stream.target();
         let Err((err, send)) = detach(target, send, 0, start_send_behind::<V>) else {
             return Poll::Ready(Ok(()));
         };

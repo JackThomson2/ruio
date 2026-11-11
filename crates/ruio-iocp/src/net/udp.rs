@@ -15,7 +15,7 @@ use ruio_buf::{BufResult, IoBuf, IoBufMut};
 
 use super::{RawAddr, handle_of, last_error, outcome, socket_of, start_recv, start_send, taken};
 use crate::handle::{IoHandle, Raw};
-use crate::op::{Op, Read, Write};
+use crate::op::{Op, Read, Started, Write};
 use crate::sys;
 
 impl Raw for net::UdpSocket {
@@ -206,21 +206,23 @@ unsafe fn start_send_to<B: IoBuf>(
     socket: sys::Handle,
     sending: &mut Sending<B>,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let buffer = sys::WsaBuf {
         len: u32::try_from(sending.buf.bytes_init()).unwrap_or(u32::MAX),
         buf: sending.buf.stable_ptr().cast_mut(),
     };
+    let mut sent = 0;
     // SAFETY: the caller's promise for the socket, the slot and the
     // `OVERLAPPED`; the buffer holds that many initialized bytes, as `IoBuf`
     // promises, which a send only reads; the address is in the slot; and
-    // Winsock copies the `WSABUF` before the call returns.
+    // Winsock copies the `WSABUF` and writes the count before the call
+    // returns.
     let failed = unsafe {
         sys::WSASendTo(
             socket_of(socket),
             &buffer,
             1,
-            ptr::null_mut(),
+            &mut sent,
             0,
             sending.to.bytes.as_ptr(),
             sending.to.len,
@@ -228,7 +230,7 @@ unsafe fn start_send_to<B: IoBuf>(
             ptr::null(),
         )
     };
-    taken(failed == 0)
+    taken(failed == 0, sent)
 }
 
 /// The future of [`UdpSocket::send_to`]. It hands the buffer, an [`IoBuf`],
@@ -276,24 +278,25 @@ unsafe fn start_recv_from<B: IoBufMut>(
     socket: sys::Handle,
     receiving: &mut Receiving<B>,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let mut buffer = sys::WsaBuf {
         len: u32::try_from(receiving.buf.bytes_total()).unwrap_or(u32::MAX),
         buf: receiving.buf.stable_mut_ptr(),
     };
     let mut flags = 0;
+    let mut received = 0;
     // SAFETY: the caller's promise for the socket, the slot and the
     // `OVERLAPPED`; the buffer is writable for that many bytes, as
     // `IoBufMut` promises; the room for the address and its length are in
     // the slot, where the system writes them as the receive completes; and
-    // Winsock copies the `WSABUF` and reads the flags before the call
-    // returns.
+    // Winsock copies the `WSABUF`, reads the flags and writes the count
+    // before the call returns.
     let failed = unsafe {
         sys::WSARecvFrom(
             socket_of(socket),
             &mut buffer,
             1,
-            ptr::null_mut(),
+            &mut received,
             &mut flags,
             receiving.from.bytes.as_mut_ptr(),
             &mut receiving.from.len,
@@ -301,7 +304,7 @@ unsafe fn start_recv_from<B: IoBufMut>(
             ptr::null(),
         )
     };
-    taken(failed == 0)
+    taken(failed == 0, received)
 }
 
 /// The future of [`UdpSocket::recv_from`]. It hands the buffer, an

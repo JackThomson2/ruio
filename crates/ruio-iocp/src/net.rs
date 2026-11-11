@@ -17,6 +17,12 @@
 //! send is started with no future to wait for it, shares the socket with
 //! the stream, so that the socket closes only once the send has finished,
 //! and records how it went for the writes after it.
+//!
+//! A stream's socket asks the system to queue no completion for an
+//! operation that succeeds during the call that starts it, where its
+//! provider allows that. So a read of data that has arrived, and a write
+//! that the system's buffer takes, are finished by the poll that starts
+//! them, and cost no turn of the port.
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -39,7 +45,7 @@ use ruio_buf::{IoBuf, IoBufMut, IoBufs, Slice};
 use crate::behind::Behind;
 use crate::buf::BufPool;
 use crate::handle::{IoHandle, Raw};
-use crate::op::{Op, Read, ReadExact, Write, WriteAll};
+use crate::op::{Op, Read, ReadExact, Started, Write, WriteAll};
 use crate::sys;
 
 mod recv;
@@ -103,6 +109,27 @@ impl Drop for Socket {
 impl Raw for Rc<Socket> {
     fn raw(&self) -> sys::Handle {
         handle_of(self.socket.as_raw_socket())
+    }
+
+    /// A stream's socket may, if its provider gives it a handle of the
+    /// system's own. A provider layered over that one has to see the
+    /// socket's completions, and would not see those the port is spared.
+    fn may_skip_port(&self) -> bool {
+        let mut info = sys::ProtocolInfo::EMPTY;
+        let mut len = size_of::<sys::ProtocolInfo>() as i32;
+        // SAFETY: the socket is open, and the provider's description has
+        // room for as many bytes as the length says, which are written
+        // during the call.
+        let failed = unsafe {
+            sys::getsockopt(
+                socket_of(self.raw()),
+                sys::SOL_SOCKET,
+                sys::SO_PROTOCOL_INFOW,
+                ptr::from_mut(&mut info).cast(),
+                &mut len,
+            )
+        };
+        failed == 0 && info.service_flags1 & sys::XP1_IFS_HANDLES != 0
     }
 }
 
@@ -308,15 +335,16 @@ unsafe fn extension(socket: sys::Socket, id: &sys::Guid, function: *mut c_void) 
     Ok(())
 }
 
-/// Whether Winsock took an operation whose call `succeeded` or did not. A
-/// call that succeeded completed the operation at once, and its completion
-/// is queued to the port all the same.
-fn taken(succeeded: bool) -> io::Result<()> {
+/// How Winsock took an operation whose call `succeeded` or did not, having
+/// transferred `bytes` if it did: the call then completed the operation,
+/// whose completion is queued to the port all the same unless the socket
+/// asked for none.
+fn taken(succeeded: bool, bytes: u32) -> io::Result<Started> {
     if succeeded {
-        return Ok(());
+        return Ok(Started::AtOnce(bytes));
     }
     match sys::WSAGetLastError() {
-        sys::WSA_IO_PENDING => Ok(()),
+        sys::WSA_IO_PENDING => Ok(Started::Later),
         code => Err(io::Error::from_raw_os_error(code)),
     }
 }
@@ -455,7 +483,7 @@ unsafe fn start_accept(
     listener: sys::Handle,
     accepting: &mut Accepting,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let listener = socket_of(listener);
     let accept_ex = extensions(listener)?.accept_ex;
     let accepted = accepting
@@ -479,7 +507,7 @@ unsafe fn start_accept(
             overlapped,
         )
     };
-    taken(ok != 0)
+    taken(ok != 0, received)
 }
 
 /// The future of [`TcpListener::accept`]: the stream of the connection it
@@ -820,13 +848,14 @@ unsafe fn start_connect(
     socket: sys::Handle,
     addr: &mut RawAddr,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let socket = socket_of(socket);
     let connect_ex = extensions(socket)?.connect_ex;
+    let mut sent = 0;
     // SAFETY: the socket is open and bound, by the caller's promise; the
     // address and the `OVERLAPPED` are in the slot, which stays in place
-    // until the completion is delivered; and nothing is sent with the
-    // connection.
+    // until the completion is delivered; nothing is sent with the
+    // connection; and the count is written before the call returns.
     let ok = unsafe {
         connect_ex(
             socket,
@@ -834,11 +863,11 @@ unsafe fn start_connect(
             addr.len,
             ptr::null(),
             0,
-            ptr::null_mut(),
+            &mut sent,
             overlapped,
         )
     };
-    taken(ok != 0)
+    taken(ok != 0, sent)
 }
 
 /// Starts a receive into `buf`, as `op`'s `Start` says.
@@ -850,28 +879,29 @@ unsafe fn start_recv<B: IoBufMut>(
     socket: sys::Handle,
     buf: &mut B,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let mut buffer = sys::WsaBuf {
         len: u32::try_from(buf.bytes_total()).unwrap_or(u32::MAX),
         buf: buf.stable_mut_ptr(),
     };
     let mut flags = 0;
+    let mut received = 0;
     // SAFETY: the caller's promise for the socket, the buffer and the
     // `OVERLAPPED`; the buffer is writable for that many bytes, as
-    // `IoBufMut` promises; and Winsock copies the `WSABUF` and reads the
-    // flags before the call returns.
+    // `IoBufMut` promises; and Winsock copies the `WSABUF`, reads the flags
+    // and writes the count before the call returns.
     let failed = unsafe {
         sys::WSARecv(
             socket_of(socket),
             &mut buffer,
             1,
-            ptr::null_mut(),
+            &mut received,
             &mut flags,
             overlapped,
             ptr::null(),
         )
     };
-    taken(failed == 0)
+    taken(failed == 0, received)
 }
 
 /// Starts a send of `buf`'s bytes, as `op`'s `Start` says.
@@ -883,34 +913,202 @@ unsafe fn start_send<B: IoBuf>(
     socket: sys::Handle,
     buf: &mut B,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let buffer = sys::WsaBuf {
         len: u32::try_from(buf.bytes_init()).unwrap_or(u32::MAX),
         buf: buf.stable_ptr().cast_mut(),
     };
+    let mut sent = 0;
     // SAFETY: the caller's promise for the socket, the buffer and the
     // `OVERLAPPED`; the buffer holds that many initialized bytes, as `IoBuf`
     // promises, which a send only reads; and Winsock copies the `WSABUF`
-    // before the call returns.
+    // and writes the count before the call returns.
     let failed = unsafe {
         sys::WSASend(
             socket_of(socket),
             &buffer,
             1,
-            ptr::null_mut(),
+            &mut sent,
             0,
             overlapped,
             ptr::null(),
         )
     };
-    taken(failed == 0)
+    taken(failed == 0, sent)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+    use std::future::Future;
+    use std::io::{self, Read as _, Write as _};
+    use std::net::{self, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::{Duration, Instant};
 
-    use super::RawAddr;
+    use ruio_engine::{Build, Engine};
+
+    use super::{RawAddr, TcpStream};
+    use crate::engine::{AT_ONCE, Builder, Iocp};
+
+    /// A task's waker, which counts how often the task was woken.
+    struct Woken(AtomicUsize);
+
+    impl Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A task that counts its wakes, and its waker.
+    fn task() -> (Arc<Woken>, Waker) {
+        let woken = Arc::new(Woken(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&woken));
+        (woken, waker)
+    }
+
+    /// Runs `future` on `engine`, whose port it turns between polls.
+    fn block_on<F: Future>(engine: &Iocp, future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return output;
+            }
+            assert!(Instant::now() < deadline, "the future did not finish");
+            engine.park(Some(Duration::from_millis(1))).unwrap();
+        }
+    }
+
+    /// Polls `future` once, as the task of no waker, and drops it.
+    fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
+        pin!(future).poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// A stream of `engine`'s, which the thread has entered, connected to a
+    /// socket of the standard library's, and that socket; or `None` where
+    /// the stream's operations all complete through the port, as under a
+    /// provider layered over the system's, and there is nothing to test.
+    fn pair(engine: &Iocp) -> io::Result<Option<(TcpStream, net::TcpStream)>> {
+        let listener = net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let stream = block_on(engine, TcpStream::connect(listener.local_addr()?))?;
+        let (peer, _) = listener.accept()?;
+        if !stream.stream.skips() {
+            eprintln!("skipped: the socket's completions all come through the port");
+            return Ok(None);
+        }
+        // The operations counted from here are the test's.
+        engine.submit()?;
+        Ok(Some((stream, peer)))
+    }
+
+    /// How many operations of `engine`'s the port has yet to deliver.
+    fn in_flight(engine: &Iocp) -> String {
+        let engine = format!("{engine:?}");
+        let from = engine.find("in_flight").expect("an engine says so");
+        engine[from..].to_owned()
+    }
+
+    #[test]
+    fn what_has_arrived_is_read_by_the_poll_that_starts_the_read() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let Some((stream, mut peer)) = pair(&engine)? else {
+            return Ok(());
+        };
+        peer.write_all(b"hello")?;
+        // Until it has arrived.
+        assert_eq!(stream.socket().peek(&mut [0])?, 1);
+
+        let Poll::Ready((read, buf)) = poll_once(stream.read(Vec::with_capacity(16))) else {
+            panic!("a read of what had arrived waited for the port");
+        };
+        assert_eq!(read?, 5);
+        assert_eq!(buf, b"hello");
+        // Nothing is left for the port to deliver.
+        assert!(in_flight(&engine).starts_with("in_flight: 0,"));
+
+        // The end of the stream is read the same way.
+        drop(peer);
+        assert_eq!(stream.socket().peek(&mut [0])?, 0);
+        let Poll::Ready((read, _)) = poll_once(stream.read(Vec::with_capacity(16))) else {
+            panic!("a read of a stream that had ended waited for the port");
+        };
+        assert_eq!(read?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn only_so_many_writes_finish_as_they_start_between_two_turns() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let Some((stream, mut peer)) = pair(&engine)? else {
+            return Ok(());
+        };
+        // The system's buffer takes each, which finishes it there and then.
+        for _ in 0..AT_ONCE {
+            let Poll::Ready((written, _)) = poll_once(stream.write(vec![7])) else {
+                panic!("a write that the system's buffer takes waited for the port");
+            };
+            assert_eq!(written?, 1);
+        }
+        assert!(in_flight(&engine).starts_with("in_flight: 0,"));
+
+        // The next waits for the port to be turned, and is not started: its
+        // task is woken to try again, which it does in vain until the turn.
+        let (woken, waker) = task();
+        let mut cx = Context::from_waker(&waker);
+        let mut write = pin!(stream.write(vec![8]));
+        assert!(write.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(woken.0.load(Ordering::Relaxed), 1);
+        assert!(write.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(woken.0.load(Ordering::Relaxed), 2);
+        assert!(in_flight(&engine).starts_with("in_flight: 0,"));
+        engine.submit()?;
+        let Poll::Ready((written, _)) = write.as_mut().poll(&mut cx) else {
+            panic!("a write waited for more than a turn of the port");
+        };
+        assert_eq!(written?, 1);
+
+        let mut arrived = vec![0; AT_ONCE as usize + 1];
+        peer.read_exact(&mut arrived)?;
+        assert_eq!(arrived[AT_ONCE as usize - 1..], [7, 8]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_behind_that_the_buffer_takes_is_finished_as_it_starts() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let Some((stream, mut peer)) = pair(&engine)? else {
+            return Ok(());
+        };
+        for _ in 0..AT_ONCE {
+            let sent = poll_once(stream.write_behind(vec![vec![7_u8]]));
+            assert!(matches!(sent, Poll::Ready(Ok(()))));
+            // How it went is known with no turn of the port.
+            assert!(matches!(stream.try_flush(), Some(Ok(()))));
+        }
+        assert!(in_flight(&engine).starts_with("in_flight: 0,"));
+
+        // A task that only writes behind yields to the port all the same.
+        let (woken, waker) = task();
+        let mut cx = Context::from_waker(&waker);
+        let mut behind = pin!(stream.write_behind(vec![vec![8_u8]]));
+        assert!(behind.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(woken.0.load(Ordering::Relaxed), 1);
+        engine.submit()?;
+        assert!(matches!(behind.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(stream.try_flush(), Some(Ok(()))));
+
+        let mut arrived = vec![0; AT_ONCE as usize + 1];
+        peer.read_exact(&mut arrived)?;
+        assert_eq!(arrived[AT_ONCE as usize - 1..], [7, 8]);
+        Ok(())
+    }
 
     #[test]
     fn addresses_are_laid_out_as_winsock_reads_them() {
@@ -950,5 +1148,33 @@ mod tests {
         assert_eq!(read.unwrap(), SocketAddr::V6(flow));
         // Nothing written: no family.
         assert!(RawAddr::room().to_socket_addr().is_err());
+    }
+
+    #[test]
+    fn a_read_that_has_to_wait_still_completes_through_the_port() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let Some((stream, mut peer)) = pair(&engine)? else {
+            return Ok(());
+        };
+        let (woken, waker) = task();
+        let mut cx = Context::from_waker(&waker);
+        let mut read = pin!(stream.read(Vec::with_capacity(16)));
+        // Nothing has arrived, so the system keeps the read.
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        assert!(in_flight(&engine).starts_with("in_flight: 1,"));
+        peer.write_all(b"later")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while woken.0.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            engine.park(Some(Duration::from_millis(5)))?;
+        }
+        assert_eq!(woken.0.load(Ordering::Relaxed), 1);
+        let Poll::Ready((read, buf)) = read.as_mut().poll(&mut cx) else {
+            panic!("a read whose completion was delivered was not ready");
+        };
+        assert_eq!(read?, 5);
+        assert_eq!(buf, b"later");
+        assert!(in_flight(&engine).starts_with("in_flight: 0,"));
+        Ok(())
     }
 }

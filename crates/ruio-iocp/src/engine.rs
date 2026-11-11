@@ -25,6 +25,12 @@ const IO: usize = 1;
 /// The completion key of the packets the engine's fine timer posts.
 const TIMER: usize = 2;
 
+/// How many operations may finish during the calls that start them between
+/// two turns of the port: as many as the executor runs tasks between two.
+/// Such an operation costs no turn, so a task whose operations all finish
+/// so would otherwise never let the port be turned, nor another task run.
+pub(crate) const AT_ONCE: u32 = 64;
+
 /// The most completions a turn takes from the port at once.
 const BATCH: usize = 64;
 
@@ -72,6 +78,9 @@ struct Inner {
     /// How many operations the system has taken whose completions have not
     /// been delivered.
     in_flight: Cell<usize>,
+    /// How many operations have finished during the calls that started
+    /// them since the port was last turned.
+    at_once: Cell<u32>,
     /// The operations in flight that were left to finish by themselves,
     /// which no future's drop cancels.
     detached: op::DetachedOps,
@@ -299,6 +308,7 @@ impl Iocp {
                 fired: Cell::new(false),
                 fine: FineTimer::new(),
                 in_flight: Cell::new(0),
+                at_once: Cell::new(0),
                 detached: op::DetachedOps::default(),
                 closing: Cell::new(false),
                 shutdown_timeout: builder.shutdown_timeout,
@@ -331,6 +341,18 @@ impl Iocp {
     pub(crate) fn started(&self) {
         let in_flight = &self.inner.in_flight;
         in_flight.set(in_flight.get() + 1);
+    }
+
+    /// Whether as many operations have finished during the calls that
+    /// started them as may between two turns of the port.
+    pub(crate) fn at_once_spent(&self) -> bool {
+        self.inner.at_once.get() >= AT_ONCE
+    }
+
+    /// Counts an operation that finished during the call that started it.
+    pub(crate) fn finished_at_once(&self) {
+        let at_once = &self.inner.at_once;
+        at_once.set(at_once.get() + 1);
     }
 
     /// The operations in flight that were left to finish by themselves.
@@ -401,6 +423,7 @@ impl Inner {
     /// engines' clock, or for ever if there is none, unless the check took
     /// some already.
     fn turn(&self, deadline: Option<Duration>) -> io::Result<()> {
+        self.at_once.set(0);
         let stashed = mem::take(&mut *self.stash.borrow_mut());
         let deadline = if stashed.is_empty() {
             deadline
