@@ -19,7 +19,10 @@
 //!
 //! `buf::BufPool` is a pool of buffers for readers to take from as data
 //! arrives, which is the thread's, as a port has none for the system to
-//! pick from.
+//! pick from. A stream receives into it (`net::RecvStream`), holding no
+//! buffer while it waits for data, and a file reads into it
+//! (`fs::ReadStream`). A stream also writes several buffers as one, and
+//! leaves a write behind it for the engine to finish.
 //!
 //! Off Windows the crate is empty, but for the tests of what needs nothing
 //! of Windows': the pool, and the bookkeeping of a stream's writes.

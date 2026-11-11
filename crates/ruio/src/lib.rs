@@ -88,23 +88,26 @@ connections merge with its shutdown signal through `select`."#
 Built for Windows, ruio runs on the I/O completion port engine of
 `ruio-iocp`, and has part of its I/O there, a proof of concept. [`net`]
 has TCP and UDP sockets, which read and write with owned buffers as they
-do on io_uring; [`fs`] has files, which read and write the same way,
-with what Windows has no overlapped form of, opening a file, syncing it
-and the functions that take a path, on the blocking pool; and [`io`] has
-the traits both implement, and `copy` over them. All three are under the
-names and with the signatures they have on io_uring, so that code written
-to them builds for both. Beside them is the executor's API: runtimes,
-tasks, timers, the channels and locks of [`sync`], the blocking pool and
-[`Cores`], whose threads are not pinned off Linux, and the buffer traits
-of [`buf`], which every engine shares. The rest of the I/O and io_uring's
-own API, `process`, `signal`, the rest of `io`, the pools and registered
-buffers of `buf`, `uring` and `driver`, come with io_uring alone so far.
-Libraries that take their I/O through the poll-based traits of
-`tokio::io` or futures-io, such as hyper and rustls, run over the streams
-and files through the adapter of the `ruio-compat` crate. With the
-`futures` feature, a listener's connections, a directory's entries and
-the channels' receivers and intervals implement the `Stream` and
-`FusedStream` of futures-core."#
+do on io_uring; a stream also receives into a pool, writes several
+buffers as one, and leaves a write behind it. [`fs`] has files, which
+read and write the same way, with what Windows has no overlapped form
+of, opening a file, syncing it and the functions that take a path, on
+the blocking pool. [`io`] has the traits both implement, and `copy` over
+them, and [`buf`] has the engine's pool of buffers beside the buffer
+traits that every engine shares. All four are under the names and with
+the signatures they have on io_uring, so that code written to them
+builds for both. Beside them is the executor's API: runtimes, tasks,
+timers, the channels and locks of [`sync`], the blocking pool and
+[`Cores`], whose threads are not pinned off Linux. The rest of the I/O
+and io_uring's own API, `process`, `signal`, the rest of `io`, the
+registered buffers of `buf`, `uring` and `driver`, come with io_uring
+alone so far. Libraries that take their I/O through the poll-based
+traits of `tokio::io` or futures-io, such as hyper and rustls, run over
+the streams and files through the adapter of the `ruio-compat` crate.
+With the `futures` feature, a listener's connections, what arrives on a
+connection, a file's data, a directory's entries and the channels'
+receivers and intervals implement the `Stream` and `FusedStream` of
+futures-core."#
 )]
 #![cfg_attr(
     not(any(ruio_uring, ruio_iocp)),
