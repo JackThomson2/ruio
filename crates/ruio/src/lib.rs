@@ -170,6 +170,11 @@ pub mod process;
 pub mod process;
 #[cfg(ruio_uring)]
 pub mod signal;
+// The completion port engine's `signal`, the console's control events
+// under io_uring's names.
+#[cfg(ruio_iocp)]
+#[path = "iocp/signal.rs"]
+pub mod signal;
 
 /// The io_uring driver: operations, the futures that run them, and the types
 /// for writing new ones, down to the kernel's own structures in
