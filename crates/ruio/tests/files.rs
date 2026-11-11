@@ -151,6 +151,60 @@ async fn a_file_is_synced_resized_and_measured() -> io::Result<()> {
 }
 
 #[ruio::test]
+async fn room_is_made_for_a_range_of_a_file() -> io::Result<()> {
+    let scratch = Scratch::new("allocate");
+    let path = scratch.path("file");
+    let mut options = File::options();
+    options.read(true).write(true).create(true);
+    let file = within(options.open(&path)).await?;
+    within(file.write_all_at("0123456789", 0)).await.0?;
+
+    // A range that reaches past the end of the file makes it longer, with
+    // zeros.
+    within(file.allocate(8, 8)).await?;
+    assert_eq!(within(file.metadata()).await?.len(), 16);
+    let (read, buf) = within(file.read_at(Vec::with_capacity(32), 0)).await;
+    assert_eq!(read?, 16);
+    assert_eq!(buf, b"0123456789\0\0\0\0\0\0");
+
+    // One within the file leaves it as long as it was, and what it holds.
+    within(file.allocate(2, 4)).await?;
+    assert_eq!(within(file.metadata()).await?.len(), 16);
+    let (read, buf) = within(file.read_at(Vec::with_capacity(32), 0)).await;
+    assert_eq!(read?, 16);
+    assert_eq!(buf, b"0123456789\0\0\0\0\0\0");
+
+    // No bytes are no range.
+    let none = within(file.allocate(4, 0)).await.expect_err("no range");
+    assert_eq!(none.kind(), ErrorKind::InvalidInput);
+    Ok(())
+}
+
+#[ruio::test]
+async fn an_open_files_permissions_are_set() -> io::Result<()> {
+    let scratch = Scratch::new("permissions");
+    let path = scratch.path("file");
+    let mut options = File::options();
+    options.read(true).write(true).create(true);
+    let file = within(options.open(&path)).await?;
+    within(file.write_all_at("contents", 0)).await.0?;
+
+    // Read-only, and as it was again.
+    let writable = within(file.metadata()).await?.permissions();
+    assert!(!writable.readonly());
+    let mut read_only = writable.clone();
+    read_only.set_readonly(true);
+    within(file.set_permissions(read_only)).await?;
+    assert!(within(fs::metadata(&path)).await?.permissions().readonly());
+    within(file.set_permissions(writable)).await?;
+    assert!(!within(fs::metadata(&path)).await?.permissions().readonly());
+
+    // The standard library's file is the same file.
+    assert_eq!(file.as_std()?.metadata()?.len(), 8);
+    Ok(())
+}
+
+#[ruio::test]
 async fn names_are_made_changed_and_removed() -> io::Result<()> {
     let scratch = Scratch::new("names");
     let file = scratch.path("file");
@@ -200,6 +254,50 @@ async fn names_are_made_changed_and_removed() -> io::Result<()> {
     within(fs::write(nested.join("file"), "x")).await?;
     within(fs::remove_dir_all(&above)).await?;
     assert!(!within(fs::try_exists(&above)).await?);
+    Ok(())
+}
+
+#[ruio::test]
+async fn symbolic_links_name_files_and_directories() -> io::Result<()> {
+    let scratch = Scratch::new("symlink");
+    let file = scratch.path("file");
+    within(fs::write(&file, "contents")).await?;
+    let link = scratch.path("link");
+    match within(fs::symlink(&file, &link)).await {
+        Ok(()) => {}
+        // Windows lets an account make links only with a privilege, which
+        // the one running the tests may lack.
+        Err(err) if cfg!(windows) && err.raw_os_error() == Some(1314) => {
+            eprintln!("skipped: no privilege to make symbolic links: {err}");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    }
+    assert!(within(fs::symlink_metadata(&link)).await?.is_symlink());
+    assert!(within(fs::metadata(&link)).await?.is_file());
+    assert_eq!(within(fs::read(&link)).await?, b"contents");
+    let named = within(fs::read_link(&link)).await?;
+    assert_eq!(named.file_name(), file.file_name());
+
+    // A link to a directory leads to what is in it.
+    let dir = scratch.path("dir");
+    within(fs::create_dir(&dir)).await?;
+    within(fs::write(dir.join("inside"), "x")).await?;
+    let dir_link = scratch.path("dir-link");
+    within(fs::symlink(&dir, &dir_link)).await?;
+    assert!(within(fs::symlink_metadata(&dir_link)).await?.is_symlink());
+    assert!(within(fs::metadata(&dir_link)).await?.is_dir());
+    assert_eq!(within(fs::read(dir_link.join("inside"))).await?, b"x");
+
+    // A relative name is looked for from the link's own directory, and a
+    // link may name what is not there.
+    let relative = scratch.path("relative");
+    within(fs::symlink("dir", &relative)).await?;
+    assert_eq!(within(fs::read(relative.join("inside"))).await?, b"x");
+    let dangling = scratch.path("dangling");
+    within(fs::symlink(scratch.path("missing"), &dangling)).await?;
+    assert!(within(fs::symlink_metadata(&dangling)).await?.is_symlink());
+    assert!(!within(fs::try_exists(&dangling)).await?);
     Ok(())
 }
 

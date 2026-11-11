@@ -38,14 +38,15 @@
 //! blocking pool ([`spawn_blocking`](crate::spawn_blocking)), as the
 //! standard library's call in a job of its own, so that it holds a thread
 //! of the pool and not the runtime's: opening a file, [`File::sync_all`],
-//! [`File::sync_data`], [`File::set_len`] and [`File::metadata`], every
-//! function that takes a path, and [`read_dir`], which reads a directory's
-//! entries a batch at a time.
+//! [`File::sync_data`], [`File::set_len`], [`File::allocate`],
+//! [`File::set_permissions`] and [`File::metadata`], every function that
+//! takes a path, and [`read_dir`], which reads a directory's entries a
+//! batch at a time.
 //!
 //! Each method's future has a name of its own here, after the method:
 //! [`Read`] and [`Write`] for the reads and writes at an offset and at the
-//! position alike, [`SyncAll`], [`SyncData`] and [`SetLen`]. So code that
-//! names a future names no operation of the engine's.
+//! position alike, [`SyncAll`], [`SyncData`], [`SetLen`] and [`Allocate`].
+//! So code that names a future names no operation of the engine's.
 //!
 //! A [`File`] belongs to its thread's port, and is neither `Send` nor
 //! `Sync`. The functions that take a path hold no file of the port, so
@@ -62,12 +63,11 @@
 //! assert_send(ruio::fs::read_dir("."));
 //! ```
 //!
-//! Not here yet, of what `fs` has on io_uring: `allocate`, files taken from
-//! and given to the standard library (`from_std`, `as_std`, `into_std`), a
-//! file's `set_permissions`, `symlink`, the futures' timeouts, and the
-//! `Send` files of `portable`. A [`Metadata`] reports what the standard
-//! library's does on every system; an owner, a mode and an inode are
-//! Unix's.
+//! Not here yet, of what `fs` has on io_uring: files taken from and given
+//! to the standard library (`from_std`, `into_std`), the futures' timeouts,
+//! and the `Send` files of `portable`. A [`Metadata`] reports what the
+//! standard library's does on every system; an owner, a mode and an inode
+//! are Unix's.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -239,6 +239,24 @@ impl File {
         self.call(Call::SetLen(len))
     }
 
+    /// Makes room for `len` bytes of the file from `offset`, growing the
+    /// file if they reach past its end, on the blocking pool: a write there
+    /// then finds its space, and cannot run out of it. The file must be
+    /// open for writing.
+    ///
+    /// Windows allocates what a file is extended by, and a file that is
+    /// not sparse has no part without space, so this extends a file that
+    /// ends before the range does, with zeros, and leaves a longer one as
+    /// it is. It must not run while a write makes the file longer, which it
+    /// could then cut short.
+    ///
+    /// The call fails with `InvalidInput` for no bytes, as `fallocate(2)`
+    /// does, and with `FileTooLarge` for a range that ends past what an
+    /// offset counts.
+    pub fn allocate(&self, offset: u64, len: u64) -> Allocate<'_> {
+        self.call(Call::Allocate(offset, len))
+    }
+
     fn call(&self, call: Call) -> FileCall<'_> {
         FileCall {
             state: CallState::Unstarted(Arc::clone(self.file.as_std()), call),
@@ -254,6 +272,32 @@ impl File {
     pub async fn metadata(&self) -> io::Result<Metadata> {
         let file = Arc::clone(self.file.as_std());
         pooled(move || file.metadata()).await.map(Metadata)
+    }
+
+    /// Sets the file's permissions, on the blocking pool: here, whether it
+    /// is read-only, which is what Windows keeps of them. The file must be
+    /// open for writing.
+    ///
+    /// # Errors
+    ///
+    /// What the system reports.
+    pub async fn set_permissions(&self, perm: std::fs::Permissions) -> io::Result<()> {
+        let file = Arc::clone(self.file.as_std());
+        pooled(move || file.set_permissions(perm)).await
+    }
+
+    /// The standard library's file, for what ruio has no call for.
+    ///
+    /// Read and write the file through ruio and not through this: it is
+    /// open for overlapped I/O, and the standard library ends the process
+    /// if a read or a write of its own on such a file does not complete at
+    /// once.
+    ///
+    /// # Errors
+    ///
+    /// None here. On io_uring, a file that the ring alone holds has none.
+    pub fn as_std(&self) -> io::Result<&std::fs::File> {
+        Ok(self.file.as_std())
     }
 
     /// Closes the file. Windows reports nothing as a file closes that a
@@ -441,12 +485,14 @@ enum Call {
     SyncAll,
     SyncData,
     SetLen(u64),
+    /// A range to make room for: its offset, and its length.
+    Allocate(u64, u64),
 }
 
 /// The future of a call on a file that Windows has no overlapped form of,
-/// which runs on the blocking pool: [`File::sync_all`], [`File::sync_data`]
-/// and [`File::set_len`], under the names [`SyncAll`], [`SyncData`] and
-/// [`SetLen`].
+/// which runs on the blocking pool: [`File::sync_all`], [`File::sync_data`],
+/// [`File::set_len`] and [`File::allocate`], under the names [`SyncAll`],
+/// [`SyncData`], [`SetLen`] and [`Allocate`].
 ///
 /// It starts the call when first polled. Dropping it leaves a call that
 /// has started to finish on the pool.
@@ -478,6 +524,7 @@ impl Future for FileCall<'_> {
                         Call::SyncAll => file.sync_all(),
                         Call::SyncData => file.sync_data(),
                         Call::SetLen(len) => file.set_len(len),
+                        Call::Allocate(offset, len) => allocate(&file, offset, len),
                     });
                     this.state = CallState::Running(job);
                 }
@@ -516,6 +563,30 @@ pub type SyncData<'a> = FileCall<'a>;
 
 /// The future of [`File::set_len`].
 pub type SetLen<'a> = FileCall<'a>;
+
+/// The future of [`File::allocate`].
+pub type Allocate<'a> = FileCall<'a>;
+
+/// Makes room for `len` bytes of `file` from `offset`, as [`File::allocate`]
+/// says: extends the file to the end of the range if it ends before it.
+fn allocate(file: &std::fs::File, offset: u64, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a range to allocate holds at least one byte",
+        ));
+    }
+    let end = offset.checked_add(len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "the range to allocate ends past what an offset counts",
+        )
+    })?;
+    if end > file.metadata()?.len() {
+        file.set_len(end)?;
+    }
+    Ok(())
+}
 
 /// How a file is opened: the options of the standard library's
 /// `OpenOptions`, with the same meanings.
@@ -861,6 +932,38 @@ pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<
 pub async fn hard_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
     let (original, link) = (original.as_ref().to_owned(), link.as_ref().to_owned());
     pooled(move || std::fs::hard_link(original, link)).await
+}
+
+/// Makes `link` a symbolic link to `original`, which it holds as given and
+/// which need not exist.
+///
+/// Windows has links of two kinds, to files and to directories, and is
+/// told which as a link is made: this makes a link to a directory if
+/// `original` names one then, and a link to a file if it does not. A
+/// relative `original` is looked for where the link resolves it, from the
+/// link's own directory.
+///
+/// # Errors
+///
+/// What the system reports. It lets an account make links only with a
+/// privilege, which an administrator has, and anyone in developer mode;
+/// without it the error's code is 1314.
+pub async fn symlink(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let (original, link) = (original.as_ref().to_owned(), link.as_ref().to_owned());
+    pooled(move || {
+        let named = match link.parent() {
+            Some(dir) if original.is_relative() => dir.join(&original),
+            _ => original.clone(),
+        };
+        if std::fs::metadata(named).is_ok_and(|named| named.is_dir()) {
+            symlink_dir(original, link)
+        } else {
+            symlink_file(original, link)
+        }
+    })
+    .await
 }
 
 /// Copies the file `from` to `to`, replacing a file there, and reports how
