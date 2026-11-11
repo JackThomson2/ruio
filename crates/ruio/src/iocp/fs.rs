@@ -12,6 +12,10 @@
 //! instead, which the file keeps itself here, as Windows keeps none for a
 //! file opened for overlapped I/O.
 //!
+//! [`File::read_stream`] reads a file from its position on into the buffers
+//! of a pool, a [`BufPool`], one buffer a read, and
+//! hands each back as a lease.
+//!
 //! ```
 //! # ruio::Runtime::new()?.block_on(async {
 //! use ruio::fs::{self, File};
@@ -58,12 +62,12 @@
 //! assert_send(ruio::fs::read_dir("."));
 //! ```
 //!
-//! Not here yet, of what `fs` has on io_uring: `allocate`, `read_stream`,
-//! files taken from and given to the standard library (`from_std`,
-//! `as_std`, `into_std`), a file's `set_permissions`, `symlink`, the
-//! futures' timeouts, and the `Send` files of `portable`. A [`Metadata`]
-//! reports what the standard library's does on every system; an owner, a
-//! mode and an inode are Unix's.
+//! Not here yet, of what `fs` has on io_uring: `allocate`, files taken from
+//! and given to the standard library (`from_std`, `as_std`, `into_std`), a
+//! file's `set_permissions`, `symlink`, the futures' timeouts, and the
+//! `Send` files of `portable`. A [`Metadata`] reports what the standard
+//! library's does on every system; an owner, a mode and an inode are
+//! Unix's.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -83,7 +87,7 @@ use std::time::SystemTime;
 use ruio_executor::blocking::BlockingHandle;
 use ruio_iocp::fs as iocp;
 
-use crate::buf::{BufResult, IoBuf, IoBufMut};
+use crate::buf::{BufLease, BufPool, BufResult, IoBuf, IoBufMut};
 
 pub use ruio_iocp::{ReadExact as ReadExactAt, WriteAll as WriteAllAt};
 
@@ -197,6 +201,23 @@ impl File {
         Write {
             write: self.file.write_at(buf, self.pos.get()),
             pos: Some(&self.pos),
+        }
+    }
+
+    /// The file's data from its position on, read into buffers of `pool`,
+    /// one buffer a read; see [`ReadStream`].
+    ///
+    /// The stream starts where the file's position is as the method is
+    /// called, and moves it on past each item it yields, so it must not
+    /// overlap the file's other reads and writes at the position.
+    ///
+    /// Here the stream reads a file on a disk to its end. io_uring's is for
+    /// the files that data arrives on, pipes and devices, and yields an
+    /// error for a regular file.
+    pub fn read_stream(&self, pool: &BufPool) -> ReadStream<'_> {
+        ReadStream {
+            stream: self.file.read_stream(pool, self.pos.get()),
+            pos: &self.pos,
         }
     }
 
@@ -321,6 +342,96 @@ impl<B: IoBuf> Future for Write<'_, B> {
 impl<B: IoBuf> fmt::Debug for Write<'_, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.write, f)
+    }
+}
+
+/// A file's data from its position on, read into a [`BufPool`]. Made by
+/// [`File::read_stream`].
+///
+/// Each item is one read's data, in one buffer of the pool, and moves the
+/// file's position on past it. The stream ends at the end of the file, or
+/// after yielding an error. One read is in flight at a time, started as the
+/// stream is polled, once the pool has a buffer for it; dropping the stream
+/// cancels it, and its buffer returns to the pool once the cancellation has
+/// completed.
+///
+/// ```
+/// # ruio::Runtime::new()?.block_on(async {
+/// use ruio::buf::BufPool;
+/// use ruio::fs::{self, File};
+///
+/// let name = format!("ruio-stream-{}", std::process::id());
+/// let path = std::env::temp_dir().join(name);
+/// fs::write(&path, vec![7_u8; 10_000]).await?;
+///
+/// let file = File::open(&path).await?;
+/// let pool = BufPool::new(4, 4096)?;
+/// let mut read = 0;
+/// {
+///     let mut data = file.read_stream(&pool);
+///     while let Some(chunk) = data.next().await {
+///         read += chunk?.len();
+///     }
+/// }
+/// assert_eq!(read, 10_000);
+/// file.close().await?;
+/// fs::remove_file(&path).await?;
+/// # std::io::Result::Ok(())
+/// # })?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[derive(Debug)]
+pub struct ReadStream<'a> {
+    stream: iocp::ReadStream<'a>,
+    /// The file's position, which the stream moves on.
+    pos: &'a Cell<u64>,
+}
+
+impl ReadStream<'_> {
+    /// The next data, or `None` at the end of the file or once an error has
+    /// been yielded.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufLease>>> {
+        let next = ready!(self.stream.poll_next(cx));
+        self.pos.set(self.stream.offset());
+        Poll::Ready(next)
+    }
+
+    /// The next data; see [`poll_next`](ReadStream::poll_next).
+    pub async fn next(&mut self) -> Option<io::Result<BufLease>> {
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// The next data if it has been read already, or `None`, without
+    /// waiting, and without starting a read.
+    pub fn next_ready(&mut self) -> Option<io::Result<BufLease>> {
+        let next = self.stream.next_ready();
+        self.pos.set(self.stream.offset());
+        next
+    }
+
+    /// Whether the stream has ended: the file has ended, or an error has
+    /// been yielded.
+    pub fn is_ended(&self) -> bool {
+        self.stream.is_ended()
+    }
+}
+
+#[cfg(feature = "futures")]
+impl futures_core::Stream for ReadStream<'_> {
+    type Item = io::Result<BufLease>;
+
+    #[inline]
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        ReadStream::poll_next(self.get_mut(), cx)
+    }
+}
+
+/// Terminated once the file has ended or an error has been yielded.
+#[cfg(feature = "futures")]
+impl futures_core::stream::FusedStream for ReadStream<'_> {
+    #[inline]
+    fn is_terminated(&self) -> bool {
+        self.is_ended()
     }
 }
 

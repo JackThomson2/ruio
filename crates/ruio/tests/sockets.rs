@@ -8,8 +8,9 @@ mod support;
 
 use std::io::{self, ErrorKind};
 use std::net::Shutdown;
+use std::time::Duration;
 
-use ruio::buf::IoBuf;
+use ruio::buf::{BufPool, IoBuf};
 use ruio::net::{TcpListener, TcpStream, UdpSocket};
 
 use support::within;
@@ -22,6 +23,11 @@ async fn pair() -> io::Result<(TcpListener, TcpStream, TcpStream)> {
     let (server, peer) = within(listener.accept()).await?;
     assert_eq!(peer, client.local_addr().await?);
     Ok((listener, client, server))
+}
+
+/// `len` bytes that repeat only every 251.
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|index| (index % 251) as u8).collect()
 }
 
 #[ruio::test]
@@ -186,6 +192,89 @@ async fn a_datagram_sockets_options_read_back() -> io::Result<()> {
     Ok(())
 }
 
+#[ruio::test]
+async fn a_stream_is_received_into_a_pool() -> io::Result<()> {
+    const LEN: usize = 100_000;
+    let (_listener, client, server) = pair().await?;
+    let pool = BufPool::new(4, 4096)?;
+    let sent = pattern(LEN);
+    let writing = ruio::spawn({
+        let sent = sent.clone();
+        async move {
+            client.write_all(sent).await.0?;
+            client.shutdown(Shutdown::Write).await?;
+            // Kept open until the other end has read it all.
+            io::Result::Ok(client)
+        }
+    });
+    let mut arriving = server.recv_stream(&pool);
+    assert!(!arriving.is_ended());
+    let mut received = Vec::with_capacity(LEN);
+    while let Some(data) = within(arriving.next()).await {
+        let data = data?;
+        assert!(!data.is_empty());
+        assert!(data.buffers() <= pool.count());
+        received.extend_from_slice(&data.to_vec());
+    }
+    assert!(arriving.is_ended());
+    assert!(within(arriving.next()).await.is_none());
+    assert!(arriving.next_ready().is_none());
+    assert!(received == sent, "what arrived is what was written");
+    drop(arriving);
+    assert_eq!(pool.available(), 4);
+    let _client = within(writing).await.unwrap()?;
+    Ok(())
+}
+
+#[ruio::test]
+async fn a_stream_waits_for_a_buffer_of_a_pool_that_is_all_leased() -> io::Result<()> {
+    let (_listener, client, server) = pair().await?;
+    let pool = BufPool::new(1, 64)?;
+    let mut arriving = server.recv_stream(&pool);
+    within(client.write_all(b"one".to_vec())).await.0?;
+    let one = within(arriving.next()).await.expect("the first data")?;
+    assert_eq!(one.to_vec(), b"one");
+    assert_eq!(pool.available(), 0);
+
+    // What arrives next waits for the one buffer, which the lease holds.
+    within(client.write_all(b"two".to_vec())).await.0?;
+    let waited = ruio::time::timeout(Duration::from_millis(50), arriving.next()).await;
+    assert!(waited.is_err());
+    drop(one);
+    let two = within(arriving.next()).await.expect("the second data")?;
+    assert_eq!(two.to_vec(), b"two");
+    Ok(())
+}
+
+#[ruio::test]
+async fn what_has_arrived_is_taken_from_a_stream_without_waiting() -> io::Result<()> {
+    let (_listener, client, server) = pair().await?;
+    let pool = BufPool::new(8, 16)?;
+    let mut arriving = server.recv_stream(&pool);
+    // Nothing has arrived.
+    assert!(arriving.next_ready().is_none());
+    let sent = pattern(40);
+    within(client.write_all(sent.clone())).await.0?;
+    let mut data = within(arriving.next()).await.expect("the data")?;
+    // What is there already is taken at once, and the rest, if it came
+    // apart on the way, as it arrives.
+    while data.len() < sent.len() {
+        let more = match arriving.next_ready() {
+            Some(more) => more?,
+            None => within(arriving.next()).await.expect("the rest")?,
+        };
+        data.append(more);
+    }
+    assert_eq!(data.to_vec(), sent);
+    assert!(data.buffers() >= 3);
+    let lens: usize = data.iter().map(|lease| lease.len()).sum();
+    assert_eq!(lens, data.len());
+    assert_eq!(pool.available(), 8 - data.buffers());
+    assert!(arriving.next_ready().is_none());
+    assert!(!arriving.is_ended());
+    Ok(())
+}
+
 /// A listener's connections are a `Stream` of futures-core.
 #[cfg(feature = "futures")]
 #[ruio::test]
@@ -203,5 +292,35 @@ async fn incoming_is_a_stream_of_connections() -> io::Result<()> {
         .expect("connections never end")?;
     let client = within(connecting).await.unwrap()?;
     assert_eq!(server.peer_addr().await?, client.local_addr().await?);
+    Ok(())
+}
+
+/// What arrives on a connection is a `Stream` of futures-core.
+#[cfg(feature = "futures")]
+#[ruio::test]
+async fn what_arrives_is_a_stream_of_bundles() -> io::Result<()> {
+    use futures_util::StreamExt;
+    use futures_util::stream::FusedStream;
+
+    let (_listener, client, server) = pair().await?;
+    let pool = BufPool::new(4, 1024)?;
+    let sent = pattern(10_000);
+    let writing = ruio::spawn({
+        let sent = sent.clone();
+        async move {
+            client.write_all(sent).await.0?;
+            client.shutdown(Shutdown::Write).await?;
+            io::Result::Ok(client)
+        }
+    });
+    let mut arriving = server.recv_stream(&pool);
+    assert!(!arriving.is_terminated());
+    let mut received = Vec::new();
+    while let Some(data) = within(StreamExt::next(&mut arriving)).await {
+        received.extend_from_slice(&data?.to_vec());
+    }
+    assert!(received == sent, "what arrived is what was written");
+    assert!(arriving.is_terminated());
+    let _client = within(writing).await.unwrap()?;
     Ok(())
 }

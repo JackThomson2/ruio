@@ -66,6 +66,12 @@
 //! and resolve a host name on the thread, as a program binds its listeners
 //! as it starts.
 //!
+//! A stream also receives into a pool of buffers, a
+//! [`BufPool`], as a [`RecvStream`]: it takes a
+//! buffer only once the connection has data, so that the connections that
+//! wait hold no memory, and hands the data back as leases of the pool's
+//! buffers.
+//!
 //! Like the port their I/O completes to, sockets belong to their thread:
 //! they are neither `Send` nor `Sync`.
 //!
@@ -74,12 +80,12 @@
 //! assert_send::<ruio::net::TcpStream>();
 //! ```
 //!
-//! Not here yet, of what `net` has on io_uring: receiving into a pool of
-//! buffers (`recv_stream`, `recv_from_stream`), vectored writes and writes
-//! behind, the futures' timeouts, sockets taken from the standard library
-//! (`from_std`), `bind_reuseport`, a stream's `linger`, moving a stream to
-//! another core, and the `Send` sockets of `portable`. Unix sockets are
-//! Unix's.
+//! Not here yet, of what `net` has on io_uring: datagrams received into a
+//! pool (`recv_stream` and `recv_from_stream` of a UDP socket), vectored
+//! writes and writes behind, the futures' timeouts, sockets taken from the
+//! standard library (`from_std`), `bind_reuseport`, a stream's `linger`,
+//! moving a stream to another core, and the `Send` sockets of `portable`.
+//! Unix sockets are Unix's.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -91,7 +97,7 @@ use std::task::{Context, Poll, ready};
 
 use ruio_iocp::net as iocp;
 
-use crate::buf::{IoBuf, IoBufMut};
+use crate::buf::{BufBundle, BufPool, IoBuf, IoBufMut};
 
 #[path = "../net/addr.rs"]
 mod addr;
@@ -396,6 +402,14 @@ impl TcpStream {
         self.stream.write_all(buf)
     }
 
+    /// The data arriving on the connection, received into buffers of
+    /// `pool` as it arrives; see [`RecvStream`].
+    pub fn recv_stream(&self, pool: &BufPool) -> RecvStream<'_> {
+        RecvStream {
+            stream: self.stream.recv_stream(pool),
+        }
+    }
+
     /// Shuts down the reading or writing half of the connection, or both.
     /// The peer's reads find the end of the stream once the writing half
     /// is shut down.
@@ -411,5 +425,88 @@ impl TcpStream {
 impl fmt::Debug for TcpStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.stream, f)
+    }
+}
+
+/// The data arriving on a connection, received into a [`BufPool`]. Made by
+/// [`TcpStream::recv_stream`].
+///
+/// Each item is one receive's data, as a bundle of leases on buffers of the
+/// pool. The stream ends when the peer shuts down, or after yielding an
+/// error.
+///
+/// A stream that waits for data holds no buffer: it takes one of the pool
+/// once the connection has data, and waits for one to return when every
+/// buffer is leased. A receive fills one buffer here, where io_uring's
+/// fills as many as the data waiting takes, so data that fills several
+/// comes as several items, which [`next_ready`](RecvStream::next_ready)
+/// gathers.
+///
+/// Dropping the stream leaves what arrives after in the socket, for what
+/// reads it next.
+pub struct RecvStream<'a> {
+    stream: iocp::RecvStream<'a>,
+}
+
+impl RecvStream<'_> {
+    /// The next data, or `None` once the peer has shut down or an error has
+    /// been yielded.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufBundle>>> {
+        self.stream.poll_next(cx)
+    }
+
+    /// The next data; see [`poll_next`](RecvStream::poll_next).
+    pub async fn next(&mut self) -> Option<io::Result<BufBundle>> {
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// The next data if it has arrived already, or `None`, without waiting.
+    /// Appending it to the data taken before gathers everything that has
+    /// arrived:
+    ///
+    /// ```no_run
+    /// # async fn gather(stream: ruio::net::TcpStream, pool: ruio::buf::BufPool) {
+    /// let mut received = stream.recv_stream(&pool);
+    /// while let Some(Ok(mut data)) = received.next().await {
+    ///     while let Some(Ok(more)) = received.next_ready() {
+    ///         data.append(more);
+    ///     }
+    ///     println!("{} bytes in {} buffers", data.len(), data.buffers());
+    /// }
+    /// # }
+    /// ```
+    pub fn next_ready(&mut self) -> Option<io::Result<BufBundle>> {
+        self.stream.next_ready()
+    }
+
+    /// Whether the stream has ended: the peer has shut down, or an error has
+    /// been yielded.
+    pub fn is_ended(&self) -> bool {
+        self.stream.is_ended()
+    }
+}
+
+impl fmt::Debug for RecvStream<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.stream, f)
+    }
+}
+
+#[cfg(feature = "futures")]
+impl futures_core::Stream for RecvStream<'_> {
+    type Item = io::Result<BufBundle>;
+
+    #[inline]
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        RecvStream::poll_next(self.get_mut(), cx)
+    }
+}
+
+/// Terminated once the peer has shut down or an error has been yielded.
+#[cfg(feature = "futures")]
+impl futures_core::stream::FusedStream for RecvStream<'_> {
+    #[inline]
+    fn is_terminated(&self) -> bool {
+        self.is_ended()
     }
 }
