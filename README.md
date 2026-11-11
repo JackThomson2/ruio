@@ -45,11 +45,11 @@ by version, and the Rust toolchain that `rust-toolchain.toml` pins
 concept: `ruio::net` has TCP and UDP sockets, `ruio::fs` has files,
 `ruio::buf` a pool of buffers that streams receive into, and `ruio::io`
 the traits both implement there, under the names and with the signatures
-they have on Linux, and `ruio-compat` adapts the streams and files, so
-that hyper and rustls run there; the rest of the I/O is io_uring's so
-far. On macOS, and with `--cfg ruio_engine="park"`, ruio
-builds with its executor alone, on the park engine: runtimes, tasks,
-timers, channels and locks, and no I/O.
+they have on Linux; `Cores` pins its threads there as on Linux; and
+`ruio-compat` adapts the streams and files, so that hyper and rustls run
+there. The rest of the I/O is io_uring's so far. On macOS, and with
+`--cfg ruio_engine="park"`, ruio builds with its executor alone, on the
+park engine: runtimes, tasks, timers, channels and locks, and no I/O.
 
 ## Crates
 

@@ -28,6 +28,12 @@
 //! (`fs::ReadStream`). A stream also writes several buffers as one, and
 //! leaves a write behind it for the engine to finish.
 //!
+//! A stream's socket and a file on a disk ask the system to queue no
+//! completion for an operation that succeeds during the call that starts
+//! it. Such an operation is finished by the poll that started it, and
+//! costs no turn of the port; and a turn that would not wait asks the port
+//! for nothing while no operation is in flight.
+//!
 //! Off Windows the crate is empty, but for the tests of what needs nothing
 //! of Windows': the pool, and the bookkeeping of a stream's writes.
 

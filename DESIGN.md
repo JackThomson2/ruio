@@ -919,6 +919,8 @@ baseline are used only when probed.
   cpuset limit them, whichever thread asks), the first few, or a list.
   Each core's thread is pinned to its CPU before its runtime is built, so
   that the ring is local to it and has the thread as its one submitter.
+  Linux and Windows pin; on Windows, where processors come in groups of
+  64, a CPU's number is 64 times its group's plus its own within it.
   The cores meet before any `main` starts, each putting in its `Handle`, so
   that every core can reach every other (`spawn_on`, `handle_of`). A core
   whose `main` has returned keeps running what the others spawn onto it
@@ -1102,8 +1104,8 @@ alone.
   variable of the standard library until an unpark, its timeout or its
   timer, and runs no I/O. On it the executor's tasks, timers, channels,
   locks, blocking pool and `Cores` work wherever the standard library
-  does, though off Linux `Cores` does not pin its threads yet. It is the
-  smallest engine that keeps the contract, the one to start a new engine
+  does, though `Cores` pins its threads on Linux and Windows alone. It is
+  the smallest engine that keeps the contract, the one to start a new engine
   from, and the one besides io_uring that CI runs the executor's tests
   on, 279 of the 299, the others running io_uring operations, and builds
   the executor and its tests on for macOS. `ruio` builds on it with the
@@ -1117,12 +1119,11 @@ alone.
 - **Windows: an I/O completion port, a proof of concept.** The
   executor runs on `ruio_iocp::Iocp` on Windows. A park waits on the port
   with `GetQueuedCompletionStatusEx` until the earlier of its timeout and
-  the timer, in milliseconds rounded up, and waits out the rest of a wait
-  that ends early at a tick of Windows' timer, which is about 15.6 ms by
-  default, so its timers are as coarse. An unpark posts a packet of its
-  own, once for several, by the flag the park engine's uses, to a port
-  the engine shares with its unparkers, so that one after the engine is
-  gone posts to a port nothing reads rather than to a closed handle. A
+  the timer, and waits out the rest of a wait that ends early; what ends
+  it on time is the engine's own timer, below. An unpark posts a packet
+  of its own, once for several, by the flag the park engine's uses, to a
+  port the engine shares with its unparkers, so that one after the engine
+  is gone posts to a port nothing reads rather than to a closed handle. A
   check for work takes what the port has without waiting and keeps it for
   the next turn. Its files (`fs::File`), named pipes (`pipe::NamedPipe`)
   and sockets (`net::TcpListener`, `net::TcpStream`, `net::UdpSocket`)
@@ -1157,10 +1158,9 @@ alone.
   standard library's file, on any other (`open_std`, `File::from_std`),
   and lends that file in an `Arc` (`File::as_std`) for the calls Windows
   has no overlapped form of. Its bindings are written by hand from the
-  SDK's headers, as `ruio-sys`'s are. What it lacks so far: handles that
-  skip the port when an operation completes at once (each such
-  completion still costs a turn), a way to make a turn without a call to
-  the port, and counting the executor's wakers rather than cloning them.
+  SDK's headers, as `ruio-sys`'s are. What it lacks so far: a turn that
+  costs no call to the port while an operation is in flight, and
+  counting the executor's wakers rather than cloning them.
 - **A pool on the port.** A port has no buffers for the system to pick
   from, as io_uring's provided-buffer rings are, so `ruio-iocp`'s
   `BufPool` is the thread's, with the names, the methods and the refused
@@ -1201,6 +1201,41 @@ alone.
   standard library has not made its own stable. A socket that lingers
   refuses to close while it does not block, so one that a pooled receive
   made non-blocking is made blocking again as it closes.
+- **The port's timer and its shortcuts.** A wait on the port ends at a
+  tick of Windows' timer, 15.6 ms apart by default, so a sleep of a
+  millisecond took 12. The engine's deadline is now a high-resolution
+  waitable timer, which Windows 10 has from its version 1803, whose
+  expiry a wait completion packet of `ntdll`'s posts to the port, as the
+  Go runtime wakes its poller: a turn that waits until a deadline sets
+  the timer first, and the wait's own timeout stands behind it, alone
+  where the system has no such timer. The packet waits for the timer
+  rather than for a deadline, so a deadline that has not changed since
+  the last turn costs no call and one that has costs one, and a packet
+  from a deadline since replaced is no work: a turn that delivered
+  nothing else waits on. A stream's socket, where its provider gives it
+  a handle of the system's own, and a file on a disk ask the system to
+  queue no completion for an operation that succeeds during the call
+  that starts it (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`). Such an
+  operation is finished by the poll that started it, with the count the
+  call gave, and one left to finish by itself is told before `detach`
+  returns. Datagram sockets are left out, since a datagram cut short
+  fails the call with a completion that may or may not follow, and so
+  are listeners, pipes and other files. An operation that costs no turn
+  lets its task go on without one, so only 64 may finish so between two
+  turns, as many as the executor runs tasks between two: past that an
+  operation waits for the turn before it starts, and a write behind
+  yields the same way. And a turn that would not wait asks the port for
+  nothing when no operation is in flight and no unpark has posted, as
+  the port then holds nothing for it; on a runner of CI's the call costs
+  some 11 microseconds when the port is empty. On one such runner, the
+  engine before these and after: a sleep of a millisecond takes 2.0 ms
+  where it took 11.6 to 12.9; two tasks yield to each other 58 million
+  times a second where they did 5.3 million; a stream moves 6,930 MiB a
+  second where it moved 6,050, and 6,710 into a pool where it moved
+  5,955; round trips of 64 bytes are 88 thousand a second as they were,
+  and a file is written and read as fast as it was. With a read in
+  flight the tasks still yield 5.4 million times a second: a turn then
+  asks the port, and that call is what is left to save.
 - **`net`, `fs`, `io` and `buf` on Windows.** `ruio::net`, `ruio::fs`
   and `ruio::io` are there in part, in `src/iocp/net.rs`,
   `src/iocp/fs.rs` and `src/iocp/io.rs`, which `lib.rs` names `net`,
@@ -1296,7 +1331,19 @@ alone.
   `x86_64-pc-windows-msvc` and the same crates links those tests, with
   `--lib --tests` for `ruio-compat`; `cargo-xwin` downloads Microsoft's C
   runtime and Windows SDK for that, under Microsoft's licence, which
-  using it accepts.
+  using it accepts. `examples/speed.rs` of `ruio` times an engine through
+  the API both have: a sleep, round trips, streams, a file, and tasks
+  yielding with a read in flight and with none. Both jobs run it and
+  report its figures in an annotation of the run, which, unlike a run's
+  logs, anyone can read; `ci/annotate.sh` prints one, and also what
+  failed in a job's log, the tests and what each printed. Two runs land
+  on machines whose speeds differ by half, so `ci/compare.sh` builds the
+  example against earlier commits too, each in a target directory of its
+  own, and runs them in turn on the one machine: against the commit a
+  push replaced, and on Windows against the engine as it was before its
+  timer and its shortcuts. The tests of those skip where a system gives
+  the engine neither, and fail instead under
+  `RUIO_REQUIRE_PORT_SHORTCUTS`, which the Windows job sets.
 
 Adding an engine takes:
 
@@ -1381,12 +1428,12 @@ What is left, in order:
    sockets and files taken from the standard library, and the portable
    sockets and files, with the adapter and the client built on them;
    `ruio-compat`'s adapter there receiving into the pool the port now
-   has; and timers finer than the tick of Windows' timer.
+   has; and a turn that costs no call to the port while an operation is
+   in flight.
 2. A kqueue engine for macOS, with owned-buffer I/O. kqueue reports
    readiness, so a read waits for its socket to be readable and then reads
    into the caller's buffer itself, and files go to the blocking pool.
-3. Pinning `Cores`' threads on Windows (`SetThreadAffinityMask`); macOS
-   offers only affinity hints.
+3. Pinning `Cores`' threads on macOS, which offers only affinity hints.
 
 
 ## Networking
@@ -3708,6 +3755,13 @@ Since M7:
   behind with `flush`, and `linger`; a file's `read_stream`, `allocate`,
   `set_permissions` and `as_std`; and `symlink`. The tests of them that
   name no engine run on both (see [Engines](#engines)).
+- The completion port's timers fire on time, from a high-resolution
+  timer of the engine's own; an operation that succeeds as it starts is
+  finished there, with no turn of the port; a turn asks the port for
+  nothing when it can hold nothing; and `Cores` pins its threads on
+  Windows. A timing example and two scripts report an engine's speed,
+  and what failed, in the annotations of a run of CI (see
+  [Engines](#engines)).
 
 ## Open questions
 
