@@ -17,16 +17,31 @@
 //! cancelled, and its buffer freed only once the cancellation's completion
 //! has come.
 //!
-//! Off Windows the crate is empty.
-#![cfg(windows)]
+//! `buf::BufPool` is a pool of buffers for readers to take from as data
+//! arrives, which is the thread's, as a port has none for the system to
+//! pick from.
+//!
+//! Off Windows the crate is empty, but for the tests of the pool, which
+//! needs nothing of Windows'.
 
+#[cfg(any(windows, test))]
+pub mod buf;
+#[cfg(windows)]
 mod engine;
+#[cfg(windows)]
 pub mod fs;
+#[cfg(windows)]
 mod handle;
+#[cfg(windows)]
 pub mod net;
+#[cfg(windows)]
 mod op;
+#[cfg(windows)]
 pub mod pipe;
+#[cfg(windows)]
 mod sys;
 
+#[cfg(windows)]
 pub use engine::{Builder, Entered, Iocp, Unparker};
+#[cfg(windows)]
 pub use op::{Read, ReadExact, Write, WriteAll};
