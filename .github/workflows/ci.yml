@@ -53,6 +53,14 @@ jobs:
       # The other crates are Linux's, and do not build on Windows.
       - name: Lint the crates that build on Windows
         run: cargo clippy -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio --all-targets --all-features --locked -- -D warnings
+      # ruio-compat's examples receive into pools of buffers, which are
+      # io_uring's, so its library and its tests are what builds here.
+      - name: Lint the adapters of ruio-compat
+        run: cargo clippy -p ruio-compat --lib --tests --all-features --locked -- -D warnings
       # Every test binary runs, so that one run reports every failure.
       - name: Test them on the I/O completion port engine
         run: cargo test -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio --all-features --locked --no-fail-fast
+      - name: Test the adapters on the I/O completion port engine
+        run: cargo test -p ruio-compat --lib --tests --all-features --locked --no-fail-fast
+      - name: Test the examples in the adapters' documentation
+        run: cargo test -p ruio-compat --doc --all-features --locked
