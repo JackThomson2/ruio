@@ -109,12 +109,15 @@ jobs:
         run: |
           cargo run --release --locked -p ruio --example speed 2>>windows.log | tee speed.txt
           bash ci/annotate.sh notice "Speed on the I/O completion port" speed.txt
-      - name: Time it against what the push replaced
-        if: ${{ !cancelled() && github.event_name == 'push' && !startsWith(github.event.before, '0000000') }}
+      # Against the commit the push replaced, if it replaced one, and against
+      # the engine as it was before its timer and its shortcuts: each is
+      # built apart, so this takes some minutes.
+      - name: Time it against earlier commits
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
-          bash ci/compare.sh "${{ github.event.before }}" 2>>windows.log | tee compared.txt
-          bash ci/annotate.sh notice "The I/O completion port before and after the push" compared.txt
+          bash ci/compare.sh ${{ github.event.before }} dc5dacc1e2bd49535d3f52db17cebdc0dd732e0d 2>>windows.log | tee compared.txt
+          bash ci/annotate.sh notice "The I/O completion port against earlier commits" compared.txt
       - name: Say what failed
         if: failure() || cancelled()
         shell: bash
