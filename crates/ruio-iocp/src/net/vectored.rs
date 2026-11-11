@@ -1,0 +1,159 @@
+//! Several buffers written to a stream as one.
+
+use std::fmt;
+use std::future::Future;
+use std::io;
+use std::mem;
+use std::pin::Pin;
+use std::ptr;
+use std::task::{Context, Poll};
+
+use ruio_buf::{BufResult, IoBufs};
+
+use crate::gather::Gather;
+use crate::handle::Target;
+use crate::op::Op;
+use crate::sys;
+
+use super::{outcome, socket_of, taken};
+
+/// How many buffers a send names without allocating room for their names.
+const FEW: usize = 16;
+
+/// A `WSABUF` that names nothing.
+const EMPTY: sys::WsaBuf = sys::WsaBuf {
+    len: 0,
+    buf: ptr::null_mut(),
+};
+
+/// Starts a send of what is left of `gather`'s buffers, as `op`'s `Start`
+/// says: all of it, short of 4 GiB, as a completion counts the bytes it
+/// sent in 32 bits.
+///
+/// # Safety
+///
+/// As for `Start`.
+pub(super) unsafe fn start_send_vectored<V: IoBufs>(
+    socket: sys::Handle,
+    gather: &mut Gather<V>,
+    overlapped: *mut sys::Overlapped,
+) -> io::Result<()> {
+    let mut few = [EMPTY; FEW];
+    let mut many = Vec::new();
+    let count = gather.bufs.buf_count();
+    let buffers = if count <= FEW {
+        &mut few[..]
+    } else {
+        many.resize(count, EMPTY);
+        &mut many[..]
+    };
+    let mut used = 0;
+    gather.rest(u32::MAX as usize, |ptr, len| {
+        buffers[used] = sys::WsaBuf {
+            len: len as u32,
+            buf: ptr.cast_mut(),
+        };
+        used += 1;
+    });
+    // SAFETY: the caller's promise for the socket, the buffers and the
+    // `OVERLAPPED`; each part named holds that many initialized bytes, as
+    // `IoBufs` promises, which a send only reads; and Winsock copies the
+    // `WSABUF`s before the call returns.
+    let failed = unsafe {
+        sys::WSASend(
+            socket_of(socket),
+            buffers.as_ptr(),
+            used as u32,
+            ptr::null_mut(),
+            0,
+            overlapped,
+            ptr::null(),
+        )
+    };
+    taken(failed == 0)
+}
+
+/// The future of
+/// [`TcpStream::write_all_vectored`](super::TcpStream::write_all_vectored):
+/// several buffers written to a stream, one after another, as many of them
+/// in a send as the system takes. It hands the buffers, any [`IoBufs`],
+/// such as a bundle of received data, back with `Ok(())` once all their
+/// bytes are sent, or with the error that stopped the write.
+///
+/// Dropping it cancels the send in flight, which may have sent some of the
+/// bytes by then, and the buffers are dropped once the cancellation has
+/// completed.
+#[must_use = "futures do nothing unless polled"]
+pub struct WriteAllVectored<'a, V: IoBufs> {
+    target: Target<'a>,
+    state: Sending<'a, V>,
+}
+
+/// Where a write of several buffers has got to.
+enum Sending<'a, V> {
+    /// Not started yet: the buffers.
+    Start(V),
+    /// A send of what is left of the buffers, which hold `len` bytes, in
+    /// flight.
+    Moving { op: Op<'a, Gather<V>>, len: usize },
+    /// Finished, the buffers handed back.
+    Finished,
+}
+
+// Nothing is pinned: the buffers are only ever moved.
+impl<V: IoBufs> Unpin for WriteAllVectored<'_, V> {}
+
+impl<'a, V: IoBufs> WriteAllVectored<'a, V> {
+    pub(super) fn new(target: Target<'a>, bufs: V) -> Self {
+        Self {
+            target,
+            state: Sending::Start(bufs),
+        }
+    }
+}
+
+impl<V: IoBufs> Future for WriteAllVectored<'_, V> {
+    type Output = BufResult<(), V>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            let (gather, len) = match mem::replace(&mut this.state, Sending::Finished) {
+                Sending::Start(bufs) => {
+                    let len = bufs.bytes_init();
+                    (Gather { bufs, done: 0 }, len)
+                }
+                Sending::Moving { mut op, len } => {
+                    let start = start_send_vectored::<V>;
+                    let Poll::Ready((sent, mut gather)) = op.poll_with(cx, start, outcome) else {
+                        this.state = Sending::Moving { op, len };
+                        return Poll::Pending;
+                    };
+                    match sent {
+                        Ok(0) => {
+                            let err = io::ErrorKind::WriteZero.into();
+                            return Poll::Ready((Err(err), gather.bufs));
+                        }
+                        Ok(sent) => gather.done += sent as usize,
+                        Err(err) => return Poll::Ready((Err(err), gather.bufs)),
+                    }
+                    (gather, len)
+                }
+                Sending::Finished => panic!("`WriteAllVectored` polled after it completed"),
+            };
+            if gather.done >= len {
+                return Poll::Ready((Ok(()), gather.bufs));
+            }
+            this.state = Sending::Moving {
+                op: Op::new(this.target, gather, 0),
+                len,
+            };
+        }
+    }
+}
+
+impl<V: IoBufs> fmt::Debug for WriteAllVectored<'_, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WriteAllVectored").finish_non_exhaustive()
+    }
+}

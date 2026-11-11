@@ -388,6 +388,65 @@ fn a_read_that_cannot_fill_its_buffer_says_the_stream_ended() -> io::Result<()> 
 }
 
 #[test]
+fn several_buffers_are_written_as_one() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let (_listener, client, server) = pair().await?;
+        let bufs = vec![
+            b"hello, ".to_vec(),
+            Vec::new(),
+            b"wor".to_vec(),
+            b"ld".to_vec(),
+        ];
+        let (written, bufs) = client.write_all_vectored(bufs).await;
+        written?;
+        assert_eq!(bufs, [&b"hello, "[..], b"", b"wor", b"ld"]);
+        let (read, buf) = server.read_exact(Vec::with_capacity(12).slice(..12)).await;
+        read?;
+        assert_eq!(buf.into_inner(), b"hello, world");
+
+        // An array of buffers is written the same, and buffers that hold
+        // nothing write nothing.
+        let (written, _) = server
+            .write_all_vectored([b"ab".to_vec(), b"cd".to_vec()])
+            .await;
+        written?;
+        let (written, _) = server.write_all_vectored(Vec::<Vec<u8>>::new()).await;
+        written?;
+        let (written, _) = server
+            .write_all_vectored([Vec::<u8>::new(), Vec::new()])
+            .await;
+        written?;
+        let (read, buf) = client.read_exact(Vec::with_capacity(4).slice(..4)).await;
+        read?;
+        assert_eq!(buf.into_inner(), b"abcd");
+        Ok(())
+    })
+}
+
+#[test]
+fn many_buffers_are_written_as_one_while_the_peer_reads() -> io::Result<()> {
+    const BUFFERS: usize = 64;
+    const LEN: usize = 16 * 1024;
+    Runtime::new()?.block_on(async {
+        let (_listener, client, server) = pair().await?;
+        let bufs: Vec<Vec<u8>> = (0..BUFFERS)
+            .map(|buffer| (0..LEN).map(|at| (buffer * 7 + at % 251) as u8).collect())
+            .collect();
+        let sent = bufs.concat();
+        let reading = ruio_executor::spawn(async move {
+            let buf = Vec::with_capacity(BUFFERS * LEN).slice(..BUFFERS * LEN);
+            let (read, buf) = server.read_exact(buf).await;
+            read.map(|()| buf.into_inner())
+        });
+        let (written, bufs) = client.write_all_vectored(bufs).await;
+        written?;
+        assert_eq!(bufs.len(), BUFFERS);
+        assert!(reading.await.unwrap()? == sent, "what is read was written");
+        Ok(())
+    })
+}
+
+#[test]
 fn a_listener_binds_only_where_a_runtime_runs() {
     let err = TcpListener::bind(loopback()).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Other);

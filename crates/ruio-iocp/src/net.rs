@@ -27,7 +27,7 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::task::{Context, Poll, ready};
 
-use ruio_buf::{IoBuf, IoBufMut, Slice};
+use ruio_buf::{IoBuf, IoBufMut, IoBufs, Slice};
 
 use crate::buf::BufPool;
 use crate::handle::{IoHandle, Raw};
@@ -36,9 +36,11 @@ use crate::sys;
 
 mod recv;
 mod udp;
+mod vectored;
 
 pub use recv::RecvStream;
 pub use udp::{RecvFrom, SendTo, UdpSocket};
+pub use vectored::WriteAllVectored;
 
 /// Room for one of the two addresses `AcceptEx` writes: the largest address
 /// there is, and the 16 bytes more that it asks for.
@@ -575,6 +577,12 @@ impl TcpStream {
     pub fn write_all<B: IoBuf>(&self, buf: B) -> WriteAll<'_, B> {
         let target = self.stream.target();
         WriteAll::with(target, buf, 0, start_send::<Slice<B>>, outcome)
+    }
+
+    /// Writes all of the bytes of `bufs` to the peer, one buffer after
+    /// another, such as a bundle received; see [`WriteAllVectored`].
+    pub fn write_all_vectored<V: IoBufs>(&self, bufs: V) -> WriteAllVectored<'_, V> {
+        WriteAllVectored::new(self.stream.target(), bufs)
     }
 
     /// The data arriving on the connection, received into buffers of

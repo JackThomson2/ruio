@@ -30,6 +30,8 @@ pub mod buf;
 mod engine;
 #[cfg(windows)]
 pub mod fs;
+#[cfg(any(windows, test))]
+mod gather;
 #[cfg(windows)]
 mod handle;
 #[cfg(windows)]

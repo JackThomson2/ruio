@@ -226,6 +226,62 @@ fn a_stream_dropped_while_it_waits_leaves_the_socket_to_other_reads() -> io::Res
 }
 
 #[test]
+fn what_is_received_into_a_pool_is_written_back_as_it_is() -> io::Result<()> {
+    const LEN: usize = 200_000;
+    Runtime::new()?.block_on(async {
+        let (_listener, client, server) = pair().await?;
+        let pool = BufPool::new(16, 4096)?;
+        let echo = ruio_executor::spawn(async move {
+            let mut arriving = server.recv_stream(&pool);
+            let mut echoed = 0;
+            while let Some(data) = arriving.next().await {
+                let mut data = data?;
+                // What has arrived by now goes out with it, up to half of
+                // the pool.
+                while data.buffers() < 8 {
+                    match arriving.next_ready() {
+                        Some(more) => data.append(more?),
+                        None => break,
+                    }
+                }
+                echoed += data.len();
+                let (written, data) = server.write_all_vectored(data).await;
+                written?;
+                drop(data);
+            }
+            drop(arriving);
+            server.shutdown(Shutdown::Write)?;
+            io::Result::Ok((echoed, pool.available(), server))
+        });
+        let client = std::rc::Rc::new(client);
+        let sent = pattern(LEN);
+        // The echo is read while the data is written, as neither end's
+        // buffers hold all of it.
+        let reading = ruio_executor::spawn({
+            let client = std::rc::Rc::clone(&client);
+            async move {
+                let mut back = Vec::with_capacity(LEN);
+                loop {
+                    let (read, buf) = client.read(Vec::with_capacity(64 * 1024)).await;
+                    if read? == 0 {
+                        return io::Result::Ok(back);
+                    }
+                    back.extend_from_slice(&buf);
+                }
+            }
+        });
+        let (written, sent) = client.write_all(sent).await;
+        written?;
+        client.shutdown(Shutdown::Write)?;
+        assert!(reading.await.unwrap()? == sent, "the echo is the data");
+        let (echoed, available, _server) = echo.await.unwrap()?;
+        assert_eq!(echoed, LEN);
+        assert_eq!(available, 16);
+        Ok(())
+    })
+}
+
+#[test]
 fn a_stream_shut_down_for_reading_ends() -> io::Result<()> {
     Runtime::new()?.block_on(async {
         let (_listener, _client, server) = pair().await?;
