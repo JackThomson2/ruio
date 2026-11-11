@@ -1,7 +1,7 @@
 //! The engine: a completion port, the thread's current engine, and turning
 //! the port.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
 use std::io;
 use std::mem;
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use ruio_engine::{Build, Engine, LocalWaker, Unpark};
 
+use crate::portable::ready::{self, Afd};
 use crate::portable::wait::Waits;
 use crate::{op, sys};
 
@@ -31,6 +32,12 @@ const TIMER: usize = 2;
 ///
 /// [`HandleWait`]: crate::portable::HandleWait
 pub(crate) const SIGNALED: usize = 3;
+
+/// The completion key of the engine's handle of the AFD driver, under
+/// which the polls of [`ReadyWait`]s complete, each carrying its slot.
+///
+/// [`ReadyWait`]: crate::portable::ReadyWait
+pub(crate) const AFD: usize = 4;
 
 /// How many operations may finish during the calls that start them between
 /// two turns of the port: as many as the executor runs tasks between two.
@@ -91,6 +98,9 @@ struct Inner {
     /// The operations in flight that were left to finish by themselves,
     /// which no future's drop cancels.
     detached: op::DetachedOps,
+    /// The engine's handle of the AFD driver, opened as the first socket
+    /// waits to be ready on its thread.
+    afd: OnceCell<Arc<Afd>>,
     /// Whether the engine is being dropped, when completions wake nothing.
     closing: Cell<bool>,
     /// How long dropping the engine waits for the operations in flight.
@@ -326,6 +336,7 @@ impl Iocp {
                 in_flight: Cell::new(0),
                 at_once: Cell::new(0),
                 detached: op::DetachedOps::default(),
+                afd: OnceCell::new(),
                 closing: Cell::new(false),
                 shutdown_timeout: builder.shutdown_timeout,
             }),
@@ -380,6 +391,17 @@ impl Iocp {
     pub(crate) fn shared(&self) -> &Arc<Shared> {
         &self.inner.shared
     }
+
+    /// The engine's handle of the AFD driver, which this opens if it has
+    /// not.
+    pub(crate) fn afd(&self) -> io::Result<Arc<Afd>> {
+        if let Some(afd) = self.inner.afd.get() {
+            return Ok(Arc::clone(afd));
+        }
+        let afd = Arc::new(Afd::open(self.inner.shared.port)?);
+        let _ = self.inner.afd.set(Arc::clone(&afd));
+        Ok(afd)
+    }
 }
 
 impl Inner {
@@ -433,6 +455,13 @@ impl Inner {
                     delivered -= 1;
                 }
                 SIGNALED => self.shared.waits.signaled(entry.overlapped.addr()),
+                AFD => {
+                    self.in_flight.set(self.in_flight.get() - 1);
+                    // SAFETY: a completion under the key of the engine's
+                    // handle of the AFD driver is that of a poll `ready`
+                    // made through it, which the port hands back once.
+                    unsafe { ready::complete(entry) };
+                }
                 // Nothing posts under another key.
                 _ => {}
             }
@@ -516,12 +545,15 @@ impl Drop for Inner {
         // system may still write to its buffer. What has come by then is
         // delivered however short the timeout: past it, a turn takes what
         // the port holds without waiting, until one delivers no operation.
-        // The waits that other threads may hold are cancelled too, but for
-        // those whose packets lie in the port already, which are delivered
-        // so.
+        // The waits and the polls that other threads may hold are cancelled
+        // too: their completions are delivered so, but for the waits whose
+        // packets the system takes back.
         self.closing.set(true);
         self.detached.cancel();
         self.shared.waits.cancel_all();
+        if let Some(afd) = self.afd.get() {
+            afd.cancel_all();
+        }
         let deadline = now().saturating_add(self.shutdown_timeout);
         let pending = || self.in_flight.get() + self.shared.waits.count();
         while pending() > 0 {

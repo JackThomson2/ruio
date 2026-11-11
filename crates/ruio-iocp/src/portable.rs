@@ -11,11 +11,18 @@
 //!   it has exited, or an event once an operation that names it has
 //!   completed, with a wait completion packet that the system posts to the
 //!   port.
+//! - [`ReadyWait`] waits for a socket to be ready, with a poll of the AFD
+//!   driver's that completes to the port, through a handle of the driver's
+//!   that each engine opens: so a socket that no port has, read and written
+//!   with calls that do not wait, waits for its readiness wherever it is
+//!   polled.
 //!
 //! Polled on a thread with no engine current, a wait fails with
 //! [`io::ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported), as one
 //! of io_uring's portable operations does with no foreign ring set.
 
+pub(crate) mod ready;
 pub(crate) mod wait;
 
+pub use ready::{ReadyWait, base_socket, events};
 pub use wait::HandleWait;

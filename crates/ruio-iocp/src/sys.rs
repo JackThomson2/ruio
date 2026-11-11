@@ -45,6 +45,32 @@ pub(crate) const STATUS_PENDING: u32 = 0x0000_0103;
 /// `STATUS_SUCCESS`.
 pub(crate) const STATUS_SUCCESS: i32 = 0;
 
+/// `STATUS_CANCELLED`: the status of an operation that was cancelled.
+pub(crate) const STATUS_CANCELLED: i32 = 0xC000_0120_u32 as i32;
+
+/// `SYNCHRONIZE`: the right to wait for an object, which is all a handle of
+/// the AFD driver's needs for the polls made through it.
+pub(crate) const SYNCHRONIZE: u32 = 0x0010_0000;
+
+/// `FILE_SHARE_READ`.
+pub(crate) const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+/// `FILE_SHARE_WRITE`.
+pub(crate) const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+/// `FILE_OPEN`: open what exists, and fail if nothing does.
+pub(crate) const FILE_OPEN: u32 = 0x0000_0001;
+
+/// `IOCTL_AFD_POLL`: the control code of the AFD driver's poll, which
+/// completes once one of the sockets an [`AfdPollInfo`] names has one of
+/// the events asked for, at once if it has one already. The SDK does not
+/// declare it; Windows' own `ws2_32` makes it for `WSAPoll`.
+pub(crate) const IOCTL_AFD_POLL: u32 = 0x0001_2024;
+
+/// `SIO_BASE_HANDLE`: the `WSAIoctl` that gives the socket of the base
+/// provider beneath any layered one, which the AFD driver knows.
+pub(crate) const SIO_BASE_HANDLE: u32 = 0x4800_0022;
+
 /// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`: a timer that expires when it
 /// is due rather than at the next tick of the system's timer, which
 /// Windows 10 has from its version 1803.
@@ -338,6 +364,85 @@ const _: () = assert!(
 );
 const _: () = assert!(size_of::<Guid>() == 16);
 
+/// `IO_STATUS_BLOCK`: where the system writes the outcome of an operation
+/// started with the native calls: its status, an `NTSTATUS` in the low half
+/// of the first word, and what it transferred.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IoStatusBlock {
+    /// `Status`, in a union with a pointer, which gives it its size.
+    pub(crate) status: usize,
+    /// `Information`.
+    pub(crate) information: usize,
+}
+
+/// `UNICODE_STRING`: a name the native calls take, in UTF-16.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnicodeString {
+    /// `Length`: how many bytes the name has.
+    pub(crate) length: u16,
+    /// `MaximumLength`: how many bytes the buffer has.
+    pub(crate) maximum_length: u16,
+    /// `Buffer`.
+    pub(crate) buffer: *const u16,
+}
+
+/// `OBJECT_ATTRIBUTES`: what `NtCreateFile` opens, by name here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ObjectAttributes {
+    /// `Length`: the size of the structure.
+    pub(crate) length: u32,
+    /// `RootDirectory`: none here, the name being absolute.
+    pub(crate) root_directory: Handle,
+    /// `ObjectName`.
+    pub(crate) object_name: *const UnicodeString,
+    /// `Attributes`.
+    pub(crate) attributes: u32,
+    /// `SecurityDescriptor`.
+    pub(crate) security_descriptor: *const c_void,
+    /// `SecurityQualityOfService`.
+    pub(crate) security_quality_of_service: *const c_void,
+}
+
+/// `AFD_POLL_HANDLE_INFO`: a socket to poll, by its base handle, the events
+/// to poll it for, and, once the poll has completed, those it has.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AfdPollHandleInfo {
+    /// `Handle`.
+    pub(crate) handle: Handle,
+    /// `PollEvents`: the `AFD_POLL_*` bits.
+    pub(crate) events: u32,
+    /// `Status`.
+    pub(crate) status: i32,
+}
+
+/// `AFD_POLL_INFO`: a poll of the AFD driver's, of one socket here, which
+/// the driver reads and writes back with the events that it found.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AfdPollInfo {
+    /// `Timeout`, in units of 100 ns, of which the largest waits for ever.
+    pub(crate) timeout: i64,
+    /// `NumberOfHandles`: how many of `handles` there are, and once the
+    /// poll has completed, how many have events.
+    pub(crate) number_of_handles: u32,
+    /// `Exclusive`: whether this poll replaces the others on its sockets,
+    /// which none here does.
+    pub(crate) exclusive: u32,
+    /// `Handles`.
+    pub(crate) handles: [AfdPollHandleInfo; 1],
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    size_of::<IoStatusBlock>() == 16
+        && size_of::<ObjectAttributes>() == 48
+        && size_of::<AfdPollInfo>() == 32
+);
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     /// Makes a port, given no file and no port, or associates a file's
@@ -494,6 +599,44 @@ unsafe extern "system" {
     /// the packet it posted out of its port if `remove_signaled` is not
     /// zero and no turn has taken it yet. An `NTSTATUS`.
     pub(crate) fn NtCancelWaitCompletionPacket(packet: Handle, remove_signaled: u8) -> i32;
+
+    /// Opens the file, the device or the driver's object that `attributes`
+    /// names, and writes its handle to `file` and the outcome to `status`.
+    /// An `NTSTATUS`: negative on failure.
+    pub(crate) fn NtCreateFile(
+        file: *mut Handle,
+        access: u32,
+        attributes: *const ObjectAttributes,
+        status: *mut IoStatusBlock,
+        allocation_size: *const i64,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        extended_attributes: *const c_void,
+        extended_attributes_len: u32,
+    ) -> i32;
+
+    /// Starts the control operation `code` on `file`, with `input` and
+    /// `output`, which it uses until the operation completes, as it writes
+    /// the outcome to `status`. With no event and no routine, a file
+    /// associated with a port has the completion go there, carrying
+    /// `context`. An `NTSTATUS`: `STATUS_PENDING` if it completes later;
+    /// one that is no error if it completed at once, its completion still
+    /// going to the port; an error if it failed at once, when nothing goes
+    /// there.
+    pub(crate) fn NtDeviceIoControlFile(
+        file: Handle,
+        event: Handle,
+        routine: *const c_void,
+        context: *mut c_void,
+        status: *mut IoStatusBlock,
+        code: u32,
+        input: *const c_void,
+        input_len: u32,
+        output: *mut c_void,
+        output_len: u32,
+    ) -> i32;
 }
 
 #[link(name = "ws2_32")]
