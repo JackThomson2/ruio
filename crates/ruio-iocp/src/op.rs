@@ -11,12 +11,18 @@
 //! and all, once the completion comes, as the system may use the buffer
 //! until then. A future forgotten without being dropped leaks its slot,
 //! which is as sound: nothing frees memory the system may still write.
+//!
+//! An operation may also be left to finish by itself, with no future to
+//! wait for it. Its slot is the engine's from the start, and when the
+//! completion comes the engine hands what the slot holds the outcome. No
+//! future's drop cancels such an operation, so the engine keeps those in
+//! flight, and cancels them as it is dropped.
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::mem;
+use std::mem::{self, ManuallyDrop};
 use std::pin::Pin;
 use std::ptr::{self, NonNull};
 use std::task::{Context, Poll, Waker, ready};
@@ -39,9 +45,25 @@ struct Header {
     waker: Cell<Option<Waker>>,
     /// How many bytes the operation transferred, once it completed.
     bytes: Cell<u32>,
-    /// Frees the slot that the header begins.
-    free: unsafe fn(*mut Header),
+    /// What the engine does with the slot that the header begins once the
+    /// operation has completed and no future has the slot.
+    release: Release,
+    /// Where the engine keeps the operation among those left to finish by
+    /// themselves, if it is one.
+    place: Cell<usize>,
 }
+
+/// Disposes of the slot that a header begins, whose operation has completed
+/// with no future to take it, having transferred as many bytes as the port
+/// said: frees it, after handing what it holds the outcome if the operation
+/// was left to finish by itself, which wakes tasks only if told that it may.
+///
+/// # Safety
+///
+/// The header must begin a slot that `Box::leak` gave, of the payload the
+/// function is for, whose operation's completion has been delivered and
+/// which nothing uses again.
+type Release = unsafe fn(*mut Header, u32, bool);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -52,6 +74,10 @@ enum State {
     /// The future let go of the slot, which the engine frees once the
     /// operation completes.
     Orphaned,
+    /// No future ever had the slot: the operation was left to finish by
+    /// itself, and the engine hands what the slot holds the outcome, and
+    /// frees the slot, once the operation completes.
+    Detached,
 }
 
 /// An operation's slot: its header, and what the system uses while it has
@@ -63,7 +89,9 @@ struct Slot<T> {
 }
 
 impl Header {
-    fn new<T>(offset: u64, waker: Waker) -> Self {
+    /// The header of the slot of an operation at `offset`, which starts in
+    /// `state`, with the waker of the task that waits for it, if one does.
+    fn new(offset: u64, state: State, waker: Option<Waker>, release: Release) -> Self {
         Self {
             overlapped: UnsafeCell::new(sys::Overlapped {
                 internal: sys::STATUS_PENDING as usize,
@@ -72,45 +100,52 @@ impl Header {
                 offset_high: (offset >> 32) as u32,
                 event: ptr::null_mut(),
             }),
-            state: Cell::new(State::Waiting),
-            waker: Cell::new(Some(waker)),
+            state: Cell::new(state),
+            waker: Cell::new(waker),
             bytes: Cell::new(0),
-            free: free::<T>,
+            release,
+            place: Cell::new(0),
         }
     }
 }
 
-/// Frees the slot of a payload of type `T` that `header` begins.
+/// Frees the slot of a payload of type `T` that `header` begins, as
+/// [`Release`] says.
 ///
 /// # Safety
 ///
-/// `header` must begin a `Slot<T>` that `Box::leak` gave, which nothing uses
-/// again.
-unsafe fn free<T>(header: *mut Header) {
+/// As for [`Release`].
+unsafe fn free<T>(header: *mut Header, _bytes: u32, _wake: bool) {
     // SAFETY: the caller's promise; a slot begins with its header, as it is
     // `repr(C)`.
     drop(unsafe { Box::from_raw(header.cast::<Slot<T>>()) });
 }
 
 /// Records the completion of the operation whose `OVERLAPPED` `entry` hands
-/// back, and wakes its future if `wake`, or frees its slot if the future
-/// let go of it.
+/// back, and wakes its future if `wake`, or releases its slot if no future
+/// has it: one let go of it, or the operation is one of `detached`, left to
+/// finish by itself.
 ///
 /// # Safety
 ///
-/// `entry` must be the completion of an operation that a future of this
-/// module started, which the port hands back once.
-pub(crate) unsafe fn complete(entry: &sys::OverlappedEntry, wake: bool) {
+/// `entry` must be the completion of an operation that this module started
+/// on the port of the engine that `detached` is of, which the port hands
+/// back once.
+pub(crate) unsafe fn complete(entry: &sys::OverlappedEntry, detached: &DetachedOps, wake: bool) {
     let header = entry.overlapped.cast::<Header>();
     // SAFETY: by the caller's promise, the slot is allocated until its
     // completion is delivered, as this is; it begins with its header, which
     // begins with the `OVERLAPPED`.
     let slot = unsafe { &*header };
-    if slot.state.get() == State::Orphaned {
-        let free = slot.free;
-        // SAFETY: the future let go of the slot and the system has finished
-        // with it, so it is the engine's, which frees it this once.
-        unsafe { free(header) };
+    let state = slot.state.get();
+    if state != State::Waiting {
+        if state == State::Detached {
+            detached.remove(slot);
+        }
+        let release = slot.release;
+        // SAFETY: no future has the slot and the system has finished with
+        // it, so it is the engine's, which releases it this once.
+        unsafe { release(header, entry.bytes_transferred, wake) };
         return;
     }
     slot.bytes.set(entry.bytes_transferred);
@@ -197,26 +232,15 @@ impl<'a, T> Op<'a, T> {
         payload: T,
         start: Start<T>,
     ) -> Poll<(io::Result<u32>, T)> {
-        let slot = NonNull::from(Box::leak(Box::new(Slot {
-            header: Header::new::<T>(self.offset, cx.waker().clone()),
-            payload,
-        })));
-        // SAFETY: the slot was just made, and is the future's alone.
-        let payload = unsafe { &mut (*slot.as_ptr()).payload };
-        // SAFETY: as above; the `OVERLAPPED` lies apart from the payload.
-        let overlapped = unsafe { (*slot.as_ptr()).header.overlapped.get() };
+        let waker = Some(cx.waker().clone());
+        let header = Header::new(self.offset, State::Waiting, waker, free::<T>);
+        let slot = NonNull::from(Box::leak(Box::new(Slot { header, payload })));
         // SAFETY: the handle is open and associated with the port, as the
-        // future borrows it; the slot, which holds the payload and the
-        // `OVERLAPPED`, stays where it is until the completion is delivered,
-        // the future's until then, or the engine's.
-        let started = unsafe { start(self.target.handle, payload, overlapped) };
-        // A call that fails at once may have completed the operation all the
-        // same, with a warning, and then its completion is queued too.
-        // SAFETY: the slot is allocated, and the call has returned, so
-        // nothing writes the `OVERLAPPED` while its status is read.
-        let queued = started.is_ok() || completed(unsafe { (*overlapped).internal });
-        match started {
-            Err(err) if !queued => {
+        // future borrows it; the slot was just made, and stays where it is
+        // until the completion is delivered, the future's until then, or the
+        // engine's.
+        match unsafe { launch(self.target.handle, slot, start) } {
+            Err(err) => {
                 // SAFETY: the system did not take the operation, so nothing
                 // will come through the port for it, and the slot is the
                 // future's alone.
@@ -225,7 +249,7 @@ impl<'a, T> Op<'a, T> {
             }
             // The outcome, an error included, is read once the completion
             // has been delivered.
-            _ => {
+            Ok(()) => {
                 self.target.engine.started();
                 self.state = OpState::Started(slot);
                 Poll::Pending
@@ -301,6 +325,165 @@ impl<T> Drop for Op<'_, T> {
         // `OVERLAPPED` names the operation, which may have completed
         // already, when the call does nothing.
         unsafe { sys::CancelIoEx(self.target.handle, header.overlapped.get()) };
+    }
+}
+
+/// Starts the operation of `slot` on `handle` with `start`, and says whether
+/// the system took it, in which case its completion is to come through the
+/// port: if not, with the error, and nothing comes.
+///
+/// # Safety
+///
+/// `handle` must be open and associated with a port, and `slot` one that
+/// `Box::leak` gave and nothing else uses, which stays where it is until
+/// the completion is delivered, if the system took the operation.
+unsafe fn launch<T>(
+    handle: sys::Handle,
+    slot: NonNull<Slot<T>>,
+    start: Start<T>,
+) -> io::Result<()> {
+    // SAFETY: the slot is allocated, and the caller's alone.
+    let payload = unsafe { &mut (*slot.as_ptr()).payload };
+    // SAFETY: as above; the `OVERLAPPED` lies apart from the payload.
+    let overlapped = unsafe { (*slot.as_ptr()).header.overlapped.get() };
+    // SAFETY: the caller's promise for the handle; the slot, which holds the
+    // payload and the `OVERLAPPED`, stays where it is until the completion
+    // is delivered.
+    let started = unsafe { start(handle, payload, overlapped) };
+    // A call that fails at once may have completed the operation all the
+    // same, with a warning, and then its completion is queued too.
+    // SAFETY: the slot is allocated, and the call has returned, so
+    // nothing writes the `OVERLAPPED` while its status is read.
+    let queued = started.is_ok() || completed(unsafe { (*overlapped).internal });
+    match started {
+        Err(err) if !queued => Err(err),
+        _ => Ok(()),
+    }
+}
+
+/// What an operation left to finish by itself uses, which is told how the
+/// operation went; see [`detach`].
+pub(crate) trait Detached: Sized {
+    /// Takes the outcome of the operation, whose completion has come:
+    /// `overlapped` holds it, for an [`Outcome`] to read, and `bytes` is the
+    /// count the port gave. Tasks are woken only if `wake`: none is as the
+    /// engine is dropped.
+    ///
+    /// # Safety
+    ///
+    /// `overlapped` must be that of the operation that used this, whose
+    /// completion has been delivered, still where the operation was started
+    /// with it, and valid until the call returns.
+    unsafe fn complete(self, overlapped: *const sys::Overlapped, bytes: u32, wake: bool);
+}
+
+/// Hands the payload of type `T` in the slot that `header` begins the
+/// outcome of its operation, and frees the slot, as [`Release`] says.
+///
+/// # Safety
+///
+/// As for [`Release`].
+unsafe fn settle<T: Detached>(header: *mut Header, bytes: u32, wake: bool) {
+    // SAFETY: the caller's promise; a slot begins with its header, as it is
+    // `repr(C)`, and holds a `ManuallyDrop<T>` where it holds a `T`, the one
+    // laid out as the other.
+    let mut slot = unsafe { Box::from_raw(header.cast::<Slot<ManuallyDrop<T>>>()) };
+    // SAFETY: the payload is taken this once, and the slot is dropped
+    // without it.
+    let payload = unsafe { ManuallyDrop::take(&mut slot.payload) };
+    // SAFETY: the operation's completion has been delivered, by the caller's
+    // promise, and its `OVERLAPPED` is in the slot, where the operation was
+    // started with it, which is freed only after the call.
+    unsafe { payload.complete(slot.header.overlapped.get(), bytes, wake) };
+}
+
+/// Starts an operation on `target` that uses `payload`, at `offset` if the
+/// handle is a file's, and leaves it to finish by itself: no future waits
+/// for it, and `payload` is told how it went when its completion comes; see
+/// [`Detached`]. The engine cancels the operation as it is dropped, which
+/// it can for as long as `payload` keeps the handle open.
+///
+/// # Errors
+///
+/// What `start` reports, with the payload, if the system did not take the
+/// operation, of which the payload is then told nothing.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "nothing is left to finish by itself yet")
+)]
+pub(crate) fn detach<T: Detached>(
+    target: Target<'_>,
+    payload: T,
+    offset: u64,
+    start: Start<T>,
+) -> Result<(), (io::Error, T)> {
+    let header = Header::new(offset, State::Detached, None, settle::<T>);
+    let slot = NonNull::from(Box::leak(Box::new(Slot { header, payload })));
+    // SAFETY: the handle is open and associated with the port, as `target`
+    // borrows it; the slot was just made, and stays where it is until the
+    // completion is delivered, when the engine releases it.
+    match unsafe { launch(target.handle, slot, start) } {
+        Err(err) => {
+            // SAFETY: the system did not take the operation, so nothing will
+            // come through the port for it, and nothing else has the slot.
+            let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
+            Err((err, payload))
+        }
+        Ok(()) => {
+            target.engine.started();
+            target.engine.detached().add(target.handle, slot.cast());
+            Ok(())
+        }
+    }
+}
+
+/// The operations of an engine's that were left to finish by themselves and
+/// have not: what the engine cancels as it is dropped.
+#[derive(Default)]
+pub(crate) struct DetachedOps {
+    /// Each operation's handle, and the header of its slot, whose `place`
+    /// is where in the vector the operation is.
+    ops: RefCell<Vec<(sys::Handle, NonNull<Header>)>>,
+}
+
+impl DetachedOps {
+    /// Adds an operation on `handle` that the system took, by the header of
+    /// its slot.
+    fn add(&self, handle: sys::Handle, header: NonNull<Header>) {
+        let mut ops = self.ops.borrow_mut();
+        // SAFETY: the slot is allocated until the operation's completion is
+        // delivered, which it has not been.
+        unsafe { header.as_ref() }.place.set(ops.len());
+        ops.push((handle, header));
+    }
+
+    /// Removes the operation of `header`, whose completion has come.
+    fn remove(&self, header: &Header) {
+        let mut ops = self.ops.borrow_mut();
+        let place = header.place.get();
+        debug_assert!(
+            ops.get(place)
+                .is_some_and(|(_, at)| ptr::eq(at.as_ptr(), header)),
+            "an operation left to finish by itself is where its header says"
+        );
+        ops.swap_remove(place);
+        // The last of them took its place.
+        if let Some((_, moved)) = ops.get(place) {
+            // SAFETY: the operation's completion has not come, so its slot
+            // is allocated.
+            unsafe { moved.as_ref() }.place.set(place);
+        }
+    }
+
+    /// Asks the system to cancel them all. Their completions come through
+    /// the port all the same.
+    pub(crate) fn cancel(&self) {
+        for (handle, header) in self.ops.borrow().iter() {
+            // SAFETY: the `OVERLAPPED` names the operation, whose slot is
+            // allocated until its completion is delivered; a handle that
+            // has closed since has no such operation to cancel.
+            unsafe { sys::CancelIoEx(*handle, header.as_ptr().cast()) };
+        }
     }
 }
 
@@ -759,7 +942,123 @@ impl<B: IoBuf> fmt::Debug for WriteAll<'_, B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{completed, result};
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::io::Write as _;
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use ruio_engine::{Build, Engine};
+
+    use super::*;
+    use crate::engine::{Builder, Iocp};
+    use crate::handle::{IoHandle, Raw};
+
+    /// What a read left to finish by itself told: which read it was, what
+    /// it read or the system's error, and whether tasks could be woken.
+    type Told = (u8, Result<Vec<u8>, Option<i32>>, bool);
+
+    /// What a read of a pipe that is left to finish by itself uses, which
+    /// tells how the read went.
+    struct Probe {
+        id: u8,
+        buf: Vec<u8>,
+        /// The pipe's end, which stays open until the read has finished.
+        pipe: Arc<fs::File>,
+        told: Rc<RefCell<Vec<Told>>>,
+    }
+
+    impl Detached for Probe {
+        unsafe fn complete(mut self, overlapped: *const sys::Overlapped, bytes: u32, wake: bool) {
+            // SAFETY: the caller's promise, and the pipe's end is open.
+            let read = unsafe { status_outcome(self.pipe.raw(), overlapped, bytes) };
+            let read = match read {
+                Ok(read) => {
+                    // SAFETY: the system wrote that many bytes from the
+                    // start of the buffer, within its capacity.
+                    unsafe { self.buf.set_len(read as usize) };
+                    Ok(mem::take(&mut self.buf))
+                }
+                Err(err) => Err(err.raw_os_error()),
+            };
+            self.told.borrow_mut().push((self.id, read, wake));
+        }
+    }
+
+    /// Starts a probe's read, as `Start` says.
+    ///
+    /// # Safety
+    ///
+    /// As for `Start`.
+    unsafe fn start_probe(
+        pipe: sys::Handle,
+        probe: &mut Probe,
+        overlapped: *mut sys::Overlapped,
+    ) -> io::Result<()> {
+        // SAFETY: the caller's promise.
+        unsafe { start_read(pipe, &mut probe.buf, overlapped) }
+    }
+
+    fn pipe_name(test: &str) -> String {
+        format!(r"\\.\pipe\ruio-iocp-op-{}-{test}", std::process::id())
+    }
+
+    /// The server's end of a new pipe `name`, opened for overlapped I/O and
+    /// associated with no port.
+    fn server(name: &str) -> io::Result<Arc<fs::File>> {
+        let wide: Vec<u16> = OsStr::new(name)
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        // SAFETY: the name is UTF-16 ended by a zero, and the pipe gets the
+        // default security, given no attributes.
+        let handle = unsafe {
+            sys::CreateNamedPipeW(
+                wide.as_ptr(),
+                sys::PIPE_ACCESS_DUPLEX
+                    | sys::FILE_FLAG_OVERLAPPED
+                    | sys::FILE_FLAG_FIRST_PIPE_INSTANCE,
+                sys::PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                0,
+                ptr::null(),
+            )
+        };
+        if handle == sys::INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the handle was just opened, and nothing else owns it.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+        Ok(Arc::new(fs::File::from(handle)))
+    }
+
+    /// The client's end of the pipe `name`, as the standard library opens
+    /// it: its writes go through no port.
+    fn client(name: &str) -> io::Result<fs::File> {
+        fs::OpenOptions::new().read(true).write(true).open(name)
+    }
+
+    /// Leaves a read of the pipe's end of `handle` to finish by itself, as
+    /// the read `id`.
+    fn probe(
+        handle: &IoHandle<Arc<fs::File>>,
+        id: u8,
+        told: &Rc<RefCell<Vec<Told>>>,
+    ) -> Result<(), (io::Error, Probe)> {
+        let probe = Probe {
+            id,
+            buf: Vec::with_capacity(16),
+            pipe: Arc::clone(handle.io()),
+            told: Rc::clone(told),
+        };
+        detach(handle.target(), probe, 0, start_probe)
+    }
 
     #[test]
     fn statuses_become_windows_errors() {
@@ -785,5 +1084,93 @@ mod tests {
         assert!(!completed(0xC000_020D));
         // Only the low half of `Internal` is the status.
         assert!(!completed(0xFFFF_FFFF_0000_0103_u64 as usize));
+    }
+
+    /// Turns `engine`'s port until `done` says so, for a while at most.
+    fn turn_until(engine: &Iocp, done: impl Fn() -> bool) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() && Instant::now() < deadline {
+            engine.park(Some(Duration::from_millis(5)))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn operations_left_to_finish_by_themselves_tell_how_they_went() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let mut ends = Vec::new();
+        for id in 0..3 {
+            let name = pipe_name(&format!("told-{id}"));
+            let server = IoHandle::new(server(&name)?)?;
+            let client = client(&name)?;
+            probe(&server, id, &told).map_err(|(err, _)| err)?;
+            ends.push((server, client));
+        }
+        // Nothing is written, so nothing is told.
+        engine.park(Some(Duration::from_millis(20)))?;
+        assert!(told.borrow().is_empty());
+
+        // The reads finish in another order than they started in.
+        let order = [1_u8, 0, 2];
+        for id in order {
+            let mut client = &ends[usize::from(id)].1;
+            client.write_all(&[b'a' + id; 4])?;
+            turn_until(&engine, || {
+                told.borrow().last().is_some_and(|last| last.0 == id)
+            })?;
+        }
+        let expected: Vec<Told> = order
+            .into_iter()
+            .map(|id| (id, Ok(vec![b'a' + id; 4]), true))
+            .collect();
+        assert_eq!(*told.borrow(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn an_engine_dropped_cancels_what_was_left_to_finish_by_itself() -> io::Result<()> {
+        // Long enough that only the read's cancellation, not the timeout,
+        // ends the wait in time.
+        let engine = Builder::new()
+            .shutdown_timeout(Duration::from_secs(60))
+            .build()?;
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let name = pipe_name("cancelled");
+        let server = server(&name)?;
+        // The client writes nothing and stays open, so the read is in
+        // flight when the engine goes.
+        let _client = client(&name)?;
+        {
+            let _entered = engine.enter();
+            let handle = IoHandle::new(Arc::clone(&server))?;
+            probe(&handle, 0, &told).map_err(|(err, _)| err)?;
+        }
+        assert_eq!(Arc::strong_count(&server), 2);
+        let started = Instant::now();
+        drop(engine);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // ERROR_OPERATION_ABORTED, and no task is woken as the engine goes.
+        assert_eq!(*told.borrow(), [(0, Err(Some(995)), false)]);
+        // The read let go of the pipe's end.
+        assert_eq!(Arc::strong_count(&server), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_operation_the_system_does_not_take_hands_back_what_it_was_to_use() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let told = Rc::new(RefCell::new(Vec::new()));
+        // No client has opened the pipe, so a read of it fails at once.
+        let handle = IoHandle::new(server(&pipe_name("refused"))?)?;
+        let (err, back) = probe(&handle, 7, &told).expect_err("a read of a pipe nobody opened");
+        assert!(err.raw_os_error().is_some(), "{err}");
+        assert_eq!(back.id, 7);
+        drop(back);
+        engine.park(Some(Duration::from_millis(20)))?;
+        assert!(told.borrow().is_empty());
+        Ok(())
     }
 }

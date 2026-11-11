@@ -66,6 +66,9 @@ struct Inner {
     /// How many operations the system has taken whose completions have not
     /// been delivered.
     in_flight: Cell<usize>,
+    /// The operations in flight that were left to finish by themselves,
+    /// which no future's drop cancels.
+    detached: op::DetachedOps,
     /// Whether the engine is being dropped, when completions wake nothing.
     closing: Cell<bool>,
     /// How long dropping the engine waits for the operations in flight.
@@ -154,6 +157,7 @@ impl Iocp {
                 armed: Cell::new(None),
                 fired: Cell::new(false),
                 in_flight: Cell::new(0),
+                detached: op::DetachedOps::default(),
                 closing: Cell::new(false),
                 shutdown_timeout: builder.shutdown_timeout,
             }),
@@ -185,6 +189,11 @@ impl Iocp {
     pub(crate) fn started(&self) {
         let in_flight = &self.inner.in_flight;
         in_flight.set(in_flight.get() + 1);
+    }
+
+    /// The operations in flight that were left to finish by themselves.
+    pub(crate) fn detached(&self) -> &op::DetachedOps {
+        &self.inner.detached
     }
 }
 
@@ -228,7 +237,7 @@ impl Inner {
                     // SAFETY: a completion under the key of the handles is
                     // that of an operation `op` started on one, which the
                     // port hands back once.
-                    unsafe { op::complete(entry, !self.closing.get()) };
+                    unsafe { op::complete(entry, &self.detached, !self.closing.get()) };
                 }
                 // Nothing posts under another key.
                 _ => {}
@@ -277,11 +286,13 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         // The operations still in flight are those whose futures were
-        // dropped, which cancelled them, and those forgotten. A completion
-        // frees the slot of an operation whose future was dropped, buffer
-        // and all; one that has not come by the timeout leaves its slot
-        // leaked, as the system may still write to its buffer.
+        // dropped, which cancelled them, those forgotten, and those left to
+        // finish by themselves, which are cancelled here. A completion frees
+        // the slot of an operation that no future has, buffer and all; one
+        // that has not come by the timeout leaves its slot leaked, as the
+        // system may still write to its buffer.
         self.closing.set(true);
+        self.detached.cancel();
         let deadline = now().saturating_add(self.shutdown_timeout);
         while self.in_flight.get() > 0 && now() < deadline {
             if self.turn(Some(deadline)).is_err() {
@@ -404,8 +415,9 @@ impl Build for Builder {
     type Engine = Iocp;
 
     /// Sets how long dropping the engine waits for the operations still in
-    /// flight, which the drops of their futures cancelled, to complete,
-    /// before it leaks their buffers. The default is one second.
+    /// flight, which the drops of their futures cancelled, or the engine as
+    /// it is dropped, to complete, before it leaks their buffers. The
+    /// default is one second.
     fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
         self
