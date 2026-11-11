@@ -266,6 +266,18 @@ impl<'a, T> Op<'a, T> {
         let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
         Poll::Ready((result, payload))
     }
+
+    /// Whether the operation's completion has been delivered and not yet
+    /// read, so that a poll finishes it without waiting.
+    pub(crate) fn is_done(&self) -> bool {
+        let OpState::Started(slot) = &self.state else {
+            return false;
+        };
+        // SAFETY: the slot is allocated while the future has it, and only
+        // this thread uses it.
+        let header = unsafe { &slot.as_ref().header };
+        header.state.get() == State::Done
+    }
 }
 
 impl<T> Drop for Op<'_, T> {

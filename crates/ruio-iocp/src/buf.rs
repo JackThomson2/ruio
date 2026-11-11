@@ -10,10 +10,6 @@
 //! returns is handed to the first of them, rather than left for all of them
 //! to ask for, or for one that came later to take. A reader dropped before
 //! it takes the buffer it was handed leaves the buffer to the next.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no operation reads into a pool yet")
-)]
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -352,6 +348,18 @@ impl BufLease {
     pub fn capacity(&self) -> usize {
         self.buf.len()
     }
+
+    /// Reads into the buffer with `read`, which is given all of it and
+    /// says how many bytes it put at its start: the data the lease then
+    /// holds.
+    pub(crate) fn fill(
+        &mut self,
+        read: impl FnOnce(&mut [u8]) -> io::Result<usize>,
+    ) -> io::Result<usize> {
+        let len = read(&mut self.buf)?.min(self.buf.len());
+        self.len = len;
+        Ok(len)
+    }
 }
 
 impl Deref for BufLease {
@@ -562,8 +570,9 @@ mod tests {
             .is_pending()
     }
 
-    /// Fills `lease` from its start with `data`, as a read does.
-    fn fill(lease: &mut BufLease, data: &[u8]) {
+    /// Puts `data` at the start of `lease`, as an operation that reads
+    /// into it does.
+    fn read_into(lease: &mut BufLease, data: &[u8]) {
         assert!(data.len() <= lease.bytes_total());
         // SAFETY: the lease's memory is writable for `bytes_total` bytes,
         // which the data fits in, and the data lies elsewhere.
@@ -578,7 +587,7 @@ mod tests {
 
     fn lease_of(pool: &BufPool, data: &[u8]) -> BufLease {
         let mut lease = pool.take().expect("the pool has a buffer");
-        fill(&mut lease, data);
+        read_into(&mut lease, data);
         lease
     }
 
@@ -618,7 +627,7 @@ mod tests {
         assert!(lease.is_empty());
         assert_eq!(lease.capacity(), 8);
         assert_eq!((lease.bytes_init(), lease.bytes_total()), (0, 8));
-        fill(&mut lease, b"abc");
+        read_into(&mut lease, b"abc");
         assert_eq!(&*lease, b"abc");
         assert_eq!((lease.len(), lease.bytes_init()), (3, 3));
         lease[0] = b'x';
@@ -630,6 +639,29 @@ mod tests {
         drop(lease);
         // The next lease of the buffer holds none of it.
         assert!(pool.take().expect("the buffer again").is_empty());
+    }
+
+    #[test]
+    fn a_lease_holds_what_a_read_put_in_it() {
+        let pool = BufPool::new(1, 8).expect("a pool");
+        let mut lease = pool.take().expect("a buffer");
+        let mut data: &[u8] = b"hello, pool";
+        let read = lease.fill(|buf| io::Read::read(&mut data, buf));
+        assert_eq!(read.expect("a read of a slice"), 8);
+        assert_eq!(&*lease, b"hello, p");
+        // The next read's data takes the place of the last one's.
+        let read = lease.fill(|buf| io::Read::read(&mut data, buf));
+        assert_eq!(read.expect("a read of a slice"), 3);
+        assert_eq!(&*lease, b"ool");
+        // A read that fails leaves the lease as it was.
+        let err = lease
+            .fill(|_| Err(io::ErrorKind::WouldBlock.into()))
+            .expect_err("a read that fails");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(&*lease, b"ool");
+        // One that says it read more than the buffer holds is not believed.
+        assert_eq!(lease.fill(|_| Ok(64)).expect("a read"), 8);
+        assert_eq!(lease.len(), 8);
     }
 
     #[test]

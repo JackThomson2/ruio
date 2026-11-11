@@ -63,6 +63,10 @@ pub(crate) const WSA_IO_PENDING: i32 = 997;
 /// into, which holds its start.
 pub(crate) const WSAEMSGSIZE: i32 = 10040;
 
+/// `WSAESHUTDOWN`: the half of the socket that an operation needs was shut
+/// down.
+pub(crate) const WSAESHUTDOWN: i32 = 10058;
+
 /// `AF_INET`: the address family of IPv4.
 pub(crate) const AF_INET: u16 = 2;
 

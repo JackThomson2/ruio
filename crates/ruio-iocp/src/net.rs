@@ -9,7 +9,11 @@
 //! standard library's sockets report. What needs no waiting, binding a
 //! listener, addresses and options, goes through the standard library's
 //! sockets, which the types here hold.
+//!
+//! A stream also receives into a pool of buffers, as a `RecvStream`, which
+//! holds no buffer while it waits for data.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::fmt;
 use std::future::Future;
@@ -25,12 +29,15 @@ use std::task::{Context, Poll, ready};
 
 use ruio_buf::{IoBuf, IoBufMut, Slice};
 
+use crate::buf::BufPool;
 use crate::handle::{IoHandle, Raw};
 use crate::op::{Op, Read, ReadExact, Write, WriteAll};
 use crate::sys;
 
+mod recv;
 mod udp;
 
+pub use recv::RecvStream;
 pub use udp::{RecvFrom, SendTo, UdpSocket};
 
 /// Room for one of the two addresses `AcceptEx` writes: the largest address
@@ -43,9 +50,47 @@ impl Raw for net::TcpListener {
     }
 }
 
-impl Raw for net::TcpStream {
+/// A stream's socket, and whether its calls that take no `OVERLAPPED` wait.
+struct Socket {
+    socket: net::TcpStream,
+    /// Whether the socket was made non-blocking, as receiving into a pool
+    /// makes it.
+    nonblocking: Cell<bool>,
+}
+
+impl Socket {
+    fn new(socket: net::TcpStream) -> Self {
+        Self {
+            socket,
+            nonblocking: Cell::new(false),
+        }
+    }
+
+    /// Makes the socket's calls that take no `OVERLAPPED` fail rather than
+    /// wait, which leaves its operations through the port as they are.
+    fn unblock(&self) -> io::Result<()> {
+        if !self.nonblocking.get() {
+            self.socket.set_nonblocking(true)?;
+            self.nonblocking.set(true);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        // A socket that lingers closes for certain only if it blocks: one
+        // that does not refuses to close while it has data left to send,
+        // and its handle would stay open.
+        if self.nonblocking.get() {
+            let _ = self.socket.set_nonblocking(false);
+        }
+    }
+}
+
+impl Raw for Socket {
     fn raw(&self) -> sys::Handle {
-        handle_of(self.as_raw_socket())
+        handle_of(self.socket.as_raw_socket())
     }
 }
 
@@ -365,7 +410,7 @@ impl TcpListener {
         }
         let stream = net::TcpStream::from(socket);
         let peer = stream.peer_addr()?;
-        let stream = IoHandle::on(stream, self.listener.engine().clone())?;
+        let stream = IoHandle::on(Socket::new(stream), self.listener.engine().clone())?;
         Ok((TcpStream { stream }, peer))
     }
 }
@@ -461,7 +506,7 @@ impl fmt::Debug for Accept<'_> {
 /// as ruio's I/O does on io_uring. A read and a write may be in flight at
 /// once.
 pub struct TcpStream {
-    stream: IoHandle<net::TcpStream>,
+    stream: IoHandle<Socket>,
 }
 
 impl TcpStream {
@@ -475,7 +520,9 @@ impl TcpStream {
     /// error of kind `Other` if the thread has no current engine, as outside
     /// a runtime.
     pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
-        let stream = IoHandle::new(net::TcpStream::from(new_socket(family(&addr))?))?;
+        let stream = IoHandle::new(Socket::new(net::TcpStream::from(new_socket(family(
+            &addr,
+        ))?)))?;
         let socket = socket_of(stream.raw());
         // `ConnectEx` connects a socket that is bound already.
         let any = RawAddr::any_for(&addr);
@@ -530,13 +577,24 @@ impl TcpStream {
         WriteAll::with(target, buf, 0, start_send::<Slice<B>>, outcome)
     }
 
+    /// The data arriving on the connection, received into buffers of
+    /// `pool` as it arrives; see [`RecvStream`].
+    pub fn recv_stream(&self, pool: &BufPool) -> RecvStream<'_> {
+        RecvStream::new(&self.stream, pool)
+    }
+
+    /// The standard library's socket, for what needs no waiting.
+    fn socket(&self) -> &net::TcpStream {
+        &self.stream.io().socket
+    }
+
     /// The address of this end of the connection.
     ///
     /// # Errors
     ///
     /// What the system reports.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.stream.io().local_addr()
+        self.socket().local_addr()
     }
 
     /// The address of the peer.
@@ -545,7 +603,7 @@ impl TcpStream {
     ///
     /// What the system reports.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.stream.io().peer_addr()
+        self.socket().peer_addr()
     }
 
     /// Sets whether small writes are sent at once (`TCP_NODELAY`) rather
@@ -555,7 +613,7 @@ impl TcpStream {
     ///
     /// What the system reports.
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        self.stream.io().set_nodelay(nodelay)
+        self.socket().set_nodelay(nodelay)
     }
 
     /// Whether small writes are sent at once.
@@ -564,7 +622,7 @@ impl TcpStream {
     ///
     /// What the system reports.
     pub fn nodelay(&self) -> io::Result<bool> {
-        self.stream.io().nodelay()
+        self.socket().nodelay()
     }
 
     /// Sets the time to live of the packets the stream sends (`IP_TTL`).
@@ -573,7 +631,7 @@ impl TcpStream {
     ///
     /// What the system reports.
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
-        self.stream.io().set_ttl(ttl)
+        self.socket().set_ttl(ttl)
     }
 
     /// The time to live of the packets the stream sends.
@@ -582,7 +640,7 @@ impl TcpStream {
     ///
     /// What the system reports.
     pub fn ttl(&self) -> io::Result<u32> {
-        self.stream.io().ttl()
+        self.socket().ttl()
     }
 
     /// Takes the error the socket holds (`SO_ERROR`), if it holds one,
@@ -592,7 +650,7 @@ impl TcpStream {
     ///
     /// What asking for it reports.
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        self.stream.io().take_error()
+        self.socket().take_error()
     }
 
     /// Shuts down the reading or the writing half of the connection, or
@@ -603,14 +661,14 @@ impl TcpStream {
     ///
     /// What the system reports.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-        self.stream.io().shutdown(how)
+        self.socket().shutdown(how)
     }
 }
 
 impl fmt::Debug for TcpStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TcpStream")
-            .field("stream", self.stream.io())
+            .field("stream", self.socket())
             .finish()
     }
 }
