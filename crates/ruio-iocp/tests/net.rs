@@ -534,3 +534,36 @@ fn a_listener_binds_only_where_a_runtime_runs() {
     let err = TcpListener::bind(loopback()).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Other);
 }
+
+/// Sockets of the standard library's are taken for the port of the
+/// thread's engine, and accept and carry data as the engine's own do,
+/// whether they blocked or not.
+#[test]
+fn sockets_of_the_standard_library_go_through_the_port() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let listener = TcpListener::from_std(std::net::TcpListener::bind(loopback())?);
+        let client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        client.set_nonblocking(true)?;
+        let client = TcpStream::from_std(client);
+        let (server, peer) = listener.accept().await?;
+        assert_eq!(peer, client.local_addr()?);
+        write_all(&client, b"ping".to_vec()).await?;
+        let (read, buf) = server.read_exact(Vec::with_capacity(4)).await;
+        read?;
+        assert_eq!(buf, b"ping");
+        write_all(&server, b"pong".to_vec()).await?;
+        let (read, buf) = client.read_exact(Vec::with_capacity(4)).await;
+        read?;
+        assert_eq!(buf, b"pong");
+        Ok(())
+    })
+}
+
+/// Taking a socket where no engine runs panics, as the first operation on
+/// one does on io_uring.
+#[test]
+#[should_panic = "no ruio runtime"]
+fn a_socket_taken_outside_a_runtime_panics() {
+    let listener = std::net::TcpListener::bind(loopback()).unwrap();
+    let _ = TcpListener::from_std(listener);
+}

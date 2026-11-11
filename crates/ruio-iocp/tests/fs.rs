@@ -172,20 +172,6 @@ fn a_file_opened_on_another_thread_is_read_through_the_port() -> io::Result<()> 
 }
 
 #[test]
-fn a_file_not_opened_for_overlapped_io_is_refused() -> io::Result<()> {
-    let scratch = Scratch::new("not-overlapped");
-    std::fs::write(&scratch.0, b"x")?;
-    Runtime::new()?.block_on(async {
-        let plain = std::fs::File::open(&scratch.0)?;
-        assert!(
-            File::from_std(plain).is_err(),
-            "a port takes only files opened for overlapped I/O"
-        );
-        Ok(())
-    })
-}
-
-#[test]
 fn the_standard_librarys_file_does_what_the_port_has_no_call_for() -> io::Result<()> {
     let scratch = Scratch::new("as-std");
     Runtime::new()?.block_on(async {
@@ -318,4 +304,55 @@ fn a_file_opens_only_where_a_runtime_runs() {
     std::fs::write(&scratch.0, b"x").unwrap();
     let err = File::open(&scratch.0).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Other);
+}
+
+/// A file that the standard library opened for I/O that waits, which no
+/// port can take, is read and written all the same, each operation
+/// finishing as it starts. One opened for overlapped I/O goes through the
+/// port, which another engine's cannot take it from.
+#[test]
+fn files_of_the_standard_library_are_taken_however_they_were_opened() -> io::Result<()> {
+    let scratch = Scratch::new("from-std");
+    std::fs::write(&scratch.0, b"hello world")?;
+    let overlapped = Runtime::new()?.block_on(async {
+        let waits = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&scratch.0)?;
+        let waits = File::from_std(waits)?;
+        assert!(!waits.appends());
+        let (read, buf) = waits.read_at(Vec::with_capacity(16), 6).await;
+        assert_eq!(read?, 5);
+        assert_eq!(buf, b"world");
+        let (read, buf) = waits.read_at(Vec::with_capacity(16), 100).await;
+        assert_eq!(read?, 0);
+        assert!(buf.is_empty());
+        waits.write_all_at(b"HELLO".to_vec(), 0).await.0?;
+        let pool = BufPool::new(1, 8)?;
+        let mut stream = waits.read_stream(&pool, 4);
+        let data = stream.next().await.expect("the file's data")?;
+        assert_eq!(&*data, b"O world");
+        drop(data);
+        assert!(stream.next().await.is_none());
+
+        let appending = std::fs::OpenOptions::new().append(true).open(&scratch.0)?;
+        let appending = File::from_std(appending)?;
+        assert!(appending.appends());
+        appending.write_at(b"!".to_vec(), 0).await.0?;
+
+        let overlapped = File::from_std(OpenOptions::new().read(true).open_std(&scratch.0)?)?;
+        assert!(!overlapped.appends());
+        let (read, buf) = overlapped.read_at(Vec::with_capacity(16), 0).await;
+        assert_eq!(read?, 12);
+        assert_eq!(buf, b"HELLO world!");
+        let overlapped = Arc::into_inner(overlapped.into_std());
+        io::Result::Ok(overlapped.expect("nothing else has the file"))
+    })?;
+    let taken = thread::spawn(move || {
+        Runtime::new()?.block_on(async { File::from_std(overlapped).map(drop) })
+    });
+    // `ERROR_INVALID_PARAMETER`, as for any handle that a port has.
+    let err = taken.join().unwrap().unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(87));
+    Ok(())
 }

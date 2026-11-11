@@ -6,7 +6,7 @@ mod support;
 
 #[cfg(unix)]
 use std::fs::Permissions;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -172,6 +172,42 @@ async fn a_files_operations_take_a_timeout() -> io::Result<()> {
         ruio::time::sleep(Duration::from_millis(1)).await;
     }
     within(file.close()).await
+}
+
+/// A file of the standard library's carries on from its position, and goes
+/// back to the standard library at the position it reached. One opened to
+/// append writes at its end, where its position follows.
+#[ruio::test]
+async fn a_file_from_the_standard_library_carries_on_from_its_position() -> io::Result<()> {
+    let scratch = Scratch::new("from-std");
+    let path = scratch.path("file");
+    std::fs::write(&path, b"hello world")?;
+    let mut std_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    std_file.seek(SeekFrom::Start(6))?;
+    let file = File::from_std(std_file);
+    let (read, buf) = within(file.read(Vec::with_capacity(16))).await;
+    assert_eq!(read?, 5);
+    assert_eq!(buf, b"world");
+    within(file.write_all_at(b"HELLO".to_vec(), 0)).await.0?;
+    within(file.write(b"!".to_vec())).await.0?;
+    assert_eq!(file.as_std()?.metadata()?.len(), 12);
+    let mut std_file = within(file.into_std()).await?;
+    assert_eq!(std_file.stream_position()?, 12);
+    let mut contents = String::new();
+    std_file.seek(SeekFrom::Start(0))?;
+    std_file.read_to_string(&mut contents)?;
+    assert_eq!(contents, "HELLO world!");
+
+    let file = File::from_std(std::fs::OpenOptions::new().append(true).open(&path)?);
+    within(file.write_at(b"?".to_vec(), 0)).await.0?;
+    within(file.write(b" more".to_vec())).await.0?;
+    assert_eq!(std::fs::read(&path)?, b"HELLO world!? more");
+    let mut std_file = within(file.into_std()).await?;
+    assert_eq!(std_file.stream_position()?, 18);
+    Ok(())
 }
 
 /// Reads and writes at the file's position advance it, and appending writes

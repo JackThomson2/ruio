@@ -60,32 +60,31 @@ impl UdpSocket {
             bind_to(&socket, addr)?;
             Ok(net::UdpSocket::from(socket))
         })?;
-        // By default, a datagram that finds nobody at its port has Windows
-        // fail the sender's receives with a reset, until one reports it.
-        let report: u32 = 0;
-        let mut returned = 0;
-        // SAFETY: the socket is open; the call reads the flag and writes how
-        // much it returned, which is nothing, and given no `OVERLAPPED` is
-        // done when it returns.
-        let failed = unsafe {
-            sys::WSAIoctl(
-                socket.as_raw_socket() as sys::Socket,
-                sys::SIO_UDP_CONNRESET,
-                ptr::from_ref(&report).cast(),
-                size_of::<u32>() as u32,
-                ptr::null_mut(),
-                0,
-                &mut returned,
-                ptr::null_mut(),
-                ptr::null(),
-            )
-        };
-        if failed != 0 {
-            return Err(last_error());
-        }
+        report_no_resets(&socket)?;
         Ok(Self {
             socket: IoHandle::new(socket)?,
         })
+    }
+
+    /// Takes a socket from the standard library, for the port of the
+    /// thread's current engine, with the signature `from_std` has in ruio's
+    /// `net` on io_uring, where taking a socket checks nothing. A datagram
+    /// sent to a port that nobody is bound to fails none of its receives
+    /// after, as with a socket bound here.
+    ///
+    /// # Panics
+    ///
+    /// If the thread has no current engine, as outside a runtime, or the
+    /// system refuses the socket: to associate it with its port, as when
+    /// another port has it already, or to keep its receives from failing,
+    /// as for a socket that is not UDP's.
+    pub fn from_std(socket: net::UdpSocket) -> Self {
+        if let Err(err) = report_no_resets(&socket) {
+            panic!("cannot keep a UDP socket's receives from failing with resets: {err}");
+        }
+        Self {
+            socket: IoHandle::taken(socket),
+        }
     }
 
     /// The address the socket is bound to.
@@ -180,6 +179,40 @@ impl fmt::Debug for UdpSocket {
             .field("socket", self.socket.io())
             .finish()
     }
+}
+
+impl From<net::UdpSocket> for UdpSocket {
+    fn from(socket: net::UdpSocket) -> Self {
+        Self::from_std(socket)
+    }
+}
+
+/// Keeps `socket`'s receives from failing after it sent a datagram that
+/// found nobody at its port, which by default has Windows fail them with a
+/// reset, until one reports it.
+fn report_no_resets(socket: &net::UdpSocket) -> io::Result<()> {
+    let report: u32 = 0;
+    let mut returned = 0;
+    // SAFETY: the socket is open; the call reads the flag and writes how
+    // much it returned, which is nothing, and given no `OVERLAPPED` is done
+    // when it returns.
+    let failed = unsafe {
+        sys::WSAIoctl(
+            socket.as_raw_socket() as sys::Socket,
+            sys::SIO_UDP_CONNRESET,
+            ptr::from_ref(&report).cast(),
+            size_of::<u32>() as u32,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+            ptr::null(),
+        )
+    };
+    if failed != 0 {
+        return Err(last_error());
+    }
+    Ok(())
 }
 
 /// Reads the outcome of a datagram's receive, as `op`'s `Outcome` says. A

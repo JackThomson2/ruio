@@ -72,18 +72,15 @@
 //! assert_send(ruio::fs::read_dir("."));
 //! ```
 //!
-//! Not here yet, of what `fs` has on io_uring: the thread-bound files
-//! taken from and given to the standard library (`from_std`, `into_std`),
-//! which the portable ones are. A [`Metadata`] reports what the standard
-//! library's does on every system; an owner, a mode and an inode are
-//! Unix's.
+//! A [`Metadata`] reports what the standard library's does on every
+//! system; an owner, a mode and an inode are Unix's.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fmt;
 use std::future::{Future, poll_fn};
-use std::io;
+use std::io::{self, Seek as _, SeekFrom};
 use std::marker::PhantomData;
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -118,6 +115,26 @@ where
     ruio_executor::spawn_blocking(call)
         .await
         .map_err(io::Error::other)?
+}
+
+/// The standard library's file that `file` shares, once nothing else has
+/// it: a call of the blocking pool's whose future was dropped, or a write
+/// that a portable file let go of, holds it until it has finished. Until
+/// then a handle of its own to the file stands in, which the system makes
+/// unless it is out of them.
+fn unshare(mut file: Arc<std::fs::File>) -> std::fs::File {
+    loop {
+        match Arc::try_unwrap(file) {
+            Ok(file) => return file,
+            Err(shared) => {
+                if let Ok(own) = shared.try_clone() {
+                    return own;
+                }
+                file = shared;
+                std::thread::yield_now();
+            }
+        }
+    }
 }
 
 /// A file, whose reads and writes complete to the port of the runtime it
@@ -173,6 +190,35 @@ impl File {
     /// [`OpenOptions`].
     pub fn options() -> OpenOptions {
         OpenOptions::new()
+    }
+
+    /// Wraps a file from the standard library, for the port of the
+    /// thread's runtime, whose position the file's starts at, and which
+    /// appends if the standard library's file was opened to.
+    ///
+    /// A file opened for overlapped I/O, as ruio opens one, is read and
+    /// written through the port. One opened as the standard library opens
+    /// one, for I/O that waits, cannot be: each of its reads and writes is
+    /// made in full as it starts, and the thread waits for the disk there,
+    /// as it would for the standard library's own, so its timeouts never
+    /// run out.
+    ///
+    /// # Panics
+    ///
+    /// If the thread has no runtime of ruio's, which on io_uring the file's
+    /// first operation needs, or the file was opened for overlapped I/O and
+    /// another runtime's port has it already.
+    pub fn from_std(file: std::fs::File) -> Self {
+        let at = (&file).stream_position().unwrap_or(0);
+        let file = iocp::File::from_std(file).unwrap_or_else(|err| {
+            panic!("cannot take the file for the port of the thread's runtime: {err}")
+        });
+        Self {
+            append: file.appends(),
+            file,
+            pos: Cell::new(at),
+            at_end: Cell::new(false),
+        }
     }
 
     /// Reads into `buf`, up to its `bytes_total`, from `offset`: 0 bytes at
@@ -325,16 +371,37 @@ impl File {
 
     /// The standard library's file, for what ruio has no call for.
     ///
-    /// Read and write the file through ruio and not through this: it is
-    /// open for overlapped I/O, and the standard library ends the process
-    /// if a read or a write of its own on such a file does not complete at
-    /// once.
+    /// Read and write a file that ruio opened through ruio and not through
+    /// this: it is open for overlapped I/O, and the standard library ends
+    /// the process if a read or a write of its own on such a file does not
+    /// complete at once.
     ///
     /// # Errors
     ///
     /// None here. On io_uring, a file that the ring alone holds has none.
     pub fn as_std(&self) -> io::Result<&std::fs::File> {
         Ok(self.file.as_std())
+    }
+
+    /// The standard library's file, moved to the file's position. While a
+    /// call of the blocking pool's whose future was dropped runs, it is a
+    /// handle of its own to the same file. A file that ruio opened stays
+    /// open for overlapped I/O, as [`as_std`](File::as_std) says, and
+    /// associated with the runtime's port.
+    ///
+    /// # Errors
+    ///
+    /// None here. On io_uring, a file that the ring alone holds may find no
+    /// descriptor left for it.
+    #[expect(
+        clippy::unused_async,
+        reason = "the signature is io_uring's, where the ring may install the file"
+    )]
+    pub async fn into_std(self) -> io::Result<std::fs::File> {
+        let at = self.position();
+        let file = unshare(self.file.into_std());
+        let _ = (&file).seek(SeekFrom::Start(at));
+        Ok(file)
     }
 
     /// Closes the file. Windows reports nothing as a file closes that a

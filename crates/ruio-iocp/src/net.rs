@@ -562,6 +562,28 @@ impl TcpListener {
         })
     }
 
+    /// Takes a listening socket from the standard library, for the port of
+    /// the thread's current engine, with the signature `from_std` has in
+    /// ruio's `net` on io_uring, where taking a socket checks nothing. The
+    /// socket keeps the options it has: one of IPv6 accepts connections
+    /// from IPv4 addresses only if it was made to.
+    ///
+    /// # Panics
+    ///
+    /// If the thread has no current engine, as outside a runtime, or the
+    /// system refuses to associate the socket with its port, as when
+    /// another port has it already.
+    pub fn from_std(listener: net::TcpListener) -> Self {
+        let family = match listener.local_addr() {
+            Ok(addr) => family(&addr),
+            Err(err) => panic!("a listening socket has an address: {err}"),
+        };
+        Self {
+            listener: IoHandle::taken(listener),
+            family,
+        }
+    }
+
     /// The address the listener is bound to.
     ///
     /// # Errors
@@ -810,6 +832,24 @@ impl TcpStream {
             return Err(last_error());
         }
         Ok(Self::new(stream))
+    }
+
+    /// Takes a connected socket from the standard library, for the port of
+    /// the thread's current engine, with the signature `from_std` has in
+    /// ruio's `net` on io_uring, where taking a socket checks nothing.
+    ///
+    /// # Panics
+    ///
+    /// If the thread has no current engine, as outside a runtime, or the
+    /// system refuses to associate the socket with its port, as when
+    /// another port has it already.
+    pub fn from_std(stream: net::TcpStream) -> Self {
+        // A socket made non-blocking blocks again, as the stream's own do
+        // until a receive into a pool needs otherwise: one that lingers
+        // closes for certain only if it blocks. Its operations through the
+        // port wait for nothing either way.
+        let _ = stream.set_nonblocking(false);
+        Self::new(IoHandle::taken(Rc::new(Socket::new(stream))))
     }
 
     /// The stream of a connected socket, with no write behind it.

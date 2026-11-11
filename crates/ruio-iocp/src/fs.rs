@@ -14,7 +14,7 @@ use std::task::{Context, Poll, Waker, ready};
 use ruio_buf::{IoBuf, IoBufMut};
 
 use crate::buf::{BufLease, BufPool, Claim};
-use crate::handle::{IoHandle, Raw};
+use crate::handle::{IoHandle, Raw, query_file};
 use crate::op::{Read, ReadExact, Write, WriteAll};
 use crate::sys;
 
@@ -43,6 +43,10 @@ impl Raw for Arc<fs::File> {
 /// ruio's I/O does on io_uring, and always names its offset: the file keeps
 /// no position. A file opened to append writes at its end whatever the
 /// offset.
+///
+/// A file taken from the standard library that was opened for I/O that
+/// waits, as the standard library opens one, cannot be associated with a
+/// port; see [`from_std`](File::from_std).
 pub struct File {
     handle: IoHandle<Arc<fs::File>>,
 }
@@ -78,18 +82,24 @@ impl File {
         OpenOptions::new()
     }
 
-    /// Takes a file that was opened for overlapped I/O, as
-    /// [`OpenOptions::open_std`] opens one on any thread, and associates it
-    /// with the port of the thread's current engine.
+    /// Takes a file from the standard library, for the thread's current
+    /// engine.
+    ///
+    /// A file opened for overlapped I/O, as [`OpenOptions::open_std`] opens
+    /// one on any thread, is associated with the engine's port. One opened
+    /// for I/O that waits, as the standard library's own options open one,
+    /// cannot be: each of its reads and writes is made in full by the poll
+    /// that starts it, which waits for the disk, and its futures' timeouts
+    /// never run out.
     ///
     /// # Errors
     ///
-    /// What the system reports for a file that was not opened for
-    /// overlapped I/O, or that another port has already, and an error of
-    /// kind `Other` if the thread has no current engine.
+    /// What the system reports for a file opened for overlapped I/O that
+    /// another port has already, and an error of kind `Other` if the thread
+    /// has no current engine.
     pub fn from_std(file: fs::File) -> io::Result<Self> {
         Ok(Self {
-            handle: IoHandle::new(Arc::new(file))?,
+            handle: IoHandle::adopt(Arc::new(file))?,
         })
     }
 
@@ -102,6 +112,21 @@ impl File {
     /// on a file opened for overlapped I/O, does not complete at once.
     pub fn as_std(&self) -> &Arc<fs::File> {
         self.handle.io()
+    }
+
+    /// The file as the standard library's, as [`as_std`](File::as_std)
+    /// shares it, out of the file. A file opened for overlapped I/O stays
+    /// so, and associated with the engine's port.
+    pub fn into_std(self) -> Arc<fs::File> {
+        self.handle.into_io()
+    }
+
+    /// Whether the file was opened to append, so that its writes go to its
+    /// end whatever offset they name. Not if the system cannot say.
+    pub fn appends(&self) -> bool {
+        query_file(self.handle.raw(), sys::FILE_ACCESS_INFORMATION).is_some_and(|access| {
+            access & sys::FILE_APPEND_DATA != 0 && access & sys::FILE_WRITE_DATA == 0
+        })
     }
 
     /// Reads into `buf`, up to its `bytes_total`, from `offset`; see

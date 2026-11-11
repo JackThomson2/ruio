@@ -585,6 +585,31 @@ async fn connecting_to_a_closed_port_is_refused() {
     assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
 }
 
+/// Sockets of the standard library's, taken with `from_std` and `From`,
+/// accept and carry data as the runtime's own do.
+#[ruio::test]
+async fn sockets_from_the_standard_library_carry_data() -> io::Result<()> {
+    let listener = TcpListener::from_std(std::net::TcpListener::bind("127.0.0.1:0")?);
+    let addr = listener.local_addr()?;
+    let client = TcpStream::from(std::net::TcpStream::connect(addr)?);
+    let (server, peer) = within(listener.accept()).await?;
+    assert_eq!(peer, client.local_addr().await?);
+    within(client.write_all(b"ping".to_vec())).await.0?;
+    let (read, buf) = within(server.read_exact(Vec::with_capacity(4))).await;
+    read?;
+    assert_eq!(buf, b"ping");
+
+    let listener = TcpListener::from(std::net::TcpListener::bind("127.0.0.1:0")?);
+    let client = ruio::spawn(TcpStream::connect(listener.local_addr()?));
+    let (server, _) = within(listener.accept()).await?;
+    let client = client.await.unwrap()?;
+    within(server.write_all(b"pong".to_vec())).await.0?;
+    let (read, buf) = within(client.read_exact(Vec::with_capacity(4))).await;
+    read?;
+    assert_eq!(buf, b"pong");
+    Ok(())
+}
+
 #[ruio::test]
 async fn a_read_that_times_out_hands_back_its_buffer() -> io::Result<()> {
     let (client, server) = pair().await?;

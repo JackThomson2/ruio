@@ -47,6 +47,27 @@ async fn datagrams_go_to_and_come_from_addresses() -> io::Result<()> {
     Ok(())
 }
 
+/// Sockets of the standard library's, taken with `from_std` and `From`,
+/// send and receive as the runtime's own do: a datagram that found nobody
+/// at its port fails no receive after it.
+#[ruio::test]
+async fn sockets_from_the_standard_library_send_and_receive() -> io::Result<()> {
+    let a = UdpSocket::from_std(std::net::UdpSocket::bind("127.0.0.1:0")?);
+    let b = UdpSocket::from(std::net::UdpSocket::bind("127.0.0.1:0")?);
+    assert_eq!(within(a.send_to("hello", b.local_addr()?)).await.0?, 5);
+    let (received, buf) = within(b.recv_from(Vec::with_capacity(16))).await;
+    assert_eq!(received?, (5, a.local_addr()?));
+    assert_eq!(buf, b"hello");
+
+    let nobody = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
+    within(a.send_to("lost", nobody)).await.0?;
+    within(b.send_to("after", a.local_addr()?)).await.0?;
+    let (received, buf) = within(a.recv_from(Vec::with_capacity(16))).await;
+    assert_eq!(received?, (5, b.local_addr()?));
+    assert_eq!(buf, b"after");
+    Ok(())
+}
+
 /// Sockets bound with `SO_REUSEPORT` share an address, which a socket
 /// without it cannot bind, and the kernel spreads the datagrams among them
 /// by sender.

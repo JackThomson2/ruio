@@ -2,6 +2,7 @@
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::ptr;
 use std::task::Context;
 
 use crate::engine::Iocp;
@@ -30,7 +31,8 @@ impl Raw for OwnedHandle {
 
 /// A handle opened for overlapped I/O, in what owns it, associated with the
 /// port of the engine current where it was made, to which its operations
-/// complete.
+/// complete; or one opened for I/O that waits, which belongs to that engine
+/// and whose operations finish as they start.
 pub(crate) struct IoHandle<T> {
     // Closed before the engine is let go of, so that the operations the
     // closing cancels complete while the engine waits for them.
@@ -39,16 +41,17 @@ pub(crate) struct IoHandle<T> {
     /// Whether the system queues no completion to the port for the
     /// handle's operations that succeed during the calls that start them.
     skips: bool,
+    /// Whether the handle was opened for I/O that waits, and so is
+    /// associated with no port: each of its operations finishes, or fails,
+    /// during the call that starts it.
+    waits: bool,
 }
 
 impl<T: Raw> IoHandle<T> {
     /// Associates `io`'s handle, opened for overlapped I/O, with the port of
     /// the thread's current engine.
     pub(crate) fn new(io: T) -> io::Result<Self> {
-        let engine = Iocp::current().ok_or_else(|| {
-            io::Error::other("the thread has no ruio runtime for the handle's I/O to run on")
-        })?;
-        Self::on(io, engine)
+        Self::on(io, current()?)
     }
 
     /// Associates `io`'s handle, opened for overlapped I/O, with the port of
@@ -56,12 +59,56 @@ impl<T: Raw> IoHandle<T> {
     pub(crate) fn on(io: T, engine: Iocp) -> io::Result<Self> {
         engine.associate(io.raw())?;
         let skips = io.may_skip_port() && skip_port(io.raw());
-        Ok(Self { io, engine, skips })
+        Ok(Self {
+            io,
+            engine,
+            skips,
+            waits: false,
+        })
+    }
+
+    /// Takes `io`'s handle for the thread's current engine, whichever way
+    /// it was opened. One opened for overlapped I/O is associated with the
+    /// engine's port, as [`IoHandle::new`] associates it. One opened for I/O
+    /// that waits, as the standard library opens a file, cannot be, and is
+    /// not: each of its operations finishes, or fails, during the call that
+    /// starts it, which waits for the device, and nothing comes through the
+    /// port for it.
+    pub(crate) fn adopt(io: T) -> io::Result<Self> {
+        if !opened_to_wait(io.raw()) {
+            return Self::new(io);
+        }
+        Ok(Self {
+            io,
+            engine: current()?,
+            skips: true,
+            waits: true,
+        })
+    }
+
+    /// Associates `io`'s handle, taken from the standard library, with the
+    /// port of the thread's current engine, as [`IoHandle::new`] does, for a
+    /// `from_std` that reports no error, as it reports none on io_uring.
+    ///
+    /// # Panics
+    ///
+    /// If the thread has no current engine, or the system refuses to
+    /// associate the handle, as when another port has it already.
+    pub(crate) fn taken(io: T) -> Self {
+        Self::new(io).unwrap_or_else(|err| {
+            panic!("cannot take the handle for the port of the thread's engine: {err}")
+        })
     }
 
     /// What owns the handle.
     pub(crate) fn io(&self) -> &T {
         &self.io
+    }
+
+    /// What owns the handle, out of it. The handle stays associated with the
+    /// port, with no operation on it: each borrows what the handle is in.
+    pub(crate) fn into_io(self) -> T {
+        self.io
     }
 
     /// The engine whose port the handle is associated with.
@@ -79,6 +126,7 @@ impl<T: Raw> IoHandle<T> {
             handle: self.io.raw(),
             engine: &self.engine,
             skips: self.skips,
+            waits: self.waits,
         }
     }
 
@@ -88,6 +136,46 @@ impl<T: Raw> IoHandle<T> {
     pub(crate) fn skips(&self) -> bool {
         self.skips
     }
+}
+
+/// The thread's current engine.
+fn current() -> io::Result<Iocp> {
+    Iocp::current().ok_or_else(|| {
+        io::Error::other("the thread has no ruio runtime for the handle's I/O to run on")
+    })
+}
+
+/// Whether `handle` was opened for I/O that waits, which the system does in
+/// full during the call that asks for it, so that it cannot be associated
+/// with a port. Not if the system cannot say, as of a socket that a
+/// provider of its own made.
+fn opened_to_wait(handle: sys::Handle) -> bool {
+    query_file(handle, sys::FILE_MODE_INFORMATION)
+        .is_some_and(|mode| mode & sys::FILE_SYNCHRONOUS_IO != 0)
+}
+
+/// What the query `class` of `NtQueryInformationFile`, one whose answer is
+/// a `u32`, finds of the file of `handle`, or `None` if the system cannot
+/// say.
+pub(crate) fn query_file(handle: sys::Handle, class: u32) -> Option<u32> {
+    let mut block = sys::IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut info = 0_u32;
+    // SAFETY: the handle is open, as its owner is borrowed; the call writes
+    // at most the value's four bytes and the status block, before it
+    // returns, as the system answers these queries from the handle alone.
+    let status = unsafe {
+        sys::NtQueryInformationFile(
+            handle,
+            &mut block,
+            ptr::from_mut(&mut info).cast(),
+            size_of::<u32>() as u32,
+            class,
+        )
+    };
+    (status >= 0).then_some(info)
 }
 
 /// Asks the system to queue no completion to the port for `handle`'s
@@ -110,6 +198,10 @@ pub(crate) struct Target<'a> {
     /// Whether the handle's operations that succeed during the calls that
     /// start them come through no port, and are finished there and then.
     pub(crate) skips: bool,
+    /// Whether the handle was opened for I/O that waits, and is associated
+    /// with no port: its operations finish, or fail, during the calls that
+    /// start them, and nothing comes through the port for any of them.
+    pub(crate) waits: bool,
 }
 
 impl Target<'_> {

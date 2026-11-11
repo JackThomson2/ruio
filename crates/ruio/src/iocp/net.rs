@@ -99,10 +99,15 @@
 //! wait on that thread's port only when there is nothing to read or no
 //! room to write.
 //!
+//! Sockets taken from the standard library, with `from_std` or `From`,
+//! are associated with the port of the thread's runtime as they are
+//! taken, where io_uring finds its ring at a socket's first operation: so
+//! taking one where no runtime runs panics.
+//!
 //! Not here yet, of what `net` has on io_uring: datagrams received into a
-//! pool (`recv_stream` and `recv_from_stream` of a UDP socket), sockets
-//! taken from the standard library (`from_std`), `bind_reuseport`, and
-//! moving a stream to another core. Unix sockets are Unix's.
+//! pool (`recv_stream` and `recv_from_stream` of a UDP socket),
+//! `bind_reuseport`, and moving a stream to another core. Unix sockets are
+//! Unix's.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -154,6 +159,21 @@ impl TcpListener {
         Ok(Self {
             listener: iocp::TcpListener::bind(addr)?,
         })
+    }
+
+    /// Wraps a listening socket from the standard library, for the port of
+    /// the thread's runtime. It keeps the options it has: one of IPv6
+    /// accepts connections from IPv4 addresses only if it was made to.
+    ///
+    /// # Panics
+    ///
+    /// If the thread has no runtime of ruio's, which on io_uring the first
+    /// operation on the socket needs, or the system refuses to associate the
+    /// socket with the runtime's port, as when another runtime's has it.
+    pub fn from_std(socket: net::TcpListener) -> Self {
+        Self {
+            listener: iocp::TcpListener::from_std(socket),
+        }
     }
 
     /// The address the listener is bound to.
@@ -352,6 +372,20 @@ impl TcpStream {
         }))
     }
 
+    /// Wraps a connected socket from the standard library, for the port of
+    /// the thread's runtime.
+    ///
+    /// # Panics
+    ///
+    /// If the thread has no runtime of ruio's, which on io_uring the first
+    /// operation on the socket needs, or the system refuses to associate the
+    /// socket with the runtime's port, as when another runtime's has it.
+    pub fn from_std(stream: net::TcpStream) -> Self {
+        Self {
+            stream: iocp::TcpStream::from_std(stream),
+        }
+    }
+
     /// The address of this end of the connection.
     ///
     /// # Errors
@@ -518,6 +552,18 @@ impl TcpStream {
 impl fmt::Debug for TcpStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.stream, f)
+    }
+}
+
+impl From<net::TcpStream> for TcpStream {
+    fn from(stream: net::TcpStream) -> Self {
+        Self::from_std(stream)
+    }
+}
+
+impl From<net::TcpListener> for TcpListener {
+    fn from(listener: net::TcpListener) -> Self {
+        Self::from_std(listener)
     }
 }
 

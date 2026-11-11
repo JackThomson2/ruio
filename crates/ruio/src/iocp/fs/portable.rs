@@ -97,7 +97,7 @@ use std::task::{Context, Poll, ready};
 
 use ruio_iocp::portable::{self as iocp, ReadAt, WriteAt};
 
-use super::{Call, FileCall, Metadata, OpenOptions, pooled};
+use super::{Call, FileCall, Metadata, OpenOptions, pooled, unshare};
 use crate::buf::{BufResult, IoBuf, IoBufMut, Slice};
 use crate::io::{AsyncRead, AsyncWrite};
 
@@ -869,25 +869,6 @@ impl Drop for Polling {
     fn drop(&mut self) {
         if let Busy::Writing { write, .. } = mem::replace(&mut self.busy, Busy::Idle) {
             write.detach(Arc::clone(&self.file));
-        }
-    }
-}
-
-/// The standard library's file that `file` shares, once nothing else has
-/// it: a write let go of, or a call of the blocking pool's whose future was
-/// dropped, holds it until it has finished. Until then a handle of its own
-/// to the file stands in, which the system makes unless it is out of them.
-fn unshare(mut file: Arc<std::fs::File>) -> std::fs::File {
-    loop {
-        match Arc::try_unwrap(file) {
-            Ok(file) => return file,
-            Err(shared) => {
-                if let Ok(own) = shared.try_clone() {
-                    return own;
-                }
-                file = shared;
-                std::thread::yield_now();
-            }
         }
     }
 }

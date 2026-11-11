@@ -105,6 +105,25 @@ pub(crate) const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
 /// `FILE_TYPE_DISK`: a file on a disk.
 pub(crate) const FILE_TYPE_DISK: u32 = 0x0001;
 
+/// `FileModeInformation`: the class of `NtQueryInformationFile` that asks
+/// how a file was opened, which `FILE_MODE_INFORMATION` holds.
+pub(crate) const FILE_MODE_INFORMATION: u32 = 16;
+
+/// `FileAccessInformation`: the class of `NtQueryInformationFile` that asks
+/// for the rights a handle grants, which `FILE_ACCESS_INFORMATION` holds.
+pub(crate) const FILE_ACCESS_INFORMATION: u32 = 8;
+
+/// `FILE_SYNCHRONOUS_IO_ALERT` and `FILE_SYNCHRONOUS_IO_NONALERT`: a file
+/// opened for I/O that waits, which the system does in full during the
+/// call that asks for it, whatever `OVERLAPPED` the call names.
+pub(crate) const FILE_SYNCHRONOUS_IO: u32 = 0x0000_0010 | 0x0000_0020;
+
+/// `FILE_WRITE_DATA`: the right to write anywhere in a file.
+pub(crate) const FILE_WRITE_DATA: u32 = 0x0002;
+
+/// `FILE_APPEND_DATA`: the right to write at the end of a file.
+pub(crate) const FILE_APPEND_DATA: u32 = 0x0004;
+
 /// `PIPE_ACCESS_DUPLEX`: a pipe that both ends read and write.
 pub(crate) const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
 
@@ -738,6 +757,17 @@ unsafe extern "system" {
         input_len: u32,
         output: *mut c_void,
         output_len: u32,
+    ) -> i32;
+
+    /// Writes what the query `class` asks of `file` to `info`, which has
+    /// room for `len` bytes, and the outcome to `status`. An `NTSTATUS`:
+    /// negative on failure.
+    pub(crate) fn NtQueryInformationFile(
+        file: Handle,
+        status: *mut IoStatusBlock,
+        info: *mut c_void,
+        len: u32,
+        class: u32,
     ) -> i32;
 }
 

@@ -203,13 +203,14 @@ pub(crate) enum Started {
 /// Starts an operation on `handle` with `payload`, under `overlapped`, and
 /// says how the system took it, if it did. Its completion is to come
 /// through the port, unless it completed during the call and the handle
-/// asked the system to queue none for such.
+/// asked the system to queue none for such, or is associated with none.
 ///
 /// # Safety
 ///
-/// `handle` must be open and associated with a port, and `payload`, with
-/// the memory it names, and `overlapped` must stay valid and in place until
-/// the completion is delivered.
+/// `handle` must be open, and associated with a port unless it was opened
+/// for I/O that waits, and `payload`, with the memory it names, and
+/// `overlapped` must stay valid and in place until the completion is
+/// delivered.
 pub(crate) type Start<T> =
     unsafe fn(sys::Handle, &mut T, *mut sys::Overlapped) -> io::Result<Started>;
 
@@ -328,10 +329,10 @@ impl<'a, T> Op<'a, T> {
     ) -> Poll<(io::Result<u32>, T)> {
         let header = Header::new(self.offset, State::Waiting, None, free::<T>);
         let slot = NonNull::from(Box::leak(Box::new(Slot { header, payload })));
-        // SAFETY: the handle is open and associated with the port, as the
-        // future borrows it; the slot was just made, and stays where it is
-        // until the completion is delivered, the future's until then, or the
-        // engine's.
+        // SAFETY: the handle is open, and associated with the port unless it
+        // waits, as the future borrows it; the slot was just made, and stays
+        // where it is until the completion is delivered, the future's until
+        // then, or the engine's.
         let result = match unsafe { launch(self.target, slot, start) } {
             // The outcome, an error included, is read once the completion
             // has been delivered, which only a turn on this thread does: the
@@ -469,9 +470,10 @@ enum Launched {
 ///
 /// # Safety
 ///
-/// The handle of `target` must be open and associated with a port, and
-/// `slot` one that `Box::leak` gave and nothing else uses, which stays
-/// where it is until the completion is delivered, if one is to come.
+/// The handle of `target` must be open, and associated with a port unless
+/// it was opened for I/O that waits, and `slot` one that `Box::leak` gave
+/// and nothing else uses, which stays where it is until the completion is
+/// delivered, if one is to come.
 unsafe fn launch<T>(
     target: Target<'_>,
     slot: NonNull<Slot<T>>,
@@ -489,6 +491,9 @@ unsafe fn launch<T>(
         // handle that asked it not to.
         Ok(Started::AtOnce(bytes)) if target.skips => Ok(Launched::Done(bytes)),
         Ok(_) => Ok(Launched::Queued),
+        // A handle opened for I/O that waits is associated with no port, so
+        // the call's error is the operation's outcome, whatever it did.
+        Err(err) if target.waits => Err(err),
         Err(err) => {
             // A call that fails at once may have completed the operation all
             // the same, with a warning, and then its completion is queued
@@ -570,9 +575,9 @@ pub(crate) fn detach<T: Detached>(
 ) -> Result<(), (io::Error, T)> {
     let header = Header::new(offset, State::Detached, None, settle::<T>);
     let slot = NonNull::from(Box::leak(Box::new(Slot { header, payload })));
-    // SAFETY: the handle is open and associated with the port, as `target`
-    // borrows it; the slot was just made, and stays where it is until the
-    // completion is delivered, when the engine releases it.
+    // SAFETY: the handle is open, and associated with the port unless it
+    // waits, as `target` borrows it; the slot was just made, and stays where
+    // it is until the completion is delivered, when the engine releases it.
     let launched = unsafe { launch(target, slot, start) };
     if matches!(launched, Ok(Launched::Queued)) {
         target.engine.started();
