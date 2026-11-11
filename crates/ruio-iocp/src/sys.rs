@@ -162,6 +162,14 @@ pub(crate) const WSAID_CONNECTEX: Guid = Guid {
     data4: [0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e],
 };
 
+/// `WSAID_GETACCEPTEXSOCKADDRS`: names `GetAcceptExSockaddrs`.
+pub(crate) const WSAID_GETACCEPTEXSOCKADDRS: Guid = Guid {
+    data1: 0xb536_7df2,
+    data2: 0xcbac,
+    data3: 0x11cf,
+    data4: [0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92],
+};
+
 /// `OVERLAPPED`: an operation's state, which the system fills in as it
 /// runs, and where in a file it reads or writes.
 #[repr(C)]
@@ -284,6 +292,21 @@ pub(crate) type ConnectEx = unsafe extern "system" fn(
     sent: *mut u32,
     overlapped: *mut Overlapped,
 ) -> Bool;
+
+/// `LPFN_GETACCEPTEXSOCKADDRS`: finds the local and remote addresses that
+/// `AcceptEx` wrote to `output`, given the lengths `AcceptEx` was given,
+/// and points `local` and `remote` at them, within `output`, writing
+/// their lengths to `local_addr_len` and `remote_addr_len`.
+pub(crate) type GetAcceptExSockaddrs = unsafe extern "system" fn(
+    output: *mut c_void,
+    receive_len: u32,
+    local_len: u32,
+    remote_len: u32,
+    local: *mut *mut u8,
+    local_addr_len: *mut i32,
+    remote: *mut *mut u8,
+    remote_addr_len: *mut i32,
+);
 
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(

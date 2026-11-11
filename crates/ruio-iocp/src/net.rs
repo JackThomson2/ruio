@@ -276,6 +276,7 @@ impl RawAddr {
 struct Extensions {
     accept_ex: sys::AcceptEx,
     connect_ex: sys::ConnectEx,
+    get_accept_ex_sockaddrs: sys::GetAcceptExSockaddrs,
 }
 
 // A function pointer in an `Option` is a pointer that may be null, which is
@@ -296,12 +297,26 @@ fn extensions(socket: sys::Socket) -> io::Result<&'static Extensions> {
     let mut connect_ex: Option<sys::ConnectEx> = None;
     // SAFETY: as above.
     unsafe { extension(socket, &sys::WSAID_CONNECTEX, (&raw mut connect_ex).cast()) }?;
-    let (Some(accept_ex), Some(connect_ex)) = (accept_ex, connect_ex) else {
-        return Err(io::Error::other("Winsock has no AcceptEx or ConnectEx"));
+    let mut get_accept_ex_sockaddrs: Option<sys::GetAcceptExSockaddrs> = None;
+    // SAFETY: as above.
+    unsafe {
+        extension(
+            socket,
+            &sys::WSAID_GETACCEPTEXSOCKADDRS,
+            (&raw mut get_accept_ex_sockaddrs).cast(),
+        )
+    }?;
+    let (Some(accept_ex), Some(connect_ex), Some(get_accept_ex_sockaddrs)) =
+        (accept_ex, connect_ex, get_accept_ex_sockaddrs)
+    else {
+        return Err(io::Error::other(
+            "Winsock has no AcceptEx, ConnectEx or GetAcceptExSockaddrs",
+        ));
     };
     Ok(EXTENSIONS.get_or_init(|| Extensions {
         accept_ex,
         connect_ex,
+        get_accept_ex_sockaddrs,
     }))
 }
 
@@ -429,11 +444,12 @@ impl TcpListener {
     }
 
     /// Makes a stream of the socket that an accept completed on.
-    fn accepted(&self, accepting: Accepting) -> io::Result<(TcpStream, SocketAddr)> {
+    fn accepted(&self, mut accepting: Accepting) -> io::Result<(TcpStream, SocketAddr)> {
+        let listener = socket_of(self.listener.raw());
+        let peer = accepting.peer(listener)?;
         let socket = accepting
             .socket
             .expect("an accept that completed made its socket");
-        let listener = socket_of(self.listener.raw());
         // SAFETY: both sockets are open, and the option's value, the
         // listener's socket, is read during the call.
         let failed = unsafe {
@@ -449,7 +465,6 @@ impl TcpListener {
             return Err(last_error());
         }
         let stream = net::TcpStream::from(socket);
-        let peer = stream.peer_addr()?;
         let stream = Rc::new(Socket::new(stream));
         let stream = IoHandle::on(stream, self.listener.engine().clone())?;
         Ok((TcpStream::new(stream), peer))
@@ -469,9 +484,52 @@ struct Accepting {
     family: u16,
     /// The socket the connection arrives on, made as the accept starts.
     socket: Option<OwnedSocket>,
-    /// Where the system writes the connection's two addresses. It needs the
-    /// room, though nothing reads them: the stream is asked for its peer's.
+    /// Where the system writes the connection's two addresses, of which
+    /// the peer's is read once the accept has completed, rather than asked
+    /// of the stream with a call more.
     addrs: [u8; 2 * ADDR_ROOM],
+}
+
+impl Accepting {
+    /// The address of the peer of the connection that the accept from
+    /// `listener` completed, as the system wrote it.
+    fn peer(&mut self, listener: sys::Socket) -> io::Result<SocketAddr> {
+        let get_accept_ex_sockaddrs = extensions(listener)?.get_accept_ex_sockaddrs;
+        let (mut local, mut local_len) = (ptr::null_mut(), 0);
+        let (mut remote, mut remote_len) = (ptr::null_mut(), 0);
+        // SAFETY: the room holds what the accept wrote, given the lengths it
+        // was given and no data to receive; the call writes four values, to
+        // the places it is given, and reads nothing beyond the room.
+        unsafe {
+            get_accept_ex_sockaddrs(
+                self.addrs.as_mut_ptr().cast(),
+                0,
+                ADDR_ROOM as u32,
+                ADDR_ROOM as u32,
+                &mut local,
+                &mut local_len,
+                &mut remote,
+                &mut remote_len,
+            );
+        }
+        // The address lies within the room, where the call points.
+        let at = remote.addr().wrapping_sub(self.addrs.as_ptr().addr());
+        let written = usize::try_from(remote_len).ok().and_then(|len| {
+            let end = at.checked_add(len)?;
+            self.addrs.get(at..end)
+        });
+        let Some(written) = written else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "AcceptEx wrote no address of the peer",
+            ));
+        };
+        let mut addr = RawAddr::room();
+        let len = written.len().min(addr.bytes.len());
+        addr.bytes[..len].copy_from_slice(&written[..len]);
+        addr.len = len as i32;
+        addr.to_socket_addr()
+    }
 }
 
 /// Starts an accept on `listener`, as `op`'s `Start` says.
