@@ -28,17 +28,19 @@
 //! call on a stream reaches them, and the traits' through a generic bound
 //! only.
 //!
-//! The portable sockets of [`net::portable`] read and write with calls of
-//! Winsock's made at once instead, on whichever thread polls them, and wait
-//! on that thread's port only when there is nothing to read or no room to
-//! write: their reads and writes are [`PortableRead`]s and
-//! [`PortableWrite`]s, which are `Send` and `Sync`, and spend a step of the
-//! task's budget ([`coop`](crate::coop)) each time they move data.
+//! The portable sockets of [`net::portable`], and the pipes to a child
+//! process of [`process`](crate::process), read and write with calls made
+//! at once instead, on whichever thread polls them, and wait on that
+//! thread's port only when there is nothing to read or no room to write:
+//! their reads and writes are [`PortableRead`]s and [`PortableWrite`]s,
+//! which are `Send` and `Sync`, and spend a step of the task's budget
+//! ([`coop`](crate::coop)) each time they move data.
 //!
 //! Polled on a thread of another executor's, where no runtime of ruio's
-//! runs and so no port, they wait on that executor's reactor once it is set
-//! as the foreign one ([`set_foreign_reactor`]), as the executor's own
-//! sockets do; with none, their waits fail as unsupported.
+//! runs and so no port, the sockets wait on that executor's reactor once
+//! it is set as the foreign one ([`set_foreign_reactor`]), as the
+//! executor's own sockets do; with none, and for the pipes, their waits
+//! fail as unsupported.
 //!
 //! ```no_run
 //! use ruio::io::{AsyncRead, AsyncWrite};
@@ -72,7 +74,7 @@ mod traits;
 pub use foreign::{
     Reactor, Registration, clear_foreign_reactor, foreign_reactor, set_foreign_reactor,
 };
-pub(crate) use nonblocking::{Nonblocking, READABLE, WRITABLE};
+pub(crate) use nonblocking::{Nonblocking, READABLE, WRITABLE, Wait};
 pub use nonblocking::{
     PortableRead, PortableReadExact, PortableWrite, PortableWriteAll, PortableWriteAllVectored,
 };

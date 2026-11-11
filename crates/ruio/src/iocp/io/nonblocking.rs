@@ -1,6 +1,6 @@
-//! Sockets read and written with calls made at once, which wait on the
-//! port only when there is nothing to take or no room: the portable
-//! sockets.
+//! Sockets and pipes read and written with calls made at once, which wait
+//! on the port only when there is nothing to take or no room: the portable
+//! sockets, and the pipes to child processes.
 //!
 //! A read or a write is a call of Winsock's on a nonblocking socket, made
 //! on whichever thread polls it, which takes what has arrived, or gives
@@ -40,18 +40,30 @@
 //! made as its task woke from a wait, or moved less than it was to, as a
 //! request whose answer has yet to come does. Elsewhere a wait, which has
 //! no port to run on, fails with [`io::ErrorKind::Unsupported`].
+//!
+//! A pipe gives no sign that it has data, or room, short of an operation
+//! that completes, so a [`Pipe`] keeps a read and a write of its own in
+//! flight: a read takes what the pipe's read brought, and a write hands
+//! the pipe's write a copy of the caller's bytes, with no call to the
+//! system unless an operation is to start. One that finds nothing brought,
+//! or the last write still in flight, waits for that operation to
+//! complete, with a wait for its event on the port of the thread that polls
+//! it ([`HandleWait`]), and is made again once it has. The hints and the
+//! budget go for pipes as for sockets. The foreign reactor takes sockets
+//! alone, so where no runtime runs a pipe's wait fails with
+//! [`io::ErrorKind::Unsupported`].
 
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io::{self, IoSlice};
 use std::mem::MaybeUninit;
-use std::os::windows::io::{AsRawSocket, AsSocket, OwnedSocket};
+use std::os::windows::io::{AsRawHandle, AsRawSocket, AsSocket, OwnedHandle, OwnedSocket};
 use std::pin::Pin;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, ready};
 
-use ruio_iocp::portable::{ReadyWait, Socket, events};
+use ruio_iocp::portable::{HandleWait, Pipe, ReadyWait, Socket, events};
 
 use super::foreign::{Foreign, interest, level};
 use crate::buf::{BufResult, IoBuf, IoBufMut, IoBufs};
@@ -72,15 +84,16 @@ const OWNED_IOVECS: usize = 64;
 /// holds them: a longer one is written in part.
 const MAX_SLICE: usize = u32::MAX as usize;
 
-/// A socket made nonblocking, read and written with calls made at once,
-/// which waits with polls on the port of the thread that polls each wait,
-/// or on the foreign reactor where that thread is one of its.
+/// A socket made nonblocking, or a pipe's end that no port has, read and
+/// written with calls made at once, which waits on the port of the thread
+/// that polls each wait, or, a socket, on the foreign reactor where that
+/// thread is one of its.
 pub(crate) struct Nonblocking {
     /// The socket's registration with the foreign reactor, if it has waited
     /// on one of its threads: first, so that it leaves the reactor before
     /// the socket closes.
     foreign: Foreign,
-    socket: Socket,
+    io: Io,
     /// What the last reads found.
     read: Hint,
     /// What the last writes found.
@@ -101,52 +114,144 @@ struct Hint {
     waited: AtomicBool,
 }
 
+/// What a [`Nonblocking`] reads and writes.
+enum Io {
+    Socket(Socket),
+    Pipe(Pipe),
+}
+
+/// A wait of a [`Nonblocking`]'s, for a socket to be ready or for a pipe's
+/// operation in flight to complete, which a read, a write or a wait for
+/// readiness keeps while it is pending, for its next poll to go on with.
+#[derive(Debug, Default)]
+pub(crate) struct Wait {
+    /// A socket's wait, a poll of the AFD driver's.
+    ready: ReadyWait,
+    /// A pipe's wait, for the event of its operation in flight.
+    handle: HandleWait,
+}
+
+impl Wait {
+    /// A wait that has not started.
+    pub(crate) const fn new() -> Self {
+        Self {
+            ready: ReadyWait::new(),
+            handle: HandleWait::new(),
+        }
+    }
+
+    /// Whether the wait has started, and has not been ready since.
+    #[inline]
+    pub(crate) fn is_waiting(&self) -> bool {
+        self.ready.is_waiting() || self.handle.is_waiting()
+    }
+}
+
 impl Nonblocking {
     /// Takes over `socket`, nonblocking already, as a [`Socket`] is.
     pub(crate) fn new(socket: Socket) -> Self {
+        Self::with(Io::Socket(socket))
+    }
+
+    /// Takes over `pipe`, a pipe's end that no port has.
+    pub(crate) fn pipe(pipe: Pipe) -> Self {
+        Self::with(Io::Pipe(pipe))
+    }
+
+    fn with(io: Io) -> Self {
         Self {
             foreign: Foreign::new(),
-            socket,
+            io,
             read: Hint::default(),
             write: Hint::default(),
         }
     }
 
     /// The socket.
+    ///
+    /// # Panics
+    ///
+    /// If this is a pipe.
     #[inline]
     pub(crate) fn socket(&self) -> &Socket {
-        &self.socket
+        match &self.io {
+            Io::Socket(socket) => socket,
+            Io::Pipe(_) => unreachable!("a pipe has no socket"),
+        }
+    }
+
+    /// The pipe.
+    ///
+    /// # Panics
+    ///
+    /// If this is a socket.
+    #[inline]
+    pub(crate) fn as_pipe(&self) -> &Pipe {
+        match &self.io {
+            Io::Pipe(pipe) => pipe,
+            Io::Socket(_) => unreachable!("a socket is no pipe"),
+        }
     }
 
     /// The socket, blocking again, as the standard library's sockets are.
+    ///
+    /// # Panics
+    ///
+    /// If this is a pipe.
     pub(crate) fn into_owned_socket(self) -> OwnedSocket {
-        let Self {
-            foreign, socket, ..
-        } = self;
+        let Self { foreign, io, .. } = self;
         // Out of the reactor while the socket is still this one's.
         drop(foreign);
-        socket.into_socket()
+        match io {
+            Io::Socket(socket) => socket.into_socket(),
+            Io::Pipe(_) => unreachable!("a pipe has no socket"),
+        }
+    }
+
+    /// The pipe's handle, with its read and write in flight cancelled, as
+    /// [`Pipe::into_handle`] gives it.
+    ///
+    /// # Panics
+    ///
+    /// If this is a socket.
+    pub(crate) fn into_owned_handle(self) -> OwnedHandle {
+        match self.io {
+            Io::Pipe(pipe) => pipe.into_handle(),
+            Io::Socket(_) => unreachable!("a socket is no pipe"),
+        }
     }
 
     /// Reads into `buf` with one call, made at once: what has arrived, 0 at
-    /// the end, or `WouldBlock` if nothing has.
+    /// the end, or `WouldBlock` if nothing has. A pipe's read takes what its
+    /// read in flight brought, and starts the next once that is all taken.
     #[inline]
     pub(crate) fn try_read(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
-        self.socket.try_read(buf)
+        match &self.io {
+            Io::Socket(socket) => socket.try_read(buf),
+            Io::Pipe(pipe) => pipe.try_read(buf),
+        }
     }
 
     /// Writes `buf` with one call, made at once: as much as there is room
-    /// for, or `WouldBlock` if there is none.
+    /// for, or `WouldBlock` if there is none. A pipe's write copies up to
+    /// 64 KiB of it into the pipe's buffer and starts writing that, and
+    /// has no room while its last write is in flight.
     #[inline]
     pub(crate) fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
-        self.socket.try_write(buf)
+        match &self.io {
+            Io::Socket(socket) => socket.try_write(buf),
+            Io::Pipe(pipe) => pipe.try_write(buf),
+        }
     }
 
     /// Writes `bufs`, one after the other, with one call, made at once: as
     /// much as there is room for, or `WouldBlock` if there is none.
     #[inline]
     pub(crate) fn try_write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        self.socket.try_write_vectored(bufs)
+        match &self.io {
+            Io::Socket(socket) => socket.try_write_vectored(bufs),
+            Io::Pipe(pipe) => pipe.try_write_vectored(bufs),
+        }
     }
 
     /// Reads into `buf` what has arrived, 0 at the end, waiting with `wait`
@@ -156,7 +261,7 @@ impl Nonblocking {
         &self,
         cx: &mut Context<'_>,
         buf: &mut [MaybeUninit<u8>],
-        wait: &mut ReadyWait,
+        wait: &mut Wait,
     ) -> Poll<io::Result<usize>> {
         let len = buf.len();
         self.poll_transfer(cx, READABLE, wait, len, |io| io.try_read(buf))
@@ -168,7 +273,7 @@ impl Nonblocking {
         &self,
         cx: &mut Context<'_>,
         buf: &[u8],
-        wait: &mut ReadyWait,
+        wait: &mut Wait,
     ) -> Poll<io::Result<usize>> {
         self.poll_transfer(cx, WRITABLE, wait, buf.len(), |io| io.try_write(buf))
     }
@@ -179,7 +284,7 @@ impl Nonblocking {
         &self,
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
-        wait: &mut ReadyWait,
+        wait: &mut Wait,
     ) -> Poll<io::Result<usize>> {
         let len = bufs.iter().map(|buf| buf.len()).sum();
         self.poll_transfer(cx, WRITABLE, wait, len, |io| io.try_write_vectored(bufs))
@@ -188,30 +293,58 @@ impl Nonblocking {
     /// Waits with `wait` for the socket to have any of `events`, as
     /// [`Socket::poll_ready`] does; or, where the socket waits on the
     /// foreign reactor, until the reactor says it may, and one `WSAPoll`
-    /// that does not wait finds it does.
+    /// that does not wait finds it does. A pipe waits for its write in
+    /// flight, if one is, to complete, for `events` that name room to
+    /// write, as [`WRITABLE`] does, and else for its read in flight, which
+    /// this starts if none is, and is ready with [`WRITABLE`] or
+    /// [`READABLE`] for the one it waited for.
     #[inline]
     pub(crate) fn poll_ready(
         &self,
         cx: &mut Context<'_>,
         events: u32,
-        wait: &mut ReadyWait,
+        wait: &mut Wait,
     ) -> Poll<io::Result<u32>> {
         if !wait.is_waiting()
-            && let Some(registered) = self.foreign.here(self.socket.as_socket())
+            && let Io::Socket(socket) = &self.io
+            && let Some(registered) = self.foreign.here(socket.as_socket())
             && let Some(polled) =
-                registered.poll_io(cx, interest(events), 0, &mut || level(&self.socket, events))
+                registered.poll_io(cx, interest(events), 0, &mut || level(socket, events))
         {
             // The AFD bits, which fit a `u32`.
             return polled.map_ok(|events| events as u32);
         }
-        self.socket.poll_ready(cx, events, wait)
+        self.poll_port(cx, events, wait)
     }
 
     /// Waits for the socket to have any of `events`, as
     /// [`poll_ready`](Nonblocking::poll_ready) does, with a wait of its own.
     pub(crate) async fn ready(&self, events: u32) -> io::Result<u32> {
-        let mut wait = ReadyWait::new();
+        let mut wait = Wait::new();
         poll_fn(|cx| self.poll_ready(cx, events, &mut wait)).await
+    }
+
+    /// Waits with `wait` for any of `events` on the port of the thread that
+    /// polls it: a socket as [`Socket::poll_ready`] does, a pipe as
+    /// [`poll_ready`](Nonblocking::poll_ready) says.
+    #[inline]
+    fn poll_port(
+        &self,
+        cx: &mut Context<'_>,
+        events: u32,
+        wait: &mut Wait,
+    ) -> Poll<io::Result<u32>> {
+        match &self.io {
+            Io::Socket(socket) => socket.poll_ready(cx, events, &mut wait.ready),
+            Io::Pipe(pipe) if events & events::SEND == 0 => {
+                ready!(pipe.poll_read_ready(cx, &mut wait.handle))?;
+                Poll::Ready(Ok(READABLE))
+            }
+            Io::Pipe(pipe) => {
+                ready!(pipe.poll_write_ready(cx, &mut wait.handle))?;
+                Poll::Ready(Ok(WRITABLE))
+            }
+        }
     }
 
     /// Runs `transfer`, a call made at once that is to move `len` bytes,
@@ -223,7 +356,7 @@ impl Nonblocking {
         &self,
         cx: &mut Context<'_>,
         events: u32,
-        wait: &mut ReadyWait,
+        wait: &mut Wait,
         len: usize,
         transfer: impl FnMut(&Self) -> io::Result<usize>,
     ) -> Poll<io::Result<usize>> {
@@ -244,7 +377,7 @@ impl Nonblocking {
         &self,
         cx: &mut Context<'_>,
         events: u32,
-        wait: &mut ReadyWait,
+        wait: &mut Wait,
         call: impl FnMut(&Self) -> io::Result<T>,
     ) -> Poll<io::Result<T>> {
         self.poll_call(cx, events, wait, None, 0, call, |_| 0)
@@ -264,7 +397,7 @@ impl Nonblocking {
         &self,
         cx: &mut Context<'_>,
         events: u32,
-        wait: &mut ReadyWait,
+        wait: &mut Wait,
         hint: Option<&Hint>,
         len: usize,
         mut call: impl FnMut(&Self) -> io::Result<T>,
@@ -278,13 +411,13 @@ impl Nonblocking {
             if let Some(polled) = self.poll_registered(cx, events, hint, len, &mut call, &moved) {
                 return progressed(polled, proceed);
             }
-            ready!(self.socket.poll_ready(cx, events, wait))?;
+            ready!(self.poll_port(cx, events, wait))?;
         }
         loop {
             if wait.is_waiting() {
                 // Woken for something else, or by the poll: the poll knows
                 // which, and costs no call to ask.
-                ready!(self.socket.poll_ready(cx, events, wait))?;
+                ready!(self.poll_port(cx, events, wait))?;
             }
             match call(self) {
                 Ok(made) => {
@@ -302,7 +435,7 @@ impl Nonblocking {
                     {
                         return progressed(polled, proceed);
                     }
-                    ready!(self.socket.poll_ready(cx, events, wait))?;
+                    ready!(self.poll_port(cx, events, wait))?;
                 }
                 Err(err) => return Poll::Ready(Err(err)),
             }
@@ -313,10 +446,10 @@ impl Nonblocking {
     /// for `events`, as [`Registration::poll_io`](super::Registration::poll_io)
     /// does, on a thread of the reactor's, where no runtime of ruio's runs
     /// and the socket is registered with the reactor, or can be; `None`
-    /// elsewhere, for the wait to go to a port. A call that has to wait
-    /// leaves `hint` so that the next this way waits first, as does the call
-    /// made as the task wakes from that wait, and one that moved less than
-    /// it was to, whose readiness the reactor has cleared.
+    /// elsewhere, and for a pipe, for the wait to go to a port. A call that
+    /// has to wait leaves `hint` so that the next this way waits first, as
+    /// does the call made as the task wakes from that wait, and one that
+    /// moved less than it was to, whose readiness the reactor has cleared.
     fn poll_registered<T>(
         &self,
         cx: &mut Context<'_>,
@@ -326,7 +459,10 @@ impl Nonblocking {
         call: &mut impl FnMut(&Self) -> io::Result<T>,
         moved: &impl Fn(&T) -> usize,
     ) -> Option<Poll<io::Result<T>>> {
-        let registered = self.foreign.here(self.socket.as_socket())?;
+        let Io::Socket(socket) = &self.io else {
+            return None;
+        };
+        let registered = self.foreign.here(socket.as_socket())?;
         let mut made = None;
         let mut through = || {
             let output = call(self)?;
@@ -363,7 +499,7 @@ impl Nonblocking {
         PortableRead {
             io: self,
             buf: Some(buf),
-            wait: ReadyWait::new(),
+            wait: Wait::new(),
         }
     }
 
@@ -374,7 +510,7 @@ impl Nonblocking {
         PortableWrite {
             io: self,
             buf: Some(buf),
-            wait: ReadyWait::new(),
+            wait: Wait::new(),
         }
     }
 
@@ -386,7 +522,7 @@ impl Nonblocking {
             io: self,
             buf: Some(buf),
             done: 0,
-            wait: ReadyWait::new(),
+            wait: Wait::new(),
         }
     }
 
@@ -398,7 +534,7 @@ impl Nonblocking {
             io: self,
             buf: Some(buf),
             done: 0,
-            wait: ReadyWait::new(),
+            wait: Wait::new(),
         }
     }
 
@@ -410,17 +546,19 @@ impl Nonblocking {
             io: self,
             bufs: Some(bufs),
             done: 0,
-            wait: ReadyWait::new(),
+            wait: Wait::new(),
         }
     }
 }
 
 impl fmt::Debug for Nonblocking {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Nonblocking")
-            .field("socket", &self.socket.as_raw_socket())
-            .field("foreign", &self.foreign)
-            .finish()
+        let mut debug = f.debug_struct("Nonblocking");
+        match &self.io {
+            Io::Socket(socket) => debug.field("socket", &socket.as_raw_socket()),
+            Io::Pipe(pipe) => debug.field("pipe", &pipe.as_raw_handle()),
+        };
+        debug.field("foreign", &self.foreign).finish()
     }
 }
 
@@ -481,19 +619,20 @@ fn progressed<T>(polled: Poll<io::Result<T>>, proceed: coop::Proceed) -> Poll<io
     polled
 }
 
-/// A read of a socket with a call made at once, which waits on the port of
-/// the thread that polls it only if nothing has arrived: made by the `read`
-/// of the portable sockets. The output is how many bytes were read, 0 at
-/// the end, and the buffer, of which that many are then initialized from
-/// its start.
+/// A read of a socket, or a pipe, with a call made at once, which waits on
+/// the port of the thread that polls it only if nothing has arrived: made
+/// by the `read` of the portable sockets and of a child's pipes. The output
+/// is how many bytes were read, 0 at the end, and the buffer, of which that
+/// many are then initialized from its start.
 ///
 /// It spends a step of the task's budget ([`coop`]) when it reads, so a
 /// socket that always has something to read cannot hold up the thread.
-/// Dropped while it waits, it lets go of its poll; nothing is read but what
-/// it returns, so nothing is lost. Its wait runs on the foreign reactor
-/// where the thread is one of its; where no runtime runs and the reactor
-/// does not take it, a read that finds nothing fails with
-/// [`io::ErrorKind::Unsupported`], as its wait has no port to run on.
+/// Dropped while it waits, it lets go of its wait; nothing is read but what
+/// it returns, so nothing is lost. A socket's wait runs on the foreign
+/// reactor where the thread is one of its; where no runtime runs and the
+/// reactor does not take the wait, as it takes no pipe's, a read that finds
+/// nothing fails with [`io::ErrorKind::Unsupported`], as its wait has no
+/// port to run on.
 ///
 /// # Panics
 ///
@@ -503,8 +642,8 @@ pub struct PortableRead<'a, B> {
     io: &'a Nonblocking,
     /// Taken as the read completes.
     buf: Option<B>,
-    /// The wait for the socket to be readable, once it was found empty.
-    wait: ReadyWait,
+    /// The wait for something to read, once nothing was found.
+    wait: Wait,
 }
 
 impl<B: IoBufMut> Future for PortableRead<'_, B> {
@@ -547,13 +686,13 @@ impl<B> fmt::Debug for PortableRead<'_, B> {
     }
 }
 
-/// A write to a socket with a call made at once, which waits on the port of
-/// the thread that polls it only if there is no room: made by the `write`
-/// of the portable sockets. The output is how many bytes were written, and
-/// the buffer.
+/// A write to a socket, or a pipe, with a call made at once, which waits on
+/// the port of the thread that polls it only if there is no room: made by
+/// the `write` of the portable sockets and of a child's input. The output
+/// is how many bytes were written, and the buffer.
 ///
 /// It spends a step of the task's budget ([`coop`]) when it writes. Dropped
-/// while it waits, it lets go of its poll, having written nothing. Its wait
+/// while it waits, it lets go of its wait, having written nothing. Its wait
 /// runs as [`PortableRead`]'s does.
 ///
 /// # Panics
@@ -564,8 +703,8 @@ pub struct PortableWrite<'a, B> {
     io: &'a Nonblocking,
     /// Taken as the write completes.
     buf: Option<B>,
-    /// The wait for the socket to be writable, once it was found full.
-    wait: ReadyWait,
+    /// The wait for room, once there was none.
+    wait: Wait,
 }
 
 impl<B: IoBuf> Future for PortableWrite<'_, B> {
@@ -599,10 +738,10 @@ impl<B> fmt::Debug for PortableWrite<'_, B> {
     }
 }
 
-/// A read that fills a whole buffer from a socket, with calls made at
-/// once, as many as it takes, which wait on the port of the thread that
-/// polls them only while nothing has arrived: made by the `read_exact` of
-/// the portable sockets.
+/// A read that fills a whole buffer from a socket, or a pipe, with calls
+/// made at once, as many as it takes, which wait on the port of the thread
+/// that polls them only while nothing has arrived: made by the
+/// `read_exact` of the portable sockets and of a child's pipes.
 ///
 /// The read fills the buffer from its start, up to its
 /// [`bytes_total`](IoBuf::bytes_total). The output is the buffer, and
@@ -625,8 +764,8 @@ pub struct PortableReadExact<'a, B> {
     buf: Option<B>,
     /// How many bytes have been read.
     done: usize,
-    /// The wait for the socket to be readable, once it was found empty.
-    wait: ReadyWait,
+    /// The wait for something to read, once nothing was found.
+    wait: Wait,
 }
 
 impl<B: IoBufMut> Future for PortableReadExact<'_, B> {
@@ -688,10 +827,10 @@ impl<B> fmt::Debug for PortableReadExact<'_, B> {
     }
 }
 
-/// A write of all of a buffer's initialized bytes to a socket, with calls
-/// made at once, as many as it takes, which wait on the port of the thread
-/// that polls them only while there is no room: made by the `write_all` of
-/// the portable sockets. The output is the buffer, with how the writes
+/// A write of all of a buffer's initialized bytes to a socket, or a pipe,
+/// with calls made at once, as many as it takes, which wait on the port of
+/// the thread that polls them only while there is no room: made by the
+/// `write_all` of the portable sockets and of a child's input. The output
 /// went: a write that writes nothing fails with `WriteZero`. Its waits run
 /// as [`PortableRead`]'s do.
 ///
@@ -705,8 +844,8 @@ pub struct PortableWriteAll<'a, B> {
     buf: Option<B>,
     /// How many bytes have been written.
     done: usize,
-    /// The wait for the socket to be writable, once it was found full.
-    wait: ReadyWait,
+    /// The wait for room, once there was none.
+    wait: Wait,
 }
 
 impl<B: IoBuf> Future for PortableWriteAll<'_, B> {
@@ -765,11 +904,12 @@ impl<B> fmt::Debug for PortableWriteAll<'_, B> {
 }
 
 /// A write of every initialized byte of several buffers, one after the
-/// other, to a socket with calls made at once, as many as it takes, each of
-/// up to 64 of the buffers, which wait on the port of the thread that polls
-/// them only while there is no room: made by the `write_all_vectored` of
-/// the portable sockets. The output is the buffers, with how the writes
-/// went: a write that writes nothing fails with `WriteZero`.
+/// other, to a socket, or a pipe, with calls made at once, as many as it
+/// takes, each of up to 64 of the buffers, which wait on the port of the
+/// thread that polls them only while there is no room: made by the
+/// `write_all_vectored` of the portable sockets. The output is the
+/// buffers, with how the writes went: a write that writes nothing fails
+/// with `WriteZero`.
 ///
 /// It spends a step of the task's budget ([`coop`]) with each write that
 /// moves data. Dropped part way, it has written what it has, and no more.
@@ -785,8 +925,8 @@ pub struct PortableWriteAllVectored<'a, V> {
     bufs: Option<V>,
     /// How many bytes have been written.
     done: usize,
-    /// The wait for the socket to be writable, once it was found full.
-    wait: ReadyWait,
+    /// The wait for room, once there was none.
+    wait: Wait,
 }
 
 impl<V: IoBufs> Future for PortableWriteAllVectored<'_, V> {
@@ -900,7 +1040,7 @@ mod tests {
     fn a_wait_in_flight_is_asked_before_the_call() {
         run(async {
             let (reader, mut writer) = pair();
-            let mut wait = ReadyWait::new();
+            let mut wait = Wait::new();
             let mut buf = [MaybeUninit::uninit(); 8];
             let polled =
                 poll_fn(|cx| Poll::Ready(reader.poll_read(cx, &mut buf, &mut wait).is_pending()))
@@ -918,7 +1058,7 @@ mod tests {
     async fn read_at_once(
         reader: &Nonblocking,
         buf: &mut [MaybeUninit<u8>],
-        wait: &mut ReadyWait,
+        wait: &mut Wait,
     ) -> Option<usize> {
         poll_fn(|cx| {
             Poll::Ready(match reader.poll_read(cx, buf, wait) {
@@ -941,7 +1081,7 @@ mod tests {
     fn a_read_after_a_short_one_waits_for_the_port_first() {
         run(async {
             let (reader, mut writer) = pair();
-            let mut wait = ReadyWait::new();
+            let mut wait = Wait::new();
             let mut buf = [MaybeUninit::uninit(); 16];
             writer.write_all(b"one").unwrap();
             arrived(&reader).await;
@@ -961,7 +1101,7 @@ mod tests {
     fn a_read_after_a_full_one_reads_at_once() {
         run(async {
             let (reader, mut writer) = pair();
-            let mut wait = ReadyWait::new();
+            let mut wait = Wait::new();
             let mut buf = [MaybeUninit::uninit(); 4];
             writer.write_all(b"12345678").unwrap();
             arrived(&reader).await;
@@ -1035,7 +1175,7 @@ mod tests {
         run(async {
             let (ours, theirs) = pair();
             let theirs = Nonblocking::new(Socket::new(theirs.into()).unwrap());
-            let mut wait = ReadyWait::new();
+            let mut wait = Wait::new();
             let bufs = [IoSlice::new(b"one "), IoSlice::new(b"two")];
             let written = poll_fn(|cx| ours.poll_write_vectored(cx, &bufs, &mut wait)).await;
             assert_eq!(written.unwrap(), 7);
@@ -1099,7 +1239,7 @@ mod tests {
         let (reader, mut writer) = pair();
         writer.write_all(b"here").unwrap();
         let mut buf = [MaybeUninit::uninit(); 4];
-        let mut wait = ReadyWait::new();
+        let mut wait = Wait::new();
         let read = futures_executor::block_on(async {
             loop {
                 match reader.try_read(&mut buf) {

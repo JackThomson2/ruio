@@ -77,30 +77,30 @@ use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket,
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-use ruio_iocp::portable::{ReadyWait, Socket};
+use ruio_iocp::portable::Socket;
 
 use super::addr::{ToSocketAddrs, resolve};
 use crate::buf::{IoBuf, IoBufMut, IoBufs};
 use crate::io::{
     AsyncRead, AsyncWrite, Nonblocking, PortableRead, PortableReadExact, PortableWrite,
-    PortableWriteAll, PortableWriteAllVectored, READABLE, WRITABLE,
+    PortableWriteAll, PortableWriteAllVectored, READABLE, WRITABLE, Wait,
 };
 
 /// What a portable stream holds: its socket, and the waits of its poll
 /// methods, which take the stream mutably and so have them to themselves.
 struct Stream {
     /// The wait of `poll_read`.
-    read: ReadyWait,
+    read: Wait,
     /// The wait of `poll_write` and `poll_write_vectored`.
-    write: ReadyWait,
+    write: Wait,
     io: Nonblocking,
 }
 
 impl Stream {
     fn new(socket: Socket) -> Self {
         Self {
-            read: ReadyWait::new(),
-            write: ReadyWait::new(),
+            read: Wait::new(),
+            write: Wait::new(),
             io: Nonblocking::new(socket),
         }
     }
@@ -508,7 +508,7 @@ impl fmt::Debug for TcpStream {
 /// take.
 pub struct TcpListener {
     /// The wait of `poll_accept`.
-    wait: ReadyWait,
+    wait: Wait,
     io: Nonblocking,
 }
 
@@ -532,7 +532,7 @@ impl TcpListener {
 
     fn with(socket: Socket) -> Self {
         Self {
-            wait: ReadyWait::new(),
+            wait: Wait::new(),
             io: Nonblocking::new(socket),
         }
     }
@@ -576,7 +576,7 @@ impl TcpListener {
     /// foreign reactor does not take it, an error of kind
     /// [`io::ErrorKind::Unsupported`].
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        let mut wait = ReadyWait::new();
+        let mut wait = Wait::new();
         let taken = poll_fn(|cx| self.io.poll_take(cx, READABLE, &mut wait, try_accept)).await;
         taken.map(accepted)
     }

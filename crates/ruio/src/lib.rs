@@ -164,6 +164,10 @@ pub mod net;
 pub mod net;
 #[cfg(ruio_uring)]
 pub mod process;
+// The completion port engine's `process`, under io_uring's names.
+#[cfg(ruio_iocp)]
+#[path = "iocp/process.rs"]
+pub mod process;
 #[cfg(ruio_uring)]
 pub mod signal;
 
