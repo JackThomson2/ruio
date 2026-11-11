@@ -37,10 +37,13 @@ tokio-reactor = ["tokio", "tokio/net", "tokio/rt"]
 futures-io = { version = "0.3.34", optional = true }
 hyper = { version = "1.11.1", default-features = false, optional = true }
 hyper-util = { version = "0.1.21", default-features = false, optional = true }
-libc.workspace = true
 ruio.workspace = true
 tokio = { version = "1.53.1", default-features = false, optional = true }
 tower-service = { version = "0.3.3", optional = true }
+
+# The flags and error numbers of the ring's adapter, which is Linux's.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["io"] }
