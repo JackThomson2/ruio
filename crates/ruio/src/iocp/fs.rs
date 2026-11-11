@@ -52,7 +52,10 @@
 //! `Sync`. The functions that take a path hold no file of the port, so
 //! their futures are `Send` when what they are given is, and they can be
 //! awaited on any thread, in a runtime or out of one; a [`ReadDir`] and its
-//! [`DirEntry`]s are `Send` and `Sync`.
+//! [`DirEntry`]s are `Send` and `Sync`. A [`portable::File`], opened with
+//! [`OpenOptions::open_portable`], is `Send` and `Sync`, and waits for each
+//! of its reads and writes on the port of the runtime on the thread that
+//! polls it.
 //!
 //! ```
 //! fn assert_send<T: Send>(_: T) {}
@@ -63,11 +66,11 @@
 //! assert_send(ruio::fs::read_dir("."));
 //! ```
 //!
-//! Not here yet, of what `fs` has on io_uring: files taken from and given
-//! to the standard library (`from_std`, `into_std`), the futures' timeouts,
-//! and the `Send` files of `portable`. A [`Metadata`] reports what the
-//! standard library's does on every system; an owner, a mode and an inode
-//! are Unix's.
+//! Not here yet, of what `fs` has on io_uring: the thread-bound files
+//! taken from and given to the standard library (`from_std`, `into_std`),
+//! which the portable ones are, and the futures' timeouts. A [`Metadata`]
+//! reports what the standard library's does on every system; an owner, a
+//! mode and an inode are Unix's.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -90,6 +93,9 @@ use ruio_iocp::fs as iocp;
 use crate::buf::{BufLease, BufPool, BufResult, IoBuf, IoBufMut};
 
 pub use ruio_iocp::{ReadExact as ReadExactAt, WriteAll as WriteAllAt};
+
+#[path = "fs/portable.rs"]
+pub mod portable;
 
 /// How many entries of a directory one job of the blocking pool reads.
 const BATCH: usize = 64;
@@ -285,10 +291,7 @@ impl File {
     }
 
     fn call(&self, call: Call) -> FileCall<'_> {
-        FileCall {
-            state: CallState::Unstarted(Arc::clone(self.file.as_std()), call),
-            _file: PhantomData,
-        }
+        FileCall::new(Arc::clone(self.file.as_std()), call)
     }
 
     /// The file's status, asked for on the blocking pool.
@@ -525,15 +528,29 @@ enum Call {
 /// The future of a call on a file that Windows has no overlapped form of,
 /// which runs on the blocking pool: [`File::sync_all`], [`File::sync_data`],
 /// [`File::set_len`] and [`File::allocate`], under the names [`SyncAll`],
-/// [`SyncData`], [`SetLen`] and [`Allocate`].
+/// [`SyncData`], [`SetLen`] and [`Allocate`], and the same of a
+/// [`portable::File`], whose future, which borrows a file that is `Sync`,
+/// is `Send`.
 ///
 /// It starts the call when first polled. Dropping it leaves a call that
 /// has started to finish on the pool.
 #[must_use = "futures do nothing unless polled"]
-pub struct FileCall<'a> {
+pub struct FileCall<'a, F = File> {
     state: CallState,
-    /// The file belongs to its thread, and so does what it starts.
-    _file: PhantomData<&'a File>,
+    /// The file the call is made on, which the future borrows: one that
+    /// belongs to its thread, as what it starts then does, or a portable
+    /// one.
+    _file: PhantomData<&'a F>,
+}
+
+impl<F> FileCall<'_, F> {
+    /// The call `call` on `file`, to start when first polled.
+    fn new(file: Arc<std::fs::File>, call: Call) -> Self {
+        Self {
+            state: CallState::Unstarted(file, call),
+            _file: PhantomData,
+        }
+    }
 }
 
 enum CallState {
@@ -545,7 +562,7 @@ enum CallState {
     Finished,
 }
 
-impl Future for FileCall<'_> {
+impl<F> Future for FileCall<'_, F> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -577,7 +594,7 @@ impl Future for FileCall<'_> {
     }
 }
 
-impl fmt::Debug for FileCall<'_> {
+impl<F> fmt::Debug for FileCall<'_, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = match &self.state {
             CallState::Unstarted(_, call) => format!("{call:?}, not started"),
@@ -711,6 +728,23 @@ impl OpenOptions {
             append: self.append,
             at_end: Cell::new(false),
         })
+    }
+
+    /// Opens the file at `path` with these options as a [`portable::File`],
+    /// which is `Send` and `Sync` and belongs to no port, on the blocking
+    /// pool, as [`open`](OpenOptions::open) opens one. It needs no runtime to
+    /// open it: each of the file's reads and writes waits on the port of the
+    /// runtime on the thread that polls it.
+    ///
+    /// # Errors
+    ///
+    /// What opening the file reports: `InvalidInput`, say, for options that
+    /// open it neither to read nor to write.
+    pub async fn open_portable(&self, path: impl AsRef<Path>) -> io::Result<portable::File> {
+        let options = self.options.clone();
+        let path = path.as_ref().to_owned();
+        let file = pooled(move || options.open_std(path)).await?;
+        Ok(portable::File::new(file, 0, self.append))
     }
 }
 

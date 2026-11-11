@@ -1,16 +1,18 @@
 //! Files that are `Send`, whose operations run on the ring of whichever
 //! thread polls them.
 
-#![cfg(ruio_uring)]
+#![cfg(any(ruio_uring, ruio_iocp))]
 
 mod support;
 
 use std::future::{Future, poll_fn};
 use std::io::{self, ErrorKind, SeekFrom};
 use std::mem::MaybeUninit;
+#[cfg(ruio_uring)]
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::pin::Pin;
+#[cfg(ruio_uring)]
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -212,6 +214,32 @@ async fn files_convert_to_and_from_the_standard_library() -> io::Result<()> {
     Ok(())
 }
 
+/// Writes to a file opened to append go to its end, at an offset too, and
+/// leave the position there, where a read at it then finds nothing.
+#[ruio::test]
+async fn writes_to_a_file_opened_to_append_go_to_its_end() -> io::Result<()> {
+    let scratch = Scratch::new("append");
+    let path = scratch.path("file");
+    std::fs::write(&path, b"hello")?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open_portable(&path)
+        .await?;
+    let (written, _) = within(file.write(" world")).await;
+    assert_eq!(written?, 6);
+    let (written, _) = within(file.write_at("!", 0)).await;
+    assert_eq!(written?, 1);
+    assert_eq!(std::fs::read(&path)?, b"hello world!");
+    within(poll_write_all(&mut file, b"?")).await?;
+    assert_eq!(std::fs::read(&path)?, b"hello world!?");
+    assert_eq!(within(poll_fn(|cx| file.poll_seek(cx))).await?, 13);
+    let (read, _) = within(file.read(Vec::with_capacity(4))).await;
+    assert_eq!(read?, 0);
+    Ok(())
+}
+
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn open_portable_refuses_what_a_plain_descriptor_cannot_honour() -> io::Result<()> {
     let scratch = Scratch::new("refused");
@@ -237,6 +265,38 @@ async fn open_portable_refuses_what_a_plain_descriptor_cannot_honour() -> io::Re
     let err = File::open(scratch.path("missing")).await.unwrap_err();
     assert_eq!(err.kind(), ErrorKind::NotFound);
     Ok(())
+}
+
+/// Opening reports what the system finds: options that open the file
+/// neither to read nor to write, and a file that is not there.
+#[cfg(ruio_iocp)]
+#[ruio::test]
+async fn open_portable_reports_what_opening_finds() -> io::Result<()> {
+    let scratch = Scratch::new("refused");
+    let path = scratch.path("file");
+    std::fs::write(&path, b"")?;
+    let err = OpenOptions::new().open_portable(&path).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    let err = File::open(scratch.path("missing")).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    Ok(())
+}
+
+/// A file opens on the blocking pool, with no runtime needed for it, and is
+/// read where one runs.
+#[cfg(ruio_iocp)]
+#[test]
+fn a_file_opened_where_no_runtime_runs_is_read_in_one() -> io::Result<()> {
+    let scratch = Scratch::new("no-runtime");
+    let path = scratch.path("file");
+    std::fs::write(&path, b"opened outside")?;
+    let file = futures_executor::block_on(File::open(&path))?;
+    ruio::Runtime::new()?.block_on(async move {
+        let (read, data) = within(file.read_exact_at(Vec::with_capacity(14), 0)).await;
+        read?;
+        assert_eq!(data, b"opened outside");
+        Ok(())
+    })
 }
 
 #[test]
@@ -283,6 +343,7 @@ fn a_file_written_on_one_core_is_read_on_another() {
     assert_eq!(whole, b"from core zero, read on one");
 }
 
+#[cfg(ruio_uring)]
 /// Locks the file the descriptor of `file` is open on, with `flock(2)`,
 /// which holds the lock until every descriptor of that open file is closed.
 fn lock(file: &File) -> io::Result<()> {
@@ -290,6 +351,7 @@ fn lock(file: &File) -> io::Result<()> {
     dup.try_lock().map_err(io::Error::from)
 }
 
+#[cfg(ruio_uring)]
 /// Opens the file at `path` and writes `data` to it on a runtime, locked
 /// with `flock(2)`, which another open of the file then cannot take.
 fn written_and_locked(runtime: &ruio::Runtime, path: &PathBuf, data: &'static str) -> File {
@@ -306,6 +368,7 @@ fn written_and_locked(runtime: &ruio::Runtime, path: &PathBuf, data: &'static st
     file
 }
 
+#[cfg(ruio_uring)]
 #[test]
 fn a_file_dropped_off_its_runtime_closes_at_the_rings_next_turn() {
     let scratch = Scratch::new("dropped");
@@ -330,6 +393,7 @@ fn a_file_dropped_off_its_runtime_closes_at_the_rings_next_turn() {
     assert_eq!(std::fs::read(&path).unwrap(), b"complete");
 }
 
+#[cfg(ruio_uring)]
 #[test]
 fn a_file_dropped_after_its_runtime_closes_at_once() {
     let scratch = Scratch::new("orphaned");
@@ -405,6 +469,7 @@ async fn a_write_goes_behind_and_a_flush_waits_for_it() -> io::Result<()> {
     let mut file = File::create(&path).await?;
     let written = poll_fn(|cx| file.poll_write(cx, b"behind")).await?;
     assert_eq!(written, 6);
+    #[cfg(ruio_uring)]
     assert_eq!(std::fs::metadata(&path)?.len(), 0, "not yet on its way");
     within(poll_fn(|cx| file.poll_flush(cx))).await?;
     assert_eq!(std::fs::read(&path)?, b"behind");
@@ -443,6 +508,10 @@ async fn seeks_move_where_the_poll_methods_read_and_write() -> io::Result<()> {
 /// A read started for more than the caller then takes keeps the rest for
 /// the next read; a write after it goes where the reader is, before what
 /// the read took ahead.
+// io_uring's read stays in flight past its first poll. Windows makes a
+// read of a file in the cache at once, which leaves nothing ahead, so the
+// portable file's own tests arrange a read ahead there instead.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_write_after_a_read_ahead_goes_where_the_reader_is() -> io::Result<()> {
     let scratch = Scratch::new("ahead");
@@ -490,6 +559,7 @@ async fn a_write_in_flight_finishes_as_the_file_is_dropped_or_closed() -> io::Re
     Ok(())
 }
 
+#[cfg(ruio_uring)]
 /// A write gone behind that fails reports at the next call.
 #[ruio::test]
 async fn a_write_that_fails_behind_reports_at_the_next_call() -> io::Result<()> {
@@ -500,6 +570,22 @@ async fn a_write_that_fails_behind_reports_at_the_next_call() -> io::Result<()> 
     assert_eq!(poll_fn(|cx| file.poll_write(cx, b"no")).await?, 2);
     let err = within(poll_fn(|cx| file.poll_flush(cx))).await.unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+    within(poll_fn(|cx| file.poll_flush(cx))).await?;
+    assert_eq!(std::fs::read(&path)?, b"read only");
+    Ok(())
+}
+
+/// A write to a file opened only to read fails as it starts, and says so
+/// at once; the next call finds nothing held back.
+#[cfg(ruio_iocp)]
+#[ruio::test]
+async fn a_write_to_a_file_opened_to_read_fails_at_once() -> io::Result<()> {
+    let scratch = Scratch::new("failed");
+    let path = scratch.path("file");
+    std::fs::write(&path, b"read only")?;
+    let mut file = File::open(&path).await?;
+    let err = poll_fn(|cx| file.poll_write(cx, b"no")).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
     within(poll_fn(|cx| file.poll_flush(cx))).await?;
     assert_eq!(std::fs::read(&path)?, b"read only");
     Ok(())

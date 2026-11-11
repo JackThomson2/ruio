@@ -11,7 +11,8 @@
 //! longer than it takes to stop, so that its buffer, of a type that may
 //! not be sent to another thread, is dropped where it belongs. What a pipe
 //! leaves in flight as it is dropped finishes on the system's thread pool
-//! instead ([`finish_later`]), as a write behind it must go on.
+//! instead ([`finish_later`]), as a write behind it must go on, and so does
+//! a write let go of with [`WriteAt::detach`].
 
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
@@ -19,7 +20,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::mem;
-use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle};
 use std::pin::Pin;
 use std::ptr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -560,6 +561,37 @@ impl<B: IoBuf> Future for WriteAt<'_, B> {
             start
         ));
         Poll::Ready((result.map(|written| written as usize), buf))
+    }
+}
+
+impl<B: Send + 'static> WriteAt<'_, B> {
+    /// Lets the write go on without its future, which cancels it if
+    /// dropped: once it has completed, the system's thread pool drops its
+    /// buffer, and `owner`, which holds the handle written open until then,
+    /// as the system writes it meanwhile. Of a write that is not in flight,
+    /// not started yet or completed, the buffer and `owner` are dropped at
+    /// once, and nothing more is written.
+    ///
+    /// # Panics
+    ///
+    /// If `owner`'s handle is not the one the write names.
+    pub fn detach<H: AsHandle + Send + 'static>(mut self, owner: H) {
+        assert_eq!(
+            owner.as_handle().as_raw_handle(),
+            self.handle.as_raw_handle(),
+            "a write goes on with the handle it writes"
+        );
+        let State::Started(slot) = mem::replace(&mut self.state, State::Finished) else {
+            return;
+        };
+        if slot.completed() {
+            return;
+        }
+        let event = slot.event().as_raw_handle();
+        // SAFETY: the event is the slot's, which the thread pool holds open
+        // until it drops it.
+        let event = unsafe { BorrowedHandle::borrow_raw(event) };
+        finish_later(event, Box::new((slot, owner)));
     }
 }
 

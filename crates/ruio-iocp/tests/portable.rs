@@ -2,11 +2,14 @@
 //! by a runtime's tasks and by other threads.
 #![cfg(windows)]
 
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::windows::io::{AsHandle, OwnedHandle};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use ruio_executor::{Runtime, spawn};
@@ -76,6 +79,33 @@ fn what_is_written_at_offsets_reads_back() -> io::Result<()> {
         assert_eq!(std::fs::read(&path.0)?, b"hello world!");
         Ok(())
     })
+}
+
+#[test]
+fn a_detached_write_goes_on_without_its_future() -> io::Result<()> {
+    const LEN: usize = 8 << 20;
+    let path = TempFile::new("detached");
+    Runtime::new()?.block_on(async {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open_std(&path.0)?;
+        let file = Arc::new(file);
+        let mut write = write_at(file.as_handle(), vec![7_u8; LEN], 0);
+        // Started by a first poll, which may see it complete.
+        let _ = poll_fn(|cx| Poll::Ready(Pin::new(&mut write).poll(cx))).await;
+        write.detach(Arc::clone(&file));
+        drop(file);
+        io::Result::Ok(())
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::metadata(&path.0)?.len() < LEN as u64 {
+        assert!(Instant::now() < deadline, "the write never finished");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(std::fs::read(&path.0)?.iter().all(|&byte| byte == 7));
+    Ok(())
 }
 
 #[test]
