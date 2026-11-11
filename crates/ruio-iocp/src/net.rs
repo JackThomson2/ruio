@@ -32,6 +32,7 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::OnceLock;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use ruio_buf::{IoBuf, IoBufMut, IoBufs, Slice};
 
@@ -699,6 +700,67 @@ impl TcpStream {
     /// What the system reports.
     pub fn ttl(&self) -> io::Result<u32> {
         self.socket().ttl()
+    }
+
+    /// Sets for how long closing the stream waits for what it has left to
+    /// send to go (`SO_LINGER`), in whole seconds, or `None` for not at all,
+    /// which is the default: the system then sends what is left after the
+    /// stream has closed.
+    ///
+    /// A stream that lingers holds up its thread for up to that long as its
+    /// socket closes, and one that lingers for no time resets its
+    /// connection instead, discarding what is left.
+    ///
+    /// # Errors
+    ///
+    /// What the system reports.
+    pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
+        let value = sys::Linger {
+            onoff: u16::from(linger.is_some()),
+            linger: linger.map_or(0, |linger| {
+                u16::try_from(linger.as_secs()).unwrap_or(u16::MAX)
+            }),
+        };
+        // SAFETY: the socket is open, and the value is read during the call.
+        let failed = unsafe {
+            sys::setsockopt(
+                socket_of(self.stream.raw()),
+                sys::SOL_SOCKET,
+                sys::SO_LINGER,
+                ptr::from_ref(&value).cast(),
+                size_of::<sys::Linger>() as i32,
+            )
+        };
+        if failed != 0 {
+            return Err(last_error());
+        }
+        Ok(())
+    }
+
+    /// For how long closing the stream waits for what it has left to send
+    /// to go, or `None` if it does not.
+    ///
+    /// # Errors
+    ///
+    /// What the system reports.
+    pub fn linger(&self) -> io::Result<Option<Duration>> {
+        let mut value = sys::Linger::default();
+        let mut len = size_of::<sys::Linger>() as i32;
+        // SAFETY: the socket is open, and the value has room for as many
+        // bytes as the length says, which are written during the call.
+        let failed = unsafe {
+            sys::getsockopt(
+                socket_of(self.stream.raw()),
+                sys::SOL_SOCKET,
+                sys::SO_LINGER,
+                ptr::from_mut(&mut value).cast(),
+                &mut len,
+            )
+        };
+        if failed != 0 {
+            return Err(last_error());
+        }
+        Ok((value.onoff != 0).then(|| Duration::from_secs(value.linger.into())))
     }
 
     /// Takes the error the socket holds (`SO_ERROR`), if it holds one,

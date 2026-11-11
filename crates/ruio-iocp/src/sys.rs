@@ -97,6 +97,10 @@ pub(crate) const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
 /// connected.
 pub(crate) const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
 
+/// `SO_LINGER`: whether closing a socket waits for what it has left to
+/// send, and for how long; its value is a [`Linger`].
+pub(crate) const SO_LINGER: i32 = 0x0080;
+
 /// `SIO_GET_EXTENSION_FUNCTION_POINTER`: the `WSAIoctl` that asks a
 /// socket's provider for the function a `GUID` names.
 pub(crate) const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
@@ -184,6 +188,16 @@ pub(crate) struct WsaBuf {
     pub(crate) len: u32,
     /// `buf`: where they are.
     pub(crate) buf: *mut u8,
+}
+
+/// `LINGER`: the value of `SO_LINGER`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Linger {
+    /// `l_onoff`: whether closing the socket waits, zero if not.
+    pub(crate) onoff: u16,
+    /// `l_linger`: for how many seconds it does.
+    pub(crate) linger: u16,
 }
 
 /// `LPFN_ACCEPTEX`: starts an accept on `listener` of a connection onto
@@ -337,6 +351,17 @@ unsafe extern "system" {
         name: i32,
         value: *const u8,
         value_len: i32,
+    ) -> i32;
+
+    /// Reads an option of `socket` into `value`, which has room for
+    /// `value_len` bytes, and sets `value_len` to how many it wrote. Zero
+    /// on success.
+    pub(crate) fn getsockopt(
+        socket: Socket,
+        level: i32,
+        name: i32,
+        value: *mut u8,
+        value_len: *mut i32,
     ) -> i32;
 
     /// Controls `socket`: here, asks its provider for a function. Zero on

@@ -447,6 +447,28 @@ fn many_buffers_are_written_as_one_while_the_peer_reads() -> io::Result<()> {
 }
 
 #[test]
+fn a_stream_lingers_for_as_long_as_it_is_told() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let (_listener, client, server) = pair().await?;
+        assert_eq!(client.linger()?, None);
+        client.set_linger(Some(Duration::from_secs(3)))?;
+        assert_eq!(client.linger()?, Some(Duration::from_secs(3)));
+        client.set_linger(None)?;
+        assert_eq!(client.linger()?, None);
+
+        // A stream that lingers for no time resets its connection as it
+        // closes.
+        client.set_linger(Some(Duration::ZERO))?;
+        assert_eq!(client.linger()?, Some(Duration::ZERO));
+        drop(client);
+        let (read, _) = server.read(Vec::with_capacity(8)).await;
+        let err = read.expect_err("a read of a connection that was reset");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err}");
+        Ok(())
+    })
+}
+
+#[test]
 fn a_listener_binds_only_where_a_runtime_runs() {
     let err = TcpListener::bind(loopback()).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Other);
