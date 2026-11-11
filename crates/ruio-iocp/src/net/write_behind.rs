@@ -6,13 +6,14 @@ use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use ruio_buf::IoBufs;
 
 use crate::behind::Behind;
 use crate::gather::Gather;
 use crate::handle::Raw;
-use crate::op::{Detached, Started, detach};
+use crate::op::{Detached, Limit, Outcome, Started, detach};
 use crate::sys;
 
 use super::vectored::start_send_vectored;
@@ -58,10 +59,11 @@ impl<V: IoBufs> SendBehind<V> {
 }
 
 impl<V: IoBufs> Detached for SendBehind<V> {
-    unsafe fn complete(self, overlapped: *const sys::Overlapped, bytes: u32, wake: bool) {
-        // SAFETY: the caller's promise for the `OVERLAPPED`, and the socket
-        // is open, as the send holds it.
-        let sent = unsafe { outcome(self.socket.raw(), overlapped, bytes) };
+    fn outcome(&self) -> (sys::Handle, Outcome) {
+        (self.socket.raw(), outcome)
+    }
+
+    fn complete(self, sent: io::Result<u32>, wake: bool) {
         self.finish(sent, wake);
     }
 
@@ -101,11 +103,15 @@ unsafe fn start_send_behind<V: IoBufs>(
 ///
 /// A write behind takes less than 4 GiB, which is what one send takes;
 /// more fails with [`io::ErrorKind::InvalidInput`], and nothing is sent.
+/// [`timeout`](WriteBehind::timeout) bounds how long the system may take
+/// over the send.
 #[must_use = "futures do nothing unless polled"]
 pub struct WriteBehind<'a, V: IoBufs> {
     stream: &'a TcpStream,
     /// Taken once the send is on its way.
     bufs: Option<V>,
+    /// When the engine cancels the send if the system has not finished it.
+    limit: Limit,
 }
 
 impl<'a, V: IoBufs> WriteBehind<'a, V> {
@@ -113,7 +119,20 @@ impl<'a, V: IoBufs> WriteBehind<'a, V> {
         Self {
             stream,
             bufs: Some(bufs),
+            limit: Limit::Never,
         }
+    }
+
+    /// Cancels the send if the system has not finished it `duration` after
+    /// it starts: it then fails with `ERROR_TIMEOUT`, of
+    /// [`io::ErrorKind::TimedOut`], and the stream's writes after it, and
+    /// a [`flush`](TcpStream::flush), fail with that error, as with any
+    /// other. The system finishes a send once it has taken all of it, which
+    /// may be at once: on the loopback interface, it takes far more than
+    /// the peer has room for.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.limit = Limit::After(duration);
+        self
     }
 }
 
@@ -152,7 +171,7 @@ impl<V: IoBufs> Future for WriteBehind<'_, V> {
             socket: Rc::clone(this.stream.stream.io()),
         };
         behind.started();
-        let Err((err, send)) = detach(target, send, 0, start_send_behind::<V>) else {
+        let Err((err, send)) = detach(target, send, 0, this.limit, start_send_behind::<V>) else {
             return Poll::Ready(Ok(()));
         };
         // The system refused the send, which leaves the stream broken as a

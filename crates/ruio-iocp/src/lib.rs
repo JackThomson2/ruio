@@ -19,7 +19,10 @@
 //! its buffer and hands it back with the result, and the system may use the
 //! buffer until the operation's completion comes, so a dropped operation is
 //! cancelled, and its buffer freed only once the cancellation's completion
-//! has come.
+//! has come. An operation may have a timeout, by which the engine cancels
+//! it if it has not completed, as a linked timeout does on io_uring: its
+//! future then fails with `ERROR_TIMEOUT` and hands its buffer back. The
+//! first of those deadlines ends a park, as the engine's own does.
 //!
 //! `buf::BufPool` is a pool of buffers for readers to take from as data
 //! arrives, which is the thread's, as a port has none for the system to

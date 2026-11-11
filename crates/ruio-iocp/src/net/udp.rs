@@ -10,6 +10,7 @@ use std::os::windows::io::AsRawSocket;
 use std::pin::Pin;
 use std::ptr;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use ruio_buf::{BufResult, IoBuf, IoBufMut};
 
@@ -18,7 +19,7 @@ use super::{
     start_recv, start_send, taken,
 };
 use crate::handle::{IoHandle, Raw};
-use crate::op::{Op, Read, Started, Write};
+use crate::op::{Limit, Op, Read, Started, Write};
 use crate::sys;
 
 impl Raw for net::UdpSocket {
@@ -255,6 +256,18 @@ pub struct SendTo<'a, B: IoBuf> {
     op: Op<'a, Sending<B>>,
 }
 
+impl<B: IoBuf> SendTo<'_, B> {
+    /// Cancels the send if it has not completed `duration` after it starts:
+    /// it then fails with `ERROR_TIMEOUT`, of [`io::ErrorKind::TimedOut`],
+    /// and hands the buffer back, as with any other error.
+    ///
+    /// This has no effect once the send has started.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.op.set_limit(Limit::After(duration));
+        self
+    }
+}
+
 impl<B: IoBuf> Future for SendTo<'_, B> {
     type Output = BufResult<usize, B>;
 
@@ -327,6 +340,20 @@ unsafe fn start_recv_from<B: IoBufMut>(
 #[must_use = "futures do nothing unless polled"]
 pub struct RecvFrom<'a, B: IoBufMut> {
     op: Op<'a, Receiving<B>>,
+}
+
+impl<B: IoBufMut> RecvFrom<'_, B> {
+    /// Cancels the receive if no datagram has come `duration` after it
+    /// starts: it then fails with `ERROR_TIMEOUT`, of
+    /// [`io::ErrorKind::TimedOut`], and hands the buffer back, as with any
+    /// other error. A datagram received before the cancellation can stop
+    /// the receive is the receive's.
+    ///
+    /// This has no effect once the receive has started.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.op.set_limit(Limit::After(duration));
+        self
+    }
 }
 
 impl<B: IoBufMut> Future for RecvFrom<'_, B> {

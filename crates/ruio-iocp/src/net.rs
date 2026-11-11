@@ -48,7 +48,7 @@ use ruio_buf::{IoBuf, IoBufMut, IoBufs, Slice};
 use crate::behind::Behind;
 use crate::buf::BufPool;
 use crate::handle::{IoHandle, Raw};
-use crate::op::{Op, Read, ReadExact, Started, Write, WriteAll};
+use crate::op::{Limit, Op, Read, ReadExact, Started, Write, WriteAll};
 use crate::sys;
 
 mod recv;
@@ -719,6 +719,19 @@ unsafe fn start_accept(
 pub struct Accept<'a> {
     op: Op<'a, Accepting>,
     listener: &'a TcpListener,
+}
+
+impl Accept<'_> {
+    /// Cancels the accept if no connection has come `duration` after it
+    /// starts: it then fails with `ERROR_TIMEOUT`, of
+    /// [`io::ErrorKind::TimedOut`]. A connection accepted before the
+    /// cancellation can stop the accept is the accept's.
+    ///
+    /// This has no effect once the accept has started.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.op.set_limit(Limit::After(duration));
+        self
+    }
 }
 
 impl Future for Accept<'_> {

@@ -37,6 +37,13 @@ pub(crate) const ERROR_IO_PENDING: u32 = 997;
 /// end was made to wait for one, and is connected.
 pub(crate) const ERROR_PIPE_CONNECTED: u32 = 535;
 
+/// `ERROR_OPERATION_ABORTED`: the error of an operation that was
+/// cancelled, which Winsock's `WSA_OPERATION_ABORTED` is too.
+pub(crate) const ERROR_OPERATION_ABORTED: u32 = 995;
+
+/// `ERROR_TIMEOUT`: the error of an operation whose time ran out.
+pub(crate) const ERROR_TIMEOUT: u32 = 1460;
+
 /// `STATUS_PENDING`: the status in the `OVERLAPPED` of an operation that
 /// has not completed, which the calls that start one set before they ask
 /// the system for it.

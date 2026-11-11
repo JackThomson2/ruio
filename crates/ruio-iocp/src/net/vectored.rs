@@ -7,13 +7,14 @@ use std::mem;
 use std::pin::Pin;
 use std::ptr;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use ruio_buf::{BufResult, IoBufs};
 
 use crate::behind::{Behind, poll_gate};
 use crate::gather::Gather;
 use crate::handle::Target;
-use crate::op::{Op, Started};
+use crate::op::{Limit, Op, Started};
 use crate::sys;
 
 use super::{outcome, socket_of, taken};
@@ -96,6 +97,9 @@ pub struct WriteAllVectored<'a, V: IoBufs> {
     /// The writes left behind a stream, which a write of the stream's waits
     /// for before it starts.
     gate: Option<&'a Behind>,
+    /// When the send in flight is cancelled: the sends share the deadline
+    /// the first fixes as it starts.
+    limit: Limit,
 }
 
 /// Where a write of several buffers has got to.
@@ -118,7 +122,22 @@ impl<'a, V: IoBufs> WriteAllVectored<'a, V> {
             target,
             state: Sending::Start(bufs),
             gate: None,
+            limit: Limit::Never,
         }
+    }
+
+    /// Fails the write with `ERROR_TIMEOUT`, of [`io::ErrorKind::TimedOut`],
+    /// if the buffers are not all sent `duration` after the first of the
+    /// sends starts, which it does once the writes behind the stream have
+    /// finished, cancelling the send in flight then: each send has what is
+    /// left of the time.
+    ///
+    /// This has no effect once the first send has started.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        if matches!(self.state, Sending::Start(_)) {
+            self.limit = Limit::After(duration);
+        }
+        self
     }
 
     /// Makes the write wait, before it starts, for the writes behind its
@@ -169,10 +188,9 @@ impl<V: IoBufs> Future for WriteAllVectored<'_, V> {
             if gather.done >= len {
                 return Poll::Ready((Ok(()), gather.bufs));
             }
-            this.state = Sending::Moving {
-                op: Op::new(this.target, gather, 0),
-                len,
-            };
+            let mut op = Op::new(this.target, gather, 0);
+            op.set_limit(this.limit.fix());
+            this.state = Sending::Moving { op, len };
         }
     }
 }

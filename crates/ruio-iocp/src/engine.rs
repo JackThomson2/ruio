@@ -98,6 +98,9 @@ struct Inner {
     /// The operations in flight that were left to finish by themselves,
     /// which no future's drop cancels.
     detached: op::DetachedOps,
+    /// The operations in flight that are cancelled if they have not
+    /// completed by their deadlines.
+    deadlines: op::Deadlines,
     /// The engine's handle of the AFD driver, opened as the first socket
     /// waits to be ready on its thread.
     afd: OnceCell<Arc<Afd>>,
@@ -160,7 +163,7 @@ impl Drop for Shared {
 
 /// The time on the engines' clock: a monotonic one, counted from its first
 /// reading.
-fn now() -> Duration {
+pub(crate) fn now() -> Duration {
     let epoch = *EPOCH.get_or_init(Instant::now);
     Instant::now().saturating_duration_since(epoch)
 }
@@ -174,6 +177,15 @@ fn milliseconds_until(deadline: Duration) -> u32 {
         .as_nanos()
         .div_ceil(1_000_000);
     u32::try_from(left).map_or(sys::INFINITE - 1, |ms| ms.min(sys::INFINITE - 1))
+}
+
+/// The earlier of two deadlines, times on the engines' clock, where none is
+/// never.
+fn earlier(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// A timer that ends a wait on the port when its deadline comes, rather
@@ -336,6 +348,7 @@ impl Iocp {
                 in_flight: Cell::new(0),
                 at_once: Cell::new(0),
                 detached: op::DetachedOps::default(),
+                deadlines: op::Deadlines::default(),
                 afd: OnceCell::new(),
                 closing: Cell::new(false),
                 shutdown_timeout: builder.shutdown_timeout,
@@ -385,6 +398,12 @@ impl Iocp {
     /// The operations in flight that were left to finish by themselves.
     pub(crate) fn detached(&self) -> &op::DetachedOps {
         &self.inner.detached
+    }
+
+    /// The operations in flight that are cancelled if they have not
+    /// completed by their deadlines.
+    pub(crate) fn deadlines(&self) -> &op::Deadlines {
+        &self.inner.deadlines
     }
 
     /// What the engine shares with other threads.
@@ -446,7 +465,9 @@ impl Inner {
                     // SAFETY: a completion under the key of the handles is
                     // that of an operation `op` started on one, which the
                     // port hands back once.
-                    unsafe { op::complete(entry, &self.detached, !self.closing.get()) };
+                    unsafe {
+                        op::complete(entry, &self.detached, &self.deadlines, !self.closing.get());
+                    }
                 }
                 TIMER => {
                     if let Some(fine) = &self.fine {
@@ -472,11 +493,13 @@ impl Inner {
     /// Delivers what a check for work took from the port and what the port
     /// has, waiting for a completion until `deadline`, a time on the
     /// engines' clock, or for ever if there is none, unless the check took
-    /// some already. A turn that would not wait asks the port for nothing
-    /// when the port can hold nothing for it.
+    /// some already; then cancels the operations whose deadlines have come.
+    /// The first of those deadlines ends a wait too. A turn that would not
+    /// wait asks the port for nothing when the port can hold nothing for
+    /// it, which it cannot while an operation has a deadline.
     fn turn(&self, deadline: Option<Duration>) -> io::Result<()> {
         self.at_once.set(0);
-        let mut deadline = deadline;
+        let mut deadline = earlier(deadline, self.deadlines.first());
         if !self.stash.borrow().is_empty() {
             let stashed = mem::take(&mut *self.stash.borrow_mut());
             self.deliver(&stashed);
@@ -511,6 +534,7 @@ impl Inner {
             }
         }
         self.check_timer();
+        self.deadlines.expire();
         Ok(())
     }
 
@@ -532,6 +556,11 @@ impl Inner {
             self.armed.set(None);
             self.fired.set(true);
         }
+    }
+
+    /// Whether the timer's deadline or an operation's has passed.
+    fn due(&self) -> bool {
+        earlier(self.armed.get(), self.deadlines.first()).is_some_and(|deadline| deadline <= now())
     }
 }
 
@@ -590,7 +619,7 @@ impl Engine for Iocp {
         let inner = &self.inner;
         if inner.shared.notified.load(Ordering::SeqCst)
             || !inner.stash.borrow().is_empty()
-            || inner.armed.get().is_some_and(|deadline| deadline <= now())
+            || inner.due()
         {
             return true;
         }
@@ -612,7 +641,7 @@ impl Engine for Iocp {
                         _ => stash.push(*entry),
                     }
                 }
-                !stash.is_empty() || inner.armed.get().is_some_and(|deadline| deadline <= now())
+                !stash.is_empty() || inner.due()
             }
             // The next turn meets the error again, and reports it.
             Err(_) => true,
@@ -621,11 +650,7 @@ impl Engine for Iocp {
 
     fn park(&self, timeout: Option<Duration>) -> io::Result<()> {
         let after = timeout.map(|timeout| now().saturating_add(timeout));
-        let until = match (after, self.inner.armed.get()) {
-            (Some(after), Some(armed)) => Some(after.min(armed)),
-            (after, armed) => after.or(armed),
-        };
-        self.inner.turn(until)
+        self.inner.turn(earlier(after, self.inner.armed.get()))
     }
 
     fn wake_at(&self, deadline: Duration) -> io::Result<()> {
