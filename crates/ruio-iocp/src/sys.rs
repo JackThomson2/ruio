@@ -337,6 +337,15 @@ pub(crate) type ConnectEx = unsafe extern "system" fn(
     overlapped: *mut Overlapped,
 ) -> Bool;
 
+/// `PTP_WAIT_CALLBACK`: what the thread pool calls once the handle that a
+/// wait of its waits for is signaled, with the wait's context and the wait.
+pub(crate) type WaitCallback = unsafe extern "system" fn(
+    instance: *mut c_void,
+    context: *mut c_void,
+    wait: *mut c_void,
+    result: u32,
+);
+
 /// `LPFN_GETACCEPTEXSOCKADDRS`: finds the local and remote addresses that
 /// `AcceptEx` wrote to `output`, given the lengths `AcceptEx` was given,
 /// and points `local` and `remote` at them, within `output`, writing
@@ -552,6 +561,45 @@ unsafe extern "system" {
     ) -> Bool;
 
     /// The calling thread's last error.
+    /// Creates an event with no name and the default security: one that
+    /// stays signaled until it is reset if `manual_reset`, and signaled to
+    /// begin with if `initial`. Null on failure.
+    pub(crate) fn CreateEventW(
+        attributes: *const c_void,
+        manual_reset: Bool,
+        initial: Bool,
+        name: *const u16,
+    ) -> Handle;
+
+    /// The outcome of the operation on `file` that `overlapped` names: true
+    /// and how many bytes it transferred, or false, with its error as the
+    /// thread's last error, `ERROR_IO_INCOMPLETE` if it has not completed
+    /// and `wait` is false. If `wait` is true, it waits for the operation
+    /// to complete first, on the event that `overlapped` names.
+    pub(crate) fn GetOverlappedResult(
+        file: Handle,
+        overlapped: *const Overlapped,
+        transferred: *mut u32,
+        wait: Bool,
+    ) -> Bool;
+
+    /// Creates a wait of the system's thread pool, whose `callback` is
+    /// called with `context` on a thread of the pool once the handle it is
+    /// set to wait for is signaled. Null on failure.
+    pub(crate) fn CreateThreadpoolWait(
+        callback: WaitCallback,
+        context: *mut c_void,
+        environment: *const c_void,
+    ) -> *mut c_void;
+
+    /// Has the pool's `wait` wait for `handle`, with no timeout if `timeout`
+    /// is null, and call its callback once.
+    pub(crate) fn SetThreadpoolWait(wait: *mut c_void, handle: Handle, timeout: *const i64);
+
+    /// Frees the pool's `wait`, at once, or once its callback has returned
+    /// if it is running, as in a call from the callback itself.
+    pub(crate) fn CloseThreadpoolWait(wait: *mut c_void);
+
     pub(crate) safe fn GetLastError() -> u32;
 }
 
