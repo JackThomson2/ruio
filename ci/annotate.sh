@@ -8,8 +8,10 @@
 #
 # What failed is the lines of a log that say so, and the few after each:
 # the tests that failed or hung, where each panicked and with what, and the
-# errors of the compiler and of cargo, without the backtraces; or the log's
-# last lines if it has none of those. A title has no comma and no colon.
+# errors of the compiler and of cargo; and what each test that failed
+# printed, its first lines, as one that fails by returning an error panics
+# nowhere; all without the backtraces. Or the log's last lines, if it has
+# none of those. A title has no comma and no colon.
 set -euo pipefail
 
 if [ $# -ne 3 ]; then
@@ -39,10 +41,19 @@ notice)
     ;;
 failures)
     # Without the colours that cargo gives its own lines.
-    plain=$(sed -e 's/\x1b\[[0-9;]*m//g' "$file")
-    found=$(printf '%s\n' "$plain" |
-        grep -E -A8 'panicked at|^error|\.\.\. FAILED$|has been running for over' |
-        grep -E -v '^ +[0-9]+: |^ +at |^--$|^stack backtrace:|RUST_BACKTRACE' || true)
+    plain=$(sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r$//' "$file")
+    found=$(printf '%s\n' "$plain" | awk '
+        # The lines of a backtrace say nothing a panic has not.
+        /^ +[0-9]+: |^ +at |^stack backtrace:|RUST_BACKTRACE/ { next }
+        # What a failed test printed is under its name, up to the list of
+        # the failures.
+        /^---- .* ----$/ { printed = 40 }
+        /^failures:$/ { printed = 0 }
+        /panicked at|^error|\.\.\. FAILED$|has been running for over/ { after = 9 }
+        printed > 0 || after > 0 { print }
+        printed > 0 { printed-- }
+        after > 0 { after-- }
+    ')
     if [ -z "$found" ]; then
         found=$(printf '%s\n' "$plain" | tail -n 30)
     fi
