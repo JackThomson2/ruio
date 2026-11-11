@@ -8,6 +8,7 @@ mod support;
 
 use std::io::{self, ErrorKind};
 use std::net::Shutdown;
+use std::rc::Rc;
 use std::time::Duration;
 
 use ruio::buf::{BufPool, IoBuf};
@@ -134,6 +135,11 @@ async fn a_streams_options_read_back() -> io::Result<()> {
     assert!(!client.nodelay().await?);
     client.set_ttl(42).await?;
     assert_eq!(client.ttl().await?, 42);
+    assert_eq!(client.linger().await?, None);
+    client.set_linger(Some(Duration::from_secs(3))).await?;
+    assert_eq!(client.linger().await?, Some(Duration::from_secs(3)));
+    client.set_linger(None).await?;
+    assert_eq!(client.linger().await?, None);
     assert!(client.take_error().await?.is_none());
     Ok(())
 }
@@ -272,6 +278,196 @@ async fn what_has_arrived_is_taken_from_a_stream_without_waiting() -> io::Result
     assert_eq!(pool.available(), 8 - data.buffers());
     assert!(arriving.next_ready().is_none());
     assert!(!arriving.is_ended());
+    Ok(())
+}
+
+#[ruio::test]
+async fn several_buffers_are_written_as_one() -> io::Result<()> {
+    let (_listener, client, server) = pair().await?;
+    let bufs = vec![
+        b"hello, ".to_vec(),
+        Vec::new(),
+        b"wor".to_vec(),
+        b"ld".to_vec(),
+    ];
+    let (written, bufs) = within(client.write_all_vectored(bufs)).await;
+    written?;
+    assert_eq!(bufs, [&b"hello, "[..], b"", b"wor", b"ld"]);
+    let buf = Vec::with_capacity(12).slice(..12);
+    let (read, buf) = within(server.read_exact(buf)).await;
+    read?;
+    assert_eq!(buf.into_inner(), b"hello, world");
+
+    // An array of buffers is written the same, and no buffers write
+    // nothing.
+    let bufs = [b"ab".to_vec(), b"cd".to_vec()];
+    within(server.write_all_vectored(bufs)).await.0?;
+    within(server.write_all_vectored(Vec::<Vec<u8>>::new()))
+        .await
+        .0?;
+    let buf = Vec::with_capacity(4).slice(..4);
+    let (read, buf) = within(client.read_exact(buf)).await;
+    read?;
+    assert_eq!(buf.into_inner(), b"abcd");
+    Ok(())
+}
+
+#[ruio::test]
+async fn what_is_received_into_a_pool_is_written_back_as_it_is() -> io::Result<()> {
+    const LEN: usize = 200_000;
+    let (_listener, client, server) = pair().await?;
+    let pool = BufPool::new(16, 4096)?;
+    let echo = ruio::spawn(async move {
+        let mut arriving = server.recv_stream(&pool);
+        let mut echoed = 0;
+        while let Some(data) = arriving.next().await {
+            let mut data = data?;
+            // What has arrived by now goes out with it, up to half of the
+            // pool.
+            while data.buffers() < 8 {
+                match arriving.next_ready() {
+                    Some(more) => data.append(more?),
+                    None => break,
+                }
+            }
+            echoed += data.len();
+            server.write_all_vectored(data).await.0?;
+        }
+        drop(arriving);
+        server.shutdown(Shutdown::Write).await?;
+        io::Result::Ok((echoed, server))
+    });
+    let client = Rc::new(client);
+    // The echo is read while the data is written, as neither end's buffers
+    // hold all of it.
+    let reading = ruio::spawn({
+        let client = Rc::clone(&client);
+        async move {
+            let mut back = Vec::with_capacity(LEN);
+            loop {
+                let (read, buf) = client.read(Vec::with_capacity(64 * 1024)).await;
+                if read? == 0 {
+                    return io::Result::Ok(back);
+                }
+                back.extend_from_slice(&buf);
+            }
+        }
+    });
+    let (written, sent) = within(client.write_all(pattern(LEN))).await;
+    written?;
+    within(client.shutdown(Shutdown::Write)).await?;
+    let back = within(reading).await.unwrap()?;
+    assert!(back == sent, "the echo is the data");
+    let (echoed, _server) = within(echo).await.unwrap()?;
+    assert_eq!(echoed, LEN);
+    Ok(())
+}
+
+#[ruio::test]
+async fn a_write_behind_is_sent_without_being_waited_for() -> io::Result<()> {
+    let (_listener, client, server) = pair().await?;
+    // Nothing has been written behind the stream.
+    assert!(matches!(client.try_flush(), Some(Ok(()))));
+    within(client.flush()).await?;
+
+    let bufs = vec![b"hello, ".to_vec(), Vec::new(), b"world".to_vec()];
+    within(client.write_behind(bufs)).await?;
+    // No buffers send nothing.
+    within(client.write_behind(Vec::<Vec<u8>>::new())).await?;
+    let buf = Vec::with_capacity(12).slice(..12);
+    let (read, buf) = within(server.read_exact(buf)).await;
+    read?;
+    assert_eq!(buf.into_inner(), b"hello, world");
+    within(client.flush()).await?;
+    assert!(matches!(client.try_flush(), Some(Ok(()))));
+    Ok(())
+}
+
+#[ruio::test]
+async fn the_writes_after_a_write_behind_wait_for_it_and_go_in_order() -> io::Result<()> {
+    const LEN: usize = 8 << 20;
+    const TAIL: &[u8] = b"one.two.three.four";
+    let (_listener, client, server) = pair().await?;
+    let sent = pattern(LEN);
+    // More than the system takes while the peer reads nothing, so the send
+    // is in flight when the writes after it are made.
+    within(client.write_behind(vec![sent.clone()])).await?;
+    let reading = ruio::spawn(async move {
+        let mut received = Vec::with_capacity(LEN + TAIL.len());
+        loop {
+            let (read, buf) = server.read(Vec::with_capacity(256 * 1024)).await;
+            if read? == 0 {
+                return io::Result::Ok(received);
+            }
+            received.extend_from_slice(&buf);
+        }
+    });
+    let (written, _) = within(client.write(b"one.".to_vec())).await;
+    assert_eq!(written?, 4);
+    within(client.write_all(b"two.".to_vec())).await.0?;
+    let bufs = [b"th".to_vec(), b"ree.".to_vec()];
+    within(client.write_all_vectored(bufs)).await.0?;
+    within(client.write_behind(vec![b"four".to_vec()])).await?;
+    // The shutdown waits for the write behind it, too.
+    within(client.shutdown(Shutdown::Write)).await?;
+    assert!(matches!(client.try_flush(), Some(Ok(()))));
+    let received = within(reading).await.unwrap()?;
+    assert_eq!(received.len(), LEN + TAIL.len());
+    assert!(received[..LEN] == sent[..], "the write behind came first");
+    assert_eq!(&received[LEN..], TAIL);
+    Ok(())
+}
+
+#[ruio::test]
+async fn a_write_behind_that_fails_fails_the_writes_after_it() -> io::Result<()> {
+    /// The system's code of the error `result` is.
+    fn code<T: std::fmt::Debug>(result: io::Result<T>) -> Option<i32> {
+        result
+            .expect_err("a write after one that failed")
+            .raw_os_error()
+    }
+
+    let (_listener, client, server) = pair().await?;
+    // The peer goes with data unread, so what is sent to it after that is
+    // refused.
+    within(client.write_all(b"unread".to_vec())).await.0?;
+    ruio::time::sleep(Duration::from_millis(20)).await;
+    drop(server);
+    let mut failed = None;
+    for _ in 0..200 {
+        let sent = within(client.write_behind(vec![vec![7_u8; 64 * 1024]])).await;
+        let flushed = match sent {
+            Ok(()) => within(client.flush()).await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = flushed {
+            failed = Some(err);
+            break;
+        }
+        ruio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let failed = failed.expect("a write to a peer that has gone fails");
+    let first = failed.raw_os_error();
+    assert!(first.is_some(), "{failed}");
+
+    // Every write after it fails with its error, and hands its buffers
+    // back unwritten.
+    let known = client.try_flush().expect("no write behind is in flight");
+    assert_eq!(code(known), first);
+    assert_eq!(code(within(client.flush()).await), first);
+    let (written, buf) = within(client.write(b"late".to_vec())).await;
+    assert_eq!(code(written), first);
+    assert_eq!(buf, b"late");
+    let (written, buf) = within(client.write_all(b"later".to_vec())).await;
+    assert_eq!(code(written), first);
+    assert_eq!(buf, b"later");
+    let bufs = vec![b"la".to_vec(), b"test".to_vec()];
+    let (written, bufs) = within(client.write_all_vectored(bufs)).await;
+    assert_eq!(code(written), first);
+    assert_eq!(bufs, [&b"la"[..], b"test"]);
+    let behind = within(client.write_behind(vec![b"last".to_vec()])).await;
+    assert_eq!(code(behind), first);
+    assert_eq!(code(within(client.shutdown(Shutdown::Write)).await), first);
     Ok(())
 }
 

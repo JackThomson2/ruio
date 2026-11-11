@@ -72,6 +72,12 @@
 //! wait hold no memory, and hands the data back as leases of the pool's
 //! buffers.
 //!
+//! A stream writes several buffers as one, any [`IoBufs`], a bundle it
+//! received included, with [`TcpStream::write_all_vectored`]. A write may
+//! also be left behind the stream, with [`TcpStream::write_behind`]: the
+//! engine sends it and drops its buffers while the task goes on, and the
+//! stream's writes after it wait for it, and fail if it failed.
+//!
 //! Like the port their I/O completes to, sockets belong to their thread:
 //! they are neither `Send` nor `Sync`.
 //!
@@ -81,11 +87,10 @@
 //! ```
 //!
 //! Not here yet, of what `net` has on io_uring: datagrams received into a
-//! pool (`recv_stream` and `recv_from_stream` of a UDP socket), vectored
-//! writes and writes behind, the futures' timeouts, sockets taken from the
-//! standard library (`from_std`), `bind_reuseport`, a stream's `linger`,
-//! moving a stream to another core, and the `Send` sockets of `portable`.
-//! Unix sockets are Unix's.
+//! pool (`recv_stream` and `recv_from_stream` of a UDP socket), the
+//! futures' timeouts, sockets taken from the standard library (`from_std`),
+//! `bind_reuseport`, moving a stream to another core, and the `Send`
+//! sockets of `portable`. Unix sockets are Unix's.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -94,10 +99,11 @@ use std::marker::PhantomData;
 use std::net::{self, Shutdown, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use ruio_iocp::net as iocp;
 
-use crate::buf::{BufBundle, BufPool, IoBuf, IoBufMut};
+use crate::buf::{BufBundle, BufPool, IoBuf, IoBufMut, IoBufs};
 
 #[path = "../net/addr.rs"]
 mod addr;
@@ -105,7 +111,7 @@ mod addr;
 use addr::resolve;
 
 pub use addr::{ToSocketAddrs, lookup_host};
-pub use ruio_iocp::net::{RecvFrom, SendTo, UdpSocket};
+pub use ruio_iocp::net::{Flush, RecvFrom, SendTo, UdpSocket, WriteAllVectored, WriteBehind};
 pub use ruio_iocp::{Read, ReadExact, Write, WriteAll};
 
 /// A TCP listener.
@@ -271,6 +277,10 @@ impl futures_core::stream::FusedStream for Incoming<'_, TcpStream> {
 /// A read and a write may be in flight at once, as a task reading a
 /// connection and another writing it have them.
 ///
+/// A write may also be left behind the stream, for the engine to finish;
+/// see [`write_behind`](TcpStream::write_behind). A stream dropped with one
+/// in flight closes once it has been sent.
+///
 /// The addresses and the options are asked of the system at once. They are
 /// `async` because they are on io_uring, where a socket the ring alone
 /// holds answers through the ring.
@@ -368,6 +378,28 @@ impl TcpStream {
         self.stream.ttl()
     }
 
+    /// Sets for how long closing the stream waits for what it has left to
+    /// send to go (`SO_LINGER`), in whole seconds, or `None` for not at
+    /// all, which is the default. A stream that lingers holds up its thread
+    /// for up to that long as it is dropped.
+    ///
+    /// # Errors
+    ///
+    /// What the system reports.
+    pub async fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
+        self.stream.set_linger(linger)
+    }
+
+    /// For how long closing the stream waits for what it has left to send
+    /// to go, or `None` if it does not.
+    ///
+    /// # Errors
+    ///
+    /// What the system reports.
+    pub async fn linger(&self) -> io::Result<Option<Duration>> {
+        self.stream.linger()
+    }
+
     /// Takes the error the socket holds (`SO_ERROR`), if it holds one,
     /// which clears it.
     ///
@@ -391,15 +423,45 @@ impl TcpStream {
     }
 
     /// Writes `buf`'s initialized bytes, or as many as the system takes;
-    /// see [`Write`].
+    /// see [`Write`]. It waits for a [`write_behind`](Self::write_behind)
+    /// in flight, and fails if one failed.
     pub fn write<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
         self.stream.write(buf)
     }
 
     /// Writes all of `buf`'s initialized bytes, with as many writes as
-    /// that takes; see [`WriteAll`].
+    /// that takes; see [`WriteAll`]. As [`write`](Self::write), it waits
+    /// for a write behind in flight, and fails if one failed.
     pub fn write_all<B: IoBuf>(&self, buf: B) -> WriteAll<'_, B> {
         self.stream.write_all(buf)
+    }
+
+    /// Writes all of the initialized bytes of `bufs`, one buffer after
+    /// another, such as a bundle received; see [`WriteAllVectored`]. As
+    /// [`write`](Self::write), it waits for a write behind in flight, and
+    /// fails if one failed.
+    pub fn write_all_vectored<V: IoBufs>(&self, bufs: V) -> WriteAllVectored<'_, V> {
+        self.stream.write_all_vectored(bufs)
+    }
+
+    /// Writes all of the initialized bytes of `bufs` without waiting for
+    /// the system to be done with them; see [`WriteBehind`].
+    pub fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V> {
+        self.stream.write_behind(bufs)
+    }
+
+    /// Waits for a [`write_behind`](Self::write_behind) in flight to finish,
+    /// and reports whether one failed; see [`Flush`].
+    pub fn flush(&self) -> Flush<'_> {
+        self.stream.flush()
+    }
+
+    /// Reports whether a [`write_behind`](Self::write_behind) failed, if
+    /// none is in flight, without waiting for one that is: `None` then, as
+    /// how it goes is not yet known. Unlike [`flush`](Self::flush), this
+    /// arranges for nothing to be woken.
+    pub fn try_flush(&self) -> Option<io::Result<()>> {
+        self.stream.try_flush()
     }
 
     /// The data arriving on the connection, received into buffers of
@@ -410,14 +472,16 @@ impl TcpStream {
         }
     }
 
-    /// Shuts down the reading or writing half of the connection, or both.
+    /// Shuts down the reading or writing half of the connection, or both,
+    /// once a [`write_behind`](Self::write_behind) in flight has finished.
     /// The peer's reads find the end of the stream once the writing half
     /// is shut down.
     ///
     /// # Errors
     ///
-    /// What the system reports.
+    /// What a write behind failed with, and what the system reports.
     pub async fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.stream.flush().await?;
         self.stream.shutdown(how)
     }
 }
@@ -462,16 +526,18 @@ impl RecvStream<'_> {
 
     /// The next data if it has arrived already, or `None`, without waiting.
     /// Appending it to the data taken before gathers everything that has
-    /// arrived:
+    /// arrived, to write back as it is:
     ///
     /// ```no_run
-    /// # async fn gather(stream: ruio::net::TcpStream, pool: ruio::buf::BufPool) {
+    /// # async fn echo(stream: ruio::net::TcpStream, pool: ruio::buf::BufPool) {
     /// let mut received = stream.recv_stream(&pool);
     /// while let Some(Ok(mut data)) = received.next().await {
     ///     while let Some(Ok(more)) = received.next_ready() {
     ///         data.append(more);
     ///     }
-    ///     println!("{} bytes in {} buffers", data.len(), data.buffers());
+    ///     if stream.write_all_vectored(data).await.0.is_err() {
+    ///         break;
+    ///     }
     /// }
     /// # }
     /// ```
