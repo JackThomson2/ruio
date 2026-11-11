@@ -1,7 +1,8 @@
 //! The executor: running, spawning, joining, waking and shutting down.
 //!
-//! Those that run operations need an engine with I/O, io_uring's, so they
-//! run only where the executor has it (`cfg(ruio_uring)`).
+//! Those that run operations run them on the engine's own, io_uring's ring
+//! or the completion port, so they run only where the executor has one of
+//! those (`cfg(any(ruio_uring, ruio_iocp))`), not on the park engine.
 
 use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
@@ -14,13 +15,98 @@ use std::time::Duration;
 use ruio_executor::{Runtime, spawn, yield_now};
 
 // What the tests that run operations use besides.
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 use {
-    ruio_driver::ops::{Nop, Timeout},
-    std::pin::Pin,
+    std::pin::{Pin, pin},
     std::task::Context,
     std::time::Instant,
 };
+
+/// The engine's own operations, which the tests that run operations wait
+/// on: on io_uring's ring, a no-op and a timeout.
+#[cfg(ruio_uring)]
+mod ops {
+    use std::time::Duration;
+
+    use ruio_driver::ops::{Nop, Timeout};
+
+    /// Completes as the ring next turns.
+    pub(crate) async fn nop() {
+        ruio_executor::driver().op(Nop).await.unwrap();
+    }
+
+    /// Completes once `duration` has passed.
+    pub(crate) async fn wait(duration: Duration) {
+        ruio_executor::driver()
+            .op(Timeout::new(duration))
+            .await
+            .unwrap();
+    }
+}
+
+/// The engine's own operations, which the tests that run operations wait
+/// on: on the completion port, a read through a named pipe whose other end
+/// writes once the read is in flight, at once or after a while.
+#[cfg(ruio_iocp)]
+mod ops {
+    use std::fs::{File, OpenOptions};
+    use std::future::{Future, poll_fn};
+    use std::io::Write as _;
+    use std::pin::pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use ruio_iocp::pipe::NamedPipe;
+
+    /// Reads a byte through a pipe of its own, whose server's end is on the
+    /// port, and hands the client's end, which writes without the port, to
+    /// `write` once the read is in flight.
+    async fn read_then(write: impl FnOnce(File)) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let name = format!(
+            r"\\.\pipe\ruio-executor-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let server = NamedPipe::create(&name).unwrap();
+        let client = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+            .unwrap();
+        let mut read = pin!(server.read(Vec::with_capacity(1)));
+        let mut write = Some((write, client));
+        let (read, _) = poll_fn(|cx| {
+            let poll = read.as_mut().poll(cx);
+            if poll.is_pending()
+                && let Some((write, client)) = write.take()
+            {
+                write(client);
+            }
+            poll
+        })
+        .await;
+        assert_eq!(read.unwrap(), 1);
+    }
+
+    /// Completes as the port next turns.
+    pub(crate) async fn nop() {
+        read_then(|mut client| client.write_all(b"x").unwrap()).await;
+    }
+
+    /// Completes once `duration` has passed, written by a thread of its
+    /// own, which finds the read gone if its task was cancelled meanwhile.
+    pub(crate) async fn wait(duration: Duration) {
+        read_then(move |mut client| {
+            thread::spawn(move || {
+                thread::sleep(duration);
+                let _ = client.write_all(b"x");
+            });
+        })
+        .await;
+    }
+}
 
 #[cfg(ruio_uring)]
 #[test]
@@ -31,10 +117,10 @@ fn the_builder_sizes_the_file_table() {
     assert_eq!(runtime.driver().files(), 0);
 }
 
-/// The shutdown timeout reaches the driver's builder, and a runtime built
+/// The shutdown timeout reaches the engine's builder, and a runtime built
 /// with a short one still drains cleanly: its drop cancels what is in
-/// flight, and the kernel finishes with it well within the bound.
-#[cfg(ruio_uring)]
+/// flight, and the system finishes with it well within the bound.
+#[cfg(any(ruio_uring, ruio_iocp))]
 #[test]
 fn the_builder_sets_the_shutdown_timeout() {
     let builder = Runtime::builder().shutdown_timeout(Duration::from_millis(10));
@@ -42,10 +128,7 @@ fn the_builder_sets_the_shutdown_timeout() {
     let runtime = builder.build().unwrap();
     runtime.block_on(async {
         // Left in flight for the drop to cancel.
-        drop(spawn(async {
-            let timeout = Timeout::new(Duration::from_secs(60));
-            ruio_executor::driver().op(timeout).await.unwrap();
-        }));
+        drop(spawn(ops::wait(Duration::from_secs(60))));
         yield_now().await;
     });
     let start = Instant::now();
@@ -122,8 +205,8 @@ impl Slot {
 fn block_on_returns_the_output() {
     let runtime = Runtime::new().unwrap();
     assert_eq!(runtime.block_on(async { 7 }), 7);
-    #[cfg(ruio_uring)]
-    runtime.block_on(runtime.driver().op(Nop)).unwrap();
+    #[cfg(any(ruio_uring, ruio_iocp))]
+    runtime.block_on(ops::nop());
 }
 
 /// Records, when dropped, the ID of the driver the thread finds then.
@@ -162,7 +245,7 @@ fn the_thread_finds_its_runtimes_driver_only_inside_it() {
     assert!(ruio_executor::try_driver().is_none());
 }
 
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 #[test]
 fn spawned_tasks_run_and_are_joined() {
     let runtime = Runtime::new().unwrap();
@@ -170,7 +253,7 @@ fn spawned_tasks_run_and_are_joined() {
         let tasks: Vec<_> = (0..10u32)
             .map(|n| {
                 spawn(async move {
-                    ruio_executor::driver().op(Nop).await.unwrap();
+                    ops::nop().await;
                     n
                 })
             })
@@ -197,19 +280,14 @@ fn tasks_need_not_be_send() {
     assert_eq!(*shared.borrow(), ["task"]);
 }
 
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 #[test]
 fn tasks_wait_on_io_concurrently() {
     let runtime = Runtime::new().unwrap();
     let start = Instant::now();
     runtime.block_on(async {
         let tasks: Vec<_> = (0..20)
-            .map(|_| {
-                spawn(async {
-                    let timeout = Timeout::new(Duration::from_millis(50));
-                    ruio_executor::driver().op(timeout).await.unwrap();
-                })
-            })
+            .map(|_| spawn(ops::wait(Duration::from_millis(50))))
             .collect();
         for task in tasks {
             task.await.unwrap();
@@ -220,7 +298,7 @@ fn tasks_wait_on_io_concurrently() {
     assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
 }
 
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 #[test]
 fn detached_tasks_keep_running() {
     let runtime = Runtime::new().unwrap();
@@ -228,7 +306,7 @@ fn detached_tasks_keep_running() {
     runtime.block_on(async {
         let flag = done.clone();
         drop(spawn(async move {
-            ruio_executor::driver().op(Nop).await.unwrap();
+            ops::nop().await;
             flag.set(true);
         }));
         while !done.get() {
@@ -251,7 +329,7 @@ fn a_panicking_task_is_reported_and_the_others_run_on() {
     });
 }
 
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 #[test]
 fn an_aborted_task_is_cancelled_and_its_future_dropped() {
     let runtime = Runtime::new().unwrap();
@@ -259,8 +337,7 @@ fn an_aborted_task_is_cancelled_and_its_future_dropped() {
     runtime.block_on(async move {
         let task = spawn(async move {
             let _flag = flag;
-            let timeout = Timeout::new(Duration::from_secs(60));
-            ruio_executor::driver().op(timeout).await.unwrap();
+            ops::wait(Duration::from_secs(60)).await;
         });
         yield_now().await;
         task.abort();
@@ -320,12 +397,12 @@ fn another_thread_can_wake_a_task() {
     assert_eq!(value, 11);
 }
 
-/// A task's waker can reach the ring of another thread's runtime, sent there
-/// and used to poll an operation. That ring's driver holds it by a clone,
+/// A task's waker can reach the engine of another thread's runtime, sent
+/// there and used to poll an operation. That engine holds it by a clone,
 /// since the task's count of references from its own thread is not another
 /// thread's to touch, and the operation's completion wakes the task from
 /// there.
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 #[test]
 fn a_waker_polled_on_another_threads_ring_wakes_its_task() {
     let runtime = Runtime::new().unwrap();
@@ -334,11 +411,11 @@ fn a_waker_polled_on_another_threads_ring_wakes_its_task() {
         let other = thread::spawn(move || {
             let waker = from_task.recv().unwrap();
             Runtime::new().unwrap().block_on(async move {
-                let mut op = ruio_executor::driver().op(Nop);
+                let mut op = pin!(ops::nop());
                 let mut cx = Context::from_waker(&waker);
-                // The ring completes the no-op as its runtime turns it,
-                // which the yields make it do.
-                while Pin::new(&mut op).poll(&mut cx).is_pending() {
+                // The engine completes the operation as its runtime turns
+                // it, which the yields make it do.
+                while op.as_mut().poll(&mut cx).is_pending() {
                     yield_now().await;
                 }
             });
@@ -449,7 +526,7 @@ fn yielding_lets_other_tasks_run() {
     assert_eq!(*log.borrow(), "ababab");
 }
 
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 #[test]
 fn io_completes_while_tasks_keep_yielding() {
     let runtime = Runtime::new().unwrap();
@@ -463,37 +540,33 @@ fn io_completes_while_tasks_keep_yielding() {
                 })
             })
             .collect();
-        let timeout = Timeout::new(Duration::from_millis(10));
-        ruio_executor::driver().op(timeout).await.unwrap();
+        ops::wait(Duration::from_millis(10)).await;
         for spinner in &spinners {
             spinner.abort();
         }
     });
 }
 
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 #[test]
 fn many_tasks() {
     let runtime = Runtime::new().unwrap();
     runtime.block_on(async {
-        let tasks: Vec<_> = (0..10_000)
-            .map(|_| spawn(async { ruio_executor::driver().op(Nop).await.unwrap() }))
-            .collect();
+        let tasks: Vec<_> = (0..10_000).map(|_| spawn(ops::nop())).collect();
         for task in tasks {
             task.await.unwrap();
         }
     });
 }
 
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 #[test]
 fn dropping_the_runtime_cancels_unfinished_tasks() {
     let runtime = Runtime::new().unwrap();
     let (flag, dropped) = drop_flag();
     let mut task = runtime.spawn(async move {
         let _flag = flag;
-        let timeout = Timeout::new(Duration::from_secs(60));
-        ruio_executor::driver().op(timeout).await.unwrap();
+        ops::wait(Duration::from_secs(60)).await;
     });
     runtime.block_on(yield_now());
     assert!(!dropped.get());

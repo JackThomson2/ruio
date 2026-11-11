@@ -106,7 +106,7 @@ fn each_core_runs_main_pinned_to_its_cpu() {
 }
 
 /// Each core spawns onto the next, which runs the task as itself.
-#[cfg(ruio_uring)]
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn cores_spawn_onto_each_other() {
     let cores = few();
@@ -114,8 +114,11 @@ fn cores_spawn_onto_each_other() {
     let answers = cores
         .run(|me: Core| async move {
             // A core's handle names its ring.
-            let ring = ruio_executor::handle_of(me.index()).ring().id();
-            assert_eq!(ring, ruio_executor::driver().id());
+            #[cfg(ruio_uring)]
+            {
+                let ring = ruio_executor::handle_of(me.index()).ring().id();
+                assert_eq!(ring, ruio_executor::driver().id());
+            }
             let next = (me.index() + 1) % count;
             let there = spawn_on(next, async { (core().unwrap(), current_cpu()) })
                 .await
