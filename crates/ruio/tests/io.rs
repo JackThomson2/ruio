@@ -1,6 +1,9 @@
-//! The owned-buffer read and write traits, and what is built on them.
+//! The owned-buffer read and write traits, and what is built on them, as
+//! every engine with I/O offers them: but for the one test of a Unix
+//! stream, which is io_uring's, the tests name nothing that only one engine
+//! has, and run on io_uring and on the I/O completion port alike.
 
-#![cfg(ruio_uring)]
+#![cfg(any(ruio_uring, ruio_iocp))]
 
 mod support;
 
@@ -14,7 +17,9 @@ use std::time::Duration;
 use ruio::buf::{BufResult, IoBuf, IoBufMut};
 use ruio::fs::{File, OpenOptions};
 use ruio::io::{AsyncRead, AsyncWrite, copy};
-use ruio::net::{TcpListener, TcpStream, UnixStream};
+#[cfg(ruio_uring)]
+use ruio::net::UnixStream;
+use ruio::net::{TcpListener, TcpStream};
 
 use support::within;
 
@@ -348,7 +353,7 @@ fn copy_between_files_goes_at_their_positions() {
 #[test]
 fn references_and_pointers_to_a_reader_or_writer_are_one() {
     ruio::Runtime::new().unwrap().block_on(async {
-        let (client, server) = UnixStream::pair().unwrap();
+        let (client, server) = tcp_pair().await.unwrap();
         let client = Rc::new(client);
         let server = Box::new(server);
         let by_rc = Rc::clone(&client);
@@ -364,6 +369,26 @@ fn references_and_pointers_to_a_reader_or_writer_are_one() {
         assert_eq!(buf, b"through an Rc and a reference");
         writer.await.unwrap();
         drop(client);
+    });
+}
+
+/// A Unix stream is a reader and a writer as a TCP stream is.
+#[cfg(ruio_uring)]
+#[test]
+fn a_unix_stream_reads_and_writes_through_the_traits() {
+    ruio::Runtime::new().unwrap().block_on(async {
+        let (client, server) = UnixStream::pair().unwrap();
+        let writer = ruio::spawn(async move {
+            drain(&client, b"over a Unix stream".to_vec())
+                .await
+                .0
+                .unwrap();
+            client
+        });
+        let (read, buf) = within(fill(&server, Vec::with_capacity(18))).await;
+        read.unwrap();
+        assert_eq!(buf, b"over a Unix stream");
+        writer.await.unwrap();
     });
 }
 
