@@ -26,8 +26,21 @@ jobs:
         run: uname -a
       - name: Report io_uring capabilities
         run: cargo run --locked -p ruio-driver --example probe
+      # What a job prints goes to a file too, from which a last step says
+      # what failed, and how fast the engine is, in annotations of the run.
       - name: Check
-        run: ci/check.sh
+        shell: bash
+        run: ci/check.sh 2>&1 | tee check.log
+      - name: Time the io_uring engine
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          cargo run --release --locked -p ruio --example speed 2>>check.log | tee speed.txt
+          ci/annotate.sh notice "Speed on io_uring" speed.txt
+      - name: Say what failed
+        if: failure() || cancelled()
+        shell: bash
+        run: ci/annotate.sh failures "What failed on Linux" check.log
 
   asan:
     runs-on: ubuntu-24.04
@@ -37,7 +50,12 @@ jobs:
         run: rustup toolchain install nightly --profile minimal --component rust-src
       - uses: Swatinem/rust-cache@v2
       - name: Test under AddressSanitizer
-        run: ci/asan.sh
+        shell: bash
+        run: ci/asan.sh 2>&1 | tee asan.log
+      - name: Say what failed
+        if: failure() || cancelled()
+        shell: bash
+        run: ci/annotate.sh failures "What failed under AddressSanitizer" asan.log
 
   windows:
     runs-on: windows-latest
@@ -50,17 +68,36 @@ jobs:
       - name: Install the toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # As on Linux, what the steps print goes to a file too, for the last
+      # step to say what failed.
       # The other crates are Linux's, and do not build on Windows.
       - name: Lint the crates that build on Windows
-        run: cargo clippy -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio --all-targets --all-features --locked -- -D warnings
+        shell: bash
+        run: cargo clippy -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio --all-targets --all-features --locked -- -D warnings 2>&1 | tee windows.log
       # ruio-compat's examples receive into pools of buffers, which are
       # io_uring's, so its library and its tests are what builds here.
       - name: Lint the adapters of ruio-compat
-        run: cargo clippy -p ruio-compat --lib --tests --all-features --locked -- -D warnings
+        shell: bash
+        run: cargo clippy -p ruio-compat --lib --tests --all-features --locked -- -D warnings 2>&1 | tee -a windows.log
       # Every test binary runs, so that one run reports every failure.
       - name: Test them on the I/O completion port engine
-        run: cargo test -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio --all-features --locked --no-fail-fast
+        shell: bash
+        run: cargo test -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio --all-features --locked --no-fail-fast 2>&1 | tee -a windows.log
       - name: Test the adapters on the I/O completion port engine
-        run: cargo test -p ruio-compat --lib --tests --all-features --locked --no-fail-fast
+        shell: bash
+        run: cargo test -p ruio-compat --lib --tests --all-features --locked --no-fail-fast 2>&1 | tee -a windows.log
       - name: Test the examples in the adapters' documentation
-        run: cargo test -p ruio-compat --doc --all-features --locked
+        shell: bash
+        run: cargo test -p ruio-compat --doc --all-features --locked 2>&1 | tee -a windows.log
+      # In release, as its figures are for telling one build of the engine
+      # from another.
+      - name: Time the I/O completion port engine
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          cargo run --release --locked -p ruio --example speed 2>>windows.log | tee speed.txt
+          bash ci/annotate.sh notice "Speed on the I/O completion port" speed.txt
+      - name: Say what failed
+        if: failure() || cancelled()
+        shell: bash
+        run: bash ci/annotate.sh failures "What failed on Windows" windows.log
