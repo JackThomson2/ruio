@@ -33,6 +33,10 @@ pub(crate) const ERROR_BROKEN_PIPE: u32 = 109;
 /// `ERROR_IO_PENDING`: the system took an operation, which completes later.
 pub(crate) const ERROR_IO_PENDING: u32 = 997;
 
+/// `ERROR_PIPE_CONNECTED`: a client opened a named pipe before its server's
+/// end was made to wait for one, and is connected.
+pub(crate) const ERROR_PIPE_CONNECTED: u32 = 535;
+
 /// `STATUS_PENDING`: the status in the `OVERLAPPED` of an operation that
 /// has not completed, which the calls that start one set before they ask
 /// the system for it.
@@ -390,6 +394,12 @@ unsafe extern "system" {
     /// completion still goes to the port, with `STATUS_CANCELLED` unless it
     /// completed first. False, with `ERROR_NOT_FOUND`, if it has completed.
     pub(crate) fn CancelIoEx(file: Handle, overlapped: *mut Overlapped) -> Bool;
+
+    /// Starts waiting on a named pipe's server end for a client to open the
+    /// pipe. False with `ERROR_IO_PENDING` if it completes later, its
+    /// completion going to the pipe's port, and with `ERROR_PIPE_CONNECTED`
+    /// if a client has opened the pipe already, when nothing goes there.
+    pub(crate) fn ConnectNamedPipe(pipe: Handle, overlapped: *mut Overlapped) -> Bool;
 
     /// Creates a named pipe's instance, and returns its server's end, or
     /// `INVALID_HANDLE_VALUE` on failure.

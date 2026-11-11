@@ -602,7 +602,7 @@ fn result(status: usize, bytes: u32) -> io::Result<u32> {
 /// # Safety
 ///
 /// As for [`Outcome`].
-unsafe fn status_outcome(
+pub(crate) unsafe fn status_outcome(
     _handle: sys::Handle,
     overlapped: *const sys::Overlapped,
     bytes: u32,
@@ -617,7 +617,7 @@ unsafe fn status_outcome(
 /// transferred `bytes` if that is true: the call then completed the
 /// operation, whose completion is queued to the port all the same unless
 /// the handle asked for none.
-fn taken(ok: sys::Bool, bytes: u32) -> io::Result<Started> {
+pub(crate) fn taken(ok: sys::Bool, bytes: u32) -> io::Result<Started> {
     if ok != 0 {
         return Ok(Started::AtOnce(bytes));
     }

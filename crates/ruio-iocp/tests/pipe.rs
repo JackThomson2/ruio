@@ -90,6 +90,53 @@ fn a_read_once_the_other_end_closes_reads_nothing() -> io::Result<()> {
     })
 }
 
+/// `ERROR_PIPE_LISTENING`: the server's end of a pipe that no client has
+/// opened yet.
+const ERROR_PIPE_LISTENING: i32 = 536;
+
+#[test]
+fn the_servers_end_waits_for_a_client_to_open_the_pipe() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let server = Rc::new(NamedPipe::create(name("wait"))?);
+        // With no client, the server's end has nobody to read from.
+        let (read, _) = server.read(Vec::with_capacity(16)).await;
+        assert_eq!(read.unwrap_err().raw_os_error(), Some(ERROR_PIPE_LISTENING));
+        // A wait that no client ends waits until the timeout drops it,
+        // which cancels it.
+        let waited = time::timeout(Duration::from_millis(20), server.wait_for_client()).await;
+        assert!(waited.is_err());
+
+        let waiting = ruio_executor::spawn({
+            let server = Rc::clone(&server);
+            async move { server.wait_for_client().await }
+        });
+        ruio_executor::yield_now().await;
+        let client = NamedPipe::connect(name("wait"))?;
+        waiting.await.expect("the wait's task ran to its end")?;
+        let (written, _) = client.write(b"hello".to_vec()).await;
+        assert_eq!(written?, 5);
+        let (read, buf) = server.read(Vec::with_capacity(16)).await;
+        assert_eq!(read?, 5);
+        assert_eq!(buf, b"hello");
+        Ok(())
+    })
+}
+
+#[test]
+fn a_wait_for_a_client_that_has_opened_the_pipe_ends_at_once() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let server = NamedPipe::create(name("opened"))?;
+        let client = NamedPipe::connect(name("opened"))?;
+        server.wait_for_client().await?;
+        let (written, _) = server.write(b"there".to_vec()).await;
+        assert_eq!(written?, 5);
+        let (read, buf) = client.read(Vec::with_capacity(16)).await;
+        assert_eq!(read?, 5);
+        assert_eq!(buf, b"there");
+        Ok(())
+    })
+}
+
 #[test]
 fn a_dropped_read_is_cancelled_and_frees_its_buffer_once_the_system_is_done() -> io::Result<()> {
     Runtime::new()?.block_on(async {
