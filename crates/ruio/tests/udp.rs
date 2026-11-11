@@ -5,10 +5,8 @@
 mod support;
 
 use std::io;
-#[cfg(ruio_uring)]
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-#[cfg(ruio_uring)]
 use std::time::Duration;
 
 #[cfg(ruio_uring)]
@@ -42,13 +40,10 @@ async fn datagrams_go_to_and_come_from_addresses() -> io::Result<()> {
         assert_eq!(received?, 100);
     }
 
-    #[cfg(ruio_uring)]
-    {
-        let recv = a
-            .recv(Vec::with_capacity(8))
-            .timeout(Duration::from_millis(10));
-        assert_eq!(recv.await.0.unwrap_err().kind(), ErrorKind::TimedOut);
-    }
+    let recv = a
+        .recv(Vec::with_capacity(8))
+        .timeout(Duration::from_millis(10));
+    assert_eq!(recv.await.0.unwrap_err().kind(), ErrorKind::TimedOut);
     Ok(())
 }
 

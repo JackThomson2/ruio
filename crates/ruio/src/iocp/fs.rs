@@ -48,6 +48,12 @@
 //! position alike, [`SyncAll`], [`SyncData`], [`SetLen`] and [`Allocate`].
 //! So code that names a future names no operation of the engine's.
 //!
+//! An operation's `timeout` gives up on it if it has not completed in time,
+//! when it fails with [`io::ErrorKind::TimedOut`]. A read or a write is
+//! cancelled, as a linked timeout cancels it on io_uring, and hands its
+//! buffer back. A call on the blocking pool cannot be stopped there, and
+//! finishes all the same.
+//!
 //! A [`File`] belongs to its thread's port, and is neither `Send` nor
 //! `Sync`. The functions that take a path hold no file of the port, so
 //! their futures are `Send` when what they are given is, and they can be
@@ -68,9 +74,9 @@
 //!
 //! Not here yet, of what `fs` has on io_uring: the thread-bound files
 //! taken from and given to the standard library (`from_std`, `into_std`),
-//! which the portable ones are, and the futures' timeouts. A [`Metadata`]
-//! reports what the standard library's does on every system; an owner, a
-//! mode and an inode are Unix's.
+//! which the portable ones are. A [`Metadata`] reports what the standard
+//! library's does on every system; an owner, a mode and an inode are
+//! Unix's.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -85,9 +91,10 @@ use std::pin::Pin;
 use std::slice;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ruio_executor::blocking::BlockingHandle;
+use ruio_executor::time::{self, Sleep};
 use ruio_iocp::fs as iocp;
 
 use crate::buf::{BufLease, BufPool, BufResult, IoBuf, IoBufMut};
@@ -370,6 +377,21 @@ pub struct Read<'a, B: IoBufMut> {
     pos: Option<&'a Cell<u64>>,
 }
 
+impl<B: IoBufMut> Read<'_, B> {
+    /// Cancels the read if it has not completed `duration` after it starts:
+    /// it then fails with `ERROR_TIMEOUT`, of [`io::ErrorKind::TimedOut`],
+    /// and hands the buffer back, as with any other error, and a read at
+    /// the position leaves the position where it was.
+    ///
+    /// This has no effect once the read has started.
+    pub fn timeout(self, duration: Duration) -> Self {
+        Self {
+            read: self.read.timeout(duration),
+            ..self
+        }
+    }
+}
+
 impl<B: IoBufMut> Future for Read<'_, B> {
     type Output = BufResult<usize, B>;
 
@@ -402,6 +424,22 @@ pub struct Write<'a, B: IoBuf> {
     /// Whether the file's position is at its end, which a write at it to a
     /// file opened to append sets.
     at_end: Option<&'a Cell<bool>>,
+}
+
+impl<B: IoBuf> Write<'_, B> {
+    /// Cancels the write if it has not completed `duration` after it
+    /// starts: it then fails with `ERROR_TIMEOUT`, of
+    /// [`io::ErrorKind::TimedOut`], and hands the buffer back, as with any
+    /// other error, though it may have written some of the buffer by then,
+    /// and a write at the position leaves the position where it was.
+    ///
+    /// This has no effect once the write has started.
+    pub fn timeout(self, duration: Duration) -> Self {
+        Self {
+            write: self.write.timeout(duration),
+            ..self
+        }
+    }
 }
 
 impl<B: IoBuf> Future for Write<'_, B> {
@@ -537,6 +575,8 @@ enum Call {
 #[must_use = "futures do nothing unless polled"]
 pub struct FileCall<'a, F = File> {
     state: CallState,
+    /// How long the call may take, from when it starts.
+    timeout: Option<Duration>,
     /// The file the call is made on, which the future borrows: one that
     /// belongs to its thread, as what it starts then does, or a portable
     /// one.
@@ -548,16 +588,31 @@ impl<F> FileCall<'_, F> {
     fn new(file: Arc<std::fs::File>, call: Call) -> Self {
         Self {
             state: CallState::Unstarted(file, call),
+            timeout: None,
             _file: PhantomData,
         }
+    }
+
+    /// Fails the call with [`io::ErrorKind::TimedOut`] if it has not
+    /// finished `duration` after it starts. Nothing stops a call on the
+    /// pool, where it finishes all the same, as it does when its future is
+    /// dropped.
+    ///
+    /// This has no effect once the call has started.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        if matches!(self.state, CallState::Unstarted(..)) {
+            self.timeout = Some(duration);
+        }
+        self
     }
 }
 
 enum CallState {
     /// Not started yet: the file, and the call to make on it.
     Unstarted(Arc<std::fs::File>, Call),
-    /// On the blocking pool.
-    Running(BlockingHandle<io::Result<()>>),
+    /// On the blocking pool, waited for until the sleep ends if the call
+    /// has a timeout.
+    Running(BlockingHandle<io::Result<()>>, Option<Sleep>),
     /// Finished.
     Finished,
 }
@@ -576,17 +631,26 @@ impl<F> Future for FileCall<'_, F> {
                         Call::SetLen(len) => file.set_len(len),
                         Call::Allocate(offset, len) => allocate(&file, offset, len),
                     });
-                    this.state = CallState::Running(job);
+                    this.state = CallState::Running(job, this.timeout.map(time::sleep));
                 }
-                CallState::Running(mut job) => {
-                    let Poll::Ready(done) = Pin::new(&mut job).poll(cx) else {
-                        this.state = CallState::Running(job);
-                        return Poll::Pending;
-                    };
-                    // A `JoinError` is a panic inside the call: the job
-                    // cannot be cancelled, as nothing but this holds its
-                    // handle.
-                    return Poll::Ready(done.map_err(io::Error::other).and_then(|done| done));
+                CallState::Running(mut job, mut limit) => {
+                    if let Poll::Ready(done) = Pin::new(&mut job).poll(cx) {
+                        // A `JoinError` is a panic inside the call: the job
+                        // cannot be cancelled, as nothing but this holds its
+                        // handle.
+                        return Poll::Ready(done.map_err(io::Error::other).and_then(|done| done));
+                    }
+                    if let Some(sleep) = &mut limit
+                        && Pin::new(sleep).poll(cx).is_ready()
+                    {
+                        // The job finishes on the pool, as dropped.
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "the call on the blocking pool did not finish in time",
+                        )));
+                    }
+                    this.state = CallState::Running(job, limit);
+                    return Poll::Pending;
                 }
                 CallState::Finished => panic!("a file's call polled after it completed"),
             }
@@ -598,7 +662,7 @@ impl<F> fmt::Debug for FileCall<'_, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = match &self.state {
             CallState::Unstarted(_, call) => format!("{call:?}, not started"),
-            CallState::Running(_) => "running".to_owned(),
+            CallState::Running(..) => "running".to_owned(),
             CallState::Finished => "finished".to_owned(),
         };
         f.debug_struct("FileCall").field("state", &state).finish()

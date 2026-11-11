@@ -13,7 +13,6 @@ use std::sync::{Barrier, Mutex, OnceLock, mpsc};
 #[cfg(ruio_uring)]
 use std::thread;
 use std::time::Duration;
-#[cfg(ruio_uring)]
 use std::time::Instant;
 
 use ruio::buf::BufPool;
@@ -259,6 +258,9 @@ async fn writes_wait_for_the_write_behind_in_flight() -> io::Result<()> {
 /// A write behind that fails, here by timing out against a peer that does
 /// not read, fails every write after it, handing buffers back unsent, and
 /// the stream's shutdown.
+// On Windows the loopback interface takes so large a write whole and at
+// once, however little the peer reads, so the write neither stays in
+// flight nor times out there.
 #[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_failed_write_behind_fails_what_comes_after() -> io::Result<()> {
@@ -288,6 +290,9 @@ async fn a_failed_write_behind_fails_what_comes_after() -> io::Result<()> {
 
 /// Asked without waiting, a stream says nothing while a write behind is in
 /// flight, and how the writes went once none is.
+// On Windows the loopback interface takes so large a write whole and at
+// once, however little the peer reads, so the write neither stays in
+// flight nor times out there.
 #[cfg(ruio_uring)]
 #[ruio::test]
 async fn try_flush_reports_only_what_is_known() -> io::Result<()> {
@@ -580,7 +585,6 @@ async fn connecting_to_a_closed_port_is_refused() {
     assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
 }
 
-#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_read_that_times_out_hands_back_its_buffer() -> io::Result<()> {
     let (client, server) = pair().await?;
@@ -628,6 +632,9 @@ async fn read_exact_fails_if_the_peer_shuts_down_first() -> io::Result<()> {
 /// The first send stops part of the way when the time is up, and the next
 /// one has no time left, which is what reports the timeout: the timeout
 /// bounds the whole write, not each send.
+// On Windows the loopback interface takes so large a write whole and at
+// once, however little the peer reads, so the write neither stays in
+// flight nor times out there.
 #[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_write_to_a_peer_that_stops_reading_times_out() -> io::Result<()> {

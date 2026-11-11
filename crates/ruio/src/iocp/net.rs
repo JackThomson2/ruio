@@ -31,6 +31,13 @@
 //! sends alike. So code that names a future names no operation of the
 //! engine's.
 //!
+//! An operation's `timeout` cancels it if it has not completed in time, as
+//! a linked timeout does on io_uring: it then fails with `ERROR_TIMEOUT`,
+//! of [`io::ErrorKind::TimedOut`], and hands its buffer back, as with any
+//! other error. A transfer of a whole buffer, such as
+//! [`TcpStream::write_all`]'s, counts the time from its first operation on,
+//! and each operation after it has what is left of it.
+//!
 //! An echo server:
 //!
 //! ```no_run
@@ -93,10 +100,9 @@
 //! room to write.
 //!
 //! Not here yet, of what `net` has on io_uring: datagrams received into a
-//! pool (`recv_stream` and `recv_from_stream` of a UDP socket), the
-//! futures' timeouts, sockets taken from the standard library (`from_std`),
-//! `bind_reuseport`, and moving a stream to another core. Unix sockets are
-//! Unix's.
+//! pool (`recv_stream` and `recv_from_stream` of a UDP socket), sockets
+//! taken from the standard library (`from_std`), `bind_reuseport`, and
+//! moving a stream to another core. Unix sockets are Unix's.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -199,6 +205,21 @@ impl fmt::Debug for TcpListener {
 pub struct Accept<'a, S, A = SocketAddr> {
     accept: iocp::Accept<'a>,
     _made: PhantomData<fn() -> (S, A)>,
+}
+
+impl<S, A> Accept<'_, S, A> {
+    /// Cancels the accept if no connection has come `duration` after it
+    /// starts: it then fails with [`io::ErrorKind::TimedOut`]. A connection
+    /// accepted before the cancellation could stop the accept is the
+    /// accept's.
+    ///
+    /// This has no effect once the accept has started.
+    pub fn timeout(self, duration: Duration) -> Self {
+        Self {
+            accept: self.accept.timeout(duration),
+            ..self
+        }
+    }
 }
 
 impl Future for Accept<'_, TcpStream> {

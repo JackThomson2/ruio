@@ -12,10 +12,7 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::PathBuf;
-#[cfg(target_os = "linux")]
-use std::time::Duration;
-#[cfg(ruio_uring)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(ruio_uring)]
 use ruio::buf::{AlignedBuf, FixedBuffers};
@@ -141,6 +138,40 @@ async fn files_grow_and_shrink() -> io::Result<()> {
     expected.resize(50, 0);
     assert_eq!(fs::read(&path).await?, expected);
     Ok(())
+}
+
+/// A file's reads, writes and calls finish within a timeout that leaves
+/// them time enough. A call on the blocking pool given none fails, and
+/// finishes on the pool all the same, as nothing stops it there.
+#[cfg(ruio_iocp)]
+#[ruio::test]
+async fn a_files_operations_take_a_timeout() -> io::Result<()> {
+    let scratch = Scratch::new("timeout");
+    let path = scratch.path("file");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .await?;
+    let ample = Duration::from_secs(10);
+    within(file.write_at("hello", 0).timeout(ample)).await.0?;
+    let read = file.read_at(Vec::with_capacity(8), 0).timeout(ample);
+    let (read, buf) = within(read).await;
+    assert_eq!(read?, 5);
+    assert_eq!(buf, b"hello");
+    within(file.sync_all().timeout(ample)).await?;
+
+    let err = within(file.set_len(3).timeout(Duration::ZERO))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+    let deadline = Instant::now() + ample;
+    while within(file.metadata()).await?.len() != 3 {
+        assert!(Instant::now() < deadline, "the call did not finish");
+        ruio::time::sleep(Duration::from_millis(1)).await;
+    }
+    within(file.close()).await
 }
 
 /// Reads and writes at the file's position advance it, and appending writes
