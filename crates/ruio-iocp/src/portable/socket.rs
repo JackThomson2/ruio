@@ -34,8 +34,10 @@ use crate::net::{RawAddr, family, last_error, linger_of, listening, new_socket, 
 use crate::sys;
 
 /// A TCP socket, made nonblocking and associated with no port, read and
-/// written with calls that do not wait, from any thread; see the
-/// [module](self).
+/// written with calls that do not wait, from any thread: Winsock's own,
+/// given no `OVERLAPPED`, which take what has arrived, or give what there
+/// is room for, or fail with `WouldBlock`. A caller that has to wait waits
+/// with a [`ReadyWait`] for the socket to be ready.
 pub struct Socket {
     socket: OwnedSocket,
     /// The base socket beneath any layered provider's, which the AFD

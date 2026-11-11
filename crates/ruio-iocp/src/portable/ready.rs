@@ -193,8 +193,12 @@ impl Drop for Afd {
 
 /// A wait for a socket to be ready, which any thread may hold and poll: it
 /// runs on the port of the engine current on the thread that polls it as it
-/// starts, through that engine's handle of the AFD driver; see the
-/// [module](self).
+/// starts, as a poll of the AFD driver's made through that engine's handle
+/// of the driver, which completes to the port once the socket has one of
+/// the events asked for. The socket itself is not touched, so several
+/// waits may poll it at once. Dropped or cancelled on any thread, it
+/// cancels its poll; an engine dropped first cancels the polls made through
+/// its handle, and their waits start again where they are polled next.
 ///
 /// [`poll_ready`](ReadyWait::poll_ready) starts it, and is ready with the
 /// events that the socket has once it has any of those asked for; the wait

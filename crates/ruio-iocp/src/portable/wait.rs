@@ -49,7 +49,12 @@ fn no_runtime() -> io::Error {
 
 /// A wait for a handle to be signaled, which any thread may hold and poll:
 /// it runs on the port of the engine current on the thread that polls it as
-/// it starts; see the [module](self).
+/// it starts, with a wait completion packet of its own that the system
+/// posts to that port once the handle is signaled, and the engine's turn
+/// wakes the task that polled it last, on whichever thread that task runs.
+/// Dropped or cancelled on any thread, it takes its packet back; an engine
+/// dropped first cancels the waits it has and wakes their tasks, whose next
+/// polls start them again where they are.
 ///
 /// [`poll_wait`](HandleWait::poll_wait) starts it, and is ready once the
 /// handle has been signaled since; the wait is then idle, for the next poll
