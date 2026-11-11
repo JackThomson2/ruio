@@ -2,22 +2,33 @@
 //! readiness and signals through the `Stream` and `FusedStream` traits of
 //! futures-core, and futures-util's combinators over them.
 
-#![cfg(ruio_uring)]
+#![cfg(any(ruio_uring, ruio_iocp))]
 #![cfg(feature = "futures")]
 
 mod support;
 
-use std::io::{self, Write as _};
-use std::net::{Shutdown, SocketAddr};
+use std::io;
+#[cfg(unix)]
+use std::io::Write as _;
+use std::net::Shutdown;
+#[cfg(ruio_uring)]
+use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::stream::FusedStream;
 use ruio::buf::BufPool;
+#[cfg(unix)]
 use ruio::fs::File;
+#[cfg(ruio_uring)]
 use ruio::io::AsyncFd;
-use ruio::net::{TcpListener, TcpStream, UdpSocket};
+#[cfg(ruio_uring)]
+use ruio::net::UdpSocket;
+use ruio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use ruio::signal::{SignalKind, signal};
 
 use support::within;
@@ -120,6 +131,7 @@ async fn recv_stream_folds_a_connections_data() -> io::Result<()> {
 
 /// Datagrams stream through `map` and `take` to their senders, and the
 /// stream goes on after.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn recv_from_stream_maps_datagrams_to_their_senders() -> io::Result<()> {
     let receiver = UdpSocket::bind("127.0.0.1:0")?;
@@ -145,6 +157,7 @@ async fn recv_from_stream_maps_datagrams_to_their_senders() -> io::Result<()> {
 }
 
 /// A pipe's data streams from a file to its end.
+#[cfg(unix)]
 #[ruio::test]
 async fn read_stream_collects_a_pipe_to_its_end() -> io::Result<()> {
     let (reader, mut writer) = io::pipe()?;
@@ -198,6 +211,7 @@ async fn read_dir_streams_its_entries() -> io::Result<()> {
 }
 
 /// A descriptor's readiness streams; each item an event, through `take`.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn readiness_streams_each_wakeup() -> io::Result<()> {
     let (reader, mut writer) = io::pipe()?;
@@ -228,6 +242,7 @@ async fn readiness_streams_each_wakeup() -> io::Result<()> {
 
 /// A server's connections merge with its shutdown signal through `select`:
 /// the connections are served until the signal comes, which ends the loop.
+#[cfg(unix)]
 #[ruio::test]
 async fn incoming_merges_with_a_signal_through_select() -> io::Result<()> {
     enum Event {

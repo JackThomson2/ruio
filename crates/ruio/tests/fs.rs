@@ -1,29 +1,41 @@
 //! Files inside the runtime.
 
-#![cfg(ruio_uring)]
+#![cfg(any(ruio_uring, ruio_iocp))]
 
 mod support;
 
+#[cfg(unix)]
 use std::fs::Permissions;
 use std::io::{self, ErrorKind};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+#[cfg(ruio_uring)]
+use std::time::Instant;
 
+#[cfg(ruio_uring)]
 use ruio::buf::{AlignedBuf, FixedBuffers};
-use ruio::fs::{self, Advice, File, OpenOptions};
+#[cfg(ruio_uring)]
+use ruio::fs::Advice;
+use ruio::fs::{self, File, OpenOptions};
 
 use support::within;
 
 /// The null block device's path, block size and the alignment direct I/O
 /// on it needs, where the polled tests run.
+#[cfg(ruio_uring)]
 const NULLB: &str = "/dev/nullb0";
+#[cfg(ruio_uring)]
 const BLOCK: usize = 4096;
 
 /// Opens the null block device for polled I/O, or says why the test has
 /// nothing to run against: the kernel's io_uring has no polled rings, or
 /// the device is missing or has no poll queues.
+#[cfg(ruio_uring)]
 async fn polled_nullb() -> Option<File> {
     if !ruio::uring::Probe::current()
         .unwrap()
@@ -163,15 +175,17 @@ async fn the_file_position_advances() -> io::Result<()> {
 async fn options_follow_the_standard_library() -> io::Result<()> {
     let scratch = Scratch::new("options");
     let path = scratch.path("file");
-    let created = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .await?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let created = options.open(&path).await?;
     drop(created);
-    let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
-    assert_eq!(mode & !0o600, 0, "{mode:o}");
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode & !0o600, 0, "{mode:o}");
+    }
 
     let again = OpenOptions::new()
         .write(true)
@@ -193,6 +207,7 @@ async fn options_follow_the_standard_library() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[ruio::test]
 async fn metadata_reports_on_files() -> io::Result<()> {
     let scratch = Scratch::new("metadata");
@@ -223,6 +238,7 @@ async fn metadata_reports_on_files() -> io::Result<()> {
 /// file descriptor, such as statx and fchmod, installs one for the call;
 /// and the file becomes a plain one, or the standard library's, with its
 /// slot freed.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn files_open_as_direct_descriptors() -> io::Result<()> {
     let scratch = Scratch::new("direct");
@@ -270,6 +286,7 @@ async fn files_open_as_direct_descriptors() -> io::Result<()> {
 
 /// Direct I/O, past the page cache, with aligned buffers and with
 /// registered ones.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn direct_io_reads_and_writes_aligned_buffers() -> io::Result<()> {
     let scratch = Scratch::new("odirect");
@@ -317,6 +334,7 @@ async fn direct_io_reads_and_writes_aligned_buffers() -> io::Result<()> {
 
 /// A polled file's reads, plain, exact and into registered buffers, go
 /// through the driver's polled ring.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn polled_reads_go_through_the_polled_ring() -> io::Result<()> {
     let Some(file) = polled_nullb().await else {
@@ -355,6 +373,7 @@ async fn polled_reads_go_through_the_polled_ring() -> io::Result<()> {
 
 /// Polled reads keep completing while a sleep is in flight, and the sleep
 /// ends on time: the runtime polls the device and watches its timer.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn polled_reads_run_beside_a_sleep() -> io::Result<()> {
     let Some(file) = polled_nullb().await else {
@@ -389,6 +408,7 @@ async fn polled_reads_run_beside_a_sleep() -> io::Result<()> {
 }
 
 /// Two polled files read at once, each from a task of its own.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn two_polled_files_read_at_once() -> io::Result<()> {
     let Some(first) = polled_nullb().await else {
@@ -417,6 +437,7 @@ async fn two_polled_files_read_at_once() -> io::Result<()> {
 
 /// A file for polled I/O must be opened for direct I/O, and as a plain
 /// descriptor.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn polled_files_take_direct_io_and_plain_descriptors_only() -> io::Result<()> {
     let buffered = OpenOptions::new().read(true).polled(true).open(NULLB).await;
@@ -471,6 +492,7 @@ async fn names_are_made_changed_and_removed() -> io::Result<()> {
 }
 
 /// Links are made through the ring and read back on the pool.
+#[cfg(unix)]
 #[ruio::test]
 async fn names_are_linked() -> io::Result<()> {
     let scratch = Scratch::new("links");
@@ -529,6 +551,7 @@ async fn names_are_linked() -> io::Result<()> {
 /// Space is allocated and freed, ranges are written back, and advice is
 /// taken, on plain descriptors here and on a direct one in
 /// `files_open_as_direct_descriptors`.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn files_are_allocated_synced_and_advised_on() -> io::Result<()> {
     let scratch = Scratch::new("allocate");
@@ -576,6 +599,7 @@ async fn files_are_allocated_synced_and_advised_on() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[ruio::test]
 async fn permissions_are_set() -> io::Result<()> {
     let scratch = Scratch::new("permissions");
@@ -596,6 +620,7 @@ async fn permissions_are_set() -> io::Result<()> {
 
 /// A copy brings the permissions along; a removal takes the whole tree and
 /// follows no link out of it.
+#[cfg(unix)]
 #[ruio::test]
 async fn files_are_copied_and_trees_removed() -> io::Result<()> {
     let scratch = Scratch::new("tree");
@@ -637,6 +662,7 @@ async fn files_are_copied_and_trees_removed() -> io::Result<()> {
 
 /// A pipe's data arrives through one multishot read until its writing end
 /// closes.
+#[cfg(unix)]
 #[ruio::test]
 async fn a_read_stream_takes_what_arrives_on_a_pipe() -> io::Result<()> {
     let (reader, writer) = io::pipe()?;
@@ -666,6 +692,7 @@ async fn a_read_stream_takes_what_arrives_on_a_pipe() -> io::Result<()> {
 /// A FIFO opened by its name, without blocking as the kernel needs to see
 /// its end, streams what a writer sends until the writer closes; a regular
 /// file, which cannot be polled, is refused.
+#[cfg(unix)]
 #[ruio::test]
 async fn a_read_stream_takes_what_arrives_on_a_fifo() -> io::Result<()> {
     let scratch = Scratch::new("fifo");
@@ -706,6 +733,7 @@ async fn a_read_stream_takes_what_arrives_on_a_fifo() -> io::Result<()> {
 
 /// Every entry, of every type, but `.` and `..`, with its name, path,
 /// inode number and type; the status of a symbolic link is the link's.
+#[cfg(unix)]
 #[ruio::test]
 async fn read_dir_lists_the_entries_of_a_directory() -> io::Result<()> {
     let scratch = Scratch::new("read-dir");
@@ -873,6 +901,7 @@ async fn an_entry_outlives_its_reader() -> io::Result<()> {
 
 /// A write and a flush linked into a chain run in order, and the flush
 /// waits for the write.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_write_linked_to_a_flush_reaches_the_file() -> io::Result<()> {
     let scratch = Scratch::new("chain");
@@ -907,6 +936,7 @@ async fn a_write_linked_to_a_flush_reaches_the_file() -> io::Result<()> {
 }
 
 /// A failing operation cancels the rest of its chain.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_failed_write_cancels_its_flush() -> io::Result<()> {
     let scratch = Scratch::new("chain-failure");
@@ -921,6 +951,7 @@ async fn a_failed_write_cancels_its_flush() -> io::Result<()> {
 
 /// A pipe's data arrives whole through a stream whose own pool the kernel
 /// consumes incrementally.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn an_incremental_read_stream_takes_what_arrives() -> io::Result<()> {
     if !ruio::uring::Probe::current()?.supports_incremental_buffers() {
@@ -966,20 +997,26 @@ async fn the_path_functions_run_in_futures_that_must_be_send() -> io::Result<()>
         assert_eq!(fs::read(&file).await?, pattern(20_000));
         assert_eq!(fs::metadata(&file).await?.len(), 20_000);
         assert!(fs::try_exists(&file).await?);
-        fs::symlink(&file, dir.join("soft")).await?;
-        assert!(fs::symlink_metadata(dir.join("soft")).await?.is_symlink());
-        assert_eq!(fs::read_link(dir.join("soft")).await?, file);
-        assert_eq!(
-            fs::canonicalize(dir.join("soft")).await?,
-            std::fs::canonicalize(&file)?
-        );
+        #[cfg(unix)]
+        {
+            fs::symlink(&file, dir.join("soft")).await?;
+            assert!(fs::symlink_metadata(dir.join("soft")).await?.is_symlink());
+            assert_eq!(fs::read_link(dir.join("soft")).await?, file);
+            assert_eq!(
+                fs::canonicalize(dir.join("soft")).await?,
+                std::fs::canonicalize(&file)?
+            );
+        }
         fs::hard_link(&file, dir.join("hard")).await?;
         fs::rename(dir.join("hard"), dir.join("moved")).await?;
         fs::copy(dir.join("moved"), dir.join("copied")).await?;
         fs::write(dir.join("text"), "text").await?;
         assert_eq!(fs::read_to_string(dir.join("text")).await?, "text");
-        fs::set_permissions(&file, Permissions::from_mode(0o600)).await?;
-        fs::remove_file(dir.join("soft")).await?;
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&file, Permissions::from_mode(0o600)).await?;
+            fs::remove_file(dir.join("soft")).await?;
+        }
         fs::remove_dir(scratch.path("empty")).await.unwrap_err();
         fs::create_dir(scratch.path("empty")).await?;
         fs::remove_dir(scratch.path("empty")).await?;
@@ -1022,9 +1059,12 @@ fn the_path_functions_run_on_any_core() {
 /// does, is read to its end, as the reads find it.
 #[ruio::test]
 async fn read_takes_a_file_to_its_end_whatever_its_size() -> io::Result<()> {
-    assert_eq!(std::fs::metadata("/proc/self/status")?.len(), 0);
-    let status = within(fs::read_to_string("/proc/self/status")).await?;
-    assert!(status.contains("Pid:"), "{status}");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(std::fs::metadata("/proc/self/status")?.len(), 0);
+        let status = within(fs::read_to_string("/proc/self/status")).await?;
+        assert!(status.contains("Pid:"), "{status}");
+    }
     let scratch = Scratch::new("ends");
     std::fs::write(scratch.path("empty"), b"")?;
     assert!(within(fs::read(scratch.path("empty"))).await?.is_empty());
@@ -1076,6 +1116,7 @@ async fn read_takes_files_of_every_size_whole() -> io::Result<()> {
 /// How many of the process's descriptors are open on the directory `dir`,
 /// as `/proc/self/fd` tells: each that links to its path, which is the
 /// scratch directory of one test, so no other test opens it.
+#[cfg(target_os = "linux")]
 fn opened_on(dir: &std::path::Path) -> usize {
     let dir = std::fs::canonicalize(dir).unwrap();
     std::fs::read_dir("/proc/self/fd")
@@ -1087,6 +1128,7 @@ fn opened_on(dir: &std::path::Path) -> usize {
 
 /// Waits, turning the ring, until no descriptor is open on the directory
 /// `dir`.
+#[cfg(target_os = "linux")]
 async fn closed_on(dir: &std::path::Path) {
     within(async {
         while opened_on(dir) != 0 {
@@ -1152,6 +1194,7 @@ fn a_reader_moves_to_another_core() {
                         names.push(entry.file_name());
                     }
                     drop(entries);
+                    #[cfg(target_os = "linux")]
                     closed_on(&dir).await;
                     io::Result::Ok((names, ruio::core().unwrap().index()))
                 });
@@ -1171,6 +1214,7 @@ fn a_reader_moves_to_another_core() {
 /// The directory's descriptor closes once the reader and its entries are
 /// gone: after the status read through it, and after a batch being read
 /// when the reader was dropped.
+#[cfg(target_os = "linux")]
 #[ruio::test]
 async fn a_directory_closes_once_its_reader_and_entries_are_gone() -> io::Result<()> {
     const COUNT: usize = 3000;

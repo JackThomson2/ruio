@@ -1,13 +1,17 @@
 //! UDP sockets inside the runtime.
 
-#![cfg(ruio_uring)]
+#![cfg(any(ruio_uring, ruio_iocp))]
 
 mod support;
 
-use std::io::{self, ErrorKind};
+use std::io;
+#[cfg(ruio_uring)]
+use std::io::ErrorKind;
 use std::net::SocketAddr;
+#[cfg(ruio_uring)]
 use std::time::Duration;
 
+#[cfg(ruio_uring)]
 use ruio::buf::BufPool;
 use ruio::net::UdpSocket;
 
@@ -31,20 +35,27 @@ async fn datagrams_go_to_and_come_from_addresses() -> io::Result<()> {
     assert_eq!(received?, 4);
     assert_eq!(buf, b"back");
 
-    assert_eq!(within(a.send_zc_to(vec![1; 100], to)).await.0?, 100);
-    let (received, _) = within(b.recv(Vec::with_capacity(128))).await;
-    assert_eq!(received?, 100);
+    #[cfg(ruio_uring)]
+    {
+        assert_eq!(within(a.send_zc_to(vec![1; 100], to)).await.0?, 100);
+        let (received, _) = within(b.recv(Vec::with_capacity(128))).await;
+        assert_eq!(received?, 100);
+    }
 
-    let recv = a
-        .recv(Vec::with_capacity(8))
-        .timeout(Duration::from_millis(10));
-    assert_eq!(recv.await.0.unwrap_err().kind(), ErrorKind::TimedOut);
+    #[cfg(ruio_uring)]
+    {
+        let recv = a
+            .recv(Vec::with_capacity(8))
+            .timeout(Duration::from_millis(10));
+        assert_eq!(recv.await.0.unwrap_err().kind(), ErrorKind::TimedOut);
+    }
     Ok(())
 }
 
 /// Sockets bound with `SO_REUSEPORT` share an address, which a socket
 /// without it cannot bind, and the kernel spreads the datagrams among them
 /// by sender.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn sockets_bound_with_reuseport_share_an_address() -> io::Result<()> {
     let first = UdpSocket::bind_reuseport("127.0.0.1:0")?;
@@ -74,6 +85,7 @@ async fn sockets_bound_with_reuseport_share_an_address() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_recv_stream_takes_datagram_after_datagram() -> io::Result<()> {
     let receiver = UdpSocket::bind("127.0.0.1:0")?;
@@ -97,6 +109,7 @@ async fn a_recv_stream_takes_datagram_after_datagram() -> io::Result<()> {
 /// A socket that is not connected answers its senders from the stream of
 /// its datagrams, taking those that have arrived together: each sender gets
 /// its own datagrams back, in order, and only those.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_recv_from_stream_answers_each_sender() -> io::Result<()> {
     let server = UdpSocket::bind("127.0.0.1:0")?;
@@ -141,6 +154,7 @@ async fn a_recv_from_stream_answers_each_sender() -> io::Result<()> {
 
 /// A datagram longer than its buffer has room for after the header and the
 /// address is cut short, and says so; the next one comes whole.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_recv_from_stream_cuts_short_what_its_buffers_cannot_hold() -> io::Result<()> {
     let receiver = UdpSocket::bind("127.0.0.1:0")?;
@@ -165,6 +179,7 @@ async fn a_recv_from_stream_cuts_short_what_its_buffers_cannot_hold() -> io::Res
 
 /// The header and an IPv4 address take 32 bytes of each buffer, and an
 /// IPv6 one 48, which a pool's buffers must have more than.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_recv_from_stream_needs_room_for_a_payload() -> io::Result<()> {
     let v4 = UdpSocket::bind("127.0.0.1:0")?;
