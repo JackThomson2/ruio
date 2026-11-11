@@ -99,9 +99,12 @@ tasks, timers, the channels and locks of [`sync`], the blocking pool and
 of [`buf`], which every engine shares. The rest of the I/O and io_uring's
 own API, `process`, `signal`, the rest of `io`, the pools and registered
 buffers of `buf`, `uring` and `driver`, come with io_uring alone so far.
-With the `futures` feature, a listener's connections, a directory's
-entries and the channels' receivers and intervals implement the `Stream`
-and `FusedStream` of futures-core."#
+Libraries that take their I/O through the poll-based traits of
+`tokio::io` or futures-io, such as hyper and rustls, run over the streams
+and files through the adapter of the `ruio-compat` crate. With the
+`futures` feature, a listener's connections, a directory's entries and
+the channels' receivers and intervals implement the `Stream` and
+`FusedStream` of futures-core."#
 )]
 #![cfg_attr(
     not(any(ruio_uring, ruio_iocp)),
