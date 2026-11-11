@@ -951,6 +951,7 @@ mod tests {
     use ruio_engine::{Build, Engine};
 
     use super::{RawAddr, TcpStream};
+    use crate::buf::BufPool;
     use crate::engine::{AT_ONCE, Builder, Iocp, skipped};
 
     /// A task's waker, which counts how often the task was woken.
@@ -1107,6 +1108,47 @@ mod tests {
         let mut arrived = vec![0; AT_ONCE as usize + 1];
         peer.read_exact(&mut arrived)?;
         assert_eq!(arrived[AT_ONCE as usize - 1..], [7, 8]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stream_that_receives_without_the_port_yields_to_it_all_the_same() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let Some((stream, mut peer)) = pair(&engine)? else {
+            return Ok(());
+        };
+        // More bytes than the stream may receive between two turns, into
+        // buffers of one byte, all of them arrived.
+        let sent = 2 * AT_ONCE as usize;
+        peer.write_all(&vec![7; sent])?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stream.socket().peek(&mut vec![0; sent])? < sent {
+            assert!(Instant::now() < deadline, "the data did not arrive");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let pool = BufPool::new(1, 1)?;
+        let mut received = stream.recv_stream(&pool);
+
+        // Each receive takes what has arrived without the port, until as
+        // many operations have finished so as may between two turns.
+        let (woken, waker) = task();
+        let mut cx = Context::from_waker(&waker);
+        let mut items = 0;
+        while let Poll::Ready(item) = received.poll_next(&mut cx) {
+            item.expect("data that has arrived")?;
+            items += 1;
+            assert!(items <= AT_ONCE, "a stream with data never yielded");
+        }
+        assert!(items > 0);
+        // Then the stream has its task woken, to try again after the turn.
+        assert_eq!(woken.0.load(Ordering::Relaxed), 1);
+        assert!(in_flight(&engine).starts_with("in_flight: 0,"));
+        engine.submit()?;
+        let Poll::Ready(Some(item)) = received.poll_next(&mut cx) else {
+            panic!("a stream with data waited for more than a turn of the port");
+        };
+        item?;
         Ok(())
     }
 

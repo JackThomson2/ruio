@@ -32,6 +32,13 @@ use super::{Socket, outcome, socket_of, taken};
 /// that another took the data fails rather than waits. The stream's other
 /// operations go through the port, and are the same either way.
 ///
+/// A receive of data that has arrived goes through no port, and so costs
+/// no turn of it, as an operation that finishes as it starts does, and it
+/// is counted with those: once as many have finished so since the port was
+/// last turned as may between two, the stream wakes its task and waits for
+/// the next turn. So a peer that sends faster than the stream takes its
+/// data keeps no other task from running.
+///
 /// Dropping the stream cancels the receive that waits. Data that has
 /// arrived stays in the socket, for what reads it next.
 pub struct RecvStream<'a> {
@@ -78,8 +85,9 @@ impl<'a> RecvStream<'a> {
     ///
     /// Data has arrived if the system has said so since the stream was last
     /// polled, or if the last receive filled its buffer, which may have
-    /// left more behind. Appending it to the data taken before gathers what
-    /// has arrived:
+    /// left more behind. It is `None` all the same once the stream has
+    /// received as much as it may between two turns of the port. Appending
+    /// it to the data taken before gathers what has arrived:
     ///
     /// ```no_run
     /// # async fn gather(stream: ruio_iocp::net::TcpStream, pool: ruio_iocp::buf::BufPool) {
@@ -143,6 +151,16 @@ impl<'a> RecvStream<'a> {
                     }
                 }
                 State::Arrived => {
+                    // The receive costs no turn of the port, so it waits
+                    // for one once as many operations have finished as
+                    // they started as may between two.
+                    let engine = self.stream.engine();
+                    if engine.at_once_spent() {
+                        if let Some(cx) = cx.as_deref_mut() {
+                            cx.waker().wake_by_ref();
+                        }
+                        return Poll::Pending;
+                    }
                     let mut lease = match cx.as_deref_mut() {
                         Some(cx) => ready!(self.claim.poll_take(cx)),
                         None => match self.claim.take() {
@@ -154,6 +172,7 @@ impl<'a> RecvStream<'a> {
                         // Nothing more comes: the peer shut down.
                         Ok(0) => self.state = State::Ended,
                         Ok(received) => {
+                            engine.finished_at_once();
                             // A receive that filled its buffer may have
                             // left data behind.
                             self.state = if received == lease.capacity() {
