@@ -1,9 +1,10 @@
-//! ruio's portable streams, listeners and a child's pipes polled by tokio's
-//! runtimes with `TokioReactor` as the foreign reactor: their waits go to
-//! tokio's reactor. No foreign ring is set in this test binary, so a wait
-//! that went to one would fail with `Unsupported` instead.
+//! ruio's portable streams, listeners and, on Linux, a child's pipes
+//! polled by tokio's runtimes with `TokioReactor` as the foreign reactor:
+//! their waits go to tokio's reactor. No foreign ring is set in this test
+//! binary, so a wait that went to one would fail with `Unsupported` instead;
+//! on Windows a wait with no reactor to go to fails so too.
 
-#![cfg(all(feature = "tokio-reactor", ruio_uring))]
+#![cfg(all(feature = "tokio-reactor", any(ruio_uring, ruio_iocp)))]
 
 use std::future::Future;
 use std::io;
@@ -30,6 +31,7 @@ fn pattern(len: usize) -> Vec<u8> {
 /// is set.
 fn set() {
     ruio::io::set_foreign_reactor(&TokioReactor);
+    #[cfg(ruio_uring)]
     assert!(ruio::uring::foreign_ring().is_none());
 }
 
@@ -147,6 +149,7 @@ fn many_tasks_wait_on_one_listener_across_workers() {
 
 /// A child's pipes wait on tokio's reactor: what is written to `cat` comes
 /// back, through tokio's traits.
+#[cfg(ruio_uring)]
 #[test]
 fn a_childs_pipes_wait_on_tokios_reactor() {
     on_current_thread(async {
@@ -170,8 +173,30 @@ fn a_childs_pipes_wait_on_tokios_reactor() {
     });
 }
 
+/// A child's pipe gives tokio's reactor nothing to wait on, which takes
+/// sockets alone: on a thread of a tokio runtime, a read that finds nothing
+/// fails as unsupported, at once.
+#[cfg(ruio_iocp)]
+#[test]
+fn a_childs_pipe_does_not_wait_on_tokios_reactor() {
+    on_current_thread(async {
+        // Silent for a second or so, and then done.
+        let mut child = Command::new("cmd")
+            .args(["/d", "/c"])
+            .raw_arg("ping -n 2 127.0.0.1 >nul")
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut stdout = PortableCompat::new(child.stdout.take().unwrap());
+        let err = stdout.read(&mut [0; 16]).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        Ok(())
+    });
+}
+
 /// A stream handed out after waiting on tokio's reactor has left it: tokio
 /// registers it again as its own, which it could not were it still there.
+#[cfg(ruio_uring)]
 #[test]
 fn a_stream_handed_out_has_left_the_reactor() {
     on_current_thread(async {
@@ -195,13 +220,72 @@ fn a_stream_handed_out_has_left_the_reactor() {
     });
 }
 
+/// A stream that waited on tokio's reactor, which polled a duplicate of its
+/// handle, and was then handed out still has its connection: the duplicate
+/// closed as the stream left the reactor, and the socket stays open, both
+/// ways, as the standard library's.
+#[cfg(ruio_iocp)]
+#[test]
+fn a_stream_handed_out_keeps_its_connection() {
+    use std::io::{Read as _, Write as _};
+
+    on_current_thread(async {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move { listener.accept().await });
+        let stream = TcpStream::connect(addr).await?;
+        let (peer, _) = server.await.unwrap()?;
+        let read = tokio::spawn(async move {
+            let (read, _) = stream.read(Vec::with_capacity(1)).await;
+            read.map(|_| stream)
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        peer.try_write(b"x")?;
+        let stream = read.await.unwrap()?;
+        let mut stream = stream.into_std();
+        stream.set_nonblocking(false)?;
+        stream.write_all(b"still here")?;
+        let mut peer = peer.into_std();
+        peer.set_nonblocking(false)?;
+        let mut back = [0; 10];
+        peer.read_exact(&mut back)?;
+        assert_eq!(&back, b"still here");
+        peer.write_all(b"and here")?;
+        drop(peer);
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest)?;
+        assert_eq!(rest, b"and here");
+        Ok(())
+    });
+}
+
 /// A thread of no runtime waits on the foreign ring, which is not set: the
 /// reactor takes no wait from it.
+#[cfg(ruio_uring)]
 #[test]
 fn a_thread_of_no_runtime_does_not_wait_on_tokio() {
     set();
     let (peer, ours) = std::os::unix::net::UnixStream::pair().unwrap();
     let stream = ruio::net::portable::UnixStream::from_std(ours).unwrap();
+    let mut read = pin!(stream.read(Vec::with_capacity(1)));
+    let mut cx = Context::from_waker(Waker::noop());
+    let Poll::Ready((read, _)) = read.as_mut().poll(&mut cx) else {
+        panic!("a wait with nowhere to go fails at once");
+    };
+    assert_eq!(read.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    drop(peer);
+}
+
+/// A thread of no runtime has no port to wait on, and the reactor takes no
+/// wait from it: a read that finds nothing fails as unsupported, at once.
+#[cfg(ruio_iocp)]
+#[test]
+fn a_thread_of_no_runtime_does_not_wait_on_tokio() {
+    set();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (ours, _) = listener.accept().unwrap();
+    let stream = TcpStream::from_std(ours).unwrap();
     let mut read = pin!(stream.read(Vec::with_capacity(1)));
     let mut cx = Context::from_waker(Waker::noop());
     let Poll::Ready((read, _)) = read.as_mut().poll(&mut cx) else {

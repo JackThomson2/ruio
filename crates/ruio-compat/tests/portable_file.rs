@@ -2,16 +2,18 @@
 //! reading, writing and seeking over `ruio::fs::portable::File`, as code
 //! written for tokio's file uses them: a file made with `File::create`, or
 //! with `OpenOptions` and `create_new`, and written with `write_all`; under a
-//! ruio runtime, and from the workers of tokio's runtime, whose waits go to
-//! a ruio runtime's ring set as the foreign one.
+//! ruio runtime, and, on io_uring, from the workers of tokio's runtime, whose
+//! waits go to a ruio runtime's ring set as the foreign one.
 
-#![cfg(all(feature = "tokio", feature = "futures-io", ruio_uring))]
+#![cfg(all(feature = "tokio", feature = "futures-io", any(ruio_uring, ruio_iocp)))]
 
 mod support;
 
 use std::io::{self, ErrorKind, SeekFrom};
 use std::path::PathBuf;
+#[cfg(ruio_uring)]
 use std::sync::{OnceLock, mpsc};
+#[cfg(ruio_uring)]
 use std::time::Duration;
 
 use ruio::fs::OpenOptions;
@@ -169,6 +171,7 @@ async fn futures_io_traits_write_read_and_seek_a_file() -> io::Result<()> {
 /// Starts, once, a ruio runtime on a thread of its own, which runs for as
 /// long as the tests do, and makes its ring the foreign one, which the
 /// portable operations of tokio's workers go to.
+#[cfg(ruio_uring)]
 fn foreign() {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
@@ -186,6 +189,7 @@ fn foreign() {
 /// Code written for tokio's file runs on a tokio worker with ruio's: made
 /// with `File::create` and with `create_new`, written, synced, and read back,
 /// each wait on the foreign ring.
+#[cfg(ruio_uring)]
 #[test]
 fn a_file_is_written_from_a_tokio_worker() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

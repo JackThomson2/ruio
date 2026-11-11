@@ -9,12 +9,22 @@ use std::net::Shutdown;
 use std::task::{Context, Poll};
 
 use ruio::fs::portable::File;
-use ruio::net::portable::{TcpStream, UnixStream};
+use ruio::net::portable::TcpStream;
+#[cfg(ruio_uring)]
+use ruio::net::portable::UnixStream;
 use ruio::process::{ChildStderr, ChildStdin, ChildStdout};
 
-/// What a [`PortableCompat`] adapts: a portable
-/// [`TcpStream`](ruio::net::portable::TcpStream) or
-/// [`UnixStream`](ruio::net::portable::UnixStream), which it reads and writes,
+#[cfg_attr(
+    ruio_uring,
+    doc = r#"What a [`PortableCompat`] adapts: a portable
+[`TcpStream`](ruio::net::portable::TcpStream) or
+[`UnixStream`](ruio::net::portable::UnixStream), which it reads and writes,"#
+)]
+#[cfg_attr(
+    ruio_iocp,
+    doc = r#"What a [`PortableCompat`] adapts: a portable
+[`TcpStream`](ruio::net::portable::TcpStream), which it reads and writes,"#
+)]
 /// a child's pipe, which it reads, a
 /// [`ChildStdout`](ruio::process::ChildStdout) or a
 /// [`ChildStderr`](ruio::process::ChildStderr), or writes, a
@@ -41,6 +51,7 @@ pub trait PortableReader: PortableStream + sealed::Read {}
 pub trait PortableWriter: PortableStream + sealed::Write {}
 
 impl PortableStream for TcpStream {}
+#[cfg(ruio_uring)]
 impl PortableStream for UnixStream {}
 impl PortableStream for ChildStdin {}
 impl PortableStream for ChildStdout {}
@@ -48,12 +59,14 @@ impl PortableStream for ChildStderr {}
 impl PortableStream for File {}
 
 impl PortableReader for TcpStream {}
+#[cfg(ruio_uring)]
 impl PortableReader for UnixStream {}
 impl PortableReader for ChildStdout {}
 impl PortableReader for ChildStderr {}
 impl PortableReader for File {}
 
 impl PortableWriter for TcpStream {}
+#[cfg(ruio_uring)]
 impl PortableWriter for UnixStream {}
 impl PortableWriter for ChildStdin {}
 impl PortableWriter for File {}
@@ -93,6 +106,7 @@ mod sealed {
     }
 
     impl Sealed for TcpStream {}
+    #[cfg(ruio_uring)]
     impl Sealed for UnixStream {}
     impl Sealed for ChildStdin {}
     impl Sealed for ChildStdout {}
@@ -158,8 +172,11 @@ mod sealed {
         };
     }
 
-    reader!(TcpStream, UnixStream, ChildStdout, ChildStderr, File);
+    reader!(TcpStream, ChildStdout, ChildStderr, File);
+    #[cfg(ruio_uring)]
+    reader!(UnixStream);
     writer!(TcpStream, stream => stream.shutdown(Shutdown::Write));
+    #[cfg(ruio_uring)]
     writer!(UnixStream, stream => stream.shutdown(Shutdown::Write));
     // Closed as it is dropped, which the child reads as the end of its
     // input: shutting down has nothing to do before then.
@@ -211,33 +228,73 @@ mod sealed {
 /// error only the reading ones ([`PortableReader`]), and its standard input
 /// only the writing ones ([`PortableWriter`]); a file has the seeking
 /// traits of tokio and futures-io too.
-///
-/// A portable stream, as a child's pipe, reads and writes with system calls
-/// made at once, on whichever thread polls it, which wait on that thread's
-/// ring only when there is nothing to read or no room to write, so the
-/// adapter needs no buffer of its own, as [`Compat`](crate::Compat) needs
-/// for a stream of its thread's ring: a read is a `read(2)` into the
-/// caller's buffer, a write a `send(2)`, or a vectored `sendmsg(2)`, from
-/// the caller's buffers, or to a pipe a `write(2)` or a `writev(2)`, with no
-/// copy either way. A flush has nothing to wait for, and is ready at once;
-/// shutting down (tokio's `poll_shutdown`, futures-io's `poll_close`) shuts
-/// a connection's writing half down, and is ready at once for a child's
-/// standard input, as tokio's own `ChildStdin` is, which closes as the
-/// adapter, or the pipe, is dropped. A read or a write that waits keeps its
-/// wait in the stream until it is polled again, as the poll-based traits
-/// poll it.
-///
-/// A file reads and writes through its own poll methods instead, as
-/// tokio's `File` does: a read goes into the file's buffer, on the ring, and
-/// is copied out; a write is copied there and goes behind, and a flush, as
-/// shutting down, waits for it. A seek is an `lseek(2)` made once nothing
-/// is in flight; see [`File`](ruio::fs::portable::File).
-///
-/// It is `Send` and `Sync`, as the stream is, so a connection that must be,
-/// as hyper-util's client and hyper's upgrades want theirs, can be one of
-/// ruio's, and it moves between threads and cores with the task that holds
-/// it: whichever thread polls it next waits on its own ring.
-///
+#[cfg_attr(
+    ruio_uring,
+    doc = r#"
+A portable stream, as a child's pipe, reads and writes with system calls
+made at once, on whichever thread polls it, which wait on that thread's
+ring only when there is nothing to read or no room to write, so the
+adapter needs no buffer of its own, as [`Compat`](crate::Compat) needs
+for a stream of its thread's ring: a read is a `read(2)` into the
+caller's buffer, a write a `send(2)`, or a vectored `sendmsg(2)`, from
+the caller's buffers, or to a pipe a `write(2)` or a `writev(2)`, with no
+copy either way. A flush has nothing to wait for, and is ready at once;
+shutting down (tokio's `poll_shutdown`, futures-io's `poll_close`) shuts
+a connection's writing half down, and is ready at once for a child's
+standard input, as tokio's own `ChildStdin` is, which closes as the
+adapter, or the pipe, is dropped. A read or a write that waits keeps its
+wait in the stream until it is polled again, as the poll-based traits
+poll it.
+
+A file reads and writes through its own poll methods instead, as
+tokio's `File` does: a read goes into the file's buffer, on the ring, and
+is copied out; a write is copied there and goes behind, and a flush, as
+shutting down, waits for it. A seek is an `lseek(2)` made once nothing
+is in flight; see [`File`](ruio::fs::portable::File).
+
+It is `Send` and `Sync`, as the stream is, so a connection that must be,
+as hyper-util's client and hyper's upgrades want theirs, can be one of
+ruio's, and it moves between threads and cores with the task that holds
+it: whichever thread polls it next waits on its own ring.
+"#
+)]
+#[cfg_attr(
+    ruio_iocp,
+    doc = r#"
+A portable stream reads and writes with calls made at once, on whichever
+thread polls it, which wait on that thread's port only when there is
+nothing to read or no room to write, so the adapter needs no buffer of
+its own, as [`Compat`](crate::Compat) needs for a stream of its thread's
+port: a read is a `WSARecv` into the caller's buffer, a write a
+`WSASend` from the caller's buffers, a vectored one included, with no
+copy either way. A child's pipe gives no sign that it has data, or room,
+short of an operation that completes, so it keeps a read and a write of
+its own in flight, with a buffer of its own, as [`ruio::process`] says: a
+read copies out what the pipe's read brought, and a write copies the
+caller's bytes into the pipe's buffer and starts writing them, done as
+far as the caller can tell, and the next write waits for it. A flush has
+nothing to wait for, and is ready at once, a pipe's write still in flight
+or not; shutting down (tokio's `poll_shutdown`, futures-io's
+`poll_close`) shuts a connection's writing half down, and is ready at
+once for a child's standard input, as tokio's own `ChildStdin` is, which
+closes as the adapter, or the pipe, is dropped. A read or a write that
+waits keeps its wait in the stream until it is polled again, as the
+poll-based traits poll it.
+
+A file reads and writes through its own poll methods instead, as
+tokio's `File` does: a read goes into the file's buffer, with an
+overlapped read whose completion the port of the polling thread waits
+for, and is copied out; a write is copied there and goes behind, and a
+flush, as shutting down, waits for it. A seek moves the position the file
+keeps, as Windows keeps none for it, once nothing is in flight; see
+[`File`](ruio::fs::portable::File).
+
+It is `Send` and `Sync`, as the stream is, so a connection that must be,
+as hyper-util's client and hyper's upgrades want theirs, can be one of
+ruio's, and it moves between threads and cores with the task that holds
+it: whichever thread polls it next waits on its own port.
+"#
+)]
 /// ```no_run
 /// use ruio::net::portable::TcpStream;
 /// use ruio_compat::PortableCompat;
@@ -266,18 +323,38 @@ mod sealed {
 /// use tokio::io::{AsyncReadExt, AsyncWriteExt};
 ///
 /// # ruio::Runtime::new().unwrap().block_on(async {
-/// let mut child = Command::new("cat")
-///     .stdin(Stdio::piped())
-///     .stdout(Stdio::piped())
-///     .spawn()?;
-/// let mut stdin = PortableCompat::new(child.stdin.take().unwrap());
-/// stdin.write_all(b"hello").await?;
-/// // Closes the pipe: cat's input ends.
-/// drop(stdin);
-/// let mut stdout = PortableCompat::new(child.stdout.take().unwrap());
-/// let mut out = Vec::new();
-/// stdout.read_to_end(&mut out).await?;
-/// assert_eq!(out, b"hello");
+#[cfg_attr(
+    ruio_uring,
+    doc = r#"let mut child = Command::new("cat")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()?;
+let mut stdin = PortableCompat::new(child.stdin.take().unwrap());
+stdin.write_all(b"hello").await?;
+// Closes the pipe: cat's input ends.
+drop(stdin);
+let mut stdout = PortableCompat::new(child.stdout.take().unwrap());
+let mut out = Vec::new();
+stdout.read_to_end(&mut out).await?;
+assert_eq!(out, b"hello");"#
+)]
+#[cfg_attr(
+    ruio_iocp,
+    doc = r#"// Copies its input's lines, each matching the start of a line.
+let mut child = Command::new("findstr")
+    .arg("^")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()?;
+let mut stdin = PortableCompat::new(child.stdin.take().unwrap());
+stdin.write_all(b"hello\r\n").await?;
+// Closes the pipe: findstr's input ends.
+drop(stdin);
+let mut stdout = PortableCompat::new(child.stdout.take().unwrap());
+let mut out = Vec::new();
+stdout.read_to_end(&mut out).await?;
+assert_eq!(out, b"hello\r\n");"#
+)]
 /// # Ok::<(), std::io::Error>(())
 /// # }).unwrap();
 /// ```
@@ -368,9 +445,18 @@ mod tokio_impls {
             self.get_mut().stream.poll_write_vectored(cx, bufs)
         }
 
-        /// Yes for a stream, whose buffers go together, with one
-        /// `sendmsg(2)`, and a pipe, with one `writev(2)`; no for a file,
-        /// which writes the first.
+        #[cfg_attr(
+            ruio_uring,
+            doc = r#"Yes for a stream, whose buffers go together, with one
+`sendmsg(2)`, and a pipe, with one `writev(2)`; no for a file,
+which writes the first."#
+        )]
+        #[cfg_attr(
+            ruio_iocp,
+            doc = r#"Yes for a stream, whose buffers go together, with one
+`WSASend`, and a pipe, which copies them into its buffer for one write;
+no for a file, which writes the first."#
+        )]
         fn is_write_vectored(&self) -> bool {
             self.stream.is_write_vectored()
         }
@@ -516,9 +602,18 @@ mod hyper_impls {
             self.get_mut().stream.poll_write_vectored(cx, bufs)
         }
 
-        /// Yes for a stream: hyper hands a message's head and body over at
-        /// once, which go with one `sendmsg(2)`, or one `writev(2)` to a
-        /// pipe; no for a file, which writes the first.
+        #[cfg_attr(
+            ruio_uring,
+            doc = r#"Yes for a stream: hyper hands a message's head and body over at
+once, which go with one `sendmsg(2)`, or one `writev(2)` to a
+pipe; no for a file, which writes the first."#
+        )]
+        #[cfg_attr(
+            ruio_iocp,
+            doc = r#"Yes for a stream: hyper hands a message's head and body over at
+once, which go with one `WSASend`, or with one write of a pipe's
+buffer; no for a file, which writes the first."#
+        )]
         fn is_write_vectored(&self) -> bool {
             self.stream.is_write_vectored()
         }

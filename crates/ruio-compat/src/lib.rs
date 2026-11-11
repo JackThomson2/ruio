@@ -85,7 +85,7 @@ into. A build for io_uring has this one instead when it asks for it with
 it adapts a `UnixStream` too."#
 )]
 #![cfg_attr(
-    ruio_uring,
+    any(ruio_uring, ruio_iocp),
     doc = r#"
 [`PortableCompat`] adapts ruio's portable streams, of
 [`ruio::net::portable`], and a child's pipes, of [`ruio::process`], to
@@ -97,8 +97,11 @@ that is, as hyper-util's client does. A child's standard output and
 error are read through it, and its standard input written.
 With the `client` feature, [`client`] runs hyper-util's client on the
 portable streams: a connector of portable TCP streams, and the client's
-builder with ruio's executor and timer.
-
+builder with ruio's executor and timer."#
+)]
+#![cfg_attr(
+    ruio_uring,
+    doc = r#"
 With the `tokio-reactor` feature, [`TokioReactor`] is tokio's reactor as
 ruio's foreign one ([`ruio::io::set_foreign_reactor`]): set so, the
 portable streams and listeners and a child's pipes polled on the threads
@@ -109,11 +112,12 @@ threads."#
 #![cfg_attr(
     ruio_iocp,
     doc = r#"
-`PortableCompat`, the `client` module and `TokioReactor` are written
-against io_uring's portable streams and descriptors, and come with that
-engine alone so far, though ruio has portable streams and a child's
-pipes here too: the `client` and `tokio-reactor` features add nothing
-here."#
+With the `tokio-reactor` feature, [`TokioReactor`] is tokio's reactor as
+ruio's foreign one ([`ruio::io::set_foreign_reactor`]): set so, the
+portable streams and listeners polled on the threads of a tokio runtime
+wait on that runtime's reactor, as its own sockets do, where they would
+have no port to wait on. A child's pipes wait on a port alone, and so
+only where a runtime of ruio's runs: the foreign reactor takes sockets."#
 )]
 #![cfg_attr(
     not(any(ruio_uring, ruio_iocp)),
@@ -155,9 +159,9 @@ family's, or call through the trait, as in
 `futures_util::AsyncWriteExt::write_all(&mut stream, data)`."#
 )]
 
-// io_uring's own: the client connects through the portable streams, which
-// the portable adapter adapts and tokio's reactor serves.
-#[cfg(all(feature = "client", ruio_uring))]
+// The portable streams' own: the client connects through them, which the
+// portable adapter adapts and tokio's reactor serves.
+#[cfg(all(feature = "client", any(ruio_uring, ruio_iocp)))]
 pub mod client;
 #[cfg(feature = "hyper")]
 mod executor;
@@ -167,7 +171,7 @@ mod futures_impls;
 mod generic;
 #[cfg(all(feature = "hyper", any(ruio_compat_ring, ruio_compat_generic)))]
 mod hyper_impls;
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 mod portable;
 #[cfg(ruio_compat_ring)]
 mod ring;
@@ -175,18 +179,18 @@ mod ring;
 mod timer;
 #[cfg(all(feature = "tokio", any(ruio_compat_ring, ruio_compat_generic)))]
 mod tokio_impls;
-#[cfg(all(feature = "tokio-reactor", ruio_uring))]
+#[cfg(all(feature = "tokio-reactor", any(ruio_uring, ruio_iocp)))]
 mod tokio_reactor;
 
 #[cfg(feature = "hyper")]
 pub use executor::Executor;
 #[cfg(ruio_compat_generic)]
 pub use generic::{Adaptable, Compat};
-#[cfg(ruio_uring)]
+#[cfg(any(ruio_uring, ruio_iocp))]
 pub use portable::{PortableCompat, PortableReader, PortableStream, PortableWriter};
 #[cfg(ruio_compat_ring)]
 pub use ring::{Adaptable, Compat, StreamSocket};
 #[cfg(feature = "hyper")]
 pub use timer::Timer;
-#[cfg(all(feature = "tokio-reactor", ruio_uring))]
+#[cfg(all(feature = "tokio-reactor", any(ruio_uring, ruio_iocp)))]
 pub use tokio_reactor::TokioReactor;
