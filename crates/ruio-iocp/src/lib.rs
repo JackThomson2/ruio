@@ -56,6 +56,8 @@ mod op;
 #[cfg(windows)]
 pub mod pipe;
 #[cfg(windows)]
+pub mod portable;
+#[cfg(windows)]
 mod sys;
 
 #[cfg(windows)]

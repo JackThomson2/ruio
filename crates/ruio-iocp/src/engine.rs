@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use ruio_engine::{Build, Engine, LocalWaker, Unpark};
 
+use crate::portable::wait::Waits;
 use crate::{op, sys};
 
 /// The completion key of the packets unparks post.
@@ -24,6 +25,12 @@ const IO: usize = 1;
 
 /// The completion key of the packets the engine's fine timer posts.
 const TIMER: usize = 2;
+
+/// The completion key of the packets that the waits of [`HandleWait`]s
+/// post, which carry the waits' keys.
+///
+/// [`HandleWait`]: crate::portable::HandleWait
+pub(crate) const SIGNALED: usize = 3;
 
 /// How many operations may finish during the calls that start them between
 /// two turns of the port: as many as the executor runs tasks between two.
@@ -90,15 +97,18 @@ struct Inner {
     shutdown_timeout: Duration,
 }
 
-/// What an engine shares with its unparkers: the port, which the last of
-/// them to go closes, so that an unpark never posts to a handle that has
-/// been closed, whose value may name another object by then.
-struct Shared {
+/// What an engine shares with its unparkers and with the waits that other
+/// threads may hold: the port, which the last of them to go closes, so that
+/// an unpark never posts to a handle that has been closed, whose value may
+/// name another object by then.
+pub(crate) struct Shared {
     port: sys::Handle,
     /// Whether an unpark has posted a packet that no turn has taken yet. An
     /// unpark posts only if it sets this, so that several before a turn
     /// wake it once.
     notified: AtomicBool,
+    /// The waits whose packets are to post to the port, or lie in it.
+    pub(crate) waits: Waits,
 }
 
 // SAFETY: a completion port's handle may be used from any thread, and the
@@ -122,6 +132,11 @@ impl Shared {
             // for the next unpark to try again.
             self.notified.store(false, Ordering::SeqCst);
         }
+    }
+
+    /// The port.
+    pub(crate) fn port(&self) -> sys::Handle {
+        self.port
     }
 }
 
@@ -302,6 +317,7 @@ impl Iocp {
                 shared: Arc::new(Shared {
                     port,
                     notified: AtomicBool::new(false),
+                    waits: Waits::default(),
                 }),
                 stash: RefCell::default(),
                 armed: Cell::new(None),
@@ -359,6 +375,11 @@ impl Iocp {
     pub(crate) fn detached(&self) -> &op::DetachedOps {
         &self.inner.detached
     }
+
+    /// What the engine shares with other threads.
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.inner.shared
+    }
 }
 
 impl Inner {
@@ -411,6 +432,7 @@ impl Inner {
                     }
                     delivered -= 1;
                 }
+                SIGNALED => self.shared.waits.signaled(entry.overlapped.addr()),
                 // Nothing posts under another key.
                 _ => {}
             }
@@ -464,11 +486,13 @@ impl Inner {
     }
 
     /// Whether the port holds nothing for a turn to deliver: no operation
-    /// is in flight, and no unpark has posted a packet. A packet of the
-    /// fine timer's may lie there, which is no work, and which the next
-    /// turn that waits takes.
+    /// is in flight, no wait's packet is to come, and no unpark has posted
+    /// a packet. A packet of the fine timer's may lie there, which is no
+    /// work, and which the next turn that waits takes.
     fn idle(&self) -> bool {
-        self.in_flight.get() == 0 && !self.shared.notified.load(Ordering::SeqCst)
+        self.in_flight.get() == 0
+            && self.shared.waits.count() == 0
+            && !self.shared.notified.load(Ordering::SeqCst)
     }
 
     /// Records that the timer fired, if its deadline has passed.
@@ -492,16 +516,21 @@ impl Drop for Inner {
         // system may still write to its buffer. What has come by then is
         // delivered however short the timeout: past it, a turn takes what
         // the port holds without waiting, until one delivers no operation.
+        // The waits that other threads may hold are cancelled too, but for
+        // those whose packets lie in the port already, which are delivered
+        // so.
         self.closing.set(true);
         self.detached.cancel();
+        self.shared.waits.cancel_all();
         let deadline = now().saturating_add(self.shutdown_timeout);
-        while self.in_flight.get() > 0 {
-            let in_flight = self.in_flight.get();
+        let pending = || self.in_flight.get() + self.shared.waits.count();
+        while pending() > 0 {
+            let before = pending();
             let waits = now() < deadline;
             if self.turn(Some(deadline)).is_err() {
                 break;
             }
-            if !waits && self.in_flight.get() == in_flight {
+            if !waits && pending() == before {
                 break;
             }
         }
@@ -533,9 +562,9 @@ impl Engine for Iocp {
         {
             return true;
         }
-        // No unpark has posted, so with no operation in flight the port
-        // holds no work, and is not asked.
-        if inner.in_flight.get() == 0 {
+        // No unpark has posted, so with no operation in flight and no wait's
+        // packet to come the port holds no work, and is not asked.
+        if inner.in_flight.get() == 0 && inner.shared.waits.count() == 0 {
             return false;
         }
         let mut entries = [sys::OverlappedEntry::EMPTY; BATCH];
