@@ -1133,15 +1133,22 @@ alone.
   operation with `CancelIoEx` and leaves the slot to the engine, which
   frees it, buffer and all, once the cancellation's completion comes, as
   the driver does with an orphaned operation; and dropping the engine
-  waits for those, up to its shutdown timeout. A listener accepts with
+  waits for those, up to its shutdown timeout, and frees what has
+  completed by then however short that is. A listener accepts with
   `AcceptEx`, onto a socket made as the accept starts and kept in the
   slot, so that a dropped accept closes a connection it had accepted by
-  then, and a stream connects with `ConnectEx`, which wants its socket
-  bound first; Winsock's provider hands both out as function pointers. A
-  datagram goes with `WSASendTo` and comes with `WSARecvFrom`, its
-  address in the slot beside the buffer. A socket's operation reports its
-  outcome through `WSAGetOverlappedResult`, so its errors are those the
-  standard library's sockets give, and what needs no waiting, binding,
+  then, and reads the peer's address from what `AcceptEx` wrote, with
+  `GetAcceptExSockaddrs`, rather than ask the stream for it, a call
+  more for every connection; a stream connects with `ConnectEx`,
+  which wants its socket bound first. Winsock's provider hands the three
+  out as function pointers. A datagram goes with `WSASendTo` and comes
+  with `WSARecvFrom`, its address in the slot beside the buffer. A
+  socket's operation reports its outcome through
+  `WSAGetOverlappedResult`, so its errors are those the standard
+  library's sockets give. Sockets are made and bound here, as the
+  standard library makes and binds its own, so that one of IPv6 reaches
+  IPv4 addresses too, in their IPv6 form, as Linux's do and Windows' do
+  not unless asked (`IPV6_V6ONLY`); what needs no waiting besides,
   addresses and options, goes through the standard library's sockets,
   which the types hold. Two of Windows' ways with datagrams are made
   every other system's: one longer than its buffer fills the buffer
@@ -1153,7 +1160,10 @@ alone.
   the port a dangling one. So a slot's `OVERLAPPED` starts as
   `STATUS_PENDING`, and a failed call whose status is no longer pending,
   and is no error, is waited for like any other. `ReadExact` and
-  `WriteAll` loop a read or a write over a slice of what is left. A file
+  `WriteAll` loop a read or a write over a slice of what is left. A named
+  pipe's server end waits for its client with `ConnectNamedPipe`
+  (`NamedPipe::wait_for_client`), which a client that came first fails
+  with `ERROR_PIPE_CONNECTED`, meaning that it is connected. A file
   is opened with `OpenOptions`, on the engine's thread or, as the
   standard library's file, on any other (`open_std`, `File::from_std`),
   and lends that file in an `Arc` (`File::as_std`) for the calls Windows
@@ -1167,21 +1177,26 @@ alone.
   arguments of io_uring's: buffers allocated as they are first needed,
   and leases that return theirs when dropped. Readers that find every
   buffer leased wait in a line, and a buffer that returns is handed to
-  the first of them, and wakes it alone. Left in the pool for whoever
-  asks first, it would go to a reader that never waited as readily as to
-  the one woken for it, and a stream with data always at hand could keep
-  the others out for as long as it had any. A stream receives into the
-  pool (`TcpStream::recv_stream`) without holding a buffer while it
-  waits: a receive of no bytes waits in its place, which the system
-  completes once the socket has data, and only then does the stream
-  claim a buffer, and receive into it without waiting, on a socket the
-  first poll makes non-blocking. So a receive costs one completion, and
-  the streams that wait leave the buffers to those that have data. A
-  receive fills one buffer, where io_uring's fills as many as the data
-  takes, and `next_ready` gathers what it left behind. A file reads into
-  the pool too (`File::read_stream`), one read in flight at a time from
-  an offset on; a file gives no sign that data has arrived, so the read
-  holds its buffer from when it starts, which suits a file on a disk.
+  the first of them, and wakes it alone; a task that asks whether one is
+  available waits in the line too, in one place however often it asks.
+  Left in the pool for whoever asks first, it would go to a reader that
+  never waited as readily as to the one woken for it, and a stream with
+  data always at hand could keep the others out for as long as it had
+  any. A stream receives into the pool (`TcpStream::recv_stream`)
+  without holding a buffer while it waits: a receive of no bytes waits
+  in its place, which the system completes once the socket has data, and
+  only then does the stream claim a buffer, and receive into it without
+  waiting, on a socket the first poll makes non-blocking. So a receive
+  costs one completion, and the streams that wait leave the buffers to
+  those that have data. The receive into the buffer costs no turn of the
+  port at all, and counts as an operation that finishes as it starts
+  does, below, so that a stream whose data keeps coming yields to the
+  other tasks as such operations do. A receive fills one buffer, where
+  io_uring's fills as many as the data takes, and `next_ready` gathers
+  what it left behind. A file reads into the pool too
+  (`File::read_stream`), one read in flight at a time from an offset on;
+  a file gives no sign that data has arrived, so the read holds its
+  buffer from when it starts, which suits a file on a disk.
 - **Writes on the port.** `TcpStream::write_all_vectored` sends any
   `IoBufs` with one `WSASend` that names them all, and again with what a
   short send left. `write_behind` leaves a send to the engine. For that
@@ -1223,19 +1238,20 @@ alone.
   are listeners, pipes and other files. An operation that costs no turn
   lets its task go on without one, so only 64 may finish so between two
   turns, as many as the executor runs tasks between two: past that an
-  operation waits for the turn before it starts, and a write behind
-  yields the same way. And a turn that would not wait asks the port for
-  nothing when no operation is in flight and no unpark has posted, as
-  the port then holds nothing for it; on a runner of CI's the call costs
-  some 11 microseconds when the port is empty. On one such runner, the
-  engine before these and after: a sleep of a millisecond takes 2.0 ms
-  where it took 11.6 to 12.9; two tasks yield to each other 58 million
-  times a second where they did 5.3 million; a stream moves 6,930 MiB a
-  second where it moved 6,050, and 6,710 into a pool where it moved
-  5,955; round trips of 64 bytes are 88 thousand a second as they were,
-  and a file is written and read as fast as it was. With a read in
-  flight the tasks still yield 5.4 million times a second: a turn then
-  asks the port, and that call is what is left to save.
+  operation waits for the turn before it starts, and a write behind, and
+  a stream's receive into a pool, yield the same way. And a turn that
+  would not wait asks the port for nothing when no operation is in
+  flight and no unpark has posted, as the port then holds nothing for
+  it; on a runner of CI's the call costs some 11 microseconds when the
+  port is empty. On one such runner, the engine before these and after:
+  a sleep of a millisecond takes 2.0 ms where it took 11.6 to 12.9; two
+  tasks yield to each other 58 million times a second where they did 5.3
+  million; a stream moves 6,930 MiB a second where it moved 6,050, and
+  6,710 into a pool where it moved 5,955; round trips of 64 bytes are 88
+  thousand a second as they were, and a file is written and read as
+  fast as it was. With a read in flight the tasks still yield 5.4
+  million times a second: a turn then asks the port, and that call is
+  what is left to save.
 - **`net`, `fs`, `io` and `buf` on Windows.** `ruio::net`, `ruio::fs`
   and `ruio::io` are there in part, in `src/iocp/net.rs`,
   `src/iocp/fs.rs` and `src/iocp/io.rs`, which `lib.rs` names `net`,
@@ -1254,10 +1270,13 @@ alone.
   little else. Reads and writes go through the port, at an offset or at
   the file's position, which the `File` keeps, as Windows keeps none for
   overlapped I/O; `read_stream` reads into a pool from that position on,
-  and moves it. The rest runs on the blocking pool as the standard
-  library's call: opening a file, `sync_all`, `sync_data`, `set_len`,
-  `allocate`, `set_permissions` and `metadata`, every function that
-  takes a path, `symlink` among them, and `read_dir`, 64 entries a job.
+  and moves it. A write at the position of a file opened to append
+  leaves the position at the end of the file, as on Linux, which the
+  next read at the position asks the system for. The rest runs on the
+  blocking pool as the standard library's call: opening a file,
+  `sync_all`, `sync_data`, `set_len`, `allocate`, `set_permissions` and
+  `metadata`, every function that takes a path, `symlink` among them,
+  and `read_dir`, 64 entries a job.
   Those hold no file of the port, so their futures are `Send` when their
   arguments are, as on io_uring; for that, `fs::write` copies its buffer
   for the pool's thread. Three of these are the system's in ways that
@@ -3762,6 +3781,14 @@ Since M7:
   Windows. A timing example and two scripts report an engine's speed,
   and what failed, in the annotations of a run of CI (see
   [Engines](#engines)).
+- On the completion port, a stream that receives into a pool yields to
+  the other tasks as an operation that finishes as it starts does;
+  dropping the engine frees what has completed however short its
+  timeout; a pool's line holds a task once; an accept reads its peer's
+  address from what `AcceptEx` wrote; IPv6 sockets reach IPv4 addresses,
+  as on Linux; a named pipe's server end waits for its client; and a
+  write at the position of a file opened to append leaves the position
+  at the file's end (see [Engines](#engines)).
 
 ## Open questions
 
