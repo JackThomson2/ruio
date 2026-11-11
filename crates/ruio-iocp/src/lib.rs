@@ -34,6 +34,15 @@
 //! costs no turn of the port; and a turn that would not wait asks the port
 //! for nothing while no operation is in flight.
 //!
+//! `portable` has what any thread may hold and poll, for the I/O that is
+//! `Send`: a wait for a handle to be signaled (`HandleWait`), which a wait
+//! completion packet posts to the port of the engine current where it
+//! starts, and one for a socket to be ready (`ReadyWait`), a poll of the
+//! AFD driver's that completes to that port; a nonblocking socket
+//! (`Socket`); reads and writes of a handle that no port has (`read_at`,
+//! `write_at`), with an event of their own; and a pipe's end that no port
+//! has (`Pipe`), which keeps a read and a write of its own in flight.
+//!
 //! Off Windows the crate is empty, but for the tests of what needs nothing
 //! of Windows': the pool, and the bookkeeping of a stream's writes.
 

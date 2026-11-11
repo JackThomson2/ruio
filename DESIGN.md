@@ -1043,7 +1043,8 @@ between its tasks and parks on while none is ready: io_uring's ring on
 Linux, an I/O completion port on Windows, and in time kqueue on macOS.
 io_uring stays the engine ruio is measured by, and the others must cost it
 nothing. `ruio` builds on any engine. Its I/O runs in full on io_uring;
-on Windows a part of `net`, `fs` and `io` runs on the completion port, a
+on Windows a part of `net`, `fs` and `io`, with their portable sockets
+and file, and `process` and `signal` run on the completion port, a
 proof of concept, and `ruio-compat` adapts its streams and files, so
 that hyper and rustls run there; elsewhere it has the executor's API
 alone.
@@ -1293,9 +1294,46 @@ alone.
   `io/traits.rs`, which both builds compile, as they do `net/addr.rs`:
   the two that name no engine. Not there yet: datagrams received into a
   pool, the futures' timeouts, `from_std` and `into_std`,
-  `bind_reuseport`, moving a stream to another core, the portable
-  sockets and files, and of `io`, `splice`, `AsyncFd` and the foreign
-  reactor.
+  `bind_reuseport`, moving a stream to another core, and of `io`,
+  `splice` and the two `AsyncFd`s.
+- **Send I/O, processes and signals on Windows.** What is `Send` on
+  io_uring is on the port too, built on `ruio_iocp::portable`: waits
+  that any thread may hold and poll, each running on the port of the
+  engine current where it starts, and handles that no port has. A
+  `HandleWait` associates a wait completion packet of `ntdll`'s with a
+  handle, which the system posts to that port once the handle is
+  signaled; a `ReadyWait` polls a socket's readiness through the
+  engine's handle of the AFD driver, as mio does, and the poll completes
+  to the port as any operation does. A wait polled from another thread
+  goes on where it started and wakes its task there; one dropped takes
+  its packet or its poll back; and an engine dropped first cancels the
+  waits it has and wakes their tasks, whose next polls start them where
+  they are. `net::portable`'s sockets are nonblocking, and read and
+  write with Winsock's calls made at once on whichever thread polls
+  them, waiting with a `ReadyWait` only when there is nothing to read or
+  no room, with the hints and the budget they have on io_uring, and on
+  the foreign reactor where the thread is one of its. `fs::portable`'s
+  file reads and writes overlapped, with no port and an event of its
+  own in the `OVERLAPPED`, whose low bit is set so that no completion
+  goes to a port even for a handle that has one, and waits for the event
+  with a `HandleWait`; it keeps its position as the thread's file does,
+  and `OpenOptions::open_portable` opens one on the blocking pool.
+  `process` spawns with the standard library and waits for the process's
+  handle. Its pipes take over the standard library's ends, which are
+  overlapped and no port's, as portable `Pipe`s: a pipe gives no sign of
+  data or room short of an operation that completes, so each keeps a
+  read and a write of its own in flight, with a buffer of 64 KiB, as
+  mio's do, and a write is a copy into that buffer, done as far as the
+  caller can tell. `Command` has `creation_flags` and `raw_arg` in place
+  of what Linux alone has. `signal` delivers the console's control
+  events: Ctrl+C, Ctrl+Break, a window closed, a log off and a shut
+  down. The handler `SetConsoleCtrlHandler` installs runs on a thread the
+  system makes for it, so it sends on the kinds' channels itself, and a
+  listener needs no runtime; an event with no listener goes on to the
+  system, which ends the process, and the handler of one after which the
+  system ends the process does not return while a listener winds down.
+  A wait for a handle or a pipe where no runtime runs has no port, and
+  fails with `Unsupported`: the foreign reactor takes sockets alone.
 - **An adapter for each kind of engine.** `ruio-compat`'s `Compat` is
   two types, one to a build, as the engine is. io_uring keeps the one it
   had, in `src/ring.rs`, which is written against the ring: its reads
@@ -1321,9 +1359,11 @@ alone.
   plain write the system cut short would leave the rest unsent until the
   next write, flush or close, and its reader waiting. It adapts a
   `TcpStream` and a `File`, and has no pool to receive into;
-  `PortableCompat`, the client and tokio's reactor, which are made of
-  portable streams and descriptors, stay io_uring's, as do the crate's
-  examples. The implementations of the traits, `Executor` and `Timer`
+  `PortableCompat`, the client and tokio's reactor, which are written
+  against io_uring's portable streams and descriptors, stay io_uring's,
+  as do the crate's examples, though the port has portable streams and
+  pipes of its own now. The implementations of the traits, `Executor`
+  and `Timer`
   are shared. `build.rs` chooses by the engine, and a build for io_uring
   that asks with `--cfg ruio_compat="generic"` gets the second adapter,
   for Unix streams too: there it runs before a change reaches a Windows
@@ -1340,7 +1380,14 @@ alone.
   `tests/rustls.rs`, 19 tests. They run on io_uring and on the
   completion port alike, so that the API the engines share is held to
   one behaviour; what the port does its own way, a file's stream into a
-  pool, is in `tests/iocp.rs`, which is the port's. `ruio-iocp`'s pool,
+  pool, is in `tests/iocp.rs`, which is the port's. The portable sockets
+  and file are tested in `tests/portable_net.rs` and
+  `tests/fs_portable.rs` on both engines, but for what io_uring alone
+  has; processes, the console's control events and the foreign reactor
+  in `tests/process_iocp.rs`, `tests/signal_iocp.rs` and
+  `tests/foreign_reactor_iocp.rs`, whose children are programs every
+  Windows has, `cmd`, `findstr` and `ping`, and, for the events, the
+  test binary run again with a console of its own. `ruio-iocp`'s pool,
   and its records of what a vectored send has left to send and of the
   writes behind a stream, are plain Rust, whose unit tests, 17 of them,
   run on Linux too, with the workspace's. `ci/check.sh` runs
@@ -1398,11 +1445,11 @@ is the standard library's argument to it, and a shutdown has no timeout
 worth setting. A pool goes on the thread's current engine
 (`BufPool::new(count, size)`), and `BufPool::with_driver` names a ring.
 
-`process` and `signal` come with io_uring alone so far, and so do
-`uring`, `driver` and the registered buffers in `buf`, whose shared
-buffers are there on every engine, and whose pool is each engine's own.
-`net`, `fs` and `io` come with io_uring in full, and with the completion
-port in part. io_uring's modules compile
+`uring`, `driver` and the registered buffers in `buf` come with io_uring
+alone; `buf`'s shared buffers are there on every engine, and its pool is
+each engine's own. `net`, `fs`, `io`, `process` and `signal` come with
+io_uring in full, and with the completion port in part. io_uring's
+modules compile
 with io_uring alone, and within them nothing more is gated: a gate on
 one of their methods would only repeat theirs. An engine that brings I/O
 offers the modules again, as files of its own that `lib.rs` names by the
@@ -1420,7 +1467,7 @@ the system, not the engine.
 | `net` | The TCP, UDP and Unix sockets: binding, connecting, `accept` and `incoming`, `read`, `write`, `read_exact`, `write_all`, `write_all_vectored`, `write_behind`, `flush`, `shutdown`, `recv_stream`, the datagrams' `send_to`, `recv_from` and `recv_from_stream`, the options and addresses, and moving a stream to another core with a plain descriptor; the futures' `timeout`; `ToSocketAddrs` and `lookup_host`; `net::portable` | `fd()`; direct descriptors (`set_direct`, `is_direct`), and moving one to another core's ring; `send_zc`; `recv_stream_incremental` | Unix sockets on Unix |
 | `fs` | `File` and `OpenOptions` as the standard library's; reads and writes at an offset and at the position, `read_exact_at`, `write_all_at`, `sync_all`, `sync_data`, `set_len`, `allocate`, `metadata`, `close` and `read_stream`; the path functions and `read_dir`; `fs::portable` | `fd()`; `read_fixed_at` and `write_fixed_at`; chains (`FileOp::link`); polled I/O (`OpenOptions::polled`); direct descriptors (`OpenOptions::direct_descriptor`); `read_stream_incremental` | `fallocate`, `sync_range`, `start_sync_range` and `advise` on Linux |
 | `io` | `AsyncRead`, `AsyncWrite`, `copy` and the futures built on them; the foreign reactor | | `AsyncFd` and `io::portable::AsyncFd` on Unix; `splice` on Linux |
-| `process`, `signal` | Spawning and waiting for children, their pipes; signals to tasks | | `Child::pidfd` on Linux; the signals Unix has |
+| `process`, `signal` | Spawning and waiting for children, their pipes; signals to tasks, `ctrl_c` among them | | `Child::pidfd`, `signal` and `signal_group`, and `Command::process_group`, `uid`, `gid`, `arg0` and `pre_exec`, on Linux; the signals Unix has; `Command::creation_flags` and `raw_arg`, and the console's control events, on Windows |
 | Futures | The names: `net::Read`, `fs::SyncAll` and the rest | Their types: `SocketOp`, `FileOp`, `FdOp`, `PortableOp` | |
 | Crate root | | `uring`, `driver` | |
 
@@ -1443,12 +1490,12 @@ What is left, in order:
 
 1. The I/O completion port engine from a proof of concept to ruio's I/O
    on Windows: the rest of the first column of `net`, `fs` and `io`,
-   which is datagrams received into a pool, the futures' timeouts,
-   sockets and files taken from the standard library, and the portable
-   sockets and files, with the adapter and the client built on them;
-   `ruio-compat`'s adapter there receiving into the pool the port now
-   has; and a turn that costs no call to the port while an operation is
-   in flight.
+   which is datagrams received into a pool, the futures' timeouts, and
+   sockets and files taken from the standard library; the portable
+   adapter, the client and tokio's reactor on the port's portable
+   streams and pipes; `ruio-compat`'s adapter there receiving into the
+   pool the port now has; and a turn that costs no call to the port
+   while an operation is in flight.
 2. A kqueue engine for macOS, with owned-buffer I/O. kqueue reports
    readiness, so a read waits for its socket to be readable and then reads
    into the caller's buffer itself, and files go to the blocking pool.
@@ -3789,6 +3836,15 @@ Since M7:
   as on Linux; a named pipe's server end waits for its client; and a
   write at the position of a file opened to append leaves the position
   at the file's end (see [Engines](#engines)).
+- On the completion port, the `Send` I/O of io_uring's build: the
+  sockets of `net::portable`, which wait on the foreign reactor where no
+  runtime runs, the file of `fs::portable` with
+  `OpenOptions::open_portable`, and `io::portable::Interest`, built on
+  the waits of `ruio_iocp::portable`, which any thread may hold;
+  `process`, whose children are waited for, and whose pipes are read and
+  written, on whichever thread polls them; and `signal`, which delivers
+  the console's control events, Ctrl+C among them (see
+  [Engines](#engines)).
 
 ## Open questions
 

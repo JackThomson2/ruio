@@ -109,9 +109,11 @@ threads."#
 #![cfg_attr(
     ruio_iocp,
     doc = r#"
-`PortableCompat`, the `client` module and `TokioReactor` are made of
-io_uring's portable streams and of descriptors, and come with that engine
-alone: the `client` and `tokio-reactor` features add nothing here."#
+`PortableCompat`, the `client` module and `TokioReactor` are written
+against io_uring's portable streams and descriptors, and come with that
+engine alone so far, though ruio has portable streams and a child's
+pipes here too: the `client` and `tokio-reactor` features add nothing
+here."#
 )]
 #![cfg_attr(
     not(any(ruio_uring, ruio_iocp)),

@@ -94,20 +94,26 @@ read and write the same way, with what Windows has no overlapped form
 of, opening a file, syncing it and the functions that take a path, on
 the blocking pool. [`io`] has the traits both implement, and `copy` over
 them, and [`buf`] has the engine's pool of buffers beside the buffer
-traits that every engine shares. All four are under the names and with
-the signatures they have on io_uring, so that code written to them
-builds for both. Beside them is the executor's API: runtimes, tasks,
-timers, the channels and locks of [`sync`], the blocking pool and
-[`Cores`], whose threads are pinned to their CPUs. The rest of the I/O
-and io_uring's own API, `process`, `signal`, the rest of `io`, the
-registered buffers of `buf`, `uring` and `driver`, come with io_uring
-alone so far. Libraries that take their I/O through the poll-based
-traits of `tokio::io` or futures-io, such as hyper and rustls, run over
-the streams and files through the adapter of the `ruio-compat` crate.
-With the `futures` feature, a listener's connections, what arrives on a
-connection, a file's data, a directory's entries and the channels'
-receivers and intervals implement the `Stream` and `FusedStream` of
-futures-core."#
+traits that every engine shares. What is `Send` on io_uring is so here
+too: the sockets of `net::portable`, the file of `fs::portable`, and
+[`process`], whose children are waited for, and whose pipes are read and
+written, on whichever thread polls them; where no runtime runs, the
+sockets wait on the foreign reactor `io::set_foreign_reactor` sets.
+[`signal`] delivers the console's control events, Ctrl+C among them, to
+tasks wherever they run. All of these are under the names and with the
+signatures they have on io_uring, so that code written to them builds
+for both. Beside them is the executor's API: runtimes, tasks, timers,
+the channels and locks of [`sync`], the blocking pool and [`Cores`],
+whose threads are pinned to their CPUs. The rest of the I/O and
+io_uring's own API, the rest of `io`, the registered buffers of `buf`,
+`uring` and `driver`, come with io_uring alone so far. Libraries that
+take their I/O through the poll-based traits of `tokio::io` or
+futures-io, such as hyper and rustls, run over the streams and files
+through the adapter of the `ruio-compat` crate. With the `futures`
+feature, a listener's connections, what arrives on a connection, a
+file's data, a directory's entries, a signal's arrivals and the
+channels' receivers and intervals implement the `Stream` and
+`FusedStream` of futures-core."#
 )]
 #![cfg_attr(
     not(any(ruio_uring, ruio_iocp)),
@@ -121,10 +127,10 @@ Linux and Windows alone, and the buffer traits of [`buf`], which every
 engine shares.
 The I/O and io_uring's own API, `net`, `fs`, `io`, `process`, `signal`,
 the pools and registered buffers of `buf`, `uring` and `driver`, come with
-an engine that offers them: io_uring, and for part of `net`, `fs` and `io`
-the I/O completion port of Windows. With the `futures` feature, the
-channels' receivers and intervals implement the `Stream` and `FusedStream`
-of futures-core."#
+an engine that offers them: io_uring, and for part of `net`, `fs`, `io`,
+`process` and `signal` the I/O completion port of Windows. With the
+`futures` feature, the channels' receivers and intervals implement the
+`Stream` and `FusedStream` of futures-core."#
 )]
 
 pub use ruio_executor::{
