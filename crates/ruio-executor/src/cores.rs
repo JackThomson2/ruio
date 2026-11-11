@@ -98,9 +98,12 @@ pub fn handle_of(index: usize) -> Handle {
 
 /// A set of CPUs to run on, a runtime on each: thread per core.
 ///
-/// On Linux each core's thread is pinned to its CPU. Elsewhere ruio cannot
-/// pin threads yet: a core's CPU is a number, from 0 up to the parallelism
-/// the standard library finds, and a run refuses one beyond it, as Linux's
+/// On Linux and on Windows each core's thread is pinned to its CPU. On
+/// Windows a CPU's number is 64 times the number of its processor group
+/// plus its number within the group, which on a machine of 64 processors
+/// or fewer is the number Windows gives it. Elsewhere ruio cannot pin
+/// threads yet: a core's CPU is a number, from 0 up to the parallelism the
+/// standard library finds, and a run refuses one beyond it, as Linux's
 /// refuses a CPU the process may not run on; the thread runs where the
 /// system puts it.
 ///
@@ -128,12 +131,15 @@ pub struct Cores {
 
 impl Cores {
     /// Every CPU the process may run on, in order, whichever thread asks:
-    /// those its main thread may run on, which `taskset(1)` or a cgroup's
-    /// cpuset limits.
+    /// on Linux those its main thread may run on, which `taskset(1)` or a
+    /// cgroup's cpuset limits; on Windows those of the process's affinity
+    /// mask, or, on a machine with several processor groups, where a
+    /// thread may be given to any of them, every processor of every group.
     ///
     /// # Errors
     ///
-    /// On Linux, what `sched_getaffinity(2)` reports.
+    /// What the system reports: `sched_getaffinity(2)` on Linux, and
+    /// `GetProcessAffinityMask` on Windows.
     pub fn all() -> io::Result<Self> {
         Ok(Self::cpus(allowed_cpus()?))
     }
@@ -142,8 +148,8 @@ impl Cores {
     ///
     /// # Errors
     ///
-    /// On Linux, what `sched_getaffinity(2)` reports, and `InvalidInput` if
-    /// `count` is zero or the process may run on fewer CPUs.
+    /// What the system reports, as for [`Cores::all`], and `InvalidInput`
+    /// if `count` is zero or the process may run on fewer CPUs.
     pub fn first(count: usize) -> io::Result<Self> {
         let cpus = allowed_cpus()?;
         if count == 0 || count > cpus.len() {
@@ -515,10 +521,122 @@ mod affinity {
     }
 }
 
+/// The CPUs the process may run on, and pinning a thread to one, through
+/// Windows' affinity masks and processor groups. A CPU's number is 64
+/// times its group's plus its number within the group.
+#[cfg(windows)]
+mod affinity {
+    use std::ffi::c_void;
+    use std::io;
+    use std::ptr;
+
+    /// How many processors a group holds at most: as many as a mask has
+    /// bits on a 64-bit system.
+    const GROUP_SIZE: usize = 64;
+
+    /// `GROUP_AFFINITY`: processors of one group.
+    #[repr(C)]
+    struct GroupAffinity {
+        /// `Mask`: a bit for each of them.
+        mask: usize,
+        /// `Group`: the group's number.
+        group: u16,
+        reserved: [u16; 3],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// A pseudo-handle of the calling process, which is not closed.
+        safe fn GetCurrentProcess() -> *mut c_void;
+
+        /// A pseudo-handle of the calling thread, which is not closed.
+        safe fn GetCurrentThread() -> *mut c_void;
+
+        /// How many processor groups the system has.
+        safe fn GetActiveProcessorGroupCount() -> u16;
+
+        /// How many processors `group` has, or none if there is no such
+        /// group.
+        safe fn GetActiveProcessorCount(group: u16) -> u32;
+
+        /// Writes the processors `process` may run on, and those the system
+        /// has, as masks of its group. False on failure.
+        fn GetProcessAffinityMask(
+            process: *mut c_void,
+            process_mask: *mut usize,
+            system_mask: *mut usize,
+        ) -> i32;
+
+        /// Confines `thread` to the processors of `affinity`, and writes
+        /// those it had to `previous` if that is not null. False on
+        /// failure, as when the process may run on none of them.
+        fn SetThreadGroupAffinity(
+            thread: *mut c_void,
+            affinity: *const GroupAffinity,
+            previous: *mut GroupAffinity,
+        ) -> i32;
+    }
+
+    /// The CPUs the process may run on, in order: those of its affinity
+    /// mask, which pinning a thread leaves as it is, or, on a system with
+    /// several groups, every processor of every group, as a thread may be
+    /// given to any group, whichever the process started in.
+    pub(super) fn allowed_cpus() -> io::Result<Vec<usize>> {
+        let groups = GetActiveProcessorGroupCount();
+        if groups > 1 {
+            let cpus = (0..groups)
+                .flat_map(|group| {
+                    let count = GetActiveProcessorCount(group) as usize;
+                    (0..count).map(move |cpu| usize::from(group) * GROUP_SIZE + cpu)
+                })
+                .collect();
+            return Ok(cpus);
+        }
+        let (mut process, mut system) = (0_usize, 0_usize);
+        // SAFETY: the masks are written during the call, and the process's
+        // pseudo-handle is always valid.
+        let ok = unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let cpus = (0..usize::BITS as usize)
+            .filter(|cpu| process & (1 << cpu) != 0)
+            .collect();
+        Ok(cpus)
+    }
+
+    /// Pins the calling thread to `cpu`.
+    pub(super) fn pin(cpu: usize) -> io::Result<()> {
+        let none = || io::Error::new(io::ErrorKind::InvalidInput, format!("no CPU {cpu}"));
+        let group = u16::try_from(cpu / GROUP_SIZE).map_err(|_| none())?;
+        // A mask has fewer bits than a group has numbers on a 32-bit system.
+        let mask = 1_usize
+            .checked_shl((cpu % GROUP_SIZE) as u32)
+            .ok_or_else(none)?;
+        let affinity = GroupAffinity {
+            mask,
+            group,
+            reserved: [0; 3],
+        };
+        // SAFETY: the affinity is read during the call, the thread's
+        // pseudo-handle is always valid, and what the thread had is not
+        // asked for.
+        let ok = unsafe { SetThreadGroupAffinity(GetCurrentThread(), &affinity, ptr::null_mut()) };
+        if ok == 0 {
+            let err = io::Error::last_os_error();
+            return Err(io::Error::new(
+                err.kind(),
+                format!("pinning to CPU {cpu}: {err}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The CPUs the process may run on, and pinning a thread to one, where ruio
 /// cannot pin threads yet: as many CPUs as the standard library finds the
 /// process can use, and no pinning, though a CPU beyond them is refused.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 mod affinity {
     use std::io;
     use std::thread;

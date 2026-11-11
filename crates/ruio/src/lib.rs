@@ -98,7 +98,7 @@ traits that every engine shares. All four are under the names and with
 the signatures they have on io_uring, so that code written to them
 builds for both. Beside them is the executor's API: runtimes, tasks,
 timers, the channels and locks of [`sync`], the blocking pool and
-[`Cores`], whose threads are not pinned off Linux. The rest of the I/O
+[`Cores`], whose threads are pinned to their CPUs. The rest of the I/O
 and io_uring's own API, `process`, `signal`, the rest of `io`, the
 registered buffers of `buf`, `uring` and `driver`, come with io_uring
 alone so far. Libraries that take their I/O through the poll-based
@@ -116,8 +116,9 @@ Built for a system whose engine ruio offers no I/O on yet, ruio has the
 executor's API alone: on macOS, or wherever it is built with
 `--cfg ruio_engine="park"`, on the park engine of `ruio-engine`, which
 runs no I/O. That is runtimes, tasks, timers, the channels and locks of
-[`sync`], the blocking pool and [`Cores`], whose threads are not pinned
-off Linux, and the buffer traits of [`buf`], which every engine shares.
+[`sync`], the blocking pool and [`Cores`], whose threads are pinned on
+Linux and Windows alone, and the buffer traits of [`buf`], which every
+engine shares.
 The I/O and io_uring's own API, `net`, `fs`, `io`, `process`, `signal`,
 the pools and registered buffers of `buf`, `uring` and `driver`, come with
 an engine that offers them: io_uring, and for part of `net`, `fs` and `io`

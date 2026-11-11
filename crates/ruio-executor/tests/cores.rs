@@ -11,7 +11,7 @@ use ruio_executor::sync::{mpsc, oneshot};
 use ruio_executor::time::sleep;
 use ruio_executor::{Core, Cores, core, spawn, spawn_on};
 // What the tests that look at the CPUs use besides.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 use ruio_executor::{JoinSet, Runtime, core_count};
 
 /// A few cores, however many CPUs the machine has: on one with fewer, some
@@ -21,12 +21,40 @@ fn few() -> Cores {
     Cores::cpus(all.cpu_list().iter().copied().cycle().take(4))
 }
 
-/// The CPU the calling thread is on. Only Linux pins a core's thread to
-/// its CPU so far, so the tests that look are Linux's.
+/// The CPU the calling thread is on, as [`Cores`] numbers CPUs. Linux and
+/// Windows pin a core's thread to its CPU, so the tests that look are
+/// theirs.
 #[cfg(target_os = "linux")]
 fn current_cpu() -> usize {
     // SAFETY: sched_getcpu reads the thread's CPU and changes nothing.
     usize::try_from(unsafe { libc::sched_getcpu() }).unwrap()
+}
+
+#[cfg(windows)]
+fn current_cpu() -> usize {
+    /// `PROCESSOR_NUMBER`: a processor, by its group and its number there.
+    #[repr(C)]
+    struct ProcessorNumber {
+        group: u16,
+        number: u8,
+        reserved: u8,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// Writes the processor the calling thread is running on.
+        fn GetCurrentProcessorNumberEx(number: *mut ProcessorNumber);
+    }
+
+    let mut on = ProcessorNumber {
+        group: 0,
+        number: 0,
+        reserved: 0,
+    };
+    // SAFETY: the processor is written during the call.
+    unsafe { GetCurrentProcessorNumberEx(&mut on) };
+    assert_eq!(on.reserved, 0);
+    usize::from(on.group) * 64 + usize::from(on.number)
 }
 
 #[test]
@@ -47,7 +75,7 @@ fn cores_are_cpus_the_process_may_run_on() {
     assert!(seen.iter().all(|cpus| cpus == all.cpu_list()), "{seen:?}");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn each_core_runs_main_pinned_to_its_cpu() {
     let cores = few();
@@ -103,7 +131,7 @@ fn cores_spawn_onto_each_other() {
 
 /// A set spawns onto every core of the run, and the outputs come as those of
 /// the set's own tasks do.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn a_set_spawns_onto_other_cores() {
     let cores = few();
