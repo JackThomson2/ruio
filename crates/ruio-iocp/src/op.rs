@@ -1316,6 +1316,35 @@ mod tests {
     }
 
     #[test]
+    fn an_engine_dropped_with_no_time_to_wait_frees_what_has_completed() -> io::Result<()> {
+        let engine = Builder::new().shutdown_timeout(Duration::ZERO).build()?;
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let name = pipe_name("no-time");
+        let server = server(&name)?;
+        let mut client = client(&name)?;
+        {
+            let _entered = engine.enter();
+            let handle = IoHandle::new(Arc::clone(&server))?;
+            probe(&handle, 0, &told).map_err(|(err, _)| err)?;
+        }
+        // The read completes, and nothing turns the port before the engine
+        // is dropped: a check for work only takes the completion from it.
+        client.write_all(b"data")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !engine.has_work() {
+            assert!(Instant::now() < deadline, "the read did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(told.borrow().is_empty());
+        drop(engine);
+        // The completion is delivered, with no task woken, rather than
+        // leaked with the read's buffer and the pipe's end it holds.
+        assert_eq!(*told.borrow(), [(0, Ok(b"data".to_vec()), false)]);
+        assert_eq!(Arc::strong_count(&server), 1);
+        Ok(())
+    }
+
+    #[test]
     fn an_operation_the_system_does_not_take_hands_back_what_it_was_to_use() -> io::Result<()> {
         let engine = Builder::new().build()?;
         let _entered = engine.enter();

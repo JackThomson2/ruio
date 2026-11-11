@@ -489,12 +489,19 @@ impl Drop for Inner {
         // finish by themselves, which are cancelled here. A completion frees
         // the slot of an operation that no future has, buffer and all; one
         // that has not come by the timeout leaves its slot leaked, as the
-        // system may still write to its buffer.
+        // system may still write to its buffer. What has come by then is
+        // delivered however short the timeout: past it, a turn takes what
+        // the port holds without waiting, until one delivers no operation.
         self.closing.set(true);
         self.detached.cancel();
         let deadline = now().saturating_add(self.shutdown_timeout);
-        while self.in_flight.get() > 0 && now() < deadline {
+        while self.in_flight.get() > 0 {
+            let in_flight = self.in_flight.get();
+            let waits = now() < deadline;
             if self.turn(Some(deadline)).is_err() {
+                break;
+            }
+            if !waits && self.in_flight.get() == in_flight {
                 break;
             }
         }
@@ -625,8 +632,9 @@ impl Build for Builder {
 
     /// Sets how long dropping the engine waits for the operations still in
     /// flight, which the drops of their futures cancelled, or the engine as
-    /// it is dropped, to complete, before it leaks their buffers. The
-    /// default is one second.
+    /// it is dropped, to complete, before it leaks their buffers. Those
+    /// that have completed by then are freed however short the timeout,
+    /// none at all included. The default is one second.
     fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
         self
