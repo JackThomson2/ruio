@@ -681,6 +681,22 @@ impl fmt::Debug for Entered {
     }
 }
 
+/// Says that a test skips, as the system does not give the engine what it
+/// tests: its fine timer, or handles that skip the port.
+///
+/// # Panics
+///
+/// If `RUIO_REQUIRE_PORT_SHORTCUTS` is set, as CI sets it, so that a run
+/// that passes there ran the test.
+#[cfg(test)]
+pub(crate) fn skipped(reason: &str) {
+    assert!(
+        std::env::var_os("RUIO_REQUIRE_PORT_SHORTCUTS").is_none(),
+        "RUIO_REQUIRE_PORT_SHORTCUTS is set, but {reason}"
+    );
+    eprintln!("skipped: {reason}");
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -781,7 +797,7 @@ mod tests {
     fn has_fine_timer(engine: &Iocp) -> bool {
         let fine = engine.inner.fine.is_some();
         if !fine {
-            eprintln!("skipped: the system has no high-resolution timer");
+            super::skipped("the system gives the engine no high-resolution timer");
         }
         fine
     }

@@ -951,7 +951,7 @@ mod tests {
     use ruio_engine::{Build, Engine};
 
     use super::{RawAddr, TcpStream};
-    use crate::engine::{AT_ONCE, Builder, Iocp};
+    use crate::engine::{AT_ONCE, Builder, Iocp, skipped};
 
     /// A task's waker, which counts how often the task was woken.
     struct Woken(AtomicUsize);
@@ -997,7 +997,7 @@ mod tests {
         let stream = block_on(engine, TcpStream::connect(listener.local_addr()?))?;
         let (peer, _) = listener.accept()?;
         if !stream.stream.skips() {
-            eprintln!("skipped: the socket's completions all come through the port");
+            skipped("a stream's completions all come through the port");
             return Ok(None);
         }
         // The operations counted from here are the test's.
