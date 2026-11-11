@@ -2,14 +2,18 @@
 
 use std::fmt;
 use std::fs;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker, ready};
 
 use ruio_buf::{IoBuf, IoBufMut};
 
+use crate::buf::{BufLease, BufPool, Claim};
 use crate::handle::{IoHandle, Raw};
 use crate::op::{Read, ReadExact, Write, WriteAll};
 use crate::sys;
@@ -111,6 +115,17 @@ impl File {
     pub fn write_all_at<B: IoBuf>(&self, buf: B, offset: u64) -> WriteAll<'_, B> {
         WriteAll::at(self.handle.target(), buf, offset)
     }
+
+    /// The file's data from `offset` on, read into buffers of `pool`; see
+    /// [`ReadStream`].
+    pub fn read_stream(&self, pool: &BufPool, offset: u64) -> ReadStream<'_> {
+        ReadStream {
+            file: self,
+            claim: Claim::new(pool),
+            offset,
+            state: Reading::Idle,
+        }
+    }
 }
 
 impl fmt::Debug for File {
@@ -118,6 +133,124 @@ impl fmt::Debug for File {
         f.debug_struct("File")
             .field("handle", &self.handle.raw())
             .finish()
+    }
+}
+
+/// A file's data from an offset on, read into a [`BufPool`]. Made by
+/// [`File::read_stream`].
+///
+/// Each item is one read's data, in one buffer of the pool, and the stream
+/// ends at the end of the file, or after yielding an error. One read is in
+/// flight at a time, started as the stream is polled: it takes a buffer of
+/// the pool then, waiting for one to return if every buffer is leased, and
+/// holds it until it completes.
+///
+/// So the stream suits a file on a disk, whose reads do not wait for data
+/// to arrive. Of a pipe opened as a file it holds a buffer for as long as
+/// it waits.
+///
+/// Dropping the stream cancels the read in flight, whose buffer returns to
+/// the pool once the cancellation has completed.
+pub struct ReadStream<'a> {
+    file: &'a File,
+    claim: Claim,
+    /// Where the next read starts.
+    offset: u64,
+    state: Reading<'a>,
+}
+
+enum Reading<'a> {
+    /// No read is in flight: the next poll starts one.
+    Idle,
+    /// A read into a buffer of the pool is in flight.
+    Started(Read<'a, BufLease>),
+    /// The file ended, or an error was yielded.
+    Ended,
+}
+
+impl ReadStream<'_> {
+    /// The next data, or `None` at the end of the file or once an error has
+    /// been yielded.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<BufLease>>> {
+        self.step(Some(cx))
+    }
+
+    /// The next data; see [`poll_next`](ReadStream::poll_next).
+    pub async fn next(&mut self) -> Option<io::Result<BufLease>> {
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// The next data if it has been read already, or `None`, without
+    /// waiting, and without starting a read.
+    pub fn next_ready(&mut self) -> Option<io::Result<BufLease>> {
+        match self.step(None) {
+            Poll::Ready(next) => next,
+            Poll::Pending => None,
+        }
+    }
+
+    /// Whether the stream has ended: the file has ended, or an error has
+    /// been yielded.
+    pub fn is_ended(&self) -> bool {
+        matches!(self.state, Reading::Ended)
+    }
+
+    /// Where the next read starts: after the data the stream has yielded.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Takes the stream as far as it goes without waiting: to its next
+    /// data, or its end. Where it has to wait, it arranges for the task of
+    /// `cx` to be woken, or, without one, starts nothing and arranges
+    /// nothing.
+    fn step(&mut self, mut cx: Option<&mut Context<'_>>) -> Poll<Option<io::Result<BufLease>>> {
+        loop {
+            match &mut self.state {
+                Reading::Ended => return Poll::Ready(None),
+                Reading::Idle => {
+                    let Some(cx) = cx.as_deref_mut() else {
+                        return Poll::Pending;
+                    };
+                    let lease = ready!(self.claim.poll_take(cx));
+                    let target = self.file.handle.target();
+                    self.state = Reading::Started(Read::new(target, lease, self.offset));
+                }
+                Reading::Started(read) => {
+                    let (result, lease) = match cx.as_deref_mut() {
+                        Some(cx) => ready!(Pin::new(read).poll(cx)),
+                        // A read whose completion has been delivered is
+                        // finished by its poll, which keeps no waker.
+                        None if read.is_done() => {
+                            let mut cx = Context::from_waker(Waker::noop());
+                            ready!(Pin::new(read).poll(&mut cx))
+                        }
+                        None => return Poll::Pending,
+                    };
+                    match result {
+                        Ok(0) => self.state = Reading::Ended,
+                        Ok(read) => {
+                            self.offset += read as u64;
+                            self.state = Reading::Idle;
+                            return Poll::Ready(Some(Ok(lease)));
+                        }
+                        Err(err) => {
+                            self.state = Reading::Ended;
+                            return Poll::Ready(Some(Err(err)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Debug for ReadStream<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadStream")
+            .field("offset", &self.offset)
+            .field("ended", &self.is_ended())
+            .finish_non_exhaustive()
     }
 }
 

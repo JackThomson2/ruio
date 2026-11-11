@@ -1,14 +1,18 @@
 //! Files read and written through the port, on ruio-executor's runtime.
 #![cfg(windows)]
 
+use std::future::poll_fn;
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 use std::thread;
+use std::time::Duration;
 
 use ruio_buf::IoBuf;
-use ruio_executor::Runtime;
+use ruio_executor::{Runtime, time};
+use ruio_iocp::buf::BufPool;
 use ruio_iocp::fs::{File, OpenOptions};
 
 /// A path for a test's file in the temporary directory, which it removes
@@ -206,6 +210,104 @@ fn the_standard_librarys_file_does_what_the_port_has_no_call_for() -> io::Result
         let (read, buf) = file.read_at(Vec::with_capacity(16), 0).await;
         assert_eq!(read?, 4);
         assert_eq!(buf, b"0123");
+        Ok(())
+    })
+}
+
+#[test]
+fn a_file_is_read_into_a_pool_from_an_offset_to_its_end() -> io::Result<()> {
+    let scratch = Scratch::new("stream");
+    let data: Vec<u8> = (0..10_000).map(|at| (at % 251) as u8).collect();
+    std::fs::write(&scratch.0, &data)?;
+    Runtime::new()?.block_on(async {
+        let file = File::open(&scratch.0)?;
+        let pool = BufPool::new(2, 4096)?;
+        let mut stream = file.read_stream(&pool, 100);
+        // Nothing is read until the stream is polled.
+        assert!(stream.next_ready().is_none());
+        assert_eq!(pool.available(), 2);
+        let mut read = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= pool.buffer_size());
+            read.extend_from_slice(&chunk);
+            assert_eq!(stream.offset(), 100 + read.len() as u64);
+        }
+        assert!(stream.is_ended());
+        assert!(stream.next().await.is_none());
+        assert!(stream.next_ready().is_none());
+        assert!(
+            read == data[100..],
+            "what was read is the file from the offset on"
+        );
+        assert_eq!(pool.available(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn a_stream_of_a_file_waits_for_a_buffer_that_a_lease_holds() -> io::Result<()> {
+    let scratch = Scratch::new("stream-waits");
+    std::fs::write(&scratch.0, b"0123456789")?;
+    Runtime::new()?.block_on(async {
+        let file = File::open(&scratch.0)?;
+        let pool = BufPool::new(1, 4)?;
+        let mut stream = file.read_stream(&pool, 0);
+        let first = stream.next().await.expect("the file's start")?;
+        assert_eq!(&*first, b"0123");
+        // The one buffer is leased, so the next read does not start.
+        let waited = time::timeout(Duration::from_millis(20), stream.next()).await;
+        assert!(waited.is_err());
+        assert!(stream.next_ready().is_none());
+        drop(first);
+        let second = stream.next().await.expect("the file's middle")?;
+        assert_eq!(&*second, b"4567");
+        drop(second);
+
+        // A read that was started and has completed is there to take
+        // without waiting.
+        let started = poll_fn(|cx| Poll::Ready(stream.poll_next(cx).is_pending())).await;
+        assert!(started);
+        let mut last = None;
+        for _ in 0..200 {
+            last = stream.next_ready();
+            if last.is_some() {
+                break;
+            }
+            time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(&*last.expect("the file's end")?, b"89");
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn a_stream_dropped_with_a_read_in_flight_returns_its_buffer() -> io::Result<()> {
+    let scratch = Scratch::new("stream-dropped");
+    std::fs::write(&scratch.0, b"0123456789")?;
+    Runtime::new()?.block_on(async {
+        let file = File::open(&scratch.0)?;
+        let pool = BufPool::new(1, 16)?;
+        let mut stream = file.read_stream(&pool, 0);
+        let started = poll_fn(|cx| Poll::Ready(stream.poll_next(cx).is_pending())).await;
+        assert!(started);
+        assert_eq!(pool.available(), 0);
+        drop(stream);
+        // The read's completion comes through the port, cancelled or not,
+        // and the engine frees the read's slot, and the lease in it, then.
+        for _ in 0..200 {
+            if pool.available() == 1 {
+                break;
+            }
+            time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(pool.available(), 1);
+        // The file reads as before.
+        let mut stream = file.read_stream(&pool, 6);
+        let rest = stream.next().await.expect("the file's end")?;
+        assert_eq!(&*rest, b"6789");
         Ok(())
     })
 }

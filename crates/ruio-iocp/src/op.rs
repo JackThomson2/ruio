@@ -449,6 +449,12 @@ impl<'a, B: IoBufMut> Read<'a, B> {
             outcome,
         }
     }
+
+    /// Whether the read's completion has been delivered and not yet read,
+    /// so that a poll finishes the read without waiting.
+    pub(crate) fn is_done(&self) -> bool {
+        self.op.is_done()
+    }
 }
 
 impl<B: IoBufMut> Future for Read<'_, B> {
