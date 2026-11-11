@@ -4,6 +4,7 @@ use std::fmt;
 use std::future::poll_fn;
 use std::io::{self, Read as _};
 use std::net;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker, ready};
 
 use crate::buf::{BufBundle, BufLease, BufPool, Claim};
@@ -34,7 +35,7 @@ use super::{Socket, outcome, socket_of, taken};
 /// Dropping the stream cancels the receive that waits. Data that has
 /// arrived stays in the socket, for what reads it next.
 pub struct RecvStream<'a> {
-    stream: &'a IoHandle<Socket>,
+    stream: &'a IoHandle<Rc<Socket>>,
     claim: Claim,
     state: State<'a>,
 }
@@ -54,7 +55,7 @@ enum State<'a> {
 }
 
 impl<'a> RecvStream<'a> {
-    pub(super) fn new(stream: &'a IoHandle<Socket>, pool: &BufPool) -> Self {
+    pub(super) fn new(stream: &'a IoHandle<Rc<Socket>>, pool: &BufPool) -> Self {
         Self {
             stream,
             claim: Claim::new(pool),

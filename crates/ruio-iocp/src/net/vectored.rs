@@ -6,10 +6,11 @@ use std::io;
 use std::mem;
 use std::pin::Pin;
 use std::ptr;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use ruio_buf::{BufResult, IoBufs};
 
+use crate::behind::{Behind, poll_gate};
 use crate::gather::Gather;
 use crate::handle::Target;
 use crate::op::Op;
@@ -83,10 +84,17 @@ pub(super) unsafe fn start_send_vectored<V: IoBufs>(
 /// Dropping it cancels the send in flight, which may have sent some of the
 /// bytes by then, and the buffers are dropped once the cancellation has
 /// completed.
+///
+/// It waits, before it starts, for the writes left behind the stream to
+/// finish, and fails with the error that one of them failed with, handing
+/// the buffers back unwritten.
 #[must_use = "futures do nothing unless polled"]
 pub struct WriteAllVectored<'a, V: IoBufs> {
     target: Target<'a>,
     state: Sending<'a, V>,
+    /// The writes left behind a stream, which a write of the stream's waits
+    /// for before it starts.
+    gate: Option<&'a Behind>,
 }
 
 /// Where a write of several buffers has got to.
@@ -108,7 +116,16 @@ impl<'a, V: IoBufs> WriteAllVectored<'a, V> {
         Self {
             target,
             state: Sending::Start(bufs),
+            gate: None,
         }
+    }
+
+    /// Makes the write wait, before it starts, for the writes behind its
+    /// stream that `gate` counts to finish, and fail with the error that
+    /// one of them failed with.
+    pub(super) fn behind(mut self, gate: &'a Behind) -> Self {
+        self.gate = Some(gate);
+        self
     }
 }
 
@@ -117,6 +134,13 @@ impl<V: IoBufs> Future for WriteAllVectored<'_, V> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        if let Err(err) = ready!(poll_gate(&mut this.gate, cx)) {
+            // A write waits at its gate only before it has started.
+            let Sending::Start(bufs) = mem::replace(&mut this.state, Sending::Finished) else {
+                panic!("`WriteAllVectored` polled after it completed");
+            };
+            return Poll::Ready((Err(err), bufs));
+        }
         loop {
             let (gather, len) = match mem::replace(&mut this.state, Sending::Finished) {
                 Sending::Start(bufs) => {

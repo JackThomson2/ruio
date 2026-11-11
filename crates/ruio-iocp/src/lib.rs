@@ -21,9 +21,11 @@
 //! arrives, which is the thread's, as a port has none for the system to
 //! pick from.
 //!
-//! Off Windows the crate is empty, but for the tests of the pool, which
-//! needs nothing of Windows'.
+//! Off Windows the crate is empty, but for the tests of what needs nothing
+//! of Windows': the pool, and the bookkeeping of a stream's writes.
 
+#[cfg(any(windows, test))]
+mod behind;
 #[cfg(any(windows, test))]
 pub mod buf;
 #[cfg(windows)]

@@ -29,6 +29,7 @@ use std::task::{Context, Poll, Waker, ready};
 
 use ruio_buf::{BufResult, IoBuf, IoBufMut, Slice};
 
+use crate::behind::{Behind, poll_gate};
 use crate::handle::Target;
 use crate::sys;
 
@@ -291,6 +292,22 @@ impl<'a, T> Op<'a, T> {
         Poll::Ready((result, payload))
     }
 
+    /// Gives up the operation before it has started, and hands back what it
+    /// was to use.
+    ///
+    /// # Panics
+    ///
+    /// If the operation has started.
+    pub(crate) fn give_up(&mut self) -> T {
+        match mem::replace(&mut self.state, OpState::Finished) {
+            OpState::Unstarted(payload) => payload,
+            state => {
+                self.state = state;
+                panic!("an operation given up after it started")
+            }
+        }
+    }
+
     /// Whether the operation's completion has been delivered and not yet
     /// read, so that a poll finishes it without waiting.
     pub(crate) fn is_done(&self) -> bool {
@@ -407,10 +424,6 @@ unsafe fn settle<T: Detached>(header: *mut Header, bytes: u32, wake: bool) {
 ///
 /// What `start` reports, with the payload, if the system did not take the
 /// operation, of which the payload is then told nothing.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "nothing is left to finish by itself yet")
-)]
 pub(crate) fn detach<T: Detached>(
     target: Target<'_>,
     payload: T,
@@ -680,11 +693,18 @@ impl<B: IoBufMut> fmt::Debug for Read<'_, B> {
 /// It starts the write when first polled. Dropping it before the write
 /// completes cancels the write, which may have written some of the buffer
 /// by then, and the buffer is dropped once the cancellation has completed.
+///
+/// A stream's write waits, before it starts, for the writes left behind the
+/// stream to finish, and fails with the error that one of them failed with,
+/// handing the buffer back unwritten.
 #[must_use = "futures do nothing unless polled"]
 pub struct Write<'a, B: IoBuf> {
     op: Op<'a, B>,
     start: Start<B>,
     outcome: Outcome,
+    /// The writes left behind a stream, which a write of the stream's waits
+    /// for before it starts.
+    gate: Option<&'a Behind>,
 }
 
 impl<'a, B: IoBuf> Write<'a, B> {
@@ -705,7 +725,16 @@ impl<'a, B: IoBuf> Write<'a, B> {
             op: Op::new(target, buf, offset),
             start,
             outcome,
+            gate: None,
         }
+    }
+
+    /// Makes the write wait, before it starts, for the writes behind its
+    /// stream that `gate` counts to finish, and fail with the error that
+    /// one of them failed with.
+    pub(crate) fn behind(mut self, gate: &'a Behind) -> Self {
+        self.gate = Some(gate);
+        self
     }
 }
 
@@ -713,8 +742,11 @@ impl<B: IoBuf> Future for Write<'_, B> {
     type Output = BufResult<usize, B>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (start, outcome) = (self.start, self.outcome);
-        let (result, buf) = ready!(self.op.poll_with(cx, start, outcome));
+        let this = &mut *self;
+        if let Err(err) = ready!(poll_gate(&mut this.gate, cx)) {
+            return Poll::Ready((Err(err), this.op.give_up()));
+        }
+        let (result, buf) = ready!(this.op.poll_with(cx, this.start, this.outcome));
         Poll::Ready((result.map(|written| written as usize), buf))
     }
 }
@@ -851,6 +883,10 @@ impl<B: IoBufMut> fmt::Debug for ReadExact<'_, B> {
 /// Dropping it cancels the write in flight, which may have written some of
 /// the buffer by then, and the buffer is dropped once the cancellation has
 /// completed.
+///
+/// A stream's waits, before it starts, for the writes left behind the
+/// stream to finish, and fails with the error that one of them failed with,
+/// handing the buffer back unwritten.
 #[must_use = "futures do nothing unless polled"]
 pub struct WriteAll<'a, B: IoBuf> {
     target: Target<'a>,
@@ -861,6 +897,9 @@ pub struct WriteAll<'a, B: IoBuf> {
     /// How much of the buffer is written.
     done: usize,
     state: Whole<Write<'a, Slice<B>>, B>,
+    /// The writes left behind a stream, which a write of the stream's waits
+    /// for before it starts.
+    gate: Option<&'a Behind>,
 }
 
 // Nothing is pinned: the buffer is only ever moved.
@@ -889,7 +928,16 @@ impl<'a, B: IoBuf> WriteAll<'a, B> {
             offset,
             done: 0,
             state: Whole::Start(buf),
+            gate: None,
         }
+    }
+
+    /// Makes the write wait, before it starts, for the writes behind its
+    /// stream that `gate` counts to finish, and fail with the error that
+    /// one of them failed with.
+    pub(crate) fn behind(mut self, gate: &'a Behind) -> Self {
+        self.gate = Some(gate);
+        self
     }
 }
 
@@ -898,6 +946,13 @@ impl<B: IoBuf> Future for WriteAll<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        if let Err(err) = ready!(poll_gate(&mut this.gate, cx)) {
+            // A write waits at its gate only before it has started.
+            let Whole::Start(buf) = mem::replace(&mut this.state, Whole::Finished) else {
+                panic!("`WriteAll` polled after it completed");
+            };
+            return Poll::Ready((Err(err), buf));
+        }
         loop {
             let buf = match mem::replace(&mut this.state, Whole::Finished) {
                 Whole::Start(buf) => buf,

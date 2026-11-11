@@ -12,6 +12,11 @@
 //!
 //! A stream also receives into a pool of buffers, as a `RecvStream`, which
 //! holds no buffer while it waits for data.
+//!
+//! A stream's write may be left behind it, for the engine to finish: the
+//! send is started with no future to wait for it, shares the socket with
+//! the stream, so that the socket closes only once the send has finished,
+//! and records how it went for the writes after it.
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -24,11 +29,13 @@ use std::net::{
 use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
 use std::pin::Pin;
 use std::ptr;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::task::{Context, Poll, ready};
 
 use ruio_buf::{IoBuf, IoBufMut, IoBufs, Slice};
 
+use crate::behind::Behind;
 use crate::buf::BufPool;
 use crate::handle::{IoHandle, Raw};
 use crate::op::{Op, Read, ReadExact, Write, WriteAll};
@@ -37,10 +44,12 @@ use crate::sys;
 mod recv;
 mod udp;
 mod vectored;
+mod write_behind;
 
 pub use recv::RecvStream;
 pub use udp::{RecvFrom, SendTo, UdpSocket};
 pub use vectored::WriteAllVectored;
+pub use write_behind::{Flush, WriteBehind};
 
 /// Room for one of the two addresses `AcceptEx` writes: the largest address
 /// there is, and the 16 bytes more that it asks for.
@@ -90,7 +99,7 @@ impl Drop for Socket {
     }
 }
 
-impl Raw for Socket {
+impl Raw for Rc<Socket> {
     fn raw(&self) -> sys::Handle {
         handle_of(self.socket.as_raw_socket())
     }
@@ -412,8 +421,9 @@ impl TcpListener {
         }
         let stream = net::TcpStream::from(socket);
         let peer = stream.peer_addr()?;
-        let stream = IoHandle::on(Socket::new(stream), self.listener.engine().clone())?;
-        Ok((TcpStream { stream }, peer))
+        let stream = Rc::new(Socket::new(stream));
+        let stream = IoHandle::on(stream, self.listener.engine().clone())?;
+        Ok((TcpStream::new(stream), peer))
     }
 }
 
@@ -507,8 +517,16 @@ impl fmt::Debug for Accept<'_> {
 /// A read or a write takes its buffer and hands it back with the result,
 /// as ruio's I/O does on io_uring. A read and a write may be in flight at
 /// once.
+///
+/// A write may also be left behind the stream, for the engine to finish;
+/// see [`write_behind`](TcpStream::write_behind). The stream's writes after
+/// it wait for it, and fail with its error if it failed. A stream dropped
+/// with a write behind it in flight closes once that has finished.
 pub struct TcpStream {
-    stream: IoHandle<Socket>,
+    /// The socket, which the sends left behind the stream share.
+    stream: IoHandle<Rc<Socket>>,
+    /// How the writes left behind the stream go.
+    behind: Rc<Behind>,
 }
 
 impl TcpStream {
@@ -522,9 +540,8 @@ impl TcpStream {
     /// error of kind `Other` if the thread has no current engine, as outside
     /// a runtime.
     pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
-        let stream = IoHandle::new(Socket::new(net::TcpStream::from(new_socket(family(
-            &addr,
-        ))?)))?;
+        let socket = Socket::new(net::TcpStream::from(new_socket(family(&addr))?));
+        let stream = IoHandle::new(Rc::new(socket))?;
         let socket = socket_of(stream.raw());
         // `ConnectEx` connects a socket that is bound already.
         let any = RawAddr::any_for(&addr);
@@ -551,7 +568,15 @@ impl TcpStream {
         if failed != 0 {
             return Err(last_error());
         }
-        Ok(Self { stream })
+        Ok(Self::new(stream))
+    }
+
+    /// The stream of a connected socket, with no write behind it.
+    fn new(stream: IoHandle<Rc<Socket>>) -> Self {
+        Self {
+            stream,
+            behind: Rc::default(),
+        }
     }
 
     /// Reads into `buf`, up to its `bytes_total`, what the peer has sent;
@@ -560,9 +585,11 @@ impl TcpStream {
         Read::with(self.stream.target(), buf, 0, start_recv::<B>, outcome)
     }
 
-    /// Writes `buf`'s bytes to the peer; see [`Write`].
+    /// Writes `buf`'s bytes to the peer; see [`Write`]. It waits for a
+    /// [`write_behind`](Self::write_behind) in flight, and fails if one
+    /// failed.
     pub fn write<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
-        Write::with(self.stream.target(), buf, 0, start_send::<B>, outcome)
+        Write::with(self.stream.target(), buf, 0, start_send::<B>, outcome).behind(&self.behind)
     }
 
     /// Fills `buf` from its start, up to its `bytes_total`, with what the
@@ -573,16 +600,39 @@ impl TcpStream {
     }
 
     /// Writes all of `buf`'s bytes to the peer, in as many writes as that
-    /// takes; see [`WriteAll`].
+    /// takes; see [`WriteAll`]. As [`write`](Self::write), it waits for a
+    /// write behind in flight, and fails if one failed.
     pub fn write_all<B: IoBuf>(&self, buf: B) -> WriteAll<'_, B> {
         let target = self.stream.target();
-        WriteAll::with(target, buf, 0, start_send::<Slice<B>>, outcome)
+        WriteAll::with(target, buf, 0, start_send::<Slice<B>>, outcome).behind(&self.behind)
     }
 
     /// Writes all of the bytes of `bufs` to the peer, one buffer after
-    /// another, such as a bundle received; see [`WriteAllVectored`].
+    /// another, such as a bundle received; see [`WriteAllVectored`]. As
+    /// [`write`](Self::write), it waits for a write behind in flight, and
+    /// fails if one failed.
     pub fn write_all_vectored<V: IoBufs>(&self, bufs: V) -> WriteAllVectored<'_, V> {
-        WriteAllVectored::new(self.stream.target(), bufs)
+        WriteAllVectored::new(self.stream.target(), bufs).behind(&self.behind)
+    }
+
+    /// Writes all of the bytes of `bufs` to the peer without waiting for
+    /// the system to be done with them; see [`WriteBehind`].
+    pub fn write_behind<V: IoBufs>(&self, bufs: V) -> WriteBehind<'_, V> {
+        WriteBehind::new(self, bufs)
+    }
+
+    /// Waits for a [`write_behind`](Self::write_behind) in flight to finish,
+    /// and reports whether one failed; see [`Flush`].
+    pub fn flush(&self) -> Flush<'_> {
+        Flush::new(&self.behind)
+    }
+
+    /// Reports whether a [`write_behind`](Self::write_behind) failed, if
+    /// none is in flight, without waiting for one that is: `None` then, as
+    /// how it goes is not yet known. Unlike [`flush`](Self::flush), this
+    /// arranges for nothing to be woken.
+    pub fn try_flush(&self) -> Option<io::Result<()>> {
+        self.behind.status()
     }
 
     /// The data arriving on the connection, received into buffers of
@@ -664,6 +714,10 @@ impl TcpStream {
     /// Shuts down the reading or the writing half of the connection, or
     /// both. The peer's reads find the end of the stream once the writing
     /// half is shut down.
+    ///
+    /// It does not wait for a [`write_behind`](Self::write_behind) in
+    /// flight, which shutting down the writing half may cut short:
+    /// [`flush`](Self::flush) first.
     ///
     /// # Errors
     ///
