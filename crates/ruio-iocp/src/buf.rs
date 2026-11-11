@@ -131,12 +131,15 @@ impl BufPool {
         if self.available() > 0 {
             return Poll::Ready(());
         }
-        // A task that asks again before it is woken is still at the back.
-        // One that asks again later is woken once for each time it asked.
-        let asked = matches!(
-            self.pool.line.borrow().back(),
-            Some(Waiting::Task(waker)) if waker.will_wake(cx.waker())
-        );
+        // A task that asks again before it is woken keeps the place it has,
+        // wherever in the line that is, so that tasks that ask in turn while
+        // no buffer returns do not lengthen the line each time. Telling
+        // whether it has one costs a look at each who waits, as many as
+        // there are tasks and readers waiting.
+        let asked = self.pool.line.borrow().iter().any(|waiting| match waiting {
+            Waiting::Task(waker) => waker.will_wake(cx.waker()),
+            Waiting::Reader(_) => false,
+        });
         if !asked {
             // Cloned outside the borrow, as cloning runs code of the task's.
             let waker = cx.waker().clone();
@@ -805,6 +808,34 @@ mod tests {
         drop(reader.take().expect("the buffer it was handed"));
         assert_eq!((woken_task.times(), woken_reader.times()), (asked + 1, 1));
         assert!(asks(&pool).is_ready());
+    }
+
+    #[test]
+    fn tasks_that_ask_in_turn_keep_one_place_each() {
+        let pool = BufPool::new(1, 8).expect("a pool");
+        let lease = pool.take().expect("the buffer");
+        let ((woken_first, first), (woken_second, second)) = (task(), task());
+        // Where a waker cannot be told to be the one in the line already,
+        // which `will_wake` need not tell, each asking takes a place.
+        let places = if first.will_wake(&first.clone()) {
+            1
+        } else {
+            10
+        };
+        for _ in 0..10 {
+            for waker in [&first, &second] {
+                let asked = pool.poll_available(&mut Context::from_waker(waker));
+                assert!(asked.is_pending());
+            }
+        }
+        assert_eq!(pool.pool.line.borrow().len(), 2 * places);
+
+        drop(lease);
+        assert_eq!(
+            (woken_first.times(), woken_second.times()),
+            (places, places)
+        );
+        assert!(pool.pool.line.borrow().is_empty());
     }
 
     #[test]
