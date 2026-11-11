@@ -1,8 +1,9 @@
 //! Times what an engine does for its timers and its I/O, through the API
 //! that every engine with I/O shares: how long a sleep of a millisecond
 //! takes, round trips and bytes a second over a loopback connection, a file
-//! written and read back, and tasks yielding to each other. Each figure is
-//! the best of a few runs, all on one thread.
+//! written and read back, and tasks yielding to each other, with no I/O in
+//! flight and while a read waits. Each figure is the best of a few runs,
+//! all on one thread.
 //!
 //! Run it with `cargo run --release -p ruio --example speed`.
 
@@ -203,6 +204,25 @@ mod timed {
         Ok((2 * YIELDS) as f64 / started.elapsed().as_secs_f64() / 1e6)
     }
 
+    /// How many million times a second two tasks yield to each other while
+    /// a read on a connection waits for data that does not come. A turn of
+    /// the engine between them then has an operation in flight to ask the
+    /// system about, where with none it has nothing to ask.
+    async fn yields_beside_a_read() -> io::Result<f64> {
+        let (client, server) = pair().await?;
+        let waiting = ruio::spawn(async move {
+            // Until the client goes, having written nothing.
+            let (read, _) = server.read(Vec::with_capacity(64)).await;
+            read
+        });
+        // The read starts as its task first runs.
+        ruio::yield_now().await;
+        let yielded = yields().await?;
+        drop(client);
+        waiting.await.map_err(io::Error::other)??;
+        Ok(yielded)
+    }
+
     /// Measures each, and prints what it found.
     pub(super) async fn run() -> io::Result<()> {
         let mut slept = (Duration::MAX, Duration::MAX);
@@ -230,6 +250,8 @@ mod timed {
         println!("file read: {:.0} MiB/s", filed.1);
         let yielded = best(yields).await?;
         println!("yields between two tasks: {yielded:.1} million a second");
+        let beside = best(yields_beside_a_read).await?;
+        println!("yields while a read waits: {beside:.1} million a second");
         Ok(())
     }
 }
