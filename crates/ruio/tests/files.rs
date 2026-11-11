@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write as _};
 use std::path::PathBuf;
 
 use ruio::buf::IoBuf;
@@ -119,6 +119,31 @@ async fn files_open_as_their_options_say() -> io::Result<()> {
     let file = within(File::options().write(true).truncate(true).open(&path)).await?;
     within(file.close()).await?;
     assert!(within(fs::read(&path)).await?.is_empty());
+    Ok(())
+}
+
+#[ruio::test]
+async fn an_append_at_the_position_leaves_it_at_the_end() -> io::Result<()> {
+    let scratch = Scratch::new("append-position");
+    let path = scratch.path("file");
+    std::fs::write(&path, "first")?;
+    let mut options = File::options();
+    options.read(true).append(true);
+    let file = within(options.open(&path)).await?;
+    assert_eq!(within(file.write(", second")).await.0?, 8);
+    // The position is at the end, where the write left it.
+    let (read, _) = within(file.read(Vec::with_capacity(16))).await;
+    assert_eq!(read?, 0);
+    // What is appended after is read from there.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)?
+        .write_all(b"!")?;
+    let (read, buf) = within(file.read(Vec::with_capacity(16))).await;
+    assert_eq!(read?, 1);
+    assert_eq!(buf, b"!");
+    within(file.close()).await?;
+    assert_eq!(std::fs::read(&path)?, b"first, second!");
     Ok(())
 }
 

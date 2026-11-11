@@ -115,12 +115,20 @@ where
 /// position go one at a time: each starts where the file's position is as
 /// the method is called, and moves it on by what it transferred once it
 /// completes. A file opened to append writes at its end whatever the
-/// offset or the position.
+/// offset or the position, and a write at the position moves the position
+/// to the end it made, as on Linux: the next read at the position asks the
+/// system how long the file is then.
 pub struct File {
     file: iocp::File,
     /// Where the next read or write at the position goes. Windows keeps no
     /// position for a file opened for overlapped I/O, so the file does.
     pos: Cell<u64>,
+    /// Whether the file was opened to append.
+    append: bool,
+    /// Whether a write at the position of a file opened to append has left
+    /// the position at the end of the file, wherever that is, which a read
+    /// at the position asks for before it starts.
+    at_end: Cell<bool>,
 }
 
 impl File {
@@ -169,6 +177,7 @@ impl File {
         Write {
             write: self.file.write_at(buf, offset),
             pos: None,
+            at_end: None,
         }
     }
 
@@ -189,19 +198,37 @@ impl File {
     /// a time: they must not overlap; ones at offsets may.
     pub fn read<B: IoBufMut>(&self, buf: B) -> Read<'_, B> {
         Read {
-            read: self.file.read_at(buf, self.pos.get()),
+            read: self.file.read_at(buf, self.position()),
             pos: Some(&self.pos),
         }
     }
 
     /// Writes `buf`'s initialized bytes at the file's position, which the
-    /// write moves on, or at its end if it was opened to append; see
-    /// [`read`](File::read).
+    /// write moves on, or at its end if it was opened to append, where it
+    /// leaves the position; see [`read`](File::read).
     pub fn write<B: IoBuf>(&self, buf: B) -> Write<'_, B> {
         Write {
             write: self.file.write_at(buf, self.pos.get()),
             pos: Some(&self.pos),
+            at_end: self.append.then_some(&self.at_end),
         }
+    }
+
+    /// Where a read at the position starts: the file's position, or the
+    /// end of the file, where a write at the position left it if the file
+    /// was opened to append, which the system is asked for here, on the
+    /// runtime's thread, as the length of an open file is what the file
+    /// system holds of it, with no disk to wait for. Where the system
+    /// cannot say, the position is where the writes moved it on, and it is
+    /// asked again the next time.
+    fn position(&self) -> u64 {
+        if self.at_end.get()
+            && let Ok(status) = self.file.as_std().metadata()
+        {
+            self.pos.set(status.len());
+            self.at_end.set(false);
+        }
+        self.pos.get()
     }
 
     /// The file's data from its position on, read into buffers of `pool`,
@@ -216,7 +243,7 @@ impl File {
     /// error for a regular file.
     pub fn read_stream(&self, pool: &BufPool) -> ReadStream<'_> {
         ReadStream {
-            stream: self.file.read_stream(pool, self.pos.get()),
+            stream: self.file.read_stream(pool, self.position()),
             pos: &self.pos,
         }
     }
@@ -369,6 +396,9 @@ pub struct Write<'a, B: IoBuf> {
     write: ruio_iocp::Write<'a, B>,
     /// The file's position, which a write at it moves on.
     pos: Option<&'a Cell<u64>>,
+    /// Whether the file's position is at its end, which a write at it to a
+    /// file opened to append sets.
+    at_end: Option<&'a Cell<bool>>,
 }
 
 impl<B: IoBuf> Future for Write<'_, B> {
@@ -378,6 +408,9 @@ impl<B: IoBuf> Future for Write<'_, B> {
         let (result, buf) = ready!(Pin::new(&mut self.write).poll(cx));
         if let (Some(pos), Ok(written)) = (self.pos, &result) {
             pos.set(pos.get() + *written as u64);
+            if let Some(at_end) = self.at_end {
+                at_end.set(true);
+            }
         }
         Poll::Ready((result, buf))
     }
@@ -593,6 +626,8 @@ fn allocate(file: &std::fs::File, offset: u64, len: u64) -> io::Result<()> {
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     options: iocp::OpenOptions,
+    /// Whether the file is opened to append, as its position then follows.
+    append: bool,
 }
 
 impl OpenOptions {
@@ -601,6 +636,7 @@ impl OpenOptions {
     pub fn new() -> Self {
         Self {
             options: iocp::OpenOptions::new(),
+            append: false,
         }
     }
 
@@ -617,9 +653,10 @@ impl OpenOptions {
     }
 
     /// Opens the file for writing at its end, whatever offset or position
-    /// a write names.
+    /// a write names; a write at the position moves the position there.
     pub fn append(&mut self, append: bool) -> &mut Self {
         self.options.append(append);
+        self.append = append;
         self
     }
 
@@ -671,6 +708,8 @@ impl OpenOptions {
         Ok(File {
             file: iocp::File::from_std(file)?,
             pos: Cell::new(0),
+            append: self.append,
+            at_end: Cell::new(false),
         })
     }
 }
