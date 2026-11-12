@@ -11,7 +11,6 @@ use std::io;
 #[cfg(unix)]
 use std::io::Write as _;
 use std::net::Shutdown;
-#[cfg(ruio_uring)]
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
@@ -25,7 +24,6 @@ use ruio::buf::BufPool;
 use ruio::fs::File;
 #[cfg(ruio_uring)]
 use ruio::io::AsyncFd;
-#[cfg(ruio_uring)]
 use ruio::net::UdpSocket;
 use ruio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
@@ -131,7 +129,6 @@ async fn recv_stream_folds_a_connections_data() -> io::Result<()> {
 
 /// Datagrams stream through `map` and `take` to their senders, and the
 /// stream goes on after.
-#[cfg(ruio_uring)]
 #[ruio::test]
 async fn recv_from_stream_maps_datagrams_to_their_senders() -> io::Result<()> {
     let receiver = UdpSocket::bind("127.0.0.1:0")?;

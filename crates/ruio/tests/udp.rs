@@ -9,7 +9,6 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-#[cfg(ruio_uring)]
 use ruio::buf::BufPool;
 use ruio::net::UdpSocket;
 
@@ -101,7 +100,6 @@ async fn sockets_bound_with_reuseport_share_an_address() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_recv_stream_takes_datagram_after_datagram() -> io::Result<()> {
     let receiver = UdpSocket::bind("127.0.0.1:0")?;
@@ -125,7 +123,6 @@ async fn a_recv_stream_takes_datagram_after_datagram() -> io::Result<()> {
 /// A socket that is not connected answers its senders from the stream of
 /// its datagrams, taking those that have arrived together: each sender gets
 /// its own datagrams back, in order, and only those.
-#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_recv_from_stream_answers_each_sender() -> io::Result<()> {
     let server = UdpSocket::bind("127.0.0.1:0")?;
@@ -170,7 +167,6 @@ async fn a_recv_from_stream_answers_each_sender() -> io::Result<()> {
 
 /// A datagram longer than its buffer has room for after the header and the
 /// address is cut short, and says so; the next one comes whole.
-#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_recv_from_stream_cuts_short_what_its_buffers_cannot_hold() -> io::Result<()> {
     let receiver = UdpSocket::bind("127.0.0.1:0")?;
@@ -195,7 +191,6 @@ async fn a_recv_from_stream_cuts_short_what_its_buffers_cannot_hold() -> io::Res
 
 /// The header and an IPv4 address take 32 bytes of each buffer, and an
 /// IPv6 one 48, which a pool's buffers must have more than.
-#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_recv_from_stream_needs_room_for_a_payload() -> io::Result<()> {
     let v4 = UdpSocket::bind("127.0.0.1:0")?;

@@ -77,7 +77,9 @@
 //! [`BufPool`], as a [`RecvStream`]: it takes a
 //! buffer only once the connection has data, so that the connections that
 //! wait hold no memory, and hands the data back as leases of the pool's
-//! buffers.
+//! buffers. A UDP socket receives its datagrams so too, one to a buffer,
+//! as a [`RecvStream`] of their payloads, or, each with the address it
+//! came from, as a [`RecvFromStream`] of [`Datagram`]s.
 //!
 //! A stream writes several buffers as one, any [`IoBufs`], a bundle it
 //! received included, with [`TcpStream::write_all_vectored`]. A write may
@@ -104,10 +106,8 @@
 //! taken, where io_uring finds its ring at a socket's first operation: so
 //! taking one where no runtime runs panics.
 //!
-//! Not here yet, of what `net` has on io_uring: datagrams received into a
-//! pool (`recv_stream` and `recv_from_stream` of a UDP socket),
-//! `bind_reuseport`, and moving a stream to another core. Unix sockets are
-//! Unix's.
+//! Not here yet, of what `net` has on io_uring: `bind_reuseport`, and
+//! moving a stream to another core. Unix sockets are Unix's.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -126,12 +126,15 @@ use crate::buf::{BufBundle, BufPool, IoBuf, IoBufMut, IoBufs};
 mod addr;
 #[path = "net/portable.rs"]
 pub mod portable;
+#[path = "net/udp.rs"]
+mod udp;
 
 use addr::resolve;
 
 pub use addr::{ToSocketAddrs, lookup_host};
-pub use ruio_iocp::net::{Flush, RecvFrom, SendTo, UdpSocket, WriteAllVectored, WriteBehind};
+pub use ruio_iocp::net::{Datagram, Flush, RecvFrom, SendTo, WriteAllVectored, WriteBehind};
 pub use ruio_iocp::{Read, ReadExact, Write, WriteAll};
+pub use udp::{RecvFromStream, UdpSocket};
 
 /// A TCP listener.
 ///
@@ -567,12 +570,14 @@ impl From<net::TcpListener> for TcpListener {
     }
 }
 
-/// The data arriving on a connection, received into a [`BufPool`]. Made by
-/// [`TcpStream::recv_stream`].
+/// The data arriving on a connection, or the datagrams arriving on a UDP
+/// socket, received into a [`BufPool`]. Made by
+/// [`TcpStream::recv_stream`] and [`UdpSocket::recv_stream`].
 ///
 /// Each item is one receive's data, as a bundle of leases on buffers of the
 /// pool. The stream ends when the peer shuts down, or after yielding an
-/// error.
+/// error. A UDP socket's items are its datagrams, one to a buffer, and its
+/// stream ends only after yielding an error.
 ///
 /// A stream that waits for data holds no buffer: it takes one of the pool
 /// once the connection has data, and waits for one to return when every
