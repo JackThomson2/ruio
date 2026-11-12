@@ -1259,16 +1259,17 @@ alone.
   `fs` and `io` on that engine, under the names and with the signatures
   of io_uring's, so that code written to them builds for both, and
   `ruio::buf` re-exports the port's `BufPool`, `BufLease` and
-  `BufBundle`. `net` has `TcpListener` (`bind`, `accept`, `incoming`,
-  which keeps one accept in flight where io_uring's keeps a multishot
-  one armed), `TcpStream` (`connect` by `ToSocketAddrs`, `read`,
-  `write`, `read_exact`, `write_all`, `write_all_vectored`,
-  `write_behind`, `flush`, `try_flush`, `recv_stream`, `shutdown`, which
-  waits for a write behind as io_uring's does, `send_to`, which moves the
-  stream to another core, and the addresses and options, `linger` among
-  them, `async` as on io_uring though they wait for nothing),
-  `UdpSocket` (`send_to`, `recv_from`, `recv_stream`, `recv_from_stream`
-  and the rest), and `lookup_host`. `fs` is in two halves,
+  `BufBundle`. `net` has `TcpListener` (`bind`, `bind_reuseport`,
+  `accept`, `incoming`, which keeps one accept in flight where io_uring's
+  keeps a multishot one armed), `TcpStream` (`connect` by
+  `ToSocketAddrs`, `read`, `write`, `read_exact`, `write_all`,
+  `write_all_vectored`, `write_behind`, `flush`, `try_flush`,
+  `recv_stream`, `shutdown`, which waits for a write behind as
+  io_uring's does, `send_to`, which moves the stream to another core, and
+  the addresses and options, `linger` among them, `async` as on io_uring
+  though they wait for nothing), `UdpSocket` (`send_to`, `recv_from`,
+  `recv_stream`, `recv_from_stream` and the rest), and `lookup_host`.
+  `fs` is in two halves,
   as Windows has an overlapped form of reading and writing a file and of
   little else. Reads and writes go through the port, at an offset or at
   the file's position, which the `File` keeps, as Windows keeps none for
@@ -1315,9 +1316,27 @@ alone.
   8.1 and later do (`NtSetInformationFile`, with
   `FileReplaceCompletionInformation`) once the port has delivered the
   completions of all of the socket's operations, a cancelled one's
-  included, and the port of the core that receives it takes it. Not
-  there yet: `bind_reuseport`, and of `io`, `splice` and the two
-  `AsyncFd`s.
+  included, and the port of the core that receives it takes it.
+  `TcpListener::bind_reuseport` has the listeners of the process bound to
+  one address share one socket, which no port has, as Windows has no
+  `SO_REUSEPORT`: of several sockets bound to one address with
+  `SO_REUSEADDR`, the first bound takes every connection, and of several
+  `AcceptEx` waiting on one listener, the last started takes the next,
+  so that the core that accepted last would accept again. Each core's
+  accept takes a connection with an `accept` made at once, and otherwise
+  waits for the socket to be ready on its own port with a poll of the AFD
+  driver's; when a connection arrives, the polls of all the cores that
+  wait complete, and the first to accept takes it. So a core takes as
+  many connections as it is free to take, where Linux's kernel deals
+  them out by a hash, at the cost of waking every core that waits for
+  each connection: on four cores, the one running the clients took none
+  of 800 connections, and the others 221, 266 and 313. The first
+  listener to bind an address makes the socket, the others find it in a
+  registry of the process's by address, and it closes with the last of
+  them; a shared accept's timeout runs on the runtime's timer. Not there
+  yet: `UdpSocket::bind_reuseport`, whose cores, sharing one socket so,
+  would scatter a sender's datagrams where Linux keeps them on one
+  socket, and of `io`, `splice` and the two `AsyncFd`s.
 - **Send I/O, processes and signals on Windows.** What is `Send` on
   io_uring is on the port too, built on `ruio_iocp::portable`: waits
   that any thread may hold and poll, each running on the port of the
@@ -1498,7 +1517,7 @@ the system, not the engine.
 | Module | Every engine with I/O | io_uring's own | By the system |
 |---|---|---|---|
 | `buf` | `BufPool::new`, `BufLease`, `BufBundle`, each engine's own types with io_uring's API; and on every engine, I/O or none, `ruio-buf`'s `IoBuf`, `IoBufMut`, `IoBufs`, `Slice`, `BufResult`, `AlignedBuf` | `BufPool::with_driver`; registered buffers: `FixedBuffers`, `FixedBuf`, `FixedIoBuf` | |
-| `net` | The TCP, UDP and Unix sockets: binding, connecting, `accept` and `incoming`, `read`, `write`, `read_exact`, `write_all`, `write_all_vectored`, `write_behind`, `flush`, `shutdown`, `recv_stream`, the datagrams' `send_to`, `recv_from` and `recv_from_stream`, the options and addresses, and moving a stream to another core with a plain descriptor; the futures' `timeout`; `ToSocketAddrs` and `lookup_host`; `net::portable` | `fd()`; direct descriptors (`set_direct`, `is_direct`), and moving one to another core's ring; `send_zc`; `recv_stream_incremental` | Unix sockets on Unix |
+| `net` | The TCP, UDP and Unix sockets: binding, connecting, `accept` and `incoming`, `read`, `write`, `read_exact`, `write_all`, `write_all_vectored`, `write_behind`, `flush`, `shutdown`, `recv_stream`, the datagrams' `send_to`, `recv_from` and `recv_from_stream`, the options and addresses, `TcpListener::bind_reuseport`, and moving a stream to another core with a plain descriptor; the futures' `timeout`; `ToSocketAddrs` and `lookup_host`; `net::portable` | `fd()`; direct descriptors (`set_direct`, `is_direct`), and moving one to another core's ring; `send_zc`; `recv_stream_incremental`; `UdpSocket::bind_reuseport` | Unix sockets on Unix |
 | `fs` | `File` and `OpenOptions` as the standard library's; reads and writes at an offset and at the position, `read_exact_at`, `write_all_at`, `sync_all`, `sync_data`, `set_len`, `allocate`, `metadata`, `close` and `read_stream`; the path functions and `read_dir`; `fs::portable` | `fd()`; `read_fixed_at` and `write_fixed_at`; chains (`FileOp::link`); polled I/O (`OpenOptions::polled`); direct descriptors (`OpenOptions::direct_descriptor`); `read_stream_incremental` | `fallocate`, `sync_range`, `start_sync_range` and `advise` on Linux |
 | `io` | `AsyncRead`, `AsyncWrite`, `copy` and the futures built on them; the foreign reactor | | `AsyncFd` and `io::portable::AsyncFd` on Unix; `splice` on Linux |
 | `process`, `signal` | Spawning and waiting for children, their pipes; signals to tasks, `ctrl_c` among them | | `Child::pidfd`, `signal` and `signal_group`, and `Command::process_group`, `uid`, `gid`, `arg0` and `pre_exec`, on Linux; the signals Unix has; `Command::creation_flags` and `raw_arg`, and the console's control events, on Windows |
@@ -1523,13 +1542,12 @@ is built.
 What is left, in order:
 
 1. The I/O completion port engine from a proof of concept to ruio's I/O
-   on Windows: `bind_reuseport`, with which Linux spreads connections
-   and datagrams among the sockets bound to one address, and for which
-   Windows has no option of the kind; `ruio-compat`'s adapter there
-   receiving into the pool the port now has; the large bodies that hyper
-   echoes over the portable adapter under ruio's own runtime, which hang
-   at times on the port; and a turn that costs no call to the port while
-   an operation is in flight.
+   on Windows: `UdpSocket::bind_reuseport`, for which cores sharing one
+   socket would scatter a sender's datagrams, where Linux keeps them on
+   one socket; `ruio-compat`'s adapter there receiving into the pool the
+   port now has; the large bodies that hyper echoes over the portable
+   adapter under ruio's own runtime, which hang at times on the port; and
+   a turn that costs no call to the port while an operation is in flight.
 2. A kqueue engine for macOS, with owned-buffer I/O. kqueue reports
    readiness, so a read waits for its socket to be readable and then reads
    into the caller's buffer itself, and files go to the blocking pool.
@@ -1661,7 +1679,10 @@ What is left, in order:
   `SO_REUSEPORT` before binding, so that a socket on each core can bind one
   address, and the kernel spreads the connections, or the datagrams, among
   them by a hash of their addresses and ports. The standard library sets no
-  option before it binds, so these make the socket themselves.
+  option before it binds, so these make the socket themselves. On the
+  completion port, `TcpListener::bind_reuseport`'s listeners share one
+  socket of the process's instead, whose connections each core takes as
+  it is free to; see the engines' section.
 - `TcpStream::send_to(core)` moves a stream to another core, once a write
   behind in flight has finished, so that what that core writes comes after
   it: a plain descriptor as it is, and a direct one with `MSG_RING`. The
