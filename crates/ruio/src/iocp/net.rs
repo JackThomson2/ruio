@@ -95,6 +95,12 @@
 //! assert_send::<ruio::net::TcpStream>();
 //! ```
 //!
+//! A stream moves to another core of a [`Cores`](crate::Cores) run with
+//! [`TcpStream::send_to`], as a [`SentTcpStream`], which is `Send`: its
+//! socket leaves the port of its runtime, once the port has delivered the
+//! completions of all of its operations, and the port of the runtime that
+//! receives it takes it.
+//!
 //! The sockets of [`portable`] are `Send` and `Sync`, for code whose
 //! futures must be: TCP streams and listeners, which no port has, read and
 //! written with calls made at once on whichever thread polls them, which
@@ -106,8 +112,8 @@
 //! taken, where io_uring finds its ring at a socket's first operation: so
 //! taking one where no runtime runs panics.
 //!
-//! Not here yet, of what `net` has on io_uring: `bind_reuseport`, and
-//! moving a stream to another core. Unix sockets are Unix's.
+//! Not here yet, of what `net` has on io_uring: `bind_reuseport`. Unix
+//! sockets are Unix's.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -550,6 +556,36 @@ impl TcpStream {
         self.stream.flush().await?;
         self.stream.shutdown(how)
     }
+
+    /// Sends the stream to core `core` of the thread's run, for a task there
+    /// to [`receive`](SentTcpStream::receive), once a
+    /// [`write_behind`](Self::write_behind) in flight has finished. Its
+    /// socket leaves the port of this core's runtime once the port has
+    /// delivered the completions of all of its operations, those cancelled
+    /// as their futures were dropped included, and the port of the runtime
+    /// that receives it takes it.
+    ///
+    /// # Errors
+    ///
+    /// Hands the stream back with what the write behind failed with, or what
+    /// moving the socket off its port reports: `ResourceBusy` if an
+    /// operation on it is still in flight a second on, and `Unsupported`
+    /// before Windows 8.1, which moves no socket off its port.
+    ///
+    /// # Panics
+    ///
+    /// Outside [`Cores::run`](crate::Cores::run), or if the run has no core
+    /// `core`.
+    pub async fn send_to(self, core: usize) -> Result<SentTcpStream, (io::Error, TcpStream)> {
+        // Whichever runtime receives the stream takes it, but the core is
+        // asked for as on io_uring, where a direct descriptor goes to its
+        // ring.
+        let _ = crate::handle_of(core);
+        match self.stream.send_off().await {
+            Ok(stream) => Ok(SentTcpStream { stream }),
+            Err((err, stream)) => Err((err, Self { stream })),
+        }
+    }
 }
 
 impl fmt::Debug for TcpStream {
@@ -567,6 +603,33 @@ impl From<net::TcpStream> for TcpStream {
 impl From<net::TcpListener> for TcpListener {
     fn from(listener: net::TcpListener) -> Self {
         Self::from_std(listener)
+    }
+}
+
+/// A TCP stream on its way to another core: `Send`, unlike a [`TcpStream`].
+/// Made by [`TcpStream::send_to`]; on the core it was sent to, a task makes
+/// it a stream again with [`receive`](SentTcpStream::receive). Its socket is
+/// on no port meanwhile. Dropping it closes the connection.
+#[derive(Debug)]
+pub struct SentTcpStream {
+    stream: iocp::SentTcpStream,
+}
+
+impl SentTcpStream {
+    /// The stream, on the port of the thread's runtime: that of the core it
+    /// was sent to, or of any other runtime whose thread this is.
+    ///
+    /// # Panics
+    ///
+    /// Where no runtime runs, or if the system refuses to associate the
+    /// socket with the runtime's port.
+    pub fn receive(self) -> TcpStream {
+        match self.stream.receive() {
+            Ok(stream) => TcpStream { stream },
+            Err(err) => {
+                panic!("cannot take the stream for the port of the thread's runtime: {err}")
+            }
+        }
     }
 }
 

@@ -489,8 +489,8 @@ fn a_server_on_several_cores_shares_out_the_connections() {
 }
 
 /// A connection accepted on one core moves to another, which serves it: as
-/// a plain descriptor, and as a direct one, from ring to ring.
-#[cfg(ruio_uring)]
+/// a plain descriptor, and, with io_uring, as a direct one, from ring to
+/// ring; with the completion port, from port to port.
 #[test]
 fn a_stream_moves_to_another_core() {
     let all = ruio::Cores::all().unwrap();
@@ -502,8 +502,13 @@ fn a_stream_moves_to_another_core() {
             if core.index() != 0 {
                 return Ok(());
             }
-            for direct in [false, true] {
+            #[cfg(ruio_uring)]
+            let kinds = [false, true];
+            #[cfg(not(ruio_uring))]
+            let kinds = [false];
+            for direct in kinds {
                 let listener = TcpListener::bind("127.0.0.1:0")?;
+                #[cfg(ruio_uring)]
                 listener.set_direct(direct);
                 let addr = listener.local_addr()?;
                 let head = pattern(8 << 20, usize::from(direct));
@@ -528,6 +533,7 @@ fn a_stream_moves_to_another_core() {
                 let sent = within(server.send_to(1)).await.map_err(|(err, _)| err)?;
                 let served = ruio::handle_of(1).spawn_with(move || async move {
                     let stream = sent.receive();
+                    #[cfg(ruio_uring)]
                     assert_eq!(stream.is_direct(), direct);
                     within(stream.write_all("tail")).await.0?;
                     let (read, buf) = within(stream.read_exact(Vec::with_capacity(4))).await;
