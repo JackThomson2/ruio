@@ -28,6 +28,11 @@
 //! the completions of all of its operations, and the other engine's port
 //! takes it as it takes a new one.
 //!
+//! A listener that the engines of a process share, a `SharedListener`, is
+//! on no port: each engine's thread accepts from it with a call made at
+//! once, waiting for it to be ready on its own port, and puts the stream on
+//! that port, so that the engines share its connections out.
+//!
 //! A stream's socket asks the system to queue no completion for an
 //! operation that succeeds during the call that starts it, where its
 //! provider allows that. So a read of data that has arrived, and a write
@@ -61,6 +66,7 @@ use crate::sys;
 mod datagrams;
 mod recv;
 mod sent;
+mod shared;
 mod udp;
 mod vectored;
 mod write_behind;
@@ -68,6 +74,7 @@ mod write_behind;
 pub use datagrams::{Datagram, RecvFromStream};
 pub use recv::RecvStream;
 pub use sent::SentTcpStream;
+pub use shared::{SharedAccept, SharedListener};
 pub use udp::{RecvFrom, SendTo, UdpSocket};
 pub use vectored::WriteAllVectored;
 pub use write_behind::{Flush, WriteBehind};
@@ -1178,7 +1185,7 @@ mod tests {
 
     use ruio_engine::{Build, Engine};
 
-    use super::{RawAddr, TcpStream, UdpSocket};
+    use super::{RawAddr, SharedListener, TcpStream, UdpSocket};
     use crate::buf::BufPool;
     use crate::engine::{AT_ONCE, Builder, Iocp, skipped};
     use crate::handle::IoHandle;
@@ -1460,6 +1467,44 @@ mod tests {
         assert_eq!(read?, 5);
         assert_eq!(buf, b"moved");
         assert!(in_flight(&engine).starts_with("in_flight: 0,"));
+        Ok(())
+    }
+
+    #[test]
+    fn connections_taken_without_the_port_yield_to_it_all_the_same() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let listener = SharedListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let addr = listener.local_addr()?;
+        // More connections than may be taken between two turns, all waiting.
+        let clients = (0..AT_ONCE + 8)
+            .map(|_| net::TcpStream::connect(addr))
+            .collect::<io::Result<Vec<_>>>()?;
+        engine.submit()?;
+
+        // Each accept takes a connection without the port, until as many
+        // operations have finished so as may between two turns.
+        let (woken, waker) = task();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..AT_ONCE {
+            let Poll::Ready(taken) = pin!(listener.accept()).poll(&mut cx) else {
+                panic!("an accept waited for a connection that was waiting");
+            };
+            taken?;
+        }
+        assert!(in_flight(&engine).starts_with("in_flight: 0,"));
+        // Then an accept has its task woken, to try again after the turn,
+        // and waits for nothing meanwhile.
+        let mut accept = pin!(listener.accept());
+        assert!(accept.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(woken.0.load(Ordering::Relaxed), 1);
+        assert!(in_flight(&engine).starts_with("in_flight: 0,"));
+        engine.submit()?;
+        let Poll::Ready(taken) = accept.as_mut().poll(&mut cx) else {
+            panic!("an accept waited for more than a turn of the port");
+        };
+        taken?;
+        drop(clients);
         Ok(())
     }
 

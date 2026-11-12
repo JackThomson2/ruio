@@ -31,7 +31,9 @@
 //! (`net::RecvFromStream`), and a file reads into it (`fs::ReadStream`).
 //! A stream also writes several buffers as one, leaves a write behind it
 //! for the engine to finish, and moves to the port of another engine, on
-//! another thread (`net::TcpStream::send_off`).
+//! another thread (`net::TcpStream::send_off`). A listener that the
+//! engines of a process share (`net::SharedListener`) is on no port, and
+//! each engine's thread accepts from it onto its own.
 //!
 //! A stream's socket and a file on a disk ask the system to queue no
 //! completion for an operation that succeeds during the call that starts
