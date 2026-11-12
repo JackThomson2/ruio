@@ -14,10 +14,12 @@ use std::time::Duration;
 
 use ruio_buf::{BufResult, IoBuf, IoBufMut};
 
+use super::datagrams::{Datagrams, RecvFromStream};
 use super::{
-    RawAddr, bind_to, family, first_bound, handle_of, last_error, open_socket, outcome, socket_of,
-    start_recv, start_send, taken,
+    RawAddr, RecvStream, bind_to, family, first_bound, handle_of, last_error, open_socket, outcome,
+    socket_of, start_recv, start_send, taken,
 };
+use crate::buf::BufPool;
 use crate::handle::{IoHandle, Raw};
 use crate::op::{Limit, Op, Read, Started, Write};
 use crate::sys;
@@ -170,6 +172,49 @@ impl UdpSocket {
         RecvFrom {
             op: Op::new(self.socket.target(), receiving, 0),
         }
+    }
+
+    /// The datagrams arriving on the socket, each received into a buffer of
+    /// `pool` as it arrives, without the address it came from: for a
+    /// connected socket, whose datagrams all come from its peer; see
+    /// [`RecvStream`]. [`recv_from_stream`](Self::recv_from_stream) gives
+    /// each datagram's address, for a socket that answers whoever sends to
+    /// it.
+    pub fn recv_stream(&self, pool: &BufPool) -> RecvStream<'_> {
+        RecvStream::of_datagrams(Datagrams::new(&self.socket, pool, 0))
+    }
+
+    /// The datagrams arriving on the socket, each with the address it came
+    /// from, received into buffers of `pool` as they arrive: what a socket
+    /// that is not connected answers its senders from; see
+    /// [`RecvFromStream`].
+    ///
+    /// Each datagram leaves out of its buffer the room that a header and the
+    /// address take on io_uring: 32 bytes for an IPv4 socket, and 48 for an
+    /// IPv6 one. A datagram longer than the rest of the buffer is cut short,
+    /// and the rest of it lost, which [`Datagram::is_truncated`] tells.
+    ///
+    /// [`Datagram::is_truncated`]: super::Datagram::is_truncated
+    ///
+    /// ```no_run
+    /// # async fn echo(socket: ruio_iocp::net::UdpSocket) -> std::io::Result<()> {
+    /// let pool = ruio_iocp::buf::BufPool::new(256, 2048)?;
+    /// let mut datagrams = socket.recv_from_stream(&pool)?;
+    /// while let Some(datagram) = datagrams.next().await {
+    ///     let (data, from) = datagram?.into_parts();
+    ///     socket.send_to(data, from).await.0?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if the pool's buffers have no room for a payload after
+    /// the room each datagram leaves out, and what the system reports of the
+    /// socket's address.
+    pub fn recv_from_stream(&self, pool: &BufPool) -> io::Result<RecvFromStream<'_>> {
+        RecvFromStream::new(&self.socket, pool, self.local_addr()?)
     }
 }
 

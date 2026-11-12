@@ -14,7 +14,9 @@
 //! sockets, which the types here hold.
 //!
 //! A stream also receives into a pool of buffers, as a `RecvStream`, which
-//! holds no buffer while it waits for data.
+//! holds no buffer while it waits for data, and a UDP socket receives its
+//! datagrams so, as a `RecvStream` too or, each with the address it came
+//! from, as a `RecvFromStream`.
 //!
 //! A stream's write may be left behind it, for the engine to finish: the
 //! send is started with no future to wait for it, shares the socket with
@@ -51,11 +53,13 @@ use crate::handle::{IoHandle, Raw};
 use crate::op::{Limit, Op, Read, ReadExact, Started, Write, WriteAll};
 use crate::sys;
 
+mod datagrams;
 mod recv;
 mod udp;
 mod vectored;
 mod write_behind;
 
+pub use datagrams::{Datagram, RecvFromStream};
 pub use recv::RecvStream;
 pub use udp::{RecvFrom, SendTo, UdpSocket};
 pub use vectored::WriteAllVectored;
@@ -1167,7 +1171,7 @@ mod tests {
 
     use ruio_engine::{Build, Engine};
 
-    use super::{RawAddr, TcpStream};
+    use super::{RawAddr, TcpStream, UdpSocket};
     use crate::buf::BufPool;
     use crate::engine::{AT_ONCE, Builder, Iocp, skipped};
 
@@ -1364,6 +1368,48 @@ mod tests {
         engine.submit()?;
         let Poll::Ready(Some(item)) = received.poll_next(&mut cx) else {
             panic!("a stream with data waited for more than a turn of the port");
+        };
+        item?;
+        Ok(())
+    }
+
+    #[test]
+    fn datagrams_received_without_the_port_yield_to_it_all_the_same() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let peer = net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        // More datagrams than the stream may receive between two turns, all
+        // of them arrived.
+        for _ in 0..2 * AT_ONCE {
+            assert_eq!(peer.send_to(&[7], socket.local_addr()?)?, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let pool = BufPool::new(1, 64)?;
+        let mut datagrams = socket.recv_from_stream(&pool)?;
+        // The wait for the first goes through the port.
+        let first = block_on(&engine, datagrams.next()).expect("a datagram")?;
+        assert_eq!((&*first, first.from()), (&[7][..], peer.local_addr()?));
+        drop(first);
+        engine.submit()?;
+
+        // Each of the rest is received without the port, until as many
+        // operations have finished so as may between two turns.
+        let (woken, waker) = task();
+        let mut cx = Context::from_waker(&waker);
+        let mut items = 0;
+        while let Poll::Ready(item) = datagrams.poll_next(&mut cx) {
+            assert_eq!(*item.expect("a datagram that has arrived")?, [7]);
+            items += 1;
+            assert!(items <= AT_ONCE, "a stream with datagrams never yielded");
+        }
+        assert_eq!(items, AT_ONCE);
+        // Then the stream has its task woken, to try again after the turn.
+        assert_eq!(woken.0.load(Ordering::Relaxed), 1);
+        assert!(in_flight(&engine).starts_with("in_flight: 0,"));
+        engine.submit()?;
+        let Poll::Ready(Some(item)) = datagrams.poll_next(&mut cx) else {
+            panic!("a stream with datagrams waited for more than a turn of the port");
         };
         item?;
         Ok(())

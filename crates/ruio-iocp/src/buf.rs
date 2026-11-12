@@ -171,6 +171,7 @@ impl BufPool {
     fn lease(&self, buf: Box<[u8]>) -> BufLease {
         BufLease {
             buf,
+            start: 0,
             len: 0,
             pool: Rc::clone(&self.pool),
         }
@@ -329,6 +330,9 @@ impl Drop for Claim {
 pub struct BufLease {
     /// The buffer, all of it initialized.
     buf: Box<[u8]>,
+    /// Where in the buffer the lease's room starts. The bytes before it are
+    /// none of the lease's, as the room a datagram's header takes.
+    start: usize,
     len: usize,
     pool: Rc<Pool>,
 }
@@ -346,20 +350,30 @@ impl BufLease {
         self.len == 0
     }
 
-    /// How much the lease can hold: the size of the buffer.
+    /// How much the lease can hold: the size of the buffer, less the room
+    /// before the data that a datagram's lease leaves out.
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.start
     }
 
-    /// Reads into the buffer with `read`, which is given all of it and
-    /// says how many bytes it put at its start: the data the lease then
+    /// Leaves the first `room` bytes of the buffer out of the lease, or all
+    /// of them if it has fewer: its data and its room start after them. The
+    /// lease holds no data then.
+    pub(crate) fn leave_out(&mut self, room: usize) {
+        self.start = room.min(self.buf.len());
+        self.len = 0;
+    }
+
+    /// Reads into the lease's room with `read`, which is given all of it
+    /// and says how many bytes it put at its start: the data the lease then
     /// holds.
     pub(crate) fn fill(
         &mut self,
         read: impl FnOnce(&mut [u8]) -> io::Result<usize>,
     ) -> io::Result<usize> {
-        let len = read(&mut self.buf)?.min(self.buf.len());
+        let room = &mut self.buf[self.start..];
+        let len = read(room)?.min(room.len());
         self.len = len;
         Ok(len)
     }
@@ -370,24 +384,24 @@ impl Deref for BufLease {
 
     #[inline]
     fn deref(&self) -> &[u8] {
-        &self.buf[..self.len]
+        &self.buf[self.start..self.start + self.len]
     }
 }
 
 impl DerefMut for BufLease {
     #[inline]
     fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.len]
+        &mut self.buf[self.start..self.start + self.len]
     }
 }
 
 // SAFETY: the buffer is on the heap, which moving the lease leaves in
 // place, and is the lease's alone until it is dropped. All of it is
-// initialized.
+// initialized, and the lease's room is the end of it, from `start`.
 unsafe impl IoBuf for BufLease {
     #[inline]
     fn stable_ptr(&self) -> *const u8 {
-        self.buf.as_ptr()
+        self.buf[self.start..].as_ptr()
     }
 
     #[inline]
@@ -402,11 +416,11 @@ unsafe impl IoBuf for BufLease {
 }
 
 // SAFETY: as for `IoBuf`; `set_init` only moves the length within the
-// buffer, all of which is initialized.
+// lease's room, all of which is initialized.
 unsafe impl IoBufMut for BufLease {
     #[inline]
     fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.buf.as_mut_ptr()
+        self.buf[self.start..].as_mut_ptr()
     }
 
     #[inline]
@@ -665,6 +679,38 @@ mod tests {
         // One that says it read more than the buffer holds is not believed.
         assert_eq!(lease.fill(|_| Ok(64)).expect("a read"), 8);
         assert_eq!(lease.len(), 8);
+    }
+
+    #[test]
+    fn a_lease_may_leave_the_start_of_its_buffer_out() {
+        let pool = BufPool::new(1, 8).expect("a pool");
+        let mut lease = pool.take().expect("a buffer");
+        read_into(&mut lease, b"abcdefgh");
+        lease.leave_out(3);
+        assert!(lease.is_empty());
+        assert_eq!(lease.capacity(), 5);
+        assert_eq!((lease.bytes_init(), lease.bytes_total()), (0, 5));
+        let mut data: &[u8] = b"hello, pool";
+        let read = lease.fill(|buf| io::Read::read(&mut data, buf));
+        assert_eq!(read.expect("a read of a slice"), 5);
+        assert_eq!(&*lease, b"hello");
+        // The room starts where the lease's data does.
+        // SAFETY: the lease holds that many bytes there.
+        let raw = unsafe { slice::from_raw_parts(lease.stable_ptr(), lease.bytes_init()) };
+        assert_eq!(raw, b"hello");
+        read_into(&mut lease, b"HE");
+        assert_eq!(&*lease, b"HEllo");
+        // SAFETY: the buffer is initialized throughout.
+        unsafe { lease.set_init(64) };
+        assert_eq!(lease.len(), 5);
+        assert_eq!(format!("{lease:?}"), "BufLease { len: 5, capacity: 5 }");
+        // Leaving out more than the buffer has leaves no room.
+        lease.leave_out(9);
+        assert_eq!((lease.len(), lease.capacity()), (0, 0));
+        assert_eq!(lease.fill(|room| Ok(room.len())).expect("a read"), 0);
+        drop(lease);
+        // The whole buffer is the next lease's.
+        assert_eq!(pool.take().expect("the buffer again").capacity(), 8);
     }
 
     #[test]

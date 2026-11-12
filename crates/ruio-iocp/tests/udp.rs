@@ -1,6 +1,7 @@
 //! UDP sockets through the port: datagrams to and from the standard
-//! library's sockets and each other, ones longer than their buffers, and
-//! receives cancelled while the system has them.
+//! library's sockets and each other, ones longer than their buffers,
+//! receives cancelled while the system has them, and streams of datagrams
+//! received into pools of buffers.
 #![cfg(windows)]
 
 use std::io;
@@ -9,7 +10,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ruio_executor::{Runtime, time};
-use ruio_iocp::net::UdpSocket;
+use ruio_iocp::buf::BufPool;
+use ruio_iocp::net::{Datagram, RecvFromStream, UdpSocket};
 
 /// How long a test waits for what should come at once, rather than hang.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -222,6 +224,297 @@ fn a_socket_keeps_the_option_to_broadcast() -> io::Result<()> {
         assert!(!socket.broadcast()?);
         socket.set_broadcast(true)?;
         assert!(socket.broadcast()?);
+        Ok(())
+    })
+}
+
+/// Sends each of `datagrams` from `sender` to `to`.
+async fn send_all(
+    sender: &UdpSocket,
+    to: SocketAddr,
+    datagrams: impl IntoIterator<Item = Vec<u8>>,
+) -> io::Result<()> {
+    for datagram in datagrams {
+        let len = datagram.len();
+        let (sent, _) = sender.send_to(datagram, to).await;
+        assert_eq!(sent?, len);
+    }
+    Ok(())
+}
+
+/// The next datagram of `datagrams`, which should come at once.
+async fn next_datagram(datagrams: &mut RecvFromStream<'_>) -> io::Result<Datagram> {
+    time::timeout(PATIENCE, datagrams.next())
+        .await
+        .expect("a datagram comes")
+        .expect("the stream goes on")
+}
+
+#[test]
+fn a_recv_from_stream_answers_each_sender() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let server = UdpSocket::bind(loopback())?;
+        let addr = server.local_addr()?;
+        let clients = [UdpSocket::bind(loopback())?, UdpSocket::bind(loopback())?];
+        for round in 0..3 {
+            for (index, client) in clients.iter().enumerate() {
+                send_all(client, addr, [vec![index as u8, round]]).await?;
+            }
+        }
+        let pool = BufPool::new(8, 2048)?;
+        let mut datagrams = server.recv_from_stream(&pool)?;
+        let mut answered = 0;
+        while answered < 6 {
+            let mut batch = vec![next_datagram(&mut datagrams).await?];
+            while let Some(datagram) = datagrams.next_ready() {
+                batch.push(datagram?);
+            }
+            for datagram in batch {
+                assert!(!datagram.is_truncated());
+                let (data, from) = datagram.into_parts();
+                // The payload's room leaves out what io_uring's header and
+                // an IPv4 address take.
+                assert_eq!((data.len(), data.capacity()), (2, 2048 - 32));
+                let (sent, _) = server.send_to(data, from).await;
+                assert_eq!(sent?, 2);
+                answered += 1;
+            }
+        }
+        for (index, client) in clients.iter().enumerate() {
+            for round in 0..3 {
+                let (received, buf) =
+                    time::timeout(PATIENCE, client.recv_from(Vec::with_capacity(8)))
+                        .await
+                        .expect("the answer comes");
+                assert_eq!(received?, (2, addr));
+                assert_eq!(buf, [index as u8, round]);
+            }
+        }
+        assert_eq!(pool.available(), 8);
+        assert!(datagrams.next_ready().is_none());
+        assert!(!datagrams.is_ended());
+        Ok(())
+    })
+}
+
+#[test]
+fn datagrams_that_have_arrived_are_taken_without_waiting() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let receiver = UdpSocket::bind(loopback())?;
+        let sender = UdpSocket::bind(loopback())?;
+        let pool = BufPool::new(4, 64)?;
+        let mut datagrams = receiver.recv_from_stream(&pool)?;
+        // Nothing has arrived, and nothing is waited for.
+        assert!(datagrams.next_ready().is_none());
+        let to = receiver.local_addr()?;
+        send_all(&sender, to, (0..10).map(|at| vec![at; 3])).await?;
+        time::sleep(Duration::from_millis(50)).await;
+        let first = next_datagram(&mut datagrams).await?;
+        let mut taken = vec![first[0]];
+        drop(first);
+        while let Some(datagram) = datagrams.next_ready() {
+            let datagram = datagram?;
+            assert_eq!((datagram.len(), datagram.from()), (3, sender.local_addr()?));
+            taken.push(datagram[0]);
+        }
+        assert_eq!(taken, (0..10).collect::<Vec<u8>>());
+        Ok(())
+    })
+}
+
+#[test]
+fn a_datagram_longer_than_the_room_of_its_buffer_is_cut_short() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let receiver = UdpSocket::bind(loopback())?;
+        let sender = UdpSocket::bind(loopback())?;
+        let to = receiver.local_addr()?;
+        // Of each buffer's 64 bytes, the stream leaves out 32.
+        let pool = BufPool::new(4, 64)?;
+        send_all(&sender, to, [vec![7; 33], vec![8; 32]]).await?;
+        let mut datagrams = receiver.recv_from_stream(&pool)?;
+        let cut = next_datagram(&mut datagrams).await?;
+        assert_eq!((&*cut, cut.is_truncated()), (&[7; 32][..], true));
+        assert_eq!(cut.from(), sender.local_addr()?);
+        let whole = next_datagram(&mut datagrams).await?;
+        assert_eq!((&*whole, whole.is_truncated()), (&[8; 32][..], false));
+        assert_eq!(whole.from(), sender.local_addr()?);
+        let debug = format!("{whole:?}");
+        assert!(debug.contains("len: 32, truncated: false"), "{debug}");
+        assert_eq!(whole.into_data().capacity(), 32);
+
+        // One that arrives while the stream waits is cut the same way.
+        let waited = time::timeout(Duration::from_millis(20), datagrams.next()).await;
+        assert!(waited.is_err(), "the stream waits for a datagram");
+        send_all(&sender, to, [vec![9; 100]]).await?;
+        let mut cut = next_datagram(&mut datagrams).await?;
+        assert_eq!((&*cut, cut.is_truncated()), (&[9; 32][..], true));
+        cut[0] = 0;
+        let (data, from) = cut.into_parts();
+        assert_eq!(
+            (data[..2].to_vec(), from),
+            (vec![0, 9], sender.local_addr()?)
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn a_recv_from_stream_needs_room_for_a_payload() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let v4 = UdpSocket::bind(loopback())?;
+        let small = BufPool::new(2, 32)?;
+        let err = v4.recv_from_stream(&small).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let pool = BufPool::new(2, 48)?;
+        assert!(v4.recv_from_stream(&pool).is_ok());
+
+        let v6 = match UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)) {
+            Ok(socket) => socket,
+            Err(err) => {
+                eprintln!("skipped: no IPv6 loopback: {err}");
+                return Ok(());
+            }
+        };
+        let err = v6.recv_from_stream(&pool).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let sender = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))?;
+        send_all(&sender, v6.local_addr()?, [b"six".to_vec()]).await?;
+        let pool = BufPool::new(2, 64)?;
+        let mut datagrams = v6.recv_from_stream(&pool)?;
+        let datagram = next_datagram(&mut datagrams).await?;
+        assert_eq!(
+            (&*datagram, datagram.from()),
+            (&b"six"[..], sender.local_addr()?)
+        );
+        assert_eq!(datagram.into_data().capacity(), 16);
+        Ok(())
+    })
+}
+
+#[test]
+fn datagrams_wait_in_the_socket_while_the_pool_is_dry() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let receiver = UdpSocket::bind(loopback())?;
+        let sender = UdpSocket::bind(loopback())?;
+        let pool = BufPool::new(1, 64)?;
+        let mut datagrams = receiver.recv_from_stream(&pool)?;
+        let to = receiver.local_addr()?;
+        send_all(&sender, to, [b"one".to_vec(), b"two".to_vec()]).await?;
+        let one = next_datagram(&mut datagrams).await?;
+        assert_eq!(&*one, b"one");
+        assert_eq!(pool.available(), 0);
+        // The second waits for the one buffer.
+        assert!(datagrams.next_ready().is_none());
+        let waited = time::timeout(Duration::from_millis(50), datagrams.next()).await;
+        assert!(waited.is_err(), "the stream waits for a buffer");
+        drop(one);
+        let two = next_datagram(&mut datagrams).await?;
+        assert_eq!((&*two, two.from()), (&b"two"[..], sender.local_addr()?));
+        drop(two);
+        assert_eq!(pool.available(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn a_datagram_of_no_bytes_is_one_all_the_same() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let receiver = UdpSocket::bind(loopback())?;
+        let sender = UdpSocket::bind(loopback())?;
+        let to = receiver.local_addr()?;
+        let pool = BufPool::new(2, 64)?;
+        let mut datagrams = receiver.recv_from_stream(&pool)?;
+        // One that arrives while the stream waits for it.
+        let waited = time::timeout(Duration::from_millis(20), datagrams.next()).await;
+        assert!(waited.is_err(), "the stream waits for a datagram");
+        send_all(&sender, to, [Vec::new()]).await?;
+        let empty = next_datagram(&mut datagrams).await?;
+        assert!(empty.is_empty() && !empty.is_truncated());
+        assert_eq!(empty.from(), sender.local_addr()?);
+        drop(empty);
+        // And one that has arrived before, with another behind it.
+        send_all(&sender, to, [Vec::new(), b"after".to_vec()]).await?;
+        let empty = next_datagram(&mut datagrams).await?;
+        assert!(empty.is_empty());
+        drop(empty);
+        let after = next_datagram(&mut datagrams).await?;
+        assert_eq!(&*after, b"after");
+        Ok(())
+    })
+}
+
+#[test]
+fn a_stream_dropped_while_it_waits_leaves_datagrams_to_other_receives() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let receiver = UdpSocket::bind(loopback())?;
+        let sender = UdpSocket::bind(loopback())?;
+        let to = receiver.local_addr()?;
+        let pool = BufPool::new(1, 64)?;
+        let mut datagrams = receiver.recv_from_stream(&pool)?;
+        let waited = time::timeout(Duration::from_millis(20), datagrams.next()).await;
+        assert!(waited.is_err(), "the stream waits for a datagram");
+        drop(datagrams);
+
+        // The socket, which the stream made non-blocking, receives through
+        // the port as before.
+        send_all(&sender, to, [b"after".to_vec()]).await?;
+        let (received, buf) = time::timeout(PATIENCE, receiver.recv_from(Vec::with_capacity(16)))
+            .await
+            .expect("the receive completes");
+        assert_eq!(received?, (5, sender.local_addr()?));
+        assert_eq!(buf, b"after");
+        let waiting = time::timeout(
+            Duration::from_millis(20),
+            receiver.recv_from(Vec::with_capacity(16)),
+        )
+        .await;
+        assert!(waiting.is_err(), "the receive waits for a datagram");
+
+        // Another stream receives what comes next.
+        send_all(&sender, to, [b"again".to_vec()]).await?;
+        let mut datagrams = receiver.recv_from_stream(&pool)?;
+        let again = next_datagram(&mut datagrams).await?;
+        assert_eq!(&*again, b"again");
+        Ok(())
+    })
+}
+
+#[test]
+fn a_recv_stream_takes_datagram_after_datagram() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let receiver = UdpSocket::bind(loopback())?;
+        let sender = UdpSocket::bind(loopback())?;
+        receiver.connect(sender.local_addr()?)?;
+        let to = receiver.local_addr()?;
+        // Fewer buffers than datagrams, each of which takes one.
+        let pool = BufPool::new(4, 16)?;
+        send_all(&sender, to, (1..=10).map(|size| vec![size as u8; size])).await?;
+        // One longer than a buffer, of which the buffer holds the start.
+        send_all(&sender, to, [vec![20; 20]]).await?;
+        let mut datagrams = receiver.recv_stream(&pool);
+        let mut held = Vec::new();
+        for size in 1..=10 {
+            let data = time::timeout(PATIENCE, datagrams.next())
+                .await
+                .expect("a datagram comes")
+                .expect("the stream goes on")?;
+            assert_eq!((data.buffers(), data.to_vec()), (1, vec![size as u8; size]));
+            // The pool runs dry and refills.
+            held.push(data);
+            if held.len() == 4 {
+                held.clear();
+            }
+        }
+        drop(held);
+        let cut = time::timeout(PATIENCE, datagrams.next())
+            .await
+            .expect("a datagram comes")
+            .expect("the stream goes on")?;
+        assert_eq!(cut.to_vec(), [20; 16]);
+        drop(cut);
+        assert!(datagrams.next_ready().is_none());
+        assert!(!datagrams.is_ended());
+        assert_eq!(pool.available(), 4);
         Ok(())
     })
 }

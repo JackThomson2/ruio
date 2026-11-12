@@ -27,9 +27,10 @@
 //! `buf::BufPool` is a pool of buffers for readers to take from as data
 //! arrives, which is the thread's, as a port has none for the system to
 //! pick from. A stream receives into it (`net::RecvStream`), holding no
-//! buffer while it waits for data, and a file reads into it
-//! (`fs::ReadStream`). A stream also writes several buffers as one, and
-//! leaves a write behind it for the engine to finish.
+//! buffer while it waits for data, as a UDP socket receives its datagrams
+//! (`net::RecvFromStream`), and a file reads into it (`fs::ReadStream`).
+//! A stream also writes several buffers as one, and leaves a write behind
+//! it for the engine to finish.
 //!
 //! A stream's socket and a file on a disk ask the system to queue no
 //! completion for an operation that succeeds during the call that starts

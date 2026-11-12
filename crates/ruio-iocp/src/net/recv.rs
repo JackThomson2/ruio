@@ -1,4 +1,5 @@
-//! A stream's data, received into a pool of buffers as it arrives.
+//! A stream's data, or a UDP socket's datagrams, received into a pool of
+//! buffers as they arrive.
 
 use std::fmt;
 use std::future::poll_fn;
@@ -8,25 +9,35 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker, ready};
 
 use crate::buf::{BufBundle, BufLease, BufPool, Claim};
+use crate::engine::Iocp;
 use crate::handle::IoHandle;
-use crate::op::{Op, Started};
+use crate::op::{Op, Start, Started};
 use crate::sys;
 
+use super::datagrams::Datagrams;
 use super::{Socket, outcome, socket_of, taken};
 
 /// The data arriving on a stream, received into a [`BufPool`]. Made by
-/// [`TcpStream::recv_stream`](super::TcpStream::recv_stream).
+/// [`TcpStream::recv_stream`](super::TcpStream::recv_stream), and by
+/// [`UdpSocket::recv_stream`](super::UdpSocket::recv_stream) for the
+/// datagrams arriving on a UDP socket.
 ///
 /// Each item is one receive's data, as a bundle of one lease on a buffer of
 /// the pool. The stream ends when the peer shuts down, or after yielding an
 /// error.
+///
+/// A UDP socket's items are its datagrams, one to a buffer, without the
+/// addresses they came from, and its stream ends only after yielding an
+/// error. A datagram longer than its buffer is cut short, and the rest of it
+/// lost.
 ///
 /// A stream that waits for data holds no buffer. A receive of no bytes
 /// waits in its place, which the system completes once the socket has data,
 /// and only then does the stream take a buffer of the pool, to receive into
 /// without waiting. So the streams that wait leave the pool's buffers to
 /// those that have data, and when every buffer is leased, a stream that has
-/// data waits for one to return.
+/// data waits for one to return. A UDP socket's receive of no bytes peeks,
+/// so that the datagram it completes for stays in the socket.
 ///
 /// The first poll makes the socket non-blocking, so that a receive finding
 /// that another took the data fails rather than waits. The stream's other
@@ -42,6 +53,19 @@ use super::{Socket, outcome, socket_of, taken};
 /// Dropping the stream cancels the receive that waits. Data that has
 /// arrived stays in the socket, for what reads it next.
 pub struct RecvStream<'a> {
+    source: Source<'a>,
+}
+
+/// What a stream receives.
+enum Source<'a> {
+    /// A TCP stream's data, in whatever pieces it arrives in.
+    Data(Data<'a>),
+    /// A UDP socket's datagrams, each in a buffer of its own.
+    Datagrams(Datagrams<'a>),
+}
+
+/// A TCP stream's data, as it is received into a pool.
+struct Data<'a> {
     stream: &'a IoHandle<Rc<Socket>>,
     claim: Claim,
     state: State<'a>,
@@ -63,10 +87,21 @@ enum State<'a> {
 
 impl<'a> RecvStream<'a> {
     pub(super) fn new(stream: &'a IoHandle<Rc<Socket>>, pool: &BufPool) -> Self {
-        Self {
+        let data = Data {
             stream,
             claim: Claim::new(pool),
             state: State::Idle,
+        };
+        Self {
+            source: Source::Data(data),
+        }
+    }
+
+    /// The stream of a UDP socket's `datagrams`, which leave none of their
+    /// buffers out.
+    pub(super) fn of_datagrams(datagrams: Datagrams<'a>) -> Self {
+        Self {
+            source: Source::Datagrams(datagrams),
         }
     }
 
@@ -85,9 +120,10 @@ impl<'a> RecvStream<'a> {
     ///
     /// Data has arrived if the system has said so since the stream was last
     /// polled, or if the last receive filled its buffer, which may have
-    /// left more behind. It is `None` all the same once the stream has
-    /// received as much as it may between two turns of the port. Appending
-    /// it to the data taken before gathers what has arrived:
+    /// left more behind, or took a datagram, which may have had others
+    /// behind it. It is `None` all the same once the stream has received as
+    /// much as it may between two turns of the port. Appending it to the
+    /// data taken before gathers what has arrived:
     ///
     /// ```no_run
     /// # async fn gather(stream: ruio_iocp::net::TcpStream, pool: ruio_iocp::buf::BufPool) {
@@ -110,13 +146,29 @@ impl<'a> RecvStream<'a> {
     /// Whether the stream has ended: the peer has shut down, or an error has
     /// been yielded.
     pub fn is_ended(&self) -> bool {
-        matches!(self.state, State::Ended)
+        match &self.source {
+            Source::Data(data) => matches!(data.state, State::Ended),
+            Source::Datagrams(datagrams) => datagrams.is_ended(),
+        }
     }
 
     /// Takes the stream as far as it goes without waiting: to its next
     /// data, or its end. Where it has to wait, it arranges for the task of
     /// `cx` to be woken, or, without one, starts nothing and arranges
     /// nothing.
+    fn step(&mut self, cx: Option<&mut Context<'_>>) -> Poll<Option<io::Result<BufBundle>>> {
+        match &mut self.source {
+            Source::Data(data) => data.step(cx),
+            Source::Datagrams(datagrams) => datagrams.step(cx).map(|next| {
+                next.map(|received| received.map(|datagram| BufBundle::of(datagram.lease)))
+            }),
+        }
+    }
+}
+
+impl Data<'_> {
+    /// Takes the data as far as it goes without waiting, as
+    /// [`RecvStream::step`] does.
     fn step(&mut self, mut cx: Option<&mut Context<'_>>) -> Poll<Option<io::Result<BufBundle>>> {
         loop {
             match &mut self.state {
@@ -130,44 +182,17 @@ impl<'a> RecvStream<'a> {
                     }
                     self.state = State::Waiting(Op::new(self.stream.target(), 0, 0));
                 }
-                State::Waiting(op) => {
-                    let (result, _) = match cx.as_deref_mut() {
-                        Some(cx) => ready!(op.poll_with(cx, start_wait, outcome)),
-                        // A receive whose completion has been delivered is
-                        // finished by its poll, which keeps no waker.
-                        None if op.is_done() => {
-                            let mut cx = Context::from_waker(Waker::noop());
-                            ready!(op.poll_with(&mut cx, start_wait, outcome))
-                        }
-                        None => return Poll::Pending,
-                    };
-                    match result {
-                        Ok(_) => self.state = State::Arrived,
-                        // The half that receives was shut down on this end.
-                        Err(err) if err.raw_os_error() == Some(sys::WSAESHUTDOWN) => {
-                            self.state = State::Ended;
-                        }
-                        Err(err) => return self.fail(err),
+                State::Waiting(op) => match ready!(poll_wait(op, cx.as_deref_mut(), start_wait)) {
+                    Ok(_) => self.state = State::Arrived,
+                    // The half that receives was shut down on this end.
+                    Err(err) if err.raw_os_error() == Some(sys::WSAESHUTDOWN) => {
+                        self.state = State::Ended;
                     }
-                }
+                    Err(err) => return self.fail(err),
+                },
                 State::Arrived => {
-                    // The receive costs no turn of the port, so it waits
-                    // for one once as many operations have finished as
-                    // they started as may between two.
                     let engine = self.stream.engine();
-                    if engine.at_once_spent() {
-                        if let Some(cx) = cx.as_deref_mut() {
-                            cx.waker().wake_by_ref();
-                        }
-                        return Poll::Pending;
-                    }
-                    let mut lease = match cx.as_deref_mut() {
-                        Some(cx) => ready!(self.claim.poll_take(cx)),
-                        None => match self.claim.take() {
-                            Some(lease) => lease,
-                            None => return Poll::Pending,
-                        },
-                    };
+                    let mut lease = ready!(poll_lease(engine, &mut self.claim, cx.as_deref_mut()));
                     match receive(&self.stream.io().socket, &mut lease) {
                         // Nothing more comes: the peer shut down.
                         Ok(0) => self.state = State::Ended,
@@ -208,6 +233,52 @@ impl fmt::Debug for RecvStream<'_> {
     }
 }
 
+/// Polls `op`, a receive of no bytes that `start` starts, for how it
+/// completed: with the task of `cx` to wake while it waits, or, without
+/// one, only once its completion has been delivered, starting nothing and
+/// arranging nothing.
+pub(super) fn poll_wait(
+    op: &mut Op<'_, u8>,
+    cx: Option<&mut Context<'_>>,
+    start: Start<u8>,
+) -> Poll<io::Result<u32>> {
+    let (result, _) = match cx {
+        Some(cx) => ready!(op.poll_with(cx, start, outcome)),
+        // A receive whose completion has been delivered is finished by its
+        // poll, which keeps no waker.
+        None if op.is_done() => {
+            let mut cx = Context::from_waker(Waker::noop());
+            ready!(op.poll_with(&mut cx, start, outcome))
+        }
+        None => return Poll::Pending,
+    };
+    Poll::Ready(result)
+}
+
+/// A buffer of `claim`'s pool, as a lease that holds no data yet, to
+/// receive what has arrived into without waiting: once `engine` may finish
+/// another operation as it starts before the next turn of its port, and the
+/// pool has a buffer for the reader. Until then it arranges for the task of
+/// `cx` to be woken, or, without one, arranges nothing.
+pub(super) fn poll_lease(
+    engine: &Iocp,
+    claim: &mut Claim,
+    cx: Option<&mut Context<'_>>,
+) -> Poll<BufLease> {
+    // The receive costs no turn of the port, so it waits for one once as
+    // many operations have finished as they started as may between two.
+    if engine.at_once_spent() {
+        if let Some(cx) = cx {
+            cx.waker().wake_by_ref();
+        }
+        return Poll::Pending;
+    }
+    match cx {
+        Some(cx) => claim.poll_take(cx),
+        None => claim.take().map_or(Poll::Pending, Poll::Ready),
+    }
+}
+
 /// Receives what `socket`, which does not block, has into `lease`'s buffer,
 /// without waiting: how many bytes, none of them once the peer has shut
 /// down, or `WouldBlock` if the socket has no data.
@@ -227,8 +298,41 @@ unsafe fn start_wait(
     byte: &mut u8,
     overlapped: *mut sys::Overlapped,
 ) -> io::Result<Started> {
+    // SAFETY: the caller's promise is the one `start_empty` asks for.
+    unsafe { start_empty(socket, byte, overlapped, 0) }
+}
+
+/// Starts a receive of no bytes that peeks, which completes once `socket`,
+/// a UDP socket, has a datagram, and leaves the datagram in it, as `op`'s
+/// `Start` says: it succeeds for a datagram of no bytes, and fails for any
+/// other with `WSAEMSGSIZE`, as for a datagram longer than its buffer.
+/// `byte` is what it names as its buffer, and does not write.
+///
+/// # Safety
+///
+/// As for `Start`.
+pub(super) unsafe fn start_peek(
+    socket: sys::Handle,
+    byte: &mut u8,
+    overlapped: *mut sys::Overlapped,
+) -> io::Result<Started> {
+    // SAFETY: the caller's promise is the one `start_empty` asks for.
+    unsafe { start_empty(socket, byte, overlapped, sys::MSG_PEEK) }
+}
+
+/// Starts a receive of no bytes on `socket` with `flags`, as `op`'s `Start`
+/// says. `byte` is what it names as its buffer, and does not write.
+///
+/// # Safety
+///
+/// As for `Start`.
+unsafe fn start_empty(
+    socket: sys::Handle,
+    byte: &mut u8,
+    overlapped: *mut sys::Overlapped,
+    mut flags: u32,
+) -> io::Result<Started> {
     let mut buffer = sys::WsaBuf { len: 0, buf: byte };
-    let mut flags = 0;
     let mut received = 0;
     // SAFETY: the caller's promise for the socket and the `OVERLAPPED`; the
     // buffer is none of the byte it starts at, which the slot keeps in place

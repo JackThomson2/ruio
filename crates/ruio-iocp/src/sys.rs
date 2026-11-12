@@ -164,6 +164,10 @@ pub(crate) const WSAECONNRESET: i32 = 10054;
 /// `u_long` that is not zero, or blocking again, given zero.
 pub(crate) const FIONBIO: i32 = 0x8004_667E_u32 as i32;
 
+/// `MSG_PEEK`: a receive that leaves what it receives in the socket, for
+/// the next receive to take.
+pub(crate) const MSG_PEEK: u32 = 0x2;
+
 /// `POLLRDNORM`: data to receive, a connection to accept, or the end, for
 /// `WSAPoll`.
 pub(crate) const POLLRDNORM: i16 = 0x0100;
