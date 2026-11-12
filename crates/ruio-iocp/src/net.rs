@@ -23,6 +23,11 @@
 //! the stream, so that the socket closes only once the send has finished,
 //! and records how it went for the writes after it.
 //!
+//! A stream also moves to the port of another engine, on another thread:
+//! the system takes its socket off its port once the port has delivered
+//! the completions of all of its operations, and the other engine's port
+//! takes it as it takes a new one.
+//!
 //! A stream's socket asks the system to queue no completion for an
 //! operation that succeeds during the call that starts it, where its
 //! provider allows that. So a read of data that has arrived, and a write
@@ -55,12 +60,14 @@ use crate::sys;
 
 mod datagrams;
 mod recv;
+mod sent;
 mod udp;
 mod vectored;
 mod write_behind;
 
 pub use datagrams::{Datagram, RecvFromStream};
 pub use recv::RecvStream;
+pub use sent::SentTcpStream;
 pub use udp::{RecvFrom, SendTo, UdpSocket};
 pub use vectored::WriteAllVectored;
 pub use write_behind::{Flush, WriteBehind};
@@ -1174,6 +1181,7 @@ mod tests {
     use super::{RawAddr, TcpStream, UdpSocket};
     use crate::buf::BufPool;
     use crate::engine::{AT_ONCE, Builder, Iocp, skipped};
+    use crate::handle::IoHandle;
 
     /// A task's waker, which counts how often the task was woken.
     struct Woken(AtomicUsize);
@@ -1412,6 +1420,46 @@ mod tests {
             panic!("a stream with datagrams waited for more than a turn of the port");
         };
         item?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_socket_leaves_its_port_once_the_port_has_delivered_its_operations() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let listener = net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let stream = block_on(&engine, TcpStream::connect(listener.local_addr()?))?;
+        let (mut peer, _) = listener.accept()?;
+        engine.submit()?;
+        // A read that waits for data, cancelled as its future is dropped.
+        assert!(poll_once(stream.read(Vec::with_capacity(8))).is_pending());
+        let Err((err, handle)) = stream.stream.release() else {
+            panic!("a socket left its port with a read in flight");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+        // The cancellation completes at once, but its completion waits in
+        // the port, and the read with it, until a turn takes it.
+        std::thread::sleep(Duration::from_millis(20));
+        let Err((err, handle)) = handle.release() else {
+            panic!("a socket left its port before the port delivered its read");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !in_flight(&engine).starts_with("in_flight: 0,") {
+            assert!(Instant::now() < deadline, "the cancellation never came");
+            engine.park(Some(Duration::from_millis(1)))?;
+        }
+        let socket = handle.release().map_err(|(err, _)| err)?;
+
+        // Another engine's port takes the socket, and its operations
+        // complete there.
+        let other = Builder::new().build()?;
+        let moved = TcpStream::new(IoHandle::on(socket, other.clone())?);
+        peer.write_all(b"moved")?;
+        let (read, buf) = block_on(&other, moved.read(Vec::with_capacity(8)));
+        assert_eq!(read?, 5);
+        assert_eq!(buf, b"moved");
+        assert!(in_flight(&engine).starts_with("in_flight: 0,"));
         Ok(())
     }
 

@@ -111,6 +111,33 @@ impl<T: Raw> IoHandle<T> {
         self.io
     }
 
+    /// What owns the handle, taken off the engine's port, for another
+    /// engine to associate with its own, as [`IoHandle::new`] does on that
+    /// engine's thread. A handle opened for I/O that waits is on no port,
+    /// and is taken as it is.
+    ///
+    /// The system moves a handle off its port only once the port has
+    /// delivered the completions of all of its operations, which a turn
+    /// of the port does: one cancelled a moment ago is in flight until
+    /// then. So nothing comes through either port for an operation started
+    /// on this one.
+    ///
+    /// # Errors
+    ///
+    /// Hands this back, still on the port, with `ResourceBusy` while an
+    /// operation on the handle is in flight, `Unsupported` before Windows
+    /// 8.1, which moves no handle off its port, and what else the system
+    /// reports.
+    pub(crate) fn release(self) -> Result<T, (io::Error, Self)> {
+        if self.waits {
+            return Ok(self.io);
+        }
+        match leave_port(self.io.raw()) {
+            Ok(()) => Ok(self.io),
+            Err(err) => Err((err, self)),
+        }
+    }
+
     /// The engine whose port the handle is associated with.
     pub(crate) fn engine(&self) -> &Iocp {
         &self.engine
@@ -187,6 +214,46 @@ fn skip_port(handle: sys::Handle) -> bool {
     // SAFETY: the handle is open, as its owner is borrowed.
     let set = unsafe { sys::SetFileCompletionNotificationModes(handle, modes) };
     set != 0
+}
+
+/// Takes `handle` off the port it is associated with, which leaves it on
+/// none, for a port to take as one takes a handle that was never on any.
+fn leave_port(handle: sys::Handle) -> io::Result<()> {
+    let mut block = sys::IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let none = sys::FileCompletionInformation {
+        port: ptr::null_mut(),
+        key: 0,
+    };
+    // SAFETY: the handle is open, as its owner is borrowed; the call reads
+    // the information and writes the status block before it returns.
+    let status = unsafe {
+        sys::NtSetInformationFile(
+            handle,
+            &mut block,
+            ptr::from_ref(&none).cast(),
+            size_of::<sys::FileCompletionInformation>() as u32,
+            sys::FILE_REPLACE_COMPLETION_INFORMATION,
+        )
+    };
+    match status {
+        0.. => Ok(()),
+        // What the system says while an operation on the handle has yet to
+        // be delivered by the port.
+        sys::STATUS_UNSUCCESSFUL => Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            "an operation on the handle is in flight, which keeps it on its port",
+        )),
+        sys::STATUS_INVALID_INFO_CLASS => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "moving a handle off its port takes Windows 8.1 or later",
+        )),
+        status => Err(io::Error::from_raw_os_error(
+            sys::RtlNtStatusToDosError(status) as i32,
+        )),
+    }
 }
 
 /// A handle of a port, borrowed from what owns it for an operation on it,

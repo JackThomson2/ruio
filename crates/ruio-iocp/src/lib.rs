@@ -29,8 +29,9 @@
 //! pick from. A stream receives into it (`net::RecvStream`), holding no
 //! buffer while it waits for data, as a UDP socket receives its datagrams
 //! (`net::RecvFromStream`), and a file reads into it (`fs::ReadStream`).
-//! A stream also writes several buffers as one, and leaves a write behind
-//! it for the engine to finish.
+//! A stream also writes several buffers as one, leaves a write behind it
+//! for the engine to finish, and moves to the port of another engine, on
+//! another thread (`net::TcpStream::send_off`).
 //!
 //! A stream's socket and a file on a disk ask the system to queue no
 //! completion for an operation that succeeds during the call that starts

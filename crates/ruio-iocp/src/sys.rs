@@ -55,6 +55,14 @@ pub(crate) const STATUS_SUCCESS: i32 = 0;
 /// `STATUS_CANCELLED`: the status of an operation that was cancelled.
 pub(crate) const STATUS_CANCELLED: i32 = 0xC000_0120_u32 as i32;
 
+/// `STATUS_UNSUCCESSFUL`: what moving a file off its port fails with while
+/// an operation on it has yet to be delivered by the port.
+pub(crate) const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001_u32 as i32;
+
+/// `STATUS_INVALID_INFO_CLASS`: a class of query or setting that the
+/// system does not have.
+pub(crate) const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003_u32 as i32;
+
 /// `SYNCHRONIZE`: the right to wait for an object, which is all a handle of
 /// the AFD driver's needs for the polls made through it.
 pub(crate) const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -112,6 +120,11 @@ pub(crate) const FILE_MODE_INFORMATION: u32 = 16;
 /// `FileAccessInformation`: the class of `NtQueryInformationFile` that asks
 /// for the rights a handle grants, which `FILE_ACCESS_INFORMATION` holds.
 pub(crate) const FILE_ACCESS_INFORMATION: u32 = 8;
+
+/// `FileReplaceCompletionInformation`: the class of `NtSetInformationFile`
+/// that moves a file to another port, or off its own, as
+/// `FILE_COMPLETION_INFORMATION` says. Windows 8.1 and later have it.
+pub(crate) const FILE_REPLACE_COMPLETION_INFORMATION: u32 = 61;
 
 /// `FILE_SYNCHRONOUS_IO_ALERT` and `FILE_SYNCHRONOUS_IO_NONALERT`: a file
 /// opened for I/O that waits, which the system does in full during the
@@ -462,6 +475,17 @@ pub(crate) struct IoStatusBlock {
     pub(crate) information: usize,
 }
 
+/// `FILE_COMPLETION_INFORMATION`: the port a file's operations complete
+/// to, none if it is null, and the key their completions carry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FileCompletionInformation {
+    /// `Port`.
+    pub(crate) port: Handle,
+    /// `Key`.
+    pub(crate) key: usize,
+}
+
 /// `UNICODE_STRING`: a name the native calls take, in UTF-16.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -770,6 +794,17 @@ unsafe extern "system" {
         file: Handle,
         status: *mut IoStatusBlock,
         info: *mut c_void,
+        len: u32,
+        class: u32,
+    ) -> i32;
+
+    /// Sets what the class `class` names of `file` to `info`, `len`
+    /// bytes of it, and writes the outcome to `status`. An `NTSTATUS`:
+    /// negative on failure.
+    pub(crate) fn NtSetInformationFile(
+        file: Handle,
+        status: *mut IoStatusBlock,
+        info: *const c_void,
         len: u32,
         class: u32,
     ) -> i32;

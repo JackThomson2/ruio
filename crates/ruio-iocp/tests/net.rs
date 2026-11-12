@@ -1,6 +1,7 @@
 //! TCP sockets through the port: accepting, connecting, reading and writing,
 //! with the standard library's sockets at the other end and with each other,
-//! and operations cancelled while the system has them.
+//! operations cancelled while the system has them, and streams sent from
+//! one engine's port to another's.
 #![cfg(windows)]
 
 use std::cell::Cell;
@@ -12,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use ruio_buf::{IoBuf, IoBufMut};
 use ruio_executor::{Runtime, time};
-use ruio_iocp::net::{TcpListener, TcpStream};
+use ruio_iocp::buf::BufPool;
+use ruio_iocp::net::{SentTcpStream, TcpListener, TcpStream};
 
 /// The loopback address, and a port for the system to choose.
 fn loopback() -> SocketAddr {
@@ -566,4 +568,89 @@ fn sockets_of_the_standard_library_go_through_the_port() -> io::Result<()> {
 fn a_socket_taken_outside_a_runtime_panics() {
     let listener = std::net::TcpListener::bind(loopback()).unwrap();
     let _ = TcpListener::from_std(listener);
+}
+
+/// A stream sent off its engine's port is received on another engine's
+/// thread, which carries on with it: after the write left behind it, and
+/// once the port has delivered the cancellation of a read dropped just
+/// before.
+#[test]
+fn a_stream_sent_off_is_received_on_another_engines_thread() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        let (_listener, client, server) = pair().await?;
+        server.write_behind(vec![b"behind ".to_vec()]).await?;
+        let waited = time::timeout(
+            Duration::from_millis(10),
+            server.read(Vec::with_capacity(8)),
+        )
+        .await;
+        assert!(waited.is_err(), "the read waits for data");
+        let sent = server.send_off().await.map_err(|(err, _)| err)?;
+        let served = thread::spawn(move || -> io::Result<()> {
+            Runtime::new()?.block_on(async move {
+                let stream = sent.receive()?;
+                write_all(&stream, b"and after".to_vec()).await?;
+                let (read, buf) = stream.read_exact(Vec::with_capacity(4)).await;
+                read?;
+                assert_eq!(buf, b"ping");
+                Ok(())
+            })
+        });
+        let (read, buf) = client.read_exact(Vec::with_capacity(16)).await;
+        read?;
+        assert_eq!(buf, b"behind and after");
+        write_all(&client, b"ping".to_vec()).await?;
+        served.join().unwrap()?;
+        Ok(())
+    })
+}
+
+/// A stream sent off may come back to the engine it left, and receives
+/// into a pool there as before.
+#[test]
+fn a_stream_sent_off_comes_back_to_its_own_engine() -> io::Result<()> {
+    fn assert_send<T: Send>() {}
+    assert_send::<SentTcpStream>();
+    Runtime::new()?.block_on(async {
+        let (_listener, client, server) = pair().await?;
+        let pool = BufPool::new(2, 64)?;
+        write_all(&client, b"one".to_vec()).await?;
+        let mut arriving = server.recv_stream(&pool);
+        let one = arriving.next().await.expect("the data")?;
+        assert_eq!(one.to_vec(), b"one");
+        drop((one, arriving));
+
+        let sent = server.send_off().await.map_err(|(err, _)| err)?;
+        assert!(format!("{sent:?}").starts_with("SentTcpStream"));
+        let server = sent.receive()?;
+        write_all(&client, b"two".to_vec()).await?;
+        let mut arriving = server.recv_stream(&pool);
+        let two = arriving.next().await.expect("the data")?;
+        assert_eq!(two.to_vec(), b"two");
+        write_all(&server, b"back".to_vec()).await?;
+        let (read, buf) = client.read_exact(Vec::with_capacity(4)).await;
+        read?;
+        assert_eq!(buf, b"back");
+        Ok(())
+    })
+}
+
+/// A stream sent off is received only where a runtime runs.
+#[test]
+fn a_stream_sent_off_is_received_only_where_a_runtime_runs() -> io::Result<()> {
+    let (sent, mut client) = Runtime::new()?.block_on(async {
+        let listener = std::net::TcpListener::bind(loopback())?;
+        let client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept()?;
+        let sent = TcpStream::from_std(server)
+            .send_off()
+            .await
+            .map_err(|(err, _)| err)?;
+        io::Result::Ok((sent, client))
+    })?;
+    let err = sent.receive().unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+    // The connection closed with it.
+    assert_eq!(client.read(&mut [0; 8])?, 0);
+    Ok(())
 }
