@@ -42,15 +42,19 @@ license has been chosen.
 ruio needs Linux 6.10 or later, which it checks by capability rather than
 by version, and the Rust toolchain that `rust-toolchain.toml` pins
 (1.97.1). On Windows ruio runs on an I/O completion port, a proof of
-concept: `ruio::net` has TCP and UDP sockets, `ruio::fs` has files,
-`ruio::buf` a pool of buffers that streams receive into, and `ruio::io`
-the traits both implement there; the portable sockets and file, which
-are `Send`, `ruio::process`, which spawns children and waits for them,
-and `ruio::signal`, which delivers the console's Ctrl+C and its other
-control events, are there too, all under the names and with the
-signatures they have on Linux; `Cores` pins its threads there as on
-Linux; and `ruio-compat` adapts the streams and files, so that hyper and
-rustls run there. The rest of the I/O is io_uring's so far. On macOS,
+concept: `ruio::net` has TCP and UDP sockets, with the futures'
+timeouts, the sockets taken from the standard library, and streams of
+data and of datagrams received into a pool, `ruio::fs` has files,
+`ruio::buf` the pool, and `ruio::io` the traits both implement there;
+the portable sockets and file, which are `Send`, `ruio::process`, which
+spawns children and waits for them, and `ruio::signal`, which delivers
+the console's Ctrl+C and its other control events, are there too, all
+under the names and with the signatures they have on Linux; `Cores`
+pins its threads there as on Linux, and a stream moves from one core to
+another; and `ruio-compat` adapts the streams and files, its portable
+adapter, client and tokio's reactor included, so that hyper and rustls
+run there. The rest of the I/O is io_uring's so far: what only a ring
+has, and `bind_reuseport`. On macOS,
 and with `--cfg ruio_engine="park"`, ruio builds with its executor
 alone, on the park engine: runtimes, tasks, timers, channels and locks,
 and no I/O.
@@ -59,11 +63,11 @@ and no I/O.
 
 | Crate | What it has |
 |---|---|
-| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, which holds tasks of other cores too, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, `signal`, and `process`, which spawns child processes and waits for them on the ring; the path functions of `fs`, `read_dir` among them, everything in `process`, the sockets of `net::portable`, the file of `fs::portable`, which also reads, writes and seeks through poll methods as tokio's file does, and `io::portable::AsyncFd`, shaped as tokio's, are `Send`, running on the ring of whichever thread polls them, and where no runtime runs, on a tokio worker say, on the foreign ring `uring::set_foreign_ring` sets, failing with `Unsupported` if none is set, while the portable sockets and a child's pipes wait there on the executor's own reactor once `io::set_foreign_reactor` sets one, as `ruio-compat`'s `TokioReactor`; with the `futures` feature, every stream implements futures-core's `Stream`; on Windows, a part of `net`, `fs` and `io`, with the portable sockets and file and the foreign reactor, `process`, `signal`, which delivers the console's control events, and `buf`'s pool of buffers, on the I/O completion port, under the same names and signatures |
-| [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; `Timer`, which gives hyper ruio's timers for its timeouts; `PortableCompat`, which gives the portable streams and a child's pipes those traits with no buffers of its own, and the portable file them and `AsyncSeek`; and, with the `client` feature, a connector that runs hyper-util's client on them; on Windows, a `Compat` for TCP streams and files, built on the traits of `io`, with `Executor` and `Timer` |
+| [`ruio`](crates/ruio) | The runtime: `Runtime`, `Cores`, `spawn`, `spawn_on`, `spawn_blocking`, `JoinSet`, which holds tasks of other cores too, `time`, `sync`, `net` and `fs`, whose I/O runs on the thread's ring, links, allocation, range syncs and advice included, `io`, the owned-buffer traits they share, with `copy`, `splice` and `AsyncFd` for any other descriptor, `signal`, and `process`, which spawns child processes and waits for them on the ring; the path functions of `fs`, `read_dir` among them, everything in `process`, the sockets of `net::portable`, the file of `fs::portable`, which also reads, writes and seeks through poll methods as tokio's file does, and `io::portable::AsyncFd`, shaped as tokio's, are `Send`, running on the ring of whichever thread polls them, and where no runtime runs, on a tokio worker say, on the foreign ring `uring::set_foreign_ring` sets, failing with `Unsupported` if none is set, while the portable sockets and a child's pipes wait there on the executor's own reactor once `io::set_foreign_reactor` sets one, as `ruio-compat`'s `TokioReactor`; with the `futures` feature, every stream implements futures-core's `Stream`; on Windows, `net`, `fs` and `io` but for what only a ring or Unix has and `bind_reuseport`, with the portable sockets and file and the foreign reactor, `process`, `signal`, which delivers the console's control events, and `buf`'s pool of buffers, on the I/O completion port, under the same names and signatures |
+| [`ruio-compat`](crates/ruio-compat) | `Compat`, which gives ruio's streams, files and `AsyncFd`s the `AsyncRead`, `AsyncBufRead` and `AsyncWrite` of `tokio::io` and of futures-io, and hyper's own I/O traits, for hyper, rustls and the rest of the ecosystem; `Executor`, which runs hyper's HTTP/2 on ruio's tasks; `Timer`, which gives hyper ruio's timers for its timeouts; `PortableCompat`, which gives the portable streams and a child's pipes those traits with no buffers of its own, and the portable file them and `AsyncSeek`; and, with the `client` feature, a connector that runs hyper-util's client on them; on Windows, a `Compat` for TCP streams and files, built on the traits of `io`, with `Executor` and `Timer`, and `PortableCompat`, the client and `TokioReactor` as on Linux |
 | [`ruio-executor`](crates/ruio-executor) | The per-thread scheduler, tasks, timers and the thread-per-core builder, over the I/O engine chosen when the program is built: io_uring on Linux, an I/O completion port on Windows, and the park engine, which runs no I/O, elsewhere |
 | [`ruio-engine`](crates/ruio-engine) | The contract between the executor and its I/O engine, a check that an engine keeps it, and the park engine |
-| [`ruio-iocp`](crates/ruio-iocp) | The I/O completion port engine of Windows, files, named pipes and TCP and UDP sockets that read and write through it with owned buffers, and a pool of buffers that streams and files read into; and, in `portable`, waits for handles and sockets that any thread may hold and poll, and the sockets, pipes and file reads and writes that any thread makes: a proof of concept |
+| [`ruio-iocp`](crates/ruio-iocp) | The I/O completion port engine of Windows, files, named pipes and TCP and UDP sockets that read and write through it with owned buffers, operations that time out, streams that move from one engine's port to another's, and a pool of buffers that streams, UDP sockets and files read into; and, in `portable`, waits for handles and sockets that any thread may hold and poll, and the sockets, pipes and file reads and writes that any thread makes: a proof of concept |
 | [`ruio-buf`](crates/ruio-buf) | The buffers an operation takes and hands back, shared by every engine: `IoBuf`, `IoBufMut`, `IoBufs`, slices and aligned buffers |
 | [`ruio-driver`](crates/ruio-driver) | One io_uring ring: operations, the futures that run them, pools and registered buffers, registered files, the capability probe |
 | [`ruio-sys`](crates/ruio-sys) | The kernel's io_uring ABI and system calls |
@@ -81,9 +85,10 @@ HTTP/2 on ruio's tasks, and tokio-rustls runs TLS over it.
 with no buffers of its own, and with the `client` feature
 `ruio_compat::client` runs hyper-util's client on them. On Windows
 `Compat` adapts a `TcpStream` or a `File`, with a buffer of its own and no
-pool, and hyper and tokio-rustls run over it the same way; the rest is
-io_uring's so far. `Timer` gives hyper ruio's timers, with which it times
-out a client that is slow to send a request's head:
+pool, and hyper and tokio-rustls run over it the same way;
+`PortableCompat`, the client and `TokioReactor` are there too. `Timer`
+gives hyper ruio's timers, with which it times out a client that is slow
+to send a request's head:
 
 ```rust
 let io = Compat::with_pool(&pool, stream);

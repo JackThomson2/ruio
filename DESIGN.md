@@ -1264,9 +1264,11 @@ alone.
   one armed), `TcpStream` (`connect` by `ToSocketAddrs`, `read`,
   `write`, `read_exact`, `write_all`, `write_all_vectored`,
   `write_behind`, `flush`, `try_flush`, `recv_stream`, `shutdown`, which
-  waits for a write behind as io_uring's does, and the addresses and
-  options, `linger` among them, `async` as on io_uring though they wait
-  for nothing), `UdpSocket`, and `lookup_host`. `fs` is in two halves,
+  waits for a write behind as io_uring's does, `send_to`, which moves the
+  stream to another core, and the addresses and options, `linger` among
+  them, `async` as on io_uring though they wait for nothing),
+  `UdpSocket` (`send_to`, `recv_from`, `recv_stream`, `recv_from_stream`
+  and the rest), and `lookup_host`. `fs` is in two halves,
   as Windows has an overlapped form of reading and writing a file and of
   little else. Reads and writes go through the port, at an offset or at
   the file's position, which the `File` keeps, as Windows keeps none for
@@ -1292,10 +1294,30 @@ alone.
   `write_all` that come with them, and `copy`. They ask nothing of an
   engine but a stream's own read and write, and are one file,
   `io/traits.rs`, which both builds compile, as they do `net/addr.rs`:
-  the two that name no engine. Not there yet: datagrams received into a
-  pool, the futures' timeouts, `from_std` and `into_std`,
-  `bind_reuseport`, moving a stream to another core, and of `io`,
-  `splice` and the two `AsyncFd`s.
+  the two that name no engine. An operation's `timeout` is the engine's:
+  it keeps the operations that have one by their deadlines, the first of
+  which ends a park, and cancels one that has not completed by its own,
+  whose future then fails with `ERROR_TIMEOUT`, of `TimedOut`, and hands
+  its buffer back, as a linked timeout's does on io_uring. A UDP socket
+  receives into a pool as a stream does: a receive of no bytes that peeks
+  (`MSG_PEEK`) waits in its place and leaves the datagram in the socket,
+  and the datagrams that have arrived are then received without the port,
+  each into a buffer of its own, whose first 32 or 48 bytes it leaves
+  out, as io_uring's header and address take them, so that a pool cuts a
+  datagram short where it does there. Sockets and files taken from the
+  standard library (`from_std`, `From`) are associated with the thread's
+  port as they are taken, so taking one where no runtime runs panics; a
+  file the standard library opened is opened for I/O that waits, which
+  no port takes, and its operations finish during the calls that start
+  them, waiting for the device. `File::into_std` hands a file back at
+  the position the `File` kept. A stream moves to another core
+  (`TcpStream::send_to`) as its socket leaves its port, which Windows
+  8.1 and later do (`NtSetInformationFile`, with
+  `FileReplaceCompletionInformation`) once the port has delivered the
+  completions of all of the socket's operations, a cancelled one's
+  included, and the port of the core that receives it takes it. Not
+  there yet: `bind_reuseport`, and of `io`, `splice` and the two
+  `AsyncFd`s.
 - **Send I/O, processes and signals on Windows.** What is `Send` on
   io_uring is on the port too, built on `ruio_iocp::portable`: waits
   that any thread may hold and poll, each running on the port of the
@@ -1358,26 +1380,38 @@ alone.
   the adapter starts a write and leaves it, with nobody to poll it: a
   plain write the system cut short would leave the rest unsent until the
   next write, flush or close, and its reader waiting. It adapts a
-  `TcpStream` and a `File`, and has no pool to receive into;
-  `PortableCompat`, the client and tokio's reactor, which are written
-  against io_uring's portable streams and descriptors, stay io_uring's,
-  as do the crate's examples, though the port has portable streams and
-  pipes of its own now. The implementations of the traits, `Executor`
-  and `Timer`
-  are shared. `build.rs` chooses by the engine, and a build for io_uring
-  that asks with `--cfg ruio_compat="generic"` gets the second adapter,
-  for Unix streams too: there it runs before a change reaches a Windows
-  machine.
+  `TcpStream` and a `File`, and has no pool to receive into.
+  `PortableCompat` and the client build on both engines, as the port's
+  portable streams, pipes and file have the names and the poll methods
+  of io_uring's. `TokioReactor` registers a socket with tokio as a
+  `tokio::net::TcpStream` there, since tokio has no `AsyncFd` on
+  Windows: a duplicate of the socket's handle, which tokio polls with an
+  AFD poll of its own and closes as the registration drops, leaving
+  ruio's socket open. A child's pipes have no readiness to register, and
+  their waits on a tokio thread fail as unsupported. Four tests of hyper
+  echoing large bodies over the portable streams under ruio's own
+  runtime hang at times on the port, and are ignored there for now. The
+  crate's examples stay io_uring's. The implementations of the traits,
+  `Executor` and `Timer`, are shared. `build.rs` chooses by the engine,
+  and a build for io_uring that asks with `--cfg ruio_compat="generic"`
+  gets the second adapter, for Unix streams too: there it runs before a
+  change reaches a Windows machine.
 - **Testing the Windows engine.** CI's `windows` job lints and tests the
   four crates that build whole on Windows, on a `windows-latest` runner,
   `cargo test -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio`, and
   the library and tests of `ruio-compat`, whose examples receive into
   pools. The other crates are Linux's, so `cargo test --workspace` does
-  not build there. Four of `ruio`'s test files name nothing one engine
-  alone has, `tests/sockets.rs`, `tests/files.rs`, `tests/addr.rs` and
-  `tests/io.rs`, 50 tests in all, one of which, of a Unix stream, is
-  io_uring's; so do two of `ruio-compat`'s, `tests/adapter.rs` and
-  `tests/rustls.rs`, 19 tests. They run on io_uring and on the
+  not build there. Most of `ruio`'s test files name nothing one engine
+  alone has, or keep what does to its build test by test:
+  `tests/sockets.rs`, `tests/files.rs`, `tests/addr.rs` and
+  `tests/io.rs`, and those of `net` and `fs`, `tests/tcp.rs`,
+  `tests/udp.rs`, `tests/fs.rs` and `tests/stream.rs`, whose direct
+  descriptors and zero-copy sends are io_uring's; so do
+  `ruio-executor`'s, and `ruio-compat`'s `tests/adapter.rs`,
+  `tests/rustls.rs`, `tests/client.rs`, `tests/portable.rs`,
+  `tests/portable_file.rs`, `tests/pipes.rs` and
+  `tests/tokio_reactor.rs`, whose children are `findstr` and `cmd` on
+  Windows. They run on io_uring and on the
   completion port alike, so that the API the engines share is held to
   one behaviour; what the port does its own way, a file's stream into a
   pool, is in `tests/iocp.rs`, which is the port's. The portable sockets
@@ -1389,7 +1423,7 @@ alone.
   Windows has, `cmd`, `findstr` and `ping`, and, for the events, the
   test binary run again with a console of its own. `ruio-iocp`'s pool,
   and its records of what a vectored send has left to send and of the
-  writes behind a stream, are plain Rust, whose unit tests, 17 of them,
+  writes behind a stream, are plain Rust, whose unit tests, 19 of them,
   run on Linux too, with the workspace's. `ci/check.sh` runs
   `ruio-compat`'s tests a second time on io_uring with the completion
   port's adapter, 67 of them, and `ci/asan.sh` runs them so under
@@ -1489,13 +1523,13 @@ is built.
 What is left, in order:
 
 1. The I/O completion port engine from a proof of concept to ruio's I/O
-   on Windows: the rest of the first column of `net`, `fs` and `io`,
-   which is datagrams received into a pool, the futures' timeouts, and
-   sockets and files taken from the standard library; the portable
-   adapter, the client and tokio's reactor on the port's portable
-   streams and pipes; `ruio-compat`'s adapter there receiving into the
-   pool the port now has; and a turn that costs no call to the port
-   while an operation is in flight.
+   on Windows: `bind_reuseport`, with which Linux spreads connections
+   and datagrams among the sockets bound to one address, and for which
+   Windows has no option of the kind; `ruio-compat`'s adapter there
+   receiving into the pool the port now has; the large bodies that hyper
+   echoes over the portable adapter under ruio's own runtime, which hang
+   at times on the port; and a turn that costs no call to the port while
+   an operation is in flight.
 2. A kqueue engine for macOS, with owned-buffer I/O. kqueue reports
    readiness, so a read waits for its socket to be readable and then reads
    into the caller's buffer itself, and files go to the blocking pool.
