@@ -101,6 +101,15 @@
 //! completions of all of its operations, and the port of the runtime that
 //! receives it takes it.
 //!
+//! Listeners bound to one address with [`TcpListener::bind_reuseport`], a
+//! listener on each core, share its connections out, as on Linux, where
+//! the kernel deals them out among sockets bound with `SO_REUSEPORT`.
+//! Windows has no such option, so the listeners of the process bound to
+//! one address share one socket, which no port has: each takes a
+//! connection with an `accept` made at once, and otherwise waits for one
+//! on its own thread's port, so that each core takes as many as it is free
+//! to take.
+//!
 //! The sockets of [`portable`] are `Send` and `Sync`, for code whose
 //! futures must be: TCP streams and listeners, which no port has, read and
 //! written with calls made at once on whichever thread polls them, which
@@ -112,8 +121,8 @@
 //! taken, where io_uring finds its ring at a socket's first operation: so
 //! taking one where no runtime runs panics.
 //!
-//! Not here yet, of what `net` has on io_uring: `bind_reuseport`. Unix
-//! sockets are Unix's.
+//! Not here yet, of what `net` has on io_uring: `UdpSocket::bind_reuseport`.
+//! Unix sockets are Unix's.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -121,9 +130,11 @@ use std::io;
 use std::marker::PhantomData;
 use std::net::{self, Shutdown, SocketAddr};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
+use ruio_executor::time::{self, Sleep};
 use ruio_iocp::net as iocp;
 
 use crate::buf::{BufBundle, BufPool, IoBuf, IoBufMut, IoBufs};
@@ -147,8 +158,28 @@ pub use udp::{RecvFromStream, UdpSocket};
 /// [`accept`](TcpListener::accept) accepts one connection, and
 /// [`incoming`](TcpListener::incoming) one after another.
 pub struct TcpListener {
-    listener: iocp::TcpListener,
+    listener: Listener,
 }
+
+/// What a listener accepts from.
+enum Listener {
+    /// A socket on the port of the thread's runtime, which accepts with
+    /// `AcceptEx`.
+    Port(iocp::TcpListener),
+    /// A socket that the listeners of the process bound to its address with
+    /// [`TcpListener::bind_reuseport`] share, which no port has.
+    Shared(Arc<iocp::SharedListener>),
+}
+
+/// The error a shared accept fails with once its time is up, which the
+/// port's accepts fail with too: `ERROR_TIMEOUT`, of
+/// [`io::ErrorKind::TimedOut`].
+const ERROR_TIMEOUT: i32 = 1460;
+
+/// The sockets that the listeners bound with
+/// [`TcpListener::bind_reuseport`] share, by the addresses they are bound
+/// to, held by those listeners alone.
+static SHARED: Mutex<Vec<(SocketAddr, Weak<iocp::SharedListener>)>> = Mutex::new(Vec::new());
 
 impl TcpListener {
     /// A listener bound to `addr`, or to the first address it resolves to
@@ -166,8 +197,56 @@ impl TcpListener {
     /// to no address, and an error of kind `Other` where no runtime runs.
     pub fn bind(addr: impl net::ToSocketAddrs) -> io::Result<Self> {
         Ok(Self {
-            listener: iocp::TcpListener::bind(addr)?,
+            listener: Listener::Port(iocp::TcpListener::bind(addr)?),
         })
+    }
+
+    /// A listener bound to `addr` as [`bind`](TcpListener::bind) binds one,
+    /// a host name resolved on the thread included, which shares the
+    /// address with the other listeners of the process bound to it so: a
+    /// listener on each core, all bound to one address, so share the
+    /// connections out, and no core has to hand any on, as on Linux.
+    ///
+    /// Windows has no `SO_REUSEPORT`, with which Linux's kernel deals the
+    /// connections out among the sockets bound to one address by a hash of
+    /// each one's addresses and ports. Here the listeners share one socket,
+    /// which no port has: the first to bind the address makes it, the
+    /// others take it, and it closes once the last of them is dropped. An
+    /// accept takes a connection with an `accept` made at once, and
+    /// otherwise waits for the socket to be ready on its own thread's port;
+    /// when a connection arrives, the accepts that wait all wake, and the
+    /// first to take it has it. So each core takes as many connections as
+    /// it is free to take, and one that stops accepting holds up none of
+    /// the others.
+    ///
+    /// Only the listeners of one process share an address, where Linux lets
+    /// those of any process of the same user share it, and a port for the
+    /// system to choose is always a new one. Either way, a listener bound
+    /// with [`bind`](TcpListener::bind) shares an address with none.
+    ///
+    /// # Errors
+    ///
+    /// What binding and listening report: `AddrInUse` if a socket not bound
+    /// so, or another process's, has the address; and `InvalidInput` if
+    /// `addr` resolves to no address.
+    pub fn bind_reuseport(addr: impl net::ToSocketAddrs) -> io::Result<Self> {
+        let mut last = None;
+        for addr in addr.to_socket_addrs()? {
+            match shared(addr) {
+                Ok(shared) => {
+                    return Ok(Self {
+                        listener: Listener::Shared(shared),
+                    });
+                }
+                Err(err) => last = Some(err),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any addresses",
+            )
+        }))
     }
 
     /// Wraps a listening socket from the standard library, for the port of
@@ -181,7 +260,7 @@ impl TcpListener {
     /// socket with the runtime's port, as when another runtime's has it.
     pub fn from_std(socket: net::TcpListener) -> Self {
         Self {
-            listener: iocp::TcpListener::from_std(socket),
+            listener: Listener::Port(iocp::TcpListener::from_std(socket)),
         }
     }
 
@@ -191,7 +270,10 @@ impl TcpListener {
     ///
     /// What the system reports.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        match &self.listener {
+            Listener::Port(listener) => listener.local_addr(),
+            Listener::Shared(listener) => listener.local_addr(),
+        }
     }
 
     /// Accepts a connection, and reports the address of its peer; see
@@ -220,19 +302,143 @@ impl fmt::Debug for TcpListener {
     }
 }
 
+/// The socket bound to `addr` that the listeners bound to it with
+/// [`TcpListener::bind_reuseport`] share: theirs, if they have one, or one
+/// bound for them now.
+fn shared(addr: SocketAddr) -> io::Result<Arc<iocp::SharedListener>> {
+    let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    shared.retain(|(_, listener)| listener.strong_count() > 0);
+    // A port for the system to choose is never one that is bound already.
+    let bound = (addr.port() != 0)
+        .then(|| {
+            shared
+                .iter()
+                .find(|(bound, _)| *bound == addr)
+                .and_then(|(_, listener)| listener.upgrade())
+        })
+        .flatten();
+    if let Some(listener) = bound {
+        return Ok(listener);
+    }
+    let listener = Arc::new(iocp::SharedListener::bind(addr)?);
+    shared.push((listener.local_addr()?, Arc::downgrade(&listener)));
+    Ok(listener)
+}
+
+impl Listener {
+    /// An accept on the listener, which starts when first polled.
+    fn accept(&self) -> Accepting<'_> {
+        match self {
+            Listener::Port(listener) => Accepting::Port(listener.accept()),
+            Listener::Shared(listener) => Accepting::Shared(SharedAccepting {
+                accept: listener.accept(),
+                polled: false,
+                timeout: None,
+                limit: None,
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for Listener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Listener::Port(listener) => fmt::Debug::fmt(listener, f),
+            Listener::Shared(listener) => fmt::Debug::fmt(listener, f),
+        }
+    }
+}
+
+/// An accept on either kind of listener.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the port's accept, as large as it was alone, would cost an allocation boxed"
+)]
+enum Accepting<'a> {
+    /// Through the port, which the engine cancels at its deadline.
+    Port(iocp::Accept<'a>),
+    /// On a shared socket, which the runtime's timer bounds.
+    Shared(SharedAccepting<'a>),
+}
+
+/// An accept on a socket that listeners share, and its time limit.
+struct SharedAccepting<'a> {
+    accept: iocp::SharedAccept<'a>,
+    /// Whether the accept has been polled, and so has started.
+    polled: bool,
+    /// How long the accept may wait, from its first poll that waits.
+    timeout: Option<Duration>,
+    /// The timer of that wait, set as it starts.
+    limit: Option<Sleep>,
+}
+
+impl Accepting<'_> {
+    /// Has the accept fail with `ERROR_TIMEOUT` if no connection has come
+    /// `duration` after it starts, unless it has started.
+    fn timeout(self, duration: Duration) -> Self {
+        match self {
+            Accepting::Port(accept) => Accepting::Port(accept.timeout(duration)),
+            Accepting::Shared(mut accepting) => {
+                if !accepting.polled {
+                    accepting.timeout = Some(duration);
+                }
+                Accepting::Shared(accepting)
+            }
+        }
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<(iocp::TcpStream, SocketAddr)>> {
+        match self {
+            Accepting::Port(accept) => Pin::new(accept).poll(cx),
+            Accepting::Shared(accepting) => accepting.poll(cx),
+        }
+    }
+}
+
+impl SharedAccepting<'_> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<(iocp::TcpStream, SocketAddr)>> {
+        self.polled = true;
+        if let Poll::Ready(accepted) = Pin::new(&mut self.accept).poll(cx) {
+            return Poll::Ready(accepted);
+        }
+        // The time counts from when the accept starts to wait, as the
+        // port's counts from when the system takes the accept.
+        let limit = match (&mut self.limit, self.timeout.take()) {
+            (Some(limit), _) => limit,
+            (limit @ None, Some(timeout)) => limit.insert(time::sleep(timeout)),
+            (None, None) => return Poll::Pending,
+        };
+        if Pin::new(limit).poll(cx).is_ready() {
+            return Poll::Ready(Err(io::Error::from_raw_os_error(ERROR_TIMEOUT)));
+        }
+        Poll::Pending
+    }
+}
+
+impl fmt::Debug for Accepting<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Accepting::Port(accept) => fmt::Debug::fmt(accept, f),
+            Accepting::Shared(accepting) => fmt::Debug::fmt(&accepting.accept, f),
+        }
+    }
+}
+
 /// The future of [`TcpListener::accept`]: the stream of the connection it
 /// accepted, and the address of the stream's peer.
 ///
 /// It starts the accept when first polled. Dropping it before the accept
 /// completes cancels the accept, and a connection it had accepted by then
-/// is closed.
+/// is closed. On a listener bound with
+/// [`bind_reuseport`](TcpListener::bind_reuseport), the accept takes a
+/// connection at once if one waits, and dropping it takes none.
 ///
 /// Its parameters are those it has on io_uring, where one future serves
 /// listeners of several kinds: the stream it makes, and the address it
 /// reports.
 #[must_use = "futures do nothing unless polled"]
 pub struct Accept<'a, S, A = SocketAddr> {
-    accept: iocp::Accept<'a>,
+    accept: Accepting<'a>,
     _made: PhantomData<fn() -> (S, A)>,
 }
 
@@ -254,8 +460,8 @@ impl<S, A> Accept<'_, S, A> {
 impl Future for Accept<'_, TcpStream> {
     type Output = io::Result<(TcpStream, SocketAddr)>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let accepted = ready!(Pin::new(&mut self.accept).poll(cx));
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let accepted = ready!(self.get_mut().accept.poll(cx));
         Poll::Ready(accepted.map(|(stream, peer)| (TcpStream { stream }, peer)))
     }
 }
@@ -277,10 +483,10 @@ impl<S, A> fmt::Debug for Accept<'_, S, A> {
 /// Its parameter is the one it has on io_uring, where it serves listeners
 /// of several kinds: the stream it yields.
 pub struct Incoming<'a, S> {
-    listener: &'a iocp::TcpListener,
+    listener: &'a Listener,
     /// The accept in flight, from the poll that starts it to the one it
     /// completes in.
-    accept: Option<iocp::Accept<'a>>,
+    accept: Option<Accepting<'a>>,
     _made: PhantomData<fn() -> S>,
 }
 
@@ -289,7 +495,7 @@ impl Incoming<'_, TcpStream> {
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<TcpStream>>> {
         let listener = self.listener;
         let accept = self.accept.get_or_insert_with(|| listener.accept());
-        let accepted = ready!(Pin::new(accept).poll(cx));
+        let accepted = ready!(accept.poll(cx));
         self.accept = None;
         Poll::Ready(Some(accepted.map(|(stream, _)| TcpStream { stream })))
     }

@@ -9,7 +9,8 @@ use std::io::Write as _;
 use std::io::{self, ErrorKind};
 use std::net::Shutdown;
 #[cfg(ruio_uring)]
-use std::sync::{Barrier, Mutex, OnceLock, mpsc};
+use std::sync::mpsc;
+use std::sync::{Barrier, Mutex, OnceLock};
 #[cfg(ruio_uring)]
 use std::thread;
 use std::time::Duration;
@@ -17,7 +18,6 @@ use std::time::Instant;
 
 use ruio::buf::BufPool;
 use ruio::net::{TcpListener, TcpStream};
-#[cfg(ruio_uring)]
 use ruio::sync::oneshot;
 #[cfg(ruio_uring)]
 use ruio::uring::ops::Nop;
@@ -384,8 +384,7 @@ async fn write_all_vectored_sends_more_buffers_than_one_send_takes() -> io::Resu
 
 /// Listeners bound with `SO_REUSEPORT` share an address, which a listener
 /// without it cannot bind, and the kernel spreads the connections among
-/// them.
-#[cfg(ruio_uring)]
+/// them. On the completion port, they share one socket.
 #[ruio::test]
 async fn listeners_bound_with_reuseport_share_an_address() -> io::Result<()> {
     let first = TcpListener::bind_reuseport("127.0.0.1:0")?;
@@ -409,13 +408,20 @@ async fn listeners_bound_with_reuseport_share_an_address() -> io::Result<()> {
         }
     }
     assert_eq!(accepted.iter().sum::<usize>(), clients.len());
+    // The kernel deals each listener its share of the connections. On the
+    // completion port the listeners share one socket, so the first takes
+    // those that wait, and the cores share them out by how free each is to
+    // take them, as the next test has it.
+    #[cfg(ruio_uring)]
     assert!(accepted.iter().all(|&count| count > 0), "{accepted:?}");
+    let timeout = Duration::from_millis(10);
+    let err = first.accept().timeout(timeout).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut, "{err}");
     Ok(())
 }
 
 /// A server on several cores, with a listener on each bound to one address,
 /// shares the connections out among its cores.
-#[cfg(ruio_uring)]
 #[test]
 fn a_server_on_several_cores_shares_out_the_connections() {
     const CLIENTS: usize = 32;

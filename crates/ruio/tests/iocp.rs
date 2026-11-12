@@ -1,7 +1,8 @@
 //! What the I/O completion port engine does in its own way, which the
 //! tests that the engines share cannot name: a file's stream into a pool
 //! reads a file on a disk, from the file's position on, where io_uring's is
-//! for the files that data arrives on.
+//! for the files that data arrives on; and listeners bound to one address
+//! with `bind_reuseport` share one socket of the process's.
 
 #![cfg(ruio_iocp)]
 
@@ -13,6 +14,7 @@ use std::time::Duration;
 
 use ruio::buf::BufPool;
 use ruio::fs::{self, File};
+use ruio::net::TcpListener;
 
 use support::within;
 
@@ -138,5 +140,33 @@ async fn a_files_data_is_a_stream_of_leases() -> io::Result<()> {
     .await;
     assert!(chunks.concat() == data, "what was read is the file");
     assert!(stream.is_terminated());
+    Ok(())
+}
+
+/// Listeners bound to one address with `bind_reuseport` share one socket,
+/// which closes once the last of them is dropped; a port for the system to
+/// choose is a new one each time, and a listener bound with `bind` shares
+/// its address with none.
+#[ruio::test]
+async fn listeners_bound_with_reuseport_share_a_socket_until_the_last_goes() -> io::Result<()> {
+    let first = TcpListener::bind_reuseport("127.0.0.1:0")?;
+    let addr = first.local_addr()?;
+    let other = TcpListener::bind_reuseport("127.0.0.1:0")?;
+    assert_ne!(other.local_addr()?, addr);
+    let second = TcpListener::bind_reuseport(addr)?;
+    let err = TcpListener::bind(addr).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+    // The second holds the socket, which a third takes too.
+    drop(first);
+    let err = TcpListener::bind(addr).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+    let third = TcpListener::bind_reuseport(addr)?;
+    assert!(format!("{third:?}").starts_with("SharedListener"));
+    drop((second, third));
+    // The socket closed with the last of its listeners.
+    let plain = TcpListener::bind(addr)?;
+    let err = TcpListener::bind_reuseport(addr).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+    drop((plain, other));
     Ok(())
 }
