@@ -1,0 +1,17 @@
+[package]
+name = "ruio-iocp"
+description = "The I/O completion port engine of ruio, for Windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+ruio-buf.workspace = true
+ruio-engine.workspace = true
+
+[dev-dependencies]
+ruio-executor.workspace = true
+
+[lints]
+workspace = true

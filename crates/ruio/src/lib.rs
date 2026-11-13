@@ -85,15 +85,16 @@ connections merge with its shutdown signal through `select`."#
 #![cfg_attr(
     not(ruio_uring),
     doc = r#"
-Built for a system that has no I/O engine of ruio's yet, as macOS and
-Windows have not, or with `--cfg ruio_engine="park"`, ruio has the
-executor's API alone, on the park engine of `ruio-engine`, which runs no
-I/O: runtimes, tasks, timers, the channels and locks of [`sync`], the
-blocking pool and [`Cores`], whose threads are not pinned off Linux, and
-the buffer traits of [`buf`], which every engine shares. The I/O and
-io_uring's own API, `net`, `fs`, `io`, `process`, `signal`, the pools and
-registered buffers of `buf`, `uring` and `driver`, come with io_uring
-alone until such a system has an engine of its own. With the `futures`
+Built for a system whose engine ruio offers no I/O on yet, ruio has the
+executor's API alone: on Windows, on the I/O completion port engine of
+`ruio-iocp`, and on macOS, or wherever it is built with
+`--cfg ruio_engine="park"`, on the park engine of `ruio-engine`, which
+runs no I/O. That is runtimes, tasks, timers, the channels and locks of
+[`sync`], the blocking pool and [`Cores`], whose threads are not pinned
+off Linux, and the buffer traits of [`buf`], which every engine shares.
+The I/O and io_uring's own API, `net`, `fs`, `io`, `process`, `signal`,
+the pools and registered buffers of `buf`, `uring` and `driver`, come with
+io_uring alone until such a system's engine offers them. With the `futures`
 feature, the channels' receivers and intervals implement the `Stream` and
 `FusedStream` of futures-core."#
 )]

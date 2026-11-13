@@ -17,6 +17,7 @@ ruio-compat = { path = "crates/ruio-compat", version = "0.0.0" }
 ruio-driver = { path = "crates/ruio-driver", version = "0.0.0" }
 ruio-engine = { path = "crates/ruio-engine", version = "0.0.0" }
 ruio-executor = { path = "crates/ruio-executor", version = "0.0.0" }
+ruio-iocp = { path = "crates/ruio-iocp", version = "0.0.0" }
 ruio-macros = { path = "crates/ruio-macros", version = "0.0.0" }
 ruio-sys = { path = "crates/ruio-sys", version = "0.0.0" }
 

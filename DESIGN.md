@@ -3,9 +3,9 @@
 ruio is an async I/O runtime for Linux built directly on io_uring. The aim is
 the fastest way to do network and file I/O from Rust on current kernels, with
 an API that still reads like ordinary async Rust.
-Other systems are to get engines of their own, kqueue on macOS and I/O
-completion ports on Windows, chosen when a program is built and at no cost
-to io_uring (see [Engines](#engines)).
+Other systems get engines of their own, chosen when a program is built and
+at no cost to io_uring: Windows has a proof of concept on I/O completion
+ports, and macOS is to have kqueue (see [Engines](#engines)).
 
 ## Goals
 
@@ -33,7 +33,7 @@ to io_uring (see [Engines](#engines)).
 | Topic | Decision | Reason |
 |---|---|---|
 | Execution model | Thread-per-core: one ring and one executor per thread; spawned tasks need not be `Send`. | `SINGLE_ISSUER` and `DEFER_TASKRUN` assume one submitting thread, registered files and buffers belong to a single ring, and the hot path needs no atomics or locks. |
-| Engines | One I/O engine per build, chosen when the binary is built: io_uring on Linux; elsewhere, until a system has one of its own, and on Linux with `--cfg ruio_engine="park"`, the park engine, which runs no I/O. The executor drives its engine through the contract of `ruio-engine`, by type. See [Engines](#engines). | The io_uring build must cost nothing for the others: no dispatch, wrapper or field, and the calls compile to the driver's own. Features unify, so a feature would let any dependency move a whole binary off io_uring; a `--cfg` belongs to the binary. |
+| Engines | One I/O engine per build, chosen when the binary is built: io_uring on Linux; an I/O completion port on Windows, a proof of concept; elsewhere, until a system has one of its own, and on Linux or Windows with `--cfg ruio_engine="park"`, the park engine, which runs no I/O. The executor drives its engine through the contract of `ruio-engine`, by type. See [Engines](#engines). | The io_uring build must cost nothing for the others: no dispatch, wrapper or field, and the calls compile to the driver's own. Features unify, so a feature would let any dependency move a whole binary off io_uring; a `--cfg` belongs to the binary. |
 | Work stealing | Not in the first release, but kept possible (see [Keeping work stealing possible](#keeping-work-stealing-possible)). | It fights per-ring state, but some workloads want it. |
 | Send I/O | Portable operations (`PortableOp`, and `PortableFd` for a descriptor) run on the ring of the thread that polls them, and where no driver is current, on another executor's thread, on the foreign ring the embedder sets, or fail with `ENOSYS` (`Unsupported`) if none is set; `fs::portable`'s file runs its operations as portable ones, and `net::portable`'s sockets and a child's pipes are plain nonblocking descriptors whose reads and writes are system calls made at once, which wait on the polling thread's ring only when there is nothing to read or no room, and on another executor's thread on that executor's reactor, once the embedder sets it as the foreign one (`ruio_compat::TokioReactor` is tokio's); the sockets and files of `net` and `fs` stay with their ring. | Futures that must be `Send`, as `async_trait`'s, hyper-util's client and those spawned onto another core are, could hold no I/O of the ring; a portable operation costs a comparison a poll while it stays on its thread, and a portable socket makes the system calls tokio's does, and on tokio's threads waits as tokio's does. |
 | Minimum kernel | Linux 6.10. Detected by capability, not by version string. | 6.1, the oldest LTS with `DEFER_TASKRUN`, had everything the core needs, but 6.10 adds bundles, which send and receive several provided buffers per request: the network path needs them to beat epoll on large messages (see [Benchmarks](#benchmarks)). It also brings `NO_SQARRAY` (6.6), multishot read (6.7) and socket options through `URING_CMD` (6.7). Distribution kernels backport features, so version numbers mislead. |
@@ -50,6 +50,7 @@ crates/
   ruio-sys/       kernel ABI: uapi structures and constants, raw system calls; no policy
   ruio-engine/    the contract between the executor and its I/O engine; the park engine
   ruio-buf/       the buffers every engine shares: IoBuf, IoBufMut, IoBufs, Slice, AlignedBuf
+  ruio-iocp/      the I/O completion port engine of Windows, files and named pipes; a proof of concept
   ruio-driver/    one ring: setup, SQ/CQ, operation table, Op<T> futures, pools,
                   registered buffers and files, capability probe; the io_uring engine
   ruio-executor/  per-thread scheduler, tasks, timer wheel, thread-per-core builder
@@ -1037,24 +1038,27 @@ baseline are used only when probed.
 
 An engine is a thread's source of events, which the executor turns
 between its tasks and parks on while none is ready: io_uring's ring on
-Linux, and in time kqueue on macOS and an I/O completion port on Windows.
+Linux, an I/O completion port on Windows, and in time kqueue on macOS.
 io_uring stays the engine ruio is measured by, and the others must cost it
 nothing. So far `ruio` builds on any engine, and its I/O runs on io_uring
-alone: elsewhere it has the executor's API, on the park engine.
+alone: elsewhere it has the executor's API, and on Windows `ruio-iocp`
+has files and named pipes of its own.
 
 - **One engine per build.** The engine is chosen when a binary is built,
-  never at run time: io_uring on Linux; the park engine of `ruio-engine`
-  elsewhere, until a system has an engine of its own, and on Linux too
-  with `--cfg ruio_engine="park"`, in `RUSTFLAGS` or the binary's
+  never at run time: io_uring on Linux; an I/O completion port on
+  Windows; the park engine of `ruio-engine` elsewhere, until a system has
+  an engine of its own, and on Linux and Windows too with
+  `--cfg ruio_engine="park"`, in `RUSTFLAGS` or the binary's
   `.cargo/config.toml`. A Cargo feature would not do: features unify
   across the dependency graph, so a library that enabled one would move
-  every binary using it off io_uring. The `build.rs` of `ruio-executor`,
-  and `ruio`'s, which repeats it, turn the rule into `cfg(ruio_uring)`,
-  and their `Cargo.toml`s depend on `ruio-driver` by it, so a build for
-  another engine does not compile the driver at all. Cargo evaluates a
-  `--cfg` of `RUSTFLAGS` in target-specific dependency tables, and a
-  build with another gets a build-script output of its own, so switching
-  never reuses a stale choice.
+  every binary using it off io_uring. The `build.rs` of `ruio-executor`
+  turns the rule into `cfg(ruio_uring)` and `cfg(ruio_iocp)`, `ruio`'s
+  repeats its io_uring half, and their `Cargo.toml`s depend on
+  `ruio-driver` and `ruio-iocp` by it, so a build for one engine does not
+  compile the others at all. Cargo evaluates a `--cfg` of `RUSTFLAGS` in
+  target-specific dependency tables, and a build with another gets a
+  build-script output of its own, so switching never reuses a stale
+  choice.
 - **A contract, called by type.** `ruio-engine`, a crate of no
   dependencies, holds what the executor needs of an engine and nothing
   more: `Engine` (a turn without waiting, a park, whether a park would
@@ -1100,23 +1104,56 @@ alone: elsewhere it has the executor's API, on the park engine.
   smallest engine that keeps the contract, the one to start a new engine
   from, and the one besides io_uring that CI runs the executor's tests
   on, 279 of the 299, the others running io_uring operations, and builds
-  the executor and its tests on for macOS and Windows. `ruio` builds on
-  it with the executor's API alone, and CI runs its macro tests there and
-  builds it for macOS and Windows too.
+  the executor and its tests on for macOS. `ruio` builds on it with the
+  executor's API alone, and CI runs its macro tests there and builds it
+  for macOS too.
 - **Checking an engine.** `ruio_engine::conformance::check` turns an
   engine through the contract alone and fails where it breaks the
   contract in a way a test with no I/O can see: unparks lost or adding
-  up, a timeout or a timer that ends a park early or never. The driver's
-  tests and the park engine's run it.
+  up, a timeout or a timer that ends a park early or never. The tests of
+  the driver, of the park engine and of the completion port run it.
+- **Windows: an I/O completion port, a proof of concept.** The
+  executor runs on `ruio_iocp::Iocp` on Windows. A park waits on the port
+  with `GetQueuedCompletionStatusEx` until the earlier of its timeout and
+  the timer, in milliseconds rounded up, and waits out the rest of a wait
+  that ends early at a tick of Windows' timer, which is about 15.6 ms by
+  default, so its timers are as coarse. An unpark posts a packet of its
+  own, once for several, by the flag the park engine's uses, to a port
+  the engine shares with its unparkers, so that one after the engine is
+  gone posts to a port nothing reads rather than to a closed handle. A
+  check for work takes what the port has without waiting and keeps it for
+  the next turn. Its files (`fs::File`) and named pipes
+  (`pipe::NamedPipe`) read and write with owned buffers: an operation's
+  buffer moves into a slot on the heap that begins with its `OVERLAPPED`,
+  whose address the port hands back with the completion; a future
+  dropped first cancels its operation with `CancelIoEx` and leaves the
+  slot to the engine, which frees it, buffer and all, once the
+  cancellation's completion comes, as the driver does with an orphaned
+  operation; and dropping the engine waits for those, up to its shutdown
+  timeout. Its bindings are written by hand from the SDK's headers, as
+  `ruio-sys`'s are. What it lacks so far: sockets, ruio's own `net` and
+  `fs` on it, a pool of its own, handles that skip the port when an
+  operation completes at once (each such completion still costs a turn),
+  a way to make a turn without a call to the port, and counting the
+  executor's wakers rather than cloning them.
+- **Testing the Windows engine.** CI's `windows` job lints and tests the
+  four crates that build on Windows, on a `windows-latest` runner:
+  `cargo test -p ruio-engine -p ruio-iocp -p ruio-executor -p ruio`. The
+  other crates are Linux's, so `cargo test --workspace` does not build
+  there. On Linux, `cargo xwin test --no-run` for
+  `x86_64-pc-windows-msvc` and the same crates links those tests;
+  `cargo-xwin` downloads Microsoft's C runtime and Windows SDK for that,
+  under Microsoft's licence, which using it accepts.
 
 Adding an engine takes:
 
 1. A crate of its own, depending on `ruio-engine` and on its system's
    API, whose engine implements `Engine`, `Build` and `Unpark`, and whose
    tests run `conformance::check`.
-2. A module beside `engine/uring.rs` and `engine/park.rs` in
-   `ruio-executor`, which names the engine `Native`, defines `Remote`,
-   what a runtime's shared part keeps of the engine for other threads,
+2. A module beside `engine/uring.rs`, `engine/iocp.rs` and
+   `engine/park.rs` in `ruio-executor`, which names the engine `Native`,
+   defines `Remote`, what a runtime's shared part keeps of the engine for
+   other threads,
    and `public`, if the engine has API of its own for the crate root to
    re-export; and the engine chosen for its systems in `engine.rs`,
    `build.rs` and `Cargo.toml`.
@@ -1179,14 +1216,17 @@ the driver, for a choice already made when the program is built.
 `ruio-compat`'s adapter, which is built on the ring's operations, is
 io_uring's too until it is built on the traits of `io`. In order:
 
-1. An I/O completion port engine for Windows and a kqueue engine for
-   macOS, with owned-buffer I/O on each. A completion port completes an
-   operation into the buffer it was given, as io_uring does, so the
-   soundness model carries over; kqueue reports readiness, so a read waits
-   for its socket to be readable and then reads into the caller's buffer
-   itself, and files go to the blocking pool.
-2. Pinning `Cores`' threads on Windows (`SetThreadAffinityMask`); macOS
+1. The I/O completion port engine from a proof of concept to ruio's I/O
+   on Windows: sockets (`AcceptEx`, `ConnectEx`, `WSARecv`, `WSASend`),
+   `ruio`'s `net`, `fs` and `io` on it, with the API of the table above,
+   a `BufPool` of its own, and timers finer than the tick of Windows'
+   timer.
+2. A kqueue engine for macOS, with owned-buffer I/O. kqueue reports
+   readiness, so a read waits for its socket to be readable and then reads
+   into the caller's buffer itself, and files go to the blocking pool.
+3. Pinning `Cores`' threads on Windows (`SetThreadAffinityMask`); macOS
    offers only affinity hints.
+
 
 ## Networking
 
@@ -3475,6 +3515,10 @@ Since M7:
 - The buffer traits, slices and aligned buffers moved out of the driver
   into `ruio-buf`, which every engine shares, and `ruio::buf` has them on
   every engine; pools stay each engine's own (see [Engines](#engines)).
+- The executor runs on an I/O completion port on Windows, and
+  `ruio-iocp` reads and writes files and named pipes through it with owned
+  buffers: a proof of concept, built here and to be run on Windows (see
+  [Engines](#engines)).
 
 ## Open questions
 
