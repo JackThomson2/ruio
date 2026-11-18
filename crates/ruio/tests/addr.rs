@@ -1,6 +1,8 @@
 //! Resolving addresses: literals at once, host names on the blocking pool.
+//! The tests name nothing that only one engine has, and run on io_uring and
+//! on the I/O completion port alike.
 
-#![cfg(ruio_uring)]
+#![cfg(any(ruio_uring, ruio_iocp))]
 
 mod support;
 

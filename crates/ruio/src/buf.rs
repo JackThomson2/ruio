@@ -20,9 +20,22 @@ pin no memory, and hands the data back as a [`BufLease`], or a
 for reads and writes that skip mapping the memory on every operation, as
 [`FixedBuf`]s, or any [`FixedIoBuf`]."#
 )]
+#![cfg_attr(
+    ruio_iocp,
+    doc = r#"
+On the I/O completion port, the engine's pool is here too. A [`BufPool`]
+holds buffers that a stream takes from once it has data to receive, so
+that waiting receives hold no memory, and hands the data back as a
+[`BufLease`], or a [`BufBundle`] of them, which a write takes as
+[`IoBufs`]."#
+)]
 
 pub use ruio_buf::{AlignedBuf, BufResult, IoBuf, IoBufMut, IoBufs, Slice};
 
 // The ring's own buffers.
 #[cfg(ruio_uring)]
 pub use ruio_driver::buf::{BufBundle, BufLease, BufPool, FixedBuf, FixedBuffers, FixedIoBuf};
+
+// The completion port engine's own buffers.
+#[cfg(ruio_iocp)]
+pub use ruio_iocp::buf::{BufBundle, BufLease, BufPool};

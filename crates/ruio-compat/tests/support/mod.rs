@@ -6,9 +6,14 @@ use std::future::Future;
 use std::io;
 use std::time::Duration;
 
+#[cfg(ruio_compat_ring)]
 use ruio::buf::BufPool;
 use ruio::net::{TcpListener, TcpStream};
-use ruio_compat::{Compat, StreamSocket};
+#[cfg(ruio_compat_generic)]
+use ruio_compat::Adaptable;
+use ruio_compat::Compat;
+#[cfg(ruio_compat_ring)]
+use ruio_compat::StreamSocket;
 
 /// How long a test waits for anything before it is considered hung.
 pub(crate) const PATIENCE: Duration = Duration::from_secs(10);
@@ -21,8 +26,19 @@ pub(crate) async fn within<F: Future>(future: F) -> F::Output {
         .expect("still waiting after PATIENCE")
 }
 
+/// A connected pair of streams on the loopback interface, the client's and
+/// the server's, made with what every engine's `net` has.
+pub(crate) async fn connected() -> io::Result<(TcpStream, TcpStream)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let client = ruio::spawn(TcpStream::connect(addr));
+    let (server, _) = within(listener.accept()).await?;
+    Ok((client.await.unwrap()?, server))
+}
+
 /// A connected pair of streams on the loopback interface: the client's and
 /// the server's, the server's direct if `direct` is set.
+#[cfg(ruio_uring)]
 pub(crate) async fn pair(direct: bool) -> io::Result<(TcpStream, TcpStream)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_direct(direct);
@@ -38,12 +54,15 @@ pub(crate) async fn pair(direct: bool) -> io::Result<(TcpStream, TcpStream)> {
 pub(crate) enum Reads {
     /// Into a buffer of its own, this many bytes at a time.
     Buffer(usize),
-    /// Into a pool of its own, of this many buffers of this many bytes.
+    /// Into a pool of its own, of this many buffers of this many bytes,
+    /// which the ring's adapter alone can.
+    #[cfg(ruio_compat_ring)]
     Pool(u16, u32),
 }
 
 impl Reads {
     /// Adapts `stream` to read so.
+    #[cfg(ruio_compat_ring)]
     pub(crate) fn adapt<S: StreamSocket>(self, stream: S) -> Compat<S> {
         match self {
             Reads::Buffer(capacity) => Compat::with_capacity(capacity, stream),
@@ -52,6 +71,13 @@ impl Reads {
                 Compat::with_pool(&pool, stream)
             }
         }
+    }
+
+    /// Adapts `stream` to read so.
+    #[cfg(ruio_compat_generic)]
+    pub(crate) fn adapt<S: Adaptable>(self, stream: S) -> Compat<S> {
+        let Reads::Buffer(capacity) = self;
+        Compat::with_capacity(capacity, stream)
     }
 }
 

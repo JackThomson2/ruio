@@ -364,3 +364,22 @@ fn a_runtime_that_shuts_down_cancels_what_it_did_not_run() {
     assert!(other.block_on(unrun).unwrap_err().is_cancelled());
     assert!(other.block_on(late).unwrap_err().is_cancelled());
 }
+
+/// A thread has a handle to ask for only while it runs a runtime, where
+/// asking for one without a way to fail would panic.
+#[test]
+fn a_thread_has_a_handle_only_inside_a_runtime() {
+    assert!(ruio_executor::try_handle().is_none());
+    let runtime = Runtime::new().unwrap();
+    assert!(
+        ruio_executor::try_handle().is_none(),
+        "a runtime that is not running is not the thread's"
+    );
+    let home = thread::current().id();
+    let ran_on = runtime.block_on(async {
+        let handle = ruio_executor::try_handle().expect("inside a runtime");
+        handle.spawn(async { thread::current().id() }).await
+    });
+    assert_eq!(ran_on.unwrap(), home);
+    assert!(ruio_executor::try_handle().is_none());
+}

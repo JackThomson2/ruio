@@ -1,7 +1,7 @@
 //! The adapters over files and other descriptors, through the traits of
 //! `tokio::io`.
 
-#![cfg(feature = "tokio")]
+#![cfg(all(feature = "tokio", ruio_compat_ring))]
 
 mod support;
 

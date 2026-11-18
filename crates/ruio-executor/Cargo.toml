@@ -27,7 +27,8 @@ ruio-driver.workspace = true
 [target.'cfg(all(windows, not(ruio_engine = "park")))'.dependencies]
 ruio-iocp.workspace = true
 
-# For pinning threads to CPUs, which ruio does on Linux alone so far.
+# For pinning threads to CPUs on Linux. On Windows the executor declares
+# the two calls it pins with itself.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 

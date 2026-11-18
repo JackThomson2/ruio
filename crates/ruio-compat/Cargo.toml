@@ -11,7 +11,8 @@ default = ["futures-io", "hyper", "tokio"]
 # `client::Connector`, which makes the connections of hyper-util's client
 # with ruio's portable TCP streams, and `client::builder`, which gives the
 # client ruio's executor and timer. The client speaks HTTP/1.1; hyper-util's
-# `http2` feature adds HTTP/2.
+# `http2` feature adds HTTP/2. The portable streams are io_uring's and the
+# completion port's, so on another engine the feature adds nothing.
 client = [
     "hyper",
     "dep:hyper-util",
@@ -29,18 +30,23 @@ hyper = ["dep:hyper"]
 # none of tokio's runtime.
 tokio = ["dep:tokio"]
 # `TokioReactor`, tokio's reactor as ruio's foreign one, which the portable
-# sockets and a child's pipes wait on from the threads of a tokio runtime.
-# It brings tokio's `net` and `rt`, the reactor's own.
+# sockets, and on Linux a child's pipes, wait on from the threads of a tokio
+# runtime. It brings tokio's `net` and `rt`, the reactor's own. The foreign
+# reactor is io_uring's and the completion port's, so on another engine the
+# feature adds nothing but those.
 tokio-reactor = ["tokio", "tokio/net", "tokio/rt"]
 
 [dependencies]
 futures-io = { version = "0.3.34", optional = true }
 hyper = { version = "1.11.1", default-features = false, optional = true }
 hyper-util = { version = "0.1.21", default-features = false, optional = true }
-libc.workspace = true
 ruio.workspace = true
 tokio = { version = "1.53.1", default-features = false, optional = true }
 tower-service = { version = "0.3.3", optional = true }
+
+# The flags and error numbers of the ring's adapter, which is Linux's.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["io"] }

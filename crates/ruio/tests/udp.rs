@@ -1,10 +1,11 @@
 //! UDP sockets inside the runtime.
 
-#![cfg(ruio_uring)]
+#![cfg(any(ruio_uring, ruio_iocp))]
 
 mod support;
 
-use std::io::{self, ErrorKind};
+use std::io;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -31,9 +32,12 @@ async fn datagrams_go_to_and_come_from_addresses() -> io::Result<()> {
     assert_eq!(received?, 4);
     assert_eq!(buf, b"back");
 
-    assert_eq!(within(a.send_zc_to(vec![1; 100], to)).await.0?, 100);
-    let (received, _) = within(b.recv(Vec::with_capacity(128))).await;
-    assert_eq!(received?, 100);
+    #[cfg(ruio_uring)]
+    {
+        assert_eq!(within(a.send_zc_to(vec![1; 100], to)).await.0?, 100);
+        let (received, _) = within(b.recv(Vec::with_capacity(128))).await;
+        assert_eq!(received?, 100);
+    }
 
     let recv = a
         .recv(Vec::with_capacity(8))
@@ -42,9 +46,31 @@ async fn datagrams_go_to_and_come_from_addresses() -> io::Result<()> {
     Ok(())
 }
 
+/// Sockets of the standard library's, taken with `from_std` and `From`,
+/// send and receive as the runtime's own do: a datagram that found nobody
+/// at its port fails no receive after it.
+#[ruio::test]
+async fn sockets_from_the_standard_library_send_and_receive() -> io::Result<()> {
+    let a = UdpSocket::from_std(std::net::UdpSocket::bind("127.0.0.1:0")?);
+    let b = UdpSocket::from(std::net::UdpSocket::bind("127.0.0.1:0")?);
+    assert_eq!(within(a.send_to("hello", b.local_addr()?)).await.0?, 5);
+    let (received, buf) = within(b.recv_from(Vec::with_capacity(16))).await;
+    assert_eq!(received?, (5, a.local_addr()?));
+    assert_eq!(buf, b"hello");
+
+    let nobody = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
+    within(a.send_to("lost", nobody)).await.0?;
+    within(b.send_to("after", a.local_addr()?)).await.0?;
+    let (received, buf) = within(a.recv_from(Vec::with_capacity(16))).await;
+    assert_eq!(received?, (5, b.local_addr()?));
+    assert_eq!(buf, b"after");
+    Ok(())
+}
+
 /// Sockets bound with `SO_REUSEPORT` share an address, which a socket
 /// without it cannot bind, and the kernel spreads the datagrams among them
 /// by sender.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn sockets_bound_with_reuseport_share_an_address() -> io::Result<()> {
     let first = UdpSocket::bind_reuseport("127.0.0.1:0")?;

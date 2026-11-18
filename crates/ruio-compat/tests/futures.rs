@@ -1,6 +1,6 @@
 //! The adapters, through the traits of futures-io.
 
-#![cfg(feature = "futures-io")]
+#![cfg(all(feature = "futures-io", ruio_uring))]
 
 mod support;
 
@@ -8,9 +8,11 @@ use std::future::poll_fn;
 use std::io::{self, ErrorKind};
 use std::pin::Pin;
 use std::task::Poll;
+#[cfg(ruio_compat_ring)]
 use std::time::Duration;
 
 use futures_util::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(ruio_compat_ring)]
 use ruio::buf::BufPool;
 use ruio::net::UnixStream;
 use ruio_compat::Compat;
@@ -64,6 +66,7 @@ async fn data_crosses_the_adapters_both_ways() -> io::Result<()> {
 
 /// The pool is too small for what arrives, so its receive waits for the
 /// reader to give buffers back, again and again.
+#[cfg(ruio_compat_ring)]
 #[ruio::test]
 async fn data_crosses_the_adapters_through_a_pool() -> io::Result<()> {
     cross_both_ways(Reads::Pool(4, 1000)).await
@@ -86,7 +89,12 @@ async fn direct_streams_are_adapted() -> io::Result<()> {
 /// receives and buffers.
 #[ruio::test]
 async fn lines_are_read_from_the_buffers() -> io::Result<()> {
-    for reads in [Reads::Buffer(5), Reads::Pool(2, 5)] {
+    let ways = [
+        Reads::Buffer(5),
+        #[cfg(ruio_compat_ring)]
+        Reads::Pool(2, 5),
+    ];
+    for reads in ways {
         read_lines(reads).await?;
     }
     Ok(())
@@ -111,6 +119,7 @@ async fn read_lines(reads: Reads) -> io::Result<()> {
 
 /// A read takes all that the pool's receive has brought in, however many
 /// buffers it fills, as far as the read's buffer takes it.
+#[cfg(ruio_compat_ring)]
 #[ruio::test]
 async fn a_read_takes_what_several_buffers_hold() -> io::Result<()> {
     let (client, server) = pair(false).await?;
@@ -134,6 +143,7 @@ async fn a_read_takes_what_several_buffers_hold() -> io::Result<()> {
 
 /// A dropped adapter gives back the buffers it held, and those its receive
 /// took after.
+#[cfg(ruio_compat_ring)]
 #[ruio::test]
 async fn a_dropped_adapter_gives_its_buffers_back() -> io::Result<()> {
     let (client, server) = pair(false).await?;

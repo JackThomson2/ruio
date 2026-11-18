@@ -83,47 +83,103 @@ and `FusedStream` of futures-core, each as one call to its own
 connections merge with its shutdown signal through `select`."#
 )]
 #![cfg_attr(
-    not(ruio_uring),
+    ruio_iocp,
+    doc = r#"
+Built for Windows, ruio runs on the I/O completion port engine of
+`ruio-iocp`, and has part of its I/O there, a proof of concept. [`net`]
+has TCP and UDP sockets, which read and write with owned buffers as they
+do on io_uring; a stream also receives into a pool, writes several
+buffers as one, and leaves a write behind it. [`fs`] has files, which
+read and write the same way, with what Windows has no overlapped form
+of, opening a file, syncing it and the functions that take a path, on
+the blocking pool. [`io`] has the traits both implement, and `copy` over
+them, and [`buf`] has the engine's pool of buffers beside the buffer
+traits that every engine shares. What is `Send` on io_uring is so here
+too: the sockets of `net::portable`, the file of `fs::portable`, and
+[`process`], whose children are waited for, and whose pipes are read and
+written, on whichever thread polls them; where no runtime runs, the
+sockets wait on the foreign reactor `io::set_foreign_reactor` sets.
+[`signal`] delivers the console's control events, Ctrl+C among them, to
+tasks wherever they run. All of these are under the names and with the
+signatures they have on io_uring, so that code written to them builds
+for both. Beside them is the executor's API: runtimes, tasks, timers,
+the channels and locks of [`sync`], the blocking pool and [`Cores`],
+whose threads are pinned to their CPUs. The rest of the I/O and
+io_uring's own API, the rest of `io`, the registered buffers of `buf`,
+`uring` and `driver`, come with io_uring alone so far. Libraries that
+take their I/O through the poll-based traits of `tokio::io` or
+futures-io, such as hyper and rustls, run over the streams and files
+through the adapter of the `ruio-compat` crate. With the `futures`
+feature, a listener's connections, what arrives on a connection, a
+file's data, a directory's entries, a signal's arrivals and the
+channels' receivers and intervals implement the `Stream` and
+`FusedStream` of futures-core."#
+)]
+#![cfg_attr(
+    not(any(ruio_uring, ruio_iocp)),
     doc = r#"
 Built for a system whose engine ruio offers no I/O on yet, ruio has the
-executor's API alone: on Windows, on the I/O completion port engine of
-`ruio-iocp`, and on macOS, or wherever it is built with
+executor's API alone: on macOS, or wherever it is built with
 `--cfg ruio_engine="park"`, on the park engine of `ruio-engine`, which
 runs no I/O. That is runtimes, tasks, timers, the channels and locks of
-[`sync`], the blocking pool and [`Cores`], whose threads are not pinned
-off Linux, and the buffer traits of [`buf`], which every engine shares.
+[`sync`], the blocking pool and [`Cores`], whose threads are pinned on
+Linux and Windows alone, and the buffer traits of [`buf`], which every
+engine shares.
 The I/O and io_uring's own API, `net`, `fs`, `io`, `process`, `signal`,
 the pools and registered buffers of `buf`, `uring` and `driver`, come with
-io_uring alone until such a system's engine offers them. With the `futures`
-feature, the channels' receivers and intervals implement the `Stream` and
-`FusedStream` of futures-core."#
+an engine that offers them: io_uring, and for part of `net`, `fs`, `io`,
+`process` and `signal` the I/O completion port of Windows. With the
+`futures` feature, the channels' receivers and intervals implement the
+`Stream` and `FusedStream` of futures-core."#
 )]
 
 pub use ruio_executor::{
     AbortHandle, Builder, Core, Cores, Handle, JoinError, JoinHandle, JoinSet, RemoteAbortHandle,
     RemoteJoinHandle, Runtime, core, core_count, handle, handle_of, spawn, spawn_blocking,
-    spawn_on, yield_now,
+    spawn_on, try_handle, yield_now,
 };
 pub use ruio_executor::{blocking, coop, sync, time};
 pub use ruio_macros::{main, test};
 
 pub mod buf;
 
-// The I/O and io_uring's own API, which run on io_uring alone so far.
+// The I/O, which runs on io_uring and, in part, on the I/O completion port,
+// and io_uring's own API.
 #[cfg(ruio_uring)]
 pub use ruio_executor::driver;
 
 #[cfg(ruio_uring)]
 pub mod fs;
+// The completion port engine's part of `fs`, under io_uring's names.
+#[cfg(ruio_iocp)]
+#[path = "iocp/fs.rs"]
+pub mod fs;
 #[cfg(all(feature = "futures", ruio_uring))]
 mod futures_impls;
 #[cfg(ruio_uring)]
 pub mod io;
+// The completion port engine's part of `io`, under io_uring's names.
+#[cfg(ruio_iocp)]
+#[path = "iocp/io.rs"]
+pub mod io;
 #[cfg(ruio_uring)]
+pub mod net;
+// The completion port engine's part of `net`, under io_uring's names.
+#[cfg(ruio_iocp)]
+#[path = "iocp/net.rs"]
 pub mod net;
 #[cfg(ruio_uring)]
 pub mod process;
+// The completion port engine's `process`, under io_uring's names.
+#[cfg(ruio_iocp)]
+#[path = "iocp/process.rs"]
+pub mod process;
 #[cfg(ruio_uring)]
+pub mod signal;
+// The completion port engine's `signal`, the console's control events
+// under io_uring's names.
+#[cfg(ruio_iocp)]
+#[path = "iocp/signal.rs"]
 pub mod signal;
 
 /// The io_uring driver: operations, the futures that run them, and the types

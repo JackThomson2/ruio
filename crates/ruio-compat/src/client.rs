@@ -43,7 +43,9 @@ use std::time::Duration;
 use hyper::Uri;
 use hyper_util::client::legacy::Builder;
 use hyper_util::client::legacy::connect::{Connected, Connection};
-use ruio::net::portable::{TcpStream, UnixStream};
+use ruio::net::portable::TcpStream;
+#[cfg(ruio_uring)]
+use ruio::net::portable::UnixStream;
 
 use crate::{Executor, PortableCompat, Timer};
 
@@ -195,6 +197,7 @@ impl Connection for PortableCompat<TcpStream> {
 
 /// A plain Unix connection, for a connector of one's own, which tells
 /// hyper-util nothing more.
+#[cfg(ruio_uring)]
 impl Connection for PortableCompat<UnixStream> {
     fn connected(&self) -> Connected {
         Connected::new()

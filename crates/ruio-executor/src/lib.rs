@@ -98,7 +98,24 @@ pub use task::{AbortHandle, JoinError, JoinHandle, RemoteAbortHandle, RemoteJoin
 ///
 /// If the thread is not inside [`Runtime::block_on`].
 pub fn handle() -> Handle {
-    context::with_current(|scheduler| Handle::new(Arc::clone(scheduler.shared()))).expect(OUTSIDE)
+    try_handle().expect(OUTSIDE)
+}
+
+/// A handle that spawns tasks onto the thread's runtime from any thread, or
+/// `None` if the thread is not inside [`Runtime::block_on`], as when code
+/// that may run anywhere, such as a destructor, has a task for the runtime
+/// if there is one.
+///
+/// ```
+/// use ruio_executor::Runtime;
+///
+/// assert!(ruio_executor::try_handle().is_none());
+/// let runtime = Runtime::new()?;
+/// runtime.block_on(async { assert!(ruio_executor::try_handle().is_some()) });
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn try_handle() -> Option<Handle> {
+    context::with_current(|scheduler| Handle::new(Arc::clone(scheduler.shared())))
 }
 
 const OUTSIDE: &str = "must be called from inside a ruio runtime";

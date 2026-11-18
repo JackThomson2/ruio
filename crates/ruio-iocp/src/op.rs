@@ -1,6 +1,7 @@
 //! Operations through the port: the slot that an operation's `OVERLAPPED`
-//! begins, which holds its buffer while the system has it, and the futures
-//! that start operations and wait for their completions.
+//! begins, which holds what the system uses while it has the operation, a
+//! read's or a write's buffer say, and the futures that start operations
+//! and wait for their completions.
 //!
 //! A future starts its operation when first polled, moving its buffer into
 //! a slot on the heap that begins with the operation's `OVERLAPPED`, whose
@@ -10,19 +11,44 @@
 //! and all, once the completion comes, as the system may use the buffer
 //! until then. A future forgotten without being dropped leaks its slot,
 //! which is as sound: nothing frees memory the system may still write.
+//!
+//! An operation may also be left to finish by itself, with no future to
+//! wait for it. Its slot is the engine's from the start, and when the
+//! completion comes the engine hands what the slot holds the outcome. No
+//! future's drop cancels such an operation, so the engine keeps those in
+//! flight, and cancels them as it is dropped.
+//!
+//! A handle may have asked the system to queue no completion for an
+//! operation that succeeds during the call that starts it, as a read of
+//! data that has arrived does. Such an operation is finished by the poll
+//! that started it, or told how it went there and then if it was left to
+//! finish by itself, and costs no turn of the port. So that a task whose
+//! operations all finish so does not keep the thread from the others, and
+//! the port from being turned, only so many may between two turns: past
+//! that, an operation waits for the next turn to start.
+//!
+//! An operation may have a deadline, by which the engine cancels it if it
+//! has not completed. Its completion comes all the same: with the error of
+//! a cancelled operation, which its future then reports as `ERROR_TIMEOUT`,
+//! or with what the operation did, if it completed before the cancellation
+//! could stop it.
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::mem;
+use std::mem::{self, ManuallyDrop};
 use std::pin::Pin;
 use std::ptr::{self, NonNull};
 use std::task::{Context, Poll, Waker, ready};
+use std::time::Duration;
 
-use ruio_buf::{BufResult, IoBuf, IoBufMut};
+use ruio_buf::{BufResult, IoBuf, IoBufMut, Slice};
 
-use crate::handle::IoHandle;
+use crate::behind::{Behind, poll_gate};
+use crate::engine::now;
+use crate::handle::Target;
 use crate::sys;
 
 /// What the system, the engine and an operation's future share: the start
@@ -38,9 +64,31 @@ struct Header {
     waker: Cell<Option<Waker>>,
     /// How many bytes the operation transferred, once it completed.
     bytes: Cell<u32>,
-    /// Frees the slot that the header begins.
-    free: unsafe fn(*mut Header),
+    /// What the engine does with the slot that the header begins once the
+    /// operation has completed and no future has the slot.
+    release: Release,
+    /// Where the engine keeps the operation among those left to finish by
+    /// themselves, if it is one.
+    place: Cell<usize>,
+    /// The deadline by which the engine cancels the operation if it has
+    /// not completed, a time on the engines' clock, while the engine keeps
+    /// the operation among its [`Deadlines`].
+    deadline: Cell<Option<Duration>>,
+    /// Whether the engine cancelled the operation at its deadline.
+    timed_out: Cell<bool>,
 }
+
+/// Disposes of the slot that a header begins, whose operation has completed
+/// with no future to take it, having transferred as many bytes as the port
+/// said: frees it, after handing what it holds the outcome if the operation
+/// was left to finish by itself, which wakes tasks only if told that it may.
+///
+/// # Safety
+///
+/// The header must begin a slot that `Box::leak` gave, of the payload the
+/// function is for, whose operation's completion has been delivered and
+/// which nothing uses again.
+type Release = unsafe fn(*mut Header, u32, bool);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -51,64 +99,86 @@ enum State {
     /// The future let go of the slot, which the engine frees once the
     /// operation completes.
     Orphaned,
+    /// No future ever had the slot: the operation was left to finish by
+    /// itself, and the engine hands what the slot holds the outcome, and
+    /// frees the slot, once the operation completes.
+    Detached,
 }
 
-/// An operation's slot: its header, and the buffer the system uses.
+/// An operation's slot: its header, and what the system uses while it has
+/// the operation, such as the buffer of a read.
 #[repr(C)]
-struct Slot<B> {
+struct Slot<T> {
     header: Header,
-    buf: B,
+    payload: T,
 }
 
 impl Header {
-    fn new<B>(offset: u64, waker: Waker) -> Self {
+    /// The header of the slot of an operation at `offset`, which starts in
+    /// `state`, with the waker of the task that waits for it, if one does.
+    fn new(offset: u64, state: State, waker: Option<Waker>, release: Release) -> Self {
         Self {
             overlapped: UnsafeCell::new(sys::Overlapped {
-                internal: 0,
+                internal: sys::STATUS_PENDING as usize,
                 internal_high: 0,
                 offset: offset as u32,
                 offset_high: (offset >> 32) as u32,
                 event: ptr::null_mut(),
             }),
-            state: Cell::new(State::Waiting),
-            waker: Cell::new(Some(waker)),
+            state: Cell::new(state),
+            waker: Cell::new(waker),
             bytes: Cell::new(0),
-            free: free::<B>,
+            release,
+            place: Cell::new(0),
+            deadline: Cell::new(None),
+            timed_out: Cell::new(false),
         }
     }
 }
 
-/// Frees the slot of a buffer of type `B` that `header` begins.
+/// Frees the slot of a payload of type `T` that `header` begins, as
+/// [`Release`] says.
 ///
 /// # Safety
 ///
-/// `header` must begin a `Slot<B>` that `Box::leak` gave, which nothing uses
-/// again.
-unsafe fn free<B>(header: *mut Header) {
+/// As for [`Release`].
+unsafe fn free<T>(header: *mut Header, _bytes: u32, _wake: bool) {
     // SAFETY: the caller's promise; a slot begins with its header, as it is
     // `repr(C)`.
-    drop(unsafe { Box::from_raw(header.cast::<Slot<B>>()) });
+    drop(unsafe { Box::from_raw(header.cast::<Slot<T>>()) });
 }
 
 /// Records the completion of the operation whose `OVERLAPPED` `entry` hands
-/// back, and wakes its future if `wake`, or frees its slot if the future
-/// let go of it.
+/// back, which `deadlines` then no longer holds, and wakes its future if
+/// `wake`, or releases its slot if no future has it: one let go of it, or
+/// the operation is one of `detached`, left to finish by itself.
 ///
 /// # Safety
 ///
-/// `entry` must be the completion of an operation that a future of this
-/// module started, which the port hands back once.
-pub(crate) unsafe fn complete(entry: &sys::OverlappedEntry, wake: bool) {
+/// `entry` must be the completion of an operation that this module started
+/// on the port of the engine that `detached` and `deadlines` are of, which
+/// the port hands back once.
+pub(crate) unsafe fn complete(
+    entry: &sys::OverlappedEntry,
+    detached: &DetachedOps,
+    deadlines: &Deadlines,
+    wake: bool,
+) {
     let header = entry.overlapped.cast::<Header>();
     // SAFETY: by the caller's promise, the slot is allocated until its
     // completion is delivered, as this is; it begins with its header, which
     // begins with the `OVERLAPPED`.
     let slot = unsafe { &*header };
-    if slot.state.get() == State::Orphaned {
-        let free = slot.free;
-        // SAFETY: the future let go of the slot and the system has finished
-        // with it, so it is the engine's, which frees it this once.
-        unsafe { free(header) };
+    deadlines.remove(slot);
+    let state = slot.state.get();
+    if state != State::Waiting {
+        if state == State::Detached {
+            detached.remove(slot);
+        }
+        let release = slot.release;
+        // SAFETY: no future has the slot and the system has finished with
+        // it, so it is the engine's, which releases it this once.
+        unsafe { release(header, entry.bytes_transferred, wake) };
         return;
     }
     slot.bytes.set(entry.bytes_transferred);
@@ -121,111 +191,246 @@ pub(crate) unsafe fn complete(entry: &sys::OverlappedEntry, wake: bool) {
     }
 }
 
-/// Starts an operation on `handle` with `buf`, under `overlapped`, and says
-/// whether the system took it, in which case its completion is to come
-/// through the port.
+/// How the system took an operation that a call started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Started {
+    /// To complete later.
+    Later,
+    /// Completed during the call, having transferred as many bytes.
+    AtOnce(u32),
+}
+
+/// Starts an operation on `handle` with `payload`, under `overlapped`, and
+/// says how the system took it, if it did. Its completion is to come
+/// through the port, unless it completed during the call and the handle
+/// asked the system to queue none for such, or is associated with none.
 ///
 /// # Safety
 ///
-/// `handle` must be open and associated with a port, and `buf`'s memory and
+/// `handle` must be open, and associated with a port unless it was opened
+/// for I/O that waits, and `payload`, with the memory it names, and
 /// `overlapped` must stay valid and in place until the completion is
 /// delivered.
-type Start<B> = unsafe fn(sys::Handle, &mut B, *mut sys::Overlapped) -> io::Result<()>;
+pub(crate) type Start<T> =
+    unsafe fn(sys::Handle, &mut T, *mut sys::Overlapped) -> io::Result<Started>;
 
-/// An operation on a handle of the port, and its buffer.
-struct Op<'a, B: IoBuf> {
-    handle: &'a IoHandle,
+/// Reads the outcome of an operation on `handle` that has completed from
+/// its `overlapped`: how many bytes it transferred, of which the last
+/// argument is the count the port gave, or the error it failed with.
+///
+/// # Safety
+///
+/// `handle` must be open, and `overlapped` that of an operation on it whose
+/// completion has been delivered, still where the operation was started
+/// with it.
+pub(crate) type Outcome = unsafe fn(sys::Handle, *const sys::Overlapped, u32) -> io::Result<u32>;
+
+/// An operation on a handle of the port, and what the system uses for it.
+pub(crate) struct Op<'a, T> {
+    target: Target<'a>,
     offset: u64,
-    state: OpState<B>,
+    state: OpState<T>,
+    /// When the engine cancels the operation if it has not completed.
+    limit: Limit,
 }
 
-enum OpState<B> {
-    /// Not started yet: the buffer.
-    Unstarted(B),
+enum OpState<T> {
+    /// Not started yet: what the operation is to use.
+    Unstarted(T),
     /// Started: the slot, which the system and the engine may use.
-    Started(NonNull<Slot<B>>),
-    /// Finished, its buffer handed back.
+    Started(NonNull<Slot<T>>),
+    /// Finished, what it used handed back.
     Finished,
 }
 
-// The buffer is never pinned: it moves into the slot, and out of it.
-impl<B: IoBuf> Unpin for Op<'_, B> {}
+/// When the engine cancels an operation that has not completed, which then
+/// fails with `ERROR_TIMEOUT`, of [`io::ErrorKind::TimedOut`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Limit {
+    /// Never.
+    #[default]
+    Never,
+    /// So long after the operation starts.
+    After(Duration),
+    /// At a time on the engines' clock.
+    At(Duration),
+}
 
-impl<'a, B: IoBuf> Op<'a, B> {
-    fn new(handle: &'a IoHandle, buf: B, offset: u64) -> Self {
+impl Limit {
+    /// The deadline of an operation that starts now, if it has one.
+    fn deadline(self) -> Option<Duration> {
+        match self {
+            Self::Never => None,
+            Self::After(timeout) => Some(now().saturating_add(timeout)),
+            Self::At(deadline) => Some(deadline),
+        }
+    }
+
+    /// The limit of the next of the operations of a transfer whose limit
+    /// this is. They share the deadline that the first fixes as it starts,
+    /// which this then becomes.
+    pub(crate) fn fix(&mut self) -> Self {
+        if let Self::After(timeout) = *self {
+            *self = Self::At(now().saturating_add(timeout));
+        }
+        *self
+    }
+}
+
+// What an operation uses is never pinned: it moves into the slot, and out
+// of it.
+impl<T> Unpin for Op<'_, T> {}
+
+impl<'a, T> Op<'a, T> {
+    /// An operation on `target` that uses `payload`, at `offset` if the
+    /// handle is a file's.
+    pub(crate) fn new(target: Target<'a>, payload: T, offset: u64) -> Self {
         Self {
-            handle,
+            target,
             offset,
-            state: OpState::Unstarted(buf),
+            state: OpState::Unstarted(payload),
+            limit: Limit::Never,
+        }
+    }
+
+    /// Has the engine cancel the operation by `limit` if it has not
+    /// completed. This does nothing once the operation has started.
+    pub(crate) fn set_limit(&mut self, limit: Limit) {
+        if matches!(self.state, OpState::Unstarted(_)) {
+            self.limit = limit;
         }
     }
 
     /// Polls the operation, which `start` starts on the first poll, for how
-    /// many bytes it transferred, and the buffer.
-    fn poll_with(&mut self, cx: &mut Context<'_>, start: Start<B>) -> Poll<BufResult<u32, B>> {
+    /// many bytes it transferred, as `outcome` reads it, and what it used.
+    pub(crate) fn poll_with(
+        &mut self,
+        cx: &mut Context<'_>,
+        start: Start<T>,
+        outcome: Outcome,
+    ) -> Poll<(io::Result<u32>, T)> {
+        // An operation that may finish as it starts waits for the port to
+        // be turned once as many have as may between two turns.
+        if matches!(self.state, OpState::Unstarted(_)) && self.target.defers(cx) {
+            return Poll::Pending;
+        }
         match mem::replace(&mut self.state, OpState::Finished) {
-            OpState::Unstarted(buf) => self.start(cx, buf, start),
-            OpState::Started(slot) => self.poll_started(cx, slot),
+            OpState::Unstarted(payload) => self.start(cx, payload, start),
+            OpState::Started(slot) => self.poll_started(cx, slot, outcome),
             OpState::Finished => panic!("an operation polled after it finished"),
         }
     }
 
-    fn start(&mut self, cx: &mut Context<'_>, buf: B, start: Start<B>) -> Poll<BufResult<u32, B>> {
-        let slot = NonNull::from(Box::leak(Box::new(Slot {
-            header: Header::new::<B>(self.offset, cx.waker().clone()),
-            buf,
-        })));
-        // SAFETY: the slot was just made, and is the future's alone.
-        let buf = unsafe { &mut (*slot.as_ptr()).buf };
-        // SAFETY: as above; the `OVERLAPPED` lies apart from the buffer.
-        let overlapped = unsafe { (*slot.as_ptr()).header.overlapped.get() };
-        // SAFETY: the handle is open and associated with the port, as the
-        // future borrows it; the slot, which holds the buffer and the
-        // `OVERLAPPED`, stays where it is until the completion is delivered,
-        // the future's until then, or the engine's.
-        let started = unsafe { start(self.handle.raw(), buf, overlapped) };
-        match started {
-            Ok(()) => {
-                self.handle.engine().started();
+    fn start(
+        &mut self,
+        cx: &mut Context<'_>,
+        payload: T,
+        start: Start<T>,
+    ) -> Poll<(io::Result<u32>, T)> {
+        let header = Header::new(self.offset, State::Waiting, None, free::<T>);
+        let slot = NonNull::from(Box::leak(Box::new(Slot { header, payload })));
+        // SAFETY: the handle is open, and associated with the port unless it
+        // waits, as the future borrows it; the slot was just made, and stays
+        // where it is until the completion is delivered, the future's until
+        // then, or the engine's.
+        let result = match unsafe { launch(self.target, slot, start) } {
+            // The outcome, an error included, is read once the completion
+            // has been delivered, which only a turn on this thread does: the
+            // waker is in the slot before that.
+            Ok(Launched::Queued) => {
+                // SAFETY: the slot is allocated until its completion is
+                // delivered, and only this thread uses it.
+                let header = unsafe { &slot.as_ref().header };
+                header.waker.set(Some(cx.waker().clone()));
+                let engine = self.target.engine;
+                engine.started();
+                // The time counts from when the system took the operation.
+                if let Some(deadline) = self.limit.deadline() {
+                    engine
+                        .deadlines()
+                        .add(deadline, self.target.handle, slot.cast());
+                }
                 self.state = OpState::Started(slot);
-                Poll::Pending
+                return Poll::Pending;
             }
-            Err(err) => {
-                // SAFETY: the system did not take the operation, so nothing
-                // will come through the port for it, and the slot is the
-                // future's alone.
-                let Slot { buf, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
-                Poll::Ready((Err(err), buf))
+            Ok(Launched::Done(bytes)) => {
+                self.target.engine.finished_at_once();
+                Ok(bytes)
             }
-        }
+            Err(err) => Err(err),
+        };
+        // SAFETY: the system did not take the operation, or has finished
+        // with it, and nothing will come through the port for it either
+        // way, so the slot is the future's alone.
+        let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
+        Poll::Ready((result, payload))
     }
 
     fn poll_started(
         &mut self,
         cx: &mut Context<'_>,
-        slot: NonNull<Slot<B>>,
-    ) -> Poll<BufResult<u32, B>> {
+        slot: NonNull<Slot<T>>,
+        outcome: Outcome,
+    ) -> Poll<(io::Result<u32>, T)> {
         // SAFETY: the slot is allocated while the future has it, and only
         // this thread uses it.
-        let waiting = unsafe { &slot.as_ref().header };
-        if waiting.state.get() == State::Waiting {
-            let waker = match waiting.waker.take() {
+        let header = unsafe { &slot.as_ref().header };
+        if header.state.get() == State::Waiting {
+            let waker = match header.waker.take() {
                 Some(waker) if waker.will_wake(cx.waker()) => waker,
                 _ => cx.waker().clone(),
             };
-            waiting.waker.set(Some(waker));
+            header.waker.set(Some(waker));
             self.state = OpState::Started(slot);
             return Poll::Pending;
         }
+        // SAFETY: the handle is open, as the future borrows it, and the
+        // operation's completion has been delivered, its `OVERLAPPED` still
+        // in the slot it was started with.
+        let result = unsafe {
+            outcome(
+                self.target.handle,
+                header.overlapped.get(),
+                header.bytes.get(),
+            )
+        };
+        let result = timed(result, header.timed_out.get());
         // SAFETY: the operation is done, so the system and the engine have
         // finished with the slot, which is the future's alone again.
-        let Slot { header, buf } = *unsafe { Box::from_raw(slot.as_ptr()) };
-        let status = header.overlapped.into_inner().internal;
-        Poll::Ready((result(status, header.bytes.get()), buf))
+        let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
+        Poll::Ready((result, payload))
+    }
+
+    /// Gives up the operation before it has started, and hands back what it
+    /// was to use.
+    ///
+    /// # Panics
+    ///
+    /// If the operation has started.
+    pub(crate) fn give_up(&mut self) -> T {
+        match mem::replace(&mut self.state, OpState::Finished) {
+            OpState::Unstarted(payload) => payload,
+            state => {
+                self.state = state;
+                panic!("an operation given up after it started")
+            }
+        }
+    }
+
+    /// Whether the operation's completion has been delivered and not yet
+    /// read, so that a poll finishes it without waiting.
+    pub(crate) fn is_done(&self) -> bool {
+        let OpState::Started(slot) = &self.state else {
+            return false;
+        };
+        // SAFETY: the slot is allocated while the future has it, and only
+        // this thread uses it.
+        let header = unsafe { &slot.as_ref().header };
+        header.state.get() == State::Done
     }
 }
 
-impl<B: IoBuf> Drop for Op<'_, B> {
+impl<T> Drop for Op<'_, T> {
     fn drop(&mut self) {
         let OpState::Started(slot) = &self.state else {
             return;
@@ -240,13 +445,297 @@ impl<B: IoBuf> Drop for Op<'_, B> {
             drop(unsafe { Box::from_raw(slot.as_ptr()) });
             return;
         }
+        self.target.engine.deadlines().remove(header);
         header.state.set(State::Orphaned);
         drop(header.waker.take());
         // SAFETY: the handle is open, as the future borrows it, and the
         // `OVERLAPPED` names the operation, which may have completed
         // already, when the call does nothing.
-        unsafe { sys::CancelIoEx(self.handle.raw(), header.overlapped.get()) };
+        unsafe { sys::CancelIoEx(self.target.handle, header.overlapped.get()) };
     }
+}
+
+/// What became of an operation that the system took.
+enum Launched {
+    /// Its completion is to come through the port.
+    Queued,
+    /// It completed during the call that started it, having transferred as
+    /// many bytes, and nothing comes through the port for it.
+    Done(u32),
+}
+
+/// Starts the operation of `slot` on `target` with `start`, and says what
+/// became of it if the system took it: if not, with the error, and nothing
+/// comes through the port.
+///
+/// # Safety
+///
+/// The handle of `target` must be open, and associated with a port unless
+/// it was opened for I/O that waits, and `slot` one that `Box::leak` gave
+/// and nothing else uses, which stays where it is until the completion is
+/// delivered, if one is to come.
+unsafe fn launch<T>(
+    target: Target<'_>,
+    slot: NonNull<Slot<T>>,
+    start: Start<T>,
+) -> io::Result<Launched> {
+    // SAFETY: the slot is allocated, and the caller's alone.
+    let payload = unsafe { &mut (*slot.as_ptr()).payload };
+    // SAFETY: as above; the `OVERLAPPED` lies apart from the payload.
+    let overlapped = unsafe { (*slot.as_ptr()).header.overlapped.get() };
+    // SAFETY: the caller's promise for the handle; the slot, which holds the
+    // payload and the `OVERLAPPED`, stays where it is until the completion
+    // is delivered.
+    match unsafe { start(target.handle, payload, overlapped) } {
+        // The system queues no completion for a call that succeeded on a
+        // handle that asked it not to.
+        Ok(Started::AtOnce(bytes)) if target.skips => Ok(Launched::Done(bytes)),
+        Ok(_) => Ok(Launched::Queued),
+        // A handle opened for I/O that waits is associated with no port, so
+        // the call's error is the operation's outcome, whatever it did.
+        Err(err) if target.waits => Err(err),
+        Err(err) => {
+            // A call that fails at once may have completed the operation all
+            // the same, with a warning, and then its completion is queued
+            // too, whatever the handle asked: the call did not succeed.
+            // SAFETY: the slot is allocated, and the call has returned
+            // without leaving an operation to complete later, so nothing
+            // writes the `OVERLAPPED` while its status is read.
+            let status = unsafe { (*overlapped).internal };
+            if completed(status) {
+                Ok(Launched::Queued)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// What an operation left to finish by itself uses, which is told how the
+/// operation went; see [`detach`].
+pub(crate) trait Detached: Sized {
+    /// The handle the operation is on, which this keeps open until it is
+    /// told how the operation went, and what reads the operation's outcome
+    /// on it once its completion has come.
+    fn outcome(&self) -> (sys::Handle, Outcome);
+
+    /// Takes the outcome of the operation, whose completion has come: how
+    /// many bytes it transferred, or the error it failed with. Tasks are
+    /// woken only if `wake`: none is as the engine is dropped.
+    fn complete(self, result: io::Result<u32>, wake: bool);
+
+    /// Takes the outcome of the operation where it completed during the
+    /// call that started it, having transferred `bytes`: nothing comes
+    /// through the port for it. The task that started it is running, and
+    /// tasks may be woken.
+    fn done(self, bytes: u32);
+}
+
+/// Hands the payload of type `T` in the slot that `header` begins the
+/// outcome of its operation, and frees the slot, as [`Release`] says.
+///
+/// # Safety
+///
+/// As for [`Release`].
+unsafe fn settle<T: Detached>(header: *mut Header, bytes: u32, wake: bool) {
+    // SAFETY: the caller's promise; a slot begins with its header, as it is
+    // `repr(C)`, and holds a `ManuallyDrop<T>` where it holds a `T`, the one
+    // laid out as the other.
+    let mut slot = unsafe { Box::from_raw(header.cast::<Slot<ManuallyDrop<T>>>()) };
+    // SAFETY: the payload is taken this once, and the slot is dropped
+    // without it.
+    let payload = unsafe { ManuallyDrop::take(&mut slot.payload) };
+    let (handle, outcome) = payload.outcome();
+    // SAFETY: the payload keeps the handle open; the operation's completion
+    // has been delivered, by the caller's promise, and its `OVERLAPPED` is
+    // in the slot, where the operation was started with it.
+    let result = unsafe { outcome(handle, slot.header.overlapped.get(), bytes) };
+    payload.complete(timed(result, slot.header.timed_out.get()), wake);
+}
+
+/// Starts an operation on `target` that uses `payload`, at `offset` if the
+/// handle is a file's, and leaves it to finish by itself: no future waits
+/// for it, and `payload` is told how it went when its completion comes, or
+/// before this returns if it completed as it started on a handle whose
+/// such operations come through no port; see [`Detached`]. The engine
+/// cancels the operation by `limit` if it has not completed, and as the
+/// engine is dropped, which it can for as long as `payload` keeps the
+/// handle open.
+///
+/// # Errors
+///
+/// What `start` reports, with the payload, if the system did not take the
+/// operation, of which the payload is then told nothing.
+pub(crate) fn detach<T: Detached>(
+    target: Target<'_>,
+    payload: T,
+    offset: u64,
+    limit: Limit,
+    start: Start<T>,
+) -> Result<(), (io::Error, T)> {
+    let header = Header::new(offset, State::Detached, None, settle::<T>);
+    let slot = NonNull::from(Box::leak(Box::new(Slot { header, payload })));
+    // SAFETY: the handle is open, and associated with the port unless it
+    // waits, as `target` borrows it; the slot was just made, and stays where
+    // it is until the completion is delivered, when the engine releases it.
+    let launched = unsafe { launch(target, slot, start) };
+    if matches!(launched, Ok(Launched::Queued)) {
+        target.engine.started();
+        target.engine.detached().add(target.handle, slot.cast());
+        if let Some(deadline) = limit.deadline() {
+            let deadlines = target.engine.deadlines();
+            deadlines.add(deadline, target.handle, slot.cast());
+        }
+        return Ok(());
+    }
+    // SAFETY: the system did not take the operation, or has finished with
+    // it, and nothing will come through the port for it either way, so
+    // nothing else has the slot.
+    let Slot { payload, .. } = *unsafe { Box::from_raw(slot.as_ptr()) };
+    match launched {
+        Ok(Launched::Done(bytes)) => {
+            target.engine.finished_at_once();
+            payload.done(bytes);
+            Ok(())
+        }
+        Ok(Launched::Queued) => unreachable!("the slot of a queued operation is the engine's"),
+        Err(err) => Err((err, payload)),
+    }
+}
+
+/// The operations of an engine's that were left to finish by themselves and
+/// have not: what the engine cancels as it is dropped.
+#[derive(Default)]
+pub(crate) struct DetachedOps {
+    /// Each operation's handle, and the header of its slot, whose `place`
+    /// is where in the vector the operation is.
+    ops: RefCell<Vec<(sys::Handle, NonNull<Header>)>>,
+}
+
+impl DetachedOps {
+    /// Adds an operation on `handle` that the system took, by the header of
+    /// its slot.
+    fn add(&self, handle: sys::Handle, header: NonNull<Header>) {
+        let mut ops = self.ops.borrow_mut();
+        // SAFETY: the slot is allocated until the operation's completion is
+        // delivered, which it has not been.
+        unsafe { header.as_ref() }.place.set(ops.len());
+        ops.push((handle, header));
+    }
+
+    /// Removes the operation of `header`, whose completion has come.
+    fn remove(&self, header: &Header) {
+        let mut ops = self.ops.borrow_mut();
+        let place = header.place.get();
+        debug_assert!(
+            ops.get(place)
+                .is_some_and(|(_, at)| ptr::eq(at.as_ptr(), header)),
+            "an operation left to finish by itself is where its header says"
+        );
+        ops.swap_remove(place);
+        // The last of them took its place.
+        if let Some((_, moved)) = ops.get(place) {
+            // SAFETY: the operation's completion has not come, so its slot
+            // is allocated.
+            unsafe { moved.as_ref() }.place.set(place);
+        }
+    }
+
+    /// Asks the system to cancel them all. Their completions come through
+    /// the port all the same.
+    pub(crate) fn cancel(&self) {
+        for (handle, header) in self.ops.borrow().iter() {
+            // SAFETY: the `OVERLAPPED` names the operation, whose slot is
+            // allocated until its completion is delivered; a handle that
+            // has closed since has no such operation to cancel.
+            unsafe { sys::CancelIoEx(*handle, header.as_ptr().cast()) };
+        }
+    }
+}
+
+/// Where an operation is among those of [`Deadlines`]: by its deadline, and
+/// then by the address of its slot's header, which tells apart the
+/// operations of one deadline.
+type Due = (Duration, usize);
+
+/// The operations of an engine's in flight that are to be cancelled if they
+/// have not completed by their deadlines: the first of those ends a turn's
+/// wait, and the turn cancels those whose deadlines have come.
+#[derive(Default)]
+pub(crate) struct Deadlines {
+    /// Each operation's handle, and the header of its slot.
+    ops: RefCell<BTreeMap<Due, (sys::Handle, NonNull<Header>)>>,
+}
+
+impl Deadlines {
+    /// Adds the operation of `header` on `handle`, which the system has
+    /// taken, to be cancelled at `deadline`.
+    fn add(&self, deadline: Duration, handle: sys::Handle, header: NonNull<Header>) {
+        // SAFETY: the slot is allocated until the operation's completion is
+        // delivered, which it has not been.
+        unsafe { header.as_ref() }.deadline.set(Some(deadline));
+        let key = (deadline, header.as_ptr().addr());
+        self.ops.borrow_mut().insert(key, (handle, header));
+    }
+
+    /// Removes the operation of `header`, if it is among them: its
+    /// completion has come, or its future has gone.
+    fn remove(&self, header: &Header) {
+        if let Some(deadline) = header.deadline.take() {
+            let key = (deadline, ptr::from_ref(header).addr());
+            self.ops.borrow_mut().remove(&key);
+        }
+    }
+
+    /// The first of their deadlines, if there are any.
+    pub(crate) fn first(&self) -> Option<Duration> {
+        let ops = self.ops.borrow();
+        ops.first_key_value().map(|(&(deadline, _), _)| deadline)
+    }
+
+    /// Asks the system to cancel those whose deadlines have come, which are
+    /// then no longer among them, and records that they timed out. Their
+    /// completions come through the port all the same.
+    pub(crate) fn expire(&self) {
+        let mut ops = self.ops.borrow_mut();
+        if ops.is_empty() {
+            return;
+        }
+        let now = now();
+        while let Some(op) = ops.first_entry()
+            && op.key().0 <= now
+        {
+            let (handle, header) = op.remove();
+            // SAFETY: the operation's completion has not come, so its slot
+            // is allocated.
+            let header = unsafe { header.as_ref() };
+            header.deadline.set(None);
+            header.timed_out.set(true);
+            // SAFETY: the `OVERLAPPED` names the operation, whose slot is
+            // allocated until its completion is delivered; a handle that
+            // has closed since has no such operation to cancel.
+            unsafe { sys::CancelIoEx(handle, header.overlapped.get()) };
+        }
+    }
+}
+
+/// Whether the system completed an operation whose call failed at once, and
+/// so queued its completion to the port, going by the status that the call
+/// left in its `OVERLAPPED`.
+///
+/// The system queues the completion of an operation that completes during
+/// the call unless it fails with an error status, and writes the status to
+/// the `OVERLAPPED` in the same cases. A warning status is no error to it,
+/// yet the call that started the operation reports it as one: a datagram
+/// longer than its buffer fails `WSARecvFrom` with `WSAEMSGSIZE`, and its
+/// completion comes through the port all the same. An `OVERLAPPED` starts
+/// as pending, so a status that is neither that nor an error is one the
+/// system wrote, with a completion behind it.
+fn completed(status: usize) -> bool {
+    // The status is the low half of `Internal`; errors have its top two bits
+    // set.
+    let status = status as u32;
+    status != sys::STATUS_PENDING && status >> 30 != 0b11
 }
 
 /// The outcome of an operation that completed with `status`, the
@@ -261,15 +750,49 @@ fn result(status: usize, bytes: u32) -> io::Result<u32> {
     Err(io::Error::from_raw_os_error(code as i32))
 }
 
-/// Whether the system took an operation that its call returned `ok` for. A
-/// call that succeeded completed the operation at once, and its completion
-/// is queued to the port all the same.
-fn taken(ok: sys::Bool) -> io::Result<()> {
+/// The outcome `result` of an operation, where one that the engine
+/// cancelled at its deadline, as `timed_out` says, and that failed for it
+/// fails with `ERROR_TIMEOUT`, of [`io::ErrorKind::TimedOut`], rather than
+/// as cancelled. One that completed before the cancellation could stop it
+/// keeps its outcome.
+fn timed(result: io::Result<u32>, timed_out: bool) -> io::Result<u32> {
+    match result {
+        Err(err)
+            if timed_out && err.raw_os_error() == Some(sys::ERROR_OPERATION_ABORTED as i32) =>
+        {
+            Err(io::Error::from_raw_os_error(sys::ERROR_TIMEOUT as i32))
+        }
+        result => result,
+    }
+}
+
+/// Reads the outcome of an operation on a file or a pipe from the status in
+/// its `OVERLAPPED`, as [`Outcome`] says.
+///
+/// # Safety
+///
+/// As for [`Outcome`].
+pub(crate) unsafe fn status_outcome(
+    _handle: sys::Handle,
+    overlapped: *const sys::Overlapped,
+    bytes: u32,
+) -> io::Result<u32> {
+    // SAFETY: the caller's promise: the operation has completed, so the
+    // system writes its `OVERLAPPED` no more, and the slot still holds it.
+    let status = unsafe { (*overlapped).internal };
+    result(status, bytes)
+}
+
+/// How the system took an operation whose call returned `ok`, having
+/// transferred `bytes` if that is true: the call then completed the
+/// operation, whose completion is queued to the port all the same unless
+/// the handle asked for none.
+pub(crate) fn taken(ok: sys::Bool, bytes: u32) -> io::Result<Started> {
     if ok != 0 {
-        return Ok(());
+        return Ok(Started::AtOnce(bytes));
     }
     match sys::GetLastError() {
-        sys::ERROR_IO_PENDING => Ok(()),
+        sys::ERROR_IO_PENDING => Ok(Started::Later),
         code => Err(io::Error::from_raw_os_error(code as i32)),
     }
 }
@@ -283,14 +806,15 @@ unsafe fn start_read<B: IoBufMut>(
     handle: sys::Handle,
     buf: &mut B,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let len = u32::try_from(buf.bytes_total()).unwrap_or(u32::MAX);
     let ptr = buf.stable_mut_ptr();
+    let mut read = 0;
     // SAFETY: the caller's promise for the handle, the buffer and the
     // `OVERLAPPED`; the buffer is writable for `len` bytes, as `IoBufMut`
-    // promises.
-    let ok = unsafe { sys::ReadFile(handle, ptr.cast(), len, ptr::null_mut(), overlapped) };
-    taken(ok)
+    // promises; and the count is written before the call returns.
+    let ok = unsafe { sys::ReadFile(handle, ptr.cast(), len, &mut read, overlapped) };
+    taken(ok, read)
 }
 
 /// Starts a write of `buf`'s bytes, as [`Start`] says.
@@ -302,14 +826,15 @@ unsafe fn start_write<B: IoBuf>(
     handle: sys::Handle,
     buf: &mut B,
     overlapped: *mut sys::Overlapped,
-) -> io::Result<()> {
+) -> io::Result<Started> {
     let len = u32::try_from(buf.bytes_init()).unwrap_or(u32::MAX);
     let ptr = buf.stable_ptr();
+    let mut written = 0;
     // SAFETY: the caller's promise for the handle, the buffer and the
     // `OVERLAPPED`; the buffer holds `len` initialized bytes, as `IoBuf`
-    // promises.
-    let ok = unsafe { sys::WriteFile(handle, ptr.cast(), len, ptr::null_mut(), overlapped) };
-    taken(ok)
+    // promises; and the count is written before the call returns.
+    let ok = unsafe { sys::WriteFile(handle, ptr.cast(), len, &mut written, overlapped) };
+    taken(ok, written)
 }
 
 /// Whether a read's error means that there is nothing more to read: the end
@@ -321,10 +846,12 @@ fn is_end(err: &io::Error) -> bool {
 }
 
 /// The future of a read through the port:
-/// [`File::read_at`](crate::fs::File::read_at) and
-/// [`NamedPipe::read`](crate::pipe::NamedPipe::read). It hands the buffer,
+/// [`File::read_at`](crate::fs::File::read_at),
+/// [`NamedPipe::read`](crate::pipe::NamedPipe::read) and
+/// [`TcpStream::read`](crate::net::TcpStream::read). It hands the buffer,
 /// an [`IoBufMut`], back with how many bytes it read: 0 at the end of a
-/// file, or of a pipe whose other end has closed.
+/// file, of a pipe whose other end has closed, or of a stream whose peer
+/// has shut down.
 ///
 /// It starts the read when first polled. Dropping it before the read
 /// completes cancels the read, and the buffer is dropped once the
@@ -332,13 +859,46 @@ fn is_end(err: &io::Error) -> bool {
 #[must_use = "futures do nothing unless polled"]
 pub struct Read<'a, B: IoBufMut> {
     op: Op<'a, B>,
+    start: Start<B>,
+    outcome: Outcome,
 }
 
 impl<'a, B: IoBufMut> Read<'a, B> {
-    pub(crate) fn new(handle: &'a IoHandle, buf: B, offset: u64) -> Self {
+    /// A read of a file, from `offset`, or of a pipe.
+    pub(crate) fn new(target: Target<'a>, buf: B, offset: u64) -> Self {
+        Self::with(target, buf, offset, start_read::<B>, status_outcome)
+    }
+
+    /// A read that `start` starts, and whose outcome `outcome` reads.
+    pub(crate) fn with(
+        target: Target<'a>,
+        buf: B,
+        offset: u64,
+        start: Start<B>,
+        outcome: Outcome,
+    ) -> Self {
         Self {
-            op: Op::new(handle, buf, offset),
+            op: Op::new(target, buf, offset),
+            start,
+            outcome,
         }
+    }
+
+    /// Whether the read's completion has been delivered and not yet read,
+    /// so that a poll finishes the read without waiting.
+    pub(crate) fn is_done(&self) -> bool {
+        self.op.is_done()
+    }
+
+    /// Cancels the read if it has not completed `duration` after it starts:
+    /// it then fails with `ERROR_TIMEOUT`, of [`io::ErrorKind::TimedOut`],
+    /// and hands the buffer back, as with any other error. A read that
+    /// completes before the cancellation can stop it keeps what it read.
+    ///
+    /// This has no effect once the read has started.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.op.set_limit(Limit::After(duration));
+        self
     }
 }
 
@@ -346,13 +906,17 @@ impl<B: IoBufMut> Future for Read<'_, B> {
     type Output = BufResult<usize, B>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (result, mut buf) = ready!(self.op.poll_with(cx, start_read::<B>));
+        let (start, outcome) = (self.start, self.outcome);
+        let (result, mut buf) = ready!(self.op.poll_with(cx, start, outcome));
         let result = match result {
             Ok(read) => {
+                // A count beyond the buffer would be the length of a datagram
+                // that did not fit, of which the buffer holds what did.
+                let read = (read as usize).min(buf.bytes_total());
                 // SAFETY: the system wrote the bytes it reports reading from
                 // the start of the buffer, within its `bytes_total`.
-                unsafe { buf.set_init(read as usize) };
-                Ok(read as usize)
+                unsafe { buf.set_init(read) };
+                Ok(read)
             }
             Err(err) if is_end(&err) => Ok(0),
             Err(err) => Err(err),
@@ -370,23 +934,70 @@ impl<B: IoBufMut> fmt::Debug for Read<'_, B> {
 }
 
 /// The future of a write through the port:
-/// [`File::write_at`](crate::fs::File::write_at) and
-/// [`NamedPipe::write`](crate::pipe::NamedPipe::write). It hands the buffer,
+/// [`File::write_at`](crate::fs::File::write_at),
+/// [`NamedPipe::write`](crate::pipe::NamedPipe::write) and
+/// [`TcpStream::write`](crate::net::TcpStream::write). It hands the buffer,
 /// an [`IoBuf`], back with how many bytes it wrote.
 ///
 /// It starts the write when first polled. Dropping it before the write
 /// completes cancels the write, which may have written some of the buffer
 /// by then, and the buffer is dropped once the cancellation has completed.
+///
+/// A stream's write waits, before it starts, for the writes left behind the
+/// stream to finish, and fails with the error that one of them failed with,
+/// handing the buffer back unwritten.
 #[must_use = "futures do nothing unless polled"]
 pub struct Write<'a, B: IoBuf> {
     op: Op<'a, B>,
+    start: Start<B>,
+    outcome: Outcome,
+    /// The writes left behind a stream, which a write of the stream's waits
+    /// for before it starts.
+    gate: Option<&'a Behind>,
 }
 
 impl<'a, B: IoBuf> Write<'a, B> {
-    pub(crate) fn new(handle: &'a IoHandle, buf: B, offset: u64) -> Self {
+    /// A write to a file, at `offset`, or to a pipe.
+    pub(crate) fn new(target: Target<'a>, buf: B, offset: u64) -> Self {
+        Self::with(target, buf, offset, start_write::<B>, status_outcome)
+    }
+
+    /// A write that `start` starts, and whose outcome `outcome` reads.
+    pub(crate) fn with(
+        target: Target<'a>,
+        buf: B,
+        offset: u64,
+        start: Start<B>,
+        outcome: Outcome,
+    ) -> Self {
         Self {
-            op: Op::new(handle, buf, offset),
+            op: Op::new(target, buf, offset),
+            start,
+            outcome,
+            gate: None,
         }
+    }
+
+    /// Makes the write wait, before it starts, for the writes behind its
+    /// stream that `gate` counts to finish, and fail with the error that
+    /// one of them failed with.
+    pub(crate) fn behind(mut self, gate: &'a Behind) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Cancels the write if it has not completed `duration` after it
+    /// starts, which a stream's does once the writes behind the stream have
+    /// finished: it then fails with `ERROR_TIMEOUT`, of
+    /// [`io::ErrorKind::TimedOut`], and hands the buffer back, as with any
+    /// other error, though it may have written some of the buffer by then.
+    /// A write that completes before the cancellation can stop it keeps
+    /// what it wrote.
+    ///
+    /// This has no effect once the write has started.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.op.set_limit(Limit::After(duration));
+        self
     }
 }
 
@@ -394,7 +1005,11 @@ impl<B: IoBuf> Future for Write<'_, B> {
     type Output = BufResult<usize, B>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (result, buf) = ready!(self.op.poll_with(cx, start_write::<B>));
+        let this = &mut *self;
+        if let Err(err) = ready!(poll_gate(&mut this.gate, cx)) {
+            return Poll::Ready((Err(err), this.op.give_up()));
+        }
+        let (result, buf) = ready!(this.op.poll_with(cx, this.start, this.outcome));
         Poll::Ready((result.map(|written| written as usize), buf))
     }
 }
@@ -407,9 +1022,420 @@ impl<B: IoBuf> fmt::Debug for Write<'_, B> {
     }
 }
 
+/// Where the transfer of a whole buffer has got to.
+enum Whole<F, B> {
+    /// Not started yet: the buffer.
+    Start(B),
+    /// A read or a write of the rest of the buffer, in flight.
+    Moving(F),
+    /// Finished, the buffer handed back.
+    Finished,
+}
+
+/// The future of a read that fills its buffer, in as many reads as that
+/// takes: [`TcpStream::read_exact`](crate::net::TcpStream::read_exact) and
+/// [`File::read_exact_at`](crate::fs::File::read_exact_at). It hands the
+/// buffer, an [`IoBufMut`], back with `Ok(())` once the buffer is full, up
+/// to its `bytes_total`, with [`io::ErrorKind::UnexpectedEof`] if the
+/// stream or the file ends first, or with the error that stopped the
+/// reads. What was read is marked initialized either way.
+///
+/// A stream's fills the buffer from its start, and a file's after the
+/// buffer's contents, as ruio's do on io_uring.
+///
+/// Dropping it cancels the read in flight, and the buffer is dropped once
+/// the cancellation has completed.
+#[must_use = "futures do nothing unless polled"]
+pub struct ReadExact<'a, B: IoBufMut> {
+    target: Target<'a>,
+    start: Start<Slice<B>>,
+    outcome: Outcome,
+    /// Where in a file the next read is from, which a stream's ignores.
+    offset: u64,
+    /// How much of the buffer is filled.
+    done: usize,
+    state: Whole<Read<'a, Slice<B>>, B>,
+    /// When the read in flight is cancelled: the reads share the deadline
+    /// the first fixes as it starts.
+    limit: Limit,
+}
+
+// Nothing is pinned: the buffer is only ever moved.
+impl<B: IoBufMut> Unpin for ReadExact<'_, B> {}
+
+impl<'a, B: IoBufMut> ReadExact<'a, B> {
+    /// A read of a file that fills `buf` after its contents, from `offset`.
+    pub(crate) fn at(target: Target<'a>, buf: B, offset: u64) -> Self {
+        let done = buf.bytes_init();
+        let start = start_read::<Slice<B>>;
+        Self::with(target, buf, done, offset, start, status_outcome)
+    }
+
+    /// A read that fills `buf` from `done` on, with reads that `start`
+    /// starts and whose outcomes `outcome` reads.
+    pub(crate) fn with(
+        target: Target<'a>,
+        buf: B,
+        done: usize,
+        offset: u64,
+        start: Start<Slice<B>>,
+        outcome: Outcome,
+    ) -> Self {
+        Self {
+            target,
+            start,
+            outcome,
+            offset,
+            done,
+            state: Whole::Start(buf),
+            limit: Limit::Never,
+        }
+    }
+
+    /// Fails the read with `ERROR_TIMEOUT`, of [`io::ErrorKind::TimedOut`],
+    /// if the buffer is not full `duration` after the first of its reads
+    /// starts, cancelling the read in flight then: each read has what is
+    /// left of the time. What was read is marked initialized, as with any
+    /// other error.
+    ///
+    /// This has no effect once the first read has started.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        if matches!(self.state, Whole::Start(_)) {
+            self.limit = Limit::After(duration);
+        }
+        self
+    }
+}
+
+impl<B: IoBufMut> Future for ReadExact<'_, B> {
+    type Output = BufResult<(), B>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            let buf = match mem::replace(&mut this.state, Whole::Finished) {
+                Whole::Start(buf) => buf,
+                Whole::Moving(mut read) => {
+                    let Poll::Ready((result, rest)) = Pin::new(&mut read).poll(cx) else {
+                        this.state = Whole::Moving(read);
+                        return Poll::Pending;
+                    };
+                    let buf = rest.into_inner();
+                    match result {
+                        Ok(0) => {
+                            let err = io::ErrorKind::UnexpectedEof.into();
+                            return Poll::Ready((Err(err), buf));
+                        }
+                        Ok(read) => {
+                            this.done += read;
+                            this.offset += read as u64;
+                        }
+                        Err(err) => return Poll::Ready((Err(err), buf)),
+                    }
+                    buf
+                }
+                Whole::Finished => panic!("`ReadExact` polled after it completed"),
+            };
+            if this.done >= buf.bytes_total() {
+                return Poll::Ready((Ok(()), buf));
+            }
+            let rest = buf.slice(this.done..);
+            let mut read = Read::with(this.target, rest, this.offset, this.start, this.outcome);
+            read.op.set_limit(this.limit.fix());
+            this.state = Whole::Moving(read);
+        }
+    }
+}
+
+impl<B: IoBufMut> fmt::Debug for ReadExact<'_, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadExact")
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The future of a write of a whole buffer, in as many writes as that
+/// takes: [`TcpStream::write_all`](crate::net::TcpStream::write_all) and
+/// [`File::write_all_at`](crate::fs::File::write_all_at). It hands the
+/// buffer, an [`IoBuf`], back with `Ok(())` once all of its initialized
+/// bytes are written, or with the error that stopped the writes:
+/// [`io::ErrorKind::WriteZero`] if one wrote nothing.
+///
+/// Dropping it cancels the write in flight, which may have written some of
+/// the buffer by then, and the buffer is dropped once the cancellation has
+/// completed.
+///
+/// A stream's waits, before it starts, for the writes left behind the
+/// stream to finish, and fails with the error that one of them failed with,
+/// handing the buffer back unwritten.
+#[must_use = "futures do nothing unless polled"]
+pub struct WriteAll<'a, B: IoBuf> {
+    target: Target<'a>,
+    start: Start<Slice<B>>,
+    outcome: Outcome,
+    /// Where in a file the next write is to, which a stream's ignores.
+    offset: u64,
+    /// How much of the buffer is written.
+    done: usize,
+    state: Whole<Write<'a, Slice<B>>, B>,
+    /// The writes left behind a stream, which a write of the stream's waits
+    /// for before it starts.
+    gate: Option<&'a Behind>,
+    /// When the write in flight is cancelled: the writes share the deadline
+    /// the first fixes as it starts.
+    limit: Limit,
+}
+
+// Nothing is pinned: the buffer is only ever moved.
+impl<B: IoBuf> Unpin for WriteAll<'_, B> {}
+
+impl<'a, B: IoBuf> WriteAll<'a, B> {
+    /// A write of all of `buf` to a file, from `offset` on.
+    pub(crate) fn at(target: Target<'a>, buf: B, offset: u64) -> Self {
+        let start = start_write::<Slice<B>>;
+        Self::with(target, buf, offset, start, status_outcome)
+    }
+
+    /// A write of all of `buf`, with writes that `start` starts and whose
+    /// outcomes `outcome` reads.
+    pub(crate) fn with(
+        target: Target<'a>,
+        buf: B,
+        offset: u64,
+        start: Start<Slice<B>>,
+        outcome: Outcome,
+    ) -> Self {
+        Self {
+            target,
+            start,
+            outcome,
+            offset,
+            done: 0,
+            state: Whole::Start(buf),
+            gate: None,
+            limit: Limit::Never,
+        }
+    }
+
+    /// Makes the write wait, before it starts, for the writes behind its
+    /// stream that `gate` counts to finish, and fail with the error that
+    /// one of them failed with.
+    pub(crate) fn behind(mut self, gate: &'a Behind) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Fails the write with `ERROR_TIMEOUT`, of [`io::ErrorKind::TimedOut`],
+    /// if the buffer is not all written `duration` after the first of its
+    /// writes starts, which a stream's does once the writes behind the
+    /// stream have finished, cancelling the write in flight then: each
+    /// write has what is left of the time.
+    ///
+    /// This has no effect once the first write has started.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        if matches!(self.state, Whole::Start(_)) {
+            self.limit = Limit::After(duration);
+        }
+        self
+    }
+}
+
+impl<B: IoBuf> Future for WriteAll<'_, B> {
+    type Output = BufResult<(), B>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Err(err) = ready!(poll_gate(&mut this.gate, cx)) {
+            // A write waits at its gate only before it has started.
+            let Whole::Start(buf) = mem::replace(&mut this.state, Whole::Finished) else {
+                panic!("`WriteAll` polled after it completed");
+            };
+            return Poll::Ready((Err(err), buf));
+        }
+        loop {
+            let buf = match mem::replace(&mut this.state, Whole::Finished) {
+                Whole::Start(buf) => buf,
+                Whole::Moving(mut write) => {
+                    let Poll::Ready((result, rest)) = Pin::new(&mut write).poll(cx) else {
+                        this.state = Whole::Moving(write);
+                        return Poll::Pending;
+                    };
+                    let buf = rest.into_inner();
+                    match result {
+                        Ok(0) => {
+                            let err = io::ErrorKind::WriteZero.into();
+                            return Poll::Ready((Err(err), buf));
+                        }
+                        Ok(written) => {
+                            this.done += written;
+                            this.offset += written as u64;
+                        }
+                        Err(err) => return Poll::Ready((Err(err), buf)),
+                    }
+                    buf
+                }
+                Whole::Finished => panic!("`WriteAll` polled after it completed"),
+            };
+            if this.done >= buf.bytes_init() {
+                return Poll::Ready((Ok(()), buf));
+            }
+            let rest = buf.slice(this.done..);
+            let mut write = Write::with(this.target, rest, this.offset, this.start, this.outcome);
+            write.op.set_limit(this.limit.fix());
+            this.state = Whole::Moving(write);
+        }
+    }
+}
+
+impl<B: IoBuf> fmt::Debug for WriteAll<'_, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WriteAll")
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::result;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::io::Write as _;
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use ruio_engine::{Build, Engine};
+
+    use super::*;
+    use crate::engine::{Builder, Iocp};
+    use crate::handle::{IoHandle, Raw};
+
+    /// What a read left to finish by itself told: which read it was, what
+    /// it read or the system's error, and whether tasks could be woken.
+    type Told = (u8, Result<Vec<u8>, Option<i32>>, bool);
+
+    /// What a read of a pipe that is left to finish by itself uses, which
+    /// tells how the read went.
+    struct Probe {
+        id: u8,
+        buf: Vec<u8>,
+        /// The pipe's end, which stays open until the read has finished.
+        pipe: Arc<fs::File>,
+        told: Rc<RefCell<Vec<Told>>>,
+    }
+
+    impl Detached for Probe {
+        fn outcome(&self) -> (sys::Handle, Outcome) {
+            (self.pipe.raw(), status_outcome)
+        }
+
+        fn complete(mut self, read: io::Result<u32>, wake: bool) {
+            let read = match read {
+                Ok(read) => {
+                    // SAFETY: the system wrote that many bytes from the
+                    // start of the buffer, within its capacity.
+                    unsafe { self.buf.set_len(read as usize) };
+                    Ok(mem::take(&mut self.buf))
+                }
+                Err(err) => Err(err.raw_os_error()),
+            };
+            self.told.borrow_mut().push((self.id, read, wake));
+        }
+
+        fn done(mut self, bytes: u32) {
+            // SAFETY: the system wrote that many bytes from the start of
+            // the buffer, within its capacity.
+            unsafe { self.buf.set_len(bytes as usize) };
+            let read = Ok(mem::take(&mut self.buf));
+            self.told.borrow_mut().push((self.id, read, true));
+        }
+    }
+
+    /// Starts a probe's read, as `Start` says.
+    ///
+    /// # Safety
+    ///
+    /// As for `Start`.
+    unsafe fn start_probe(
+        pipe: sys::Handle,
+        probe: &mut Probe,
+        overlapped: *mut sys::Overlapped,
+    ) -> io::Result<Started> {
+        // SAFETY: the caller's promise.
+        unsafe { start_read(pipe, &mut probe.buf, overlapped) }
+    }
+
+    fn pipe_name(test: &str) -> String {
+        format!(r"\\.\pipe\ruio-iocp-op-{}-{test}", std::process::id())
+    }
+
+    /// The server's end of a new pipe `name`, opened for overlapped I/O and
+    /// associated with no port.
+    fn server(name: &str) -> io::Result<Arc<fs::File>> {
+        let wide: Vec<u16> = OsStr::new(name)
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        // SAFETY: the name is UTF-16 ended by a zero, and the pipe gets the
+        // default security, given no attributes.
+        let handle = unsafe {
+            sys::CreateNamedPipeW(
+                wide.as_ptr(),
+                sys::PIPE_ACCESS_DUPLEX
+                    | sys::FILE_FLAG_OVERLAPPED
+                    | sys::FILE_FLAG_FIRST_PIPE_INSTANCE,
+                sys::PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                0,
+                ptr::null(),
+            )
+        };
+        if handle == sys::INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the handle was just opened, and nothing else owns it.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+        Ok(Arc::new(fs::File::from(handle)))
+    }
+
+    /// The client's end of the pipe `name`, as the standard library opens
+    /// it: its writes go through no port.
+    fn client(name: &str) -> io::Result<fs::File> {
+        fs::OpenOptions::new().read(true).write(true).open(name)
+    }
+
+    /// Leaves a read of the pipe's end of `handle` to finish by itself, as
+    /// the read `id`.
+    fn probe(
+        handle: &IoHandle<Arc<fs::File>>,
+        id: u8,
+        told: &Rc<RefCell<Vec<Told>>>,
+    ) -> Result<(), (io::Error, Probe)> {
+        probe_until(handle, id, told, Limit::Never)
+    }
+
+    /// Leaves a read of the pipe's end of `handle` to finish by itself, as
+    /// the read `id`, which the engine cancels by `limit`.
+    fn probe_until(
+        handle: &IoHandle<Arc<fs::File>>,
+        id: u8,
+        told: &Rc<RefCell<Vec<Told>>>,
+        limit: Limit,
+    ) -> Result<(), (io::Error, Probe)> {
+        let probe = Probe {
+            id,
+            buf: Vec::with_capacity(16),
+            pipe: Arc::clone(handle.io()),
+            told: Rc::clone(told),
+        };
+        detach(handle.target(), probe, 0, limit, start_probe)
+    }
 
     #[test]
     fn statuses_become_windows_errors() {
@@ -420,5 +1446,248 @@ mod tests {
         // STATUS_CANCELLED, as a cancelled operation completes.
         let cancelled = result(0xC000_0120, 0).unwrap_err();
         assert_eq!(cancelled.raw_os_error(), Some(995));
+    }
+
+    #[test]
+    fn a_failed_call_completed_its_operation_unless_pending_or_an_error() {
+        // STATUS_PENDING: the system never set a status.
+        assert!(!completed(0x103));
+        // STATUS_BUFFER_OVERFLOW, a warning, as a datagram longer than its
+        // buffer completes.
+        assert!(completed(0x8000_0005));
+        assert!(completed(0));
+        // STATUS_PIPE_BROKEN and STATUS_CONNECTION_RESET, errors.
+        assert!(!completed(0xC000_014B));
+        assert!(!completed(0xC000_020D));
+        // Only the low half of `Internal` is the status.
+        assert!(!completed(0xFFFF_FFFF_0000_0103_u64 as usize));
+    }
+
+    /// Turns `engine`'s port until `done` says so, for a while at most.
+    fn turn_until(engine: &Iocp, done: impl Fn() -> bool) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() && Instant::now() < deadline {
+            engine.park(Some(Duration::from_millis(5)))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn operations_left_to_finish_by_themselves_tell_how_they_went() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let mut ends = Vec::new();
+        for id in 0..3 {
+            let name = pipe_name(&format!("told-{id}"));
+            let server = IoHandle::new(server(&name)?)?;
+            let client = client(&name)?;
+            probe(&server, id, &told).map_err(|(err, _)| err)?;
+            ends.push((server, client));
+        }
+        // Nothing is written, so nothing is told.
+        engine.park(Some(Duration::from_millis(20)))?;
+        assert!(told.borrow().is_empty());
+
+        // The reads finish in another order than they started in.
+        let order = [1_u8, 0, 2];
+        for id in order {
+            let mut client = &ends[usize::from(id)].1;
+            client.write_all(&[b'a' + id; 4])?;
+            turn_until(&engine, || {
+                told.borrow().last().is_some_and(|last| last.0 == id)
+            })?;
+        }
+        let expected: Vec<Told> = order
+            .into_iter()
+            .map(|id| (id, Ok(vec![b'a' + id; 4]), true))
+            .collect();
+        assert_eq!(*told.borrow(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn a_turn_that_does_not_wait_delivers_what_has_completed() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let name = pipe_name("submitted");
+        let handle = IoHandle::new(server(&name)?)?;
+        let mut writer = client(&name)?;
+        probe(&handle, 3, &told).map_err(|(err, _)| err)?;
+        // The read is in flight, so a turn asks the port, which has nothing
+        // until the client writes.
+        engine.submit()?;
+        assert!(told.borrow().is_empty());
+        writer.write_all(b"data")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while told.borrow().is_empty() && Instant::now() < deadline {
+            engine.submit()?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(*told.borrow(), [(3, Ok(b"data".to_vec()), true)]);
+        // With nothing in flight again, a turn has nothing to ask for.
+        engine.submit()?;
+        assert!(!engine.has_work());
+        Ok(())
+    }
+
+    #[test]
+    fn an_engine_dropped_cancels_what_was_left_to_finish_by_itself() -> io::Result<()> {
+        // Long enough that only the read's cancellation, not the timeout,
+        // ends the wait in time.
+        let engine = Builder::new()
+            .shutdown_timeout(Duration::from_secs(60))
+            .build()?;
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let name = pipe_name("cancelled");
+        let server = server(&name)?;
+        // The client writes nothing and stays open, so the read is in
+        // flight when the engine goes.
+        let _client = client(&name)?;
+        {
+            let _entered = engine.enter();
+            let handle = IoHandle::new(Arc::clone(&server))?;
+            probe(&handle, 0, &told).map_err(|(err, _)| err)?;
+        }
+        assert_eq!(Arc::strong_count(&server), 2);
+        let started = Instant::now();
+        drop(engine);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // ERROR_OPERATION_ABORTED, and no task is woken as the engine goes.
+        assert_eq!(*told.borrow(), [(0, Err(Some(995)), false)]);
+        // The read let go of the pipe's end.
+        assert_eq!(Arc::strong_count(&server), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_engine_dropped_with_no_time_to_wait_frees_what_has_completed() -> io::Result<()> {
+        let engine = Builder::new().shutdown_timeout(Duration::ZERO).build()?;
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let name = pipe_name("no-time");
+        let server = server(&name)?;
+        let mut client = client(&name)?;
+        {
+            let _entered = engine.enter();
+            let handle = IoHandle::new(Arc::clone(&server))?;
+            probe(&handle, 0, &told).map_err(|(err, _)| err)?;
+        }
+        // The read completes, and nothing turns the port before the engine
+        // is dropped: a check for work only takes the completion from it.
+        client.write_all(b"data")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !engine.has_work() {
+            assert!(Instant::now() < deadline, "the read did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(told.borrow().is_empty());
+        drop(engine);
+        // The completion is delivered, with no task woken, rather than
+        // leaked with the read's buffer and the pipe's end it holds.
+        assert_eq!(*told.borrow(), [(0, Ok(b"data".to_vec()), false)]);
+        assert_eq!(Arc::strong_count(&server), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_operation_the_system_does_not_take_hands_back_what_it_was_to_use() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let told = Rc::new(RefCell::new(Vec::new()));
+        // No client has opened the pipe, so a read of it fails at once.
+        let handle = IoHandle::new(server(&pipe_name("refused"))?)?;
+        let (err, back) = probe(&handle, 7, &told).expect_err("a read of a pipe nobody opened");
+        assert!(err.raw_os_error().is_some(), "{err}");
+        assert_eq!(back.id, 7);
+        drop(back);
+        engine.park(Some(Duration::from_millis(20)))?;
+        assert!(told.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_operation_left_to_finish_by_itself_times_out_at_its_deadline() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let name = pipe_name("timed-out");
+        let handle = IoHandle::new(server(&name)?)?;
+        let mut client = client(&name)?;
+        let timeout = Duration::from_millis(30);
+        let started = Instant::now();
+        probe_until(&handle, 0, &told, Limit::After(timeout)).map_err(|(err, _)| err)?;
+        assert!(engine.deadlines().first().is_some());
+        turn_until(&engine, || !told.borrow().is_empty())?;
+        assert!(started.elapsed() >= timeout);
+        // ERROR_TIMEOUT, rather than the ERROR_OPERATION_ABORTED of any
+        // cancelled operation.
+        assert_eq!(*told.borrow(), [(0, Err(Some(1460)), true)]);
+        assert!(engine.deadlines().first().is_none());
+        // The pipe reads on: what the client writes goes to the next read.
+        probe(&handle, 1, &told).map_err(|(err, _)| err)?;
+        client.write_all(b"data")?;
+        turn_until(&engine, || told.borrow().len() == 2)?;
+        assert_eq!(told.borrow()[1], (1, Ok(b"data".to_vec()), true));
+        Ok(())
+    }
+
+    #[test]
+    fn an_operation_that_completes_by_its_deadline_keeps_its_outcome() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let name = pipe_name("in-time");
+        let handle = IoHandle::new(server(&name)?)?;
+        let mut client = client(&name)?;
+        let limit = Limit::After(Duration::from_secs(60));
+        probe_until(&handle, 0, &told, limit).map_err(|(err, _)| err)?;
+        client.write_all(b"data")?;
+        turn_until(&engine, || !told.borrow().is_empty())?;
+        assert_eq!(*told.borrow(), [(0, Ok(b"data".to_vec()), true)]);
+        // The completion took the deadline with it.
+        assert!(engine.deadlines().first().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_park_ends_at_the_deadline_of_an_operation_before_its_own_timeout() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let name = pipe_name("park-deadline");
+        let handle = IoHandle::new(server(&name)?)?;
+        let _client = client(&name)?;
+        let timeout = Duration::from_millis(30);
+        let started = Instant::now();
+        probe_until(&handle, 0, &told, Limit::After(timeout)).map_err(|(err, _)| err)?;
+        // The deadline ends the first park, which cancels the read, and the
+        // cancellation's completion the second.
+        engine.park(Some(Duration::from_secs(10)))?;
+        let first = started.elapsed();
+        assert!(first >= timeout, "{first:?}");
+        assert!(told.borrow().is_empty());
+        engine.park(Some(Duration::from_secs(10)))?;
+        let second = started.elapsed();
+        assert!(second < Duration::from_secs(5), "{second:?}");
+        assert_eq!(*told.borrow(), [(0, Err(Some(1460)), true)]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_future_dropped_before_its_deadline_takes_the_deadline_with_it() -> io::Result<()> {
+        let engine = Builder::new().build()?;
+        let _entered = engine.enter();
+        let name = pipe_name("dropped");
+        let handle = IoHandle::new(server(&name)?)?;
+        let _client = client(&name)?;
+        let read = Read::new(handle.target(), Vec::with_capacity(16), 0);
+        let mut read = read.timeout(Duration::from_secs(60));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut read).poll(&mut cx).is_pending());
+        assert!(engine.deadlines().first().is_some());
+        drop(read);
+        assert!(engine.deadlines().first().is_none());
+        Ok(())
     }
 }

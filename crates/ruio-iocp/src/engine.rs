@@ -1,7 +1,7 @@
 //! The engine: a completion port, the thread's current engine, and turning
 //! the port.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
 use std::io;
 use std::mem;
@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use ruio_engine::{Build, Engine, LocalWaker, Unpark};
 
+use crate::portable::ready::{self, Afd};
+use crate::portable::wait::Waits;
 use crate::{op, sys};
 
 /// The completion key of the packets unparks post.
@@ -21,6 +23,27 @@ const WAKE: usize = 0;
 /// The completion key of the handles associated with the port, under which
 /// their operations complete.
 const IO: usize = 1;
+
+/// The completion key of the packets the engine's fine timer posts.
+const TIMER: usize = 2;
+
+/// The completion key of the packets that the waits of [`HandleWait`]s
+/// post, which carry the waits' keys.
+///
+/// [`HandleWait`]: crate::portable::HandleWait
+pub(crate) const SIGNALED: usize = 3;
+
+/// The completion key of the engine's handle of the AFD driver, under
+/// which the polls of [`ReadyWait`]s complete, each carrying its slot.
+///
+/// [`ReadyWait`]: crate::portable::ReadyWait
+pub(crate) const AFD: usize = 4;
+
+/// How many operations may finish during the calls that start them between
+/// two turns of the port: as many as the executor runs tasks between two.
+/// Such an operation costs no turn, so a task whose operations all finish
+/// so would otherwise never let the port be turned, nor another task run.
+pub(crate) const AT_ONCE: u32 = 64;
 
 /// The most completions a turn takes from the port at once.
 const BATCH: usize = 64;
@@ -40,8 +63,8 @@ thread_local! {
 /// An engine on an I/O completion port; see the [crate] documentation.
 ///
 /// Like any engine, it belongs to the thread that made it, and so do the
-/// files and pipes whose handles are associated with its port. A clone is
-/// the same engine. Dropping the last clone, once those files and pipes
+/// files, pipes and sockets associated with its port. A clone is the same
+/// engine. Dropping the last clone, once those files, pipes and sockets
 /// are gone, waits for the operations still in flight to complete.
 ///
 /// ```compile_fail
@@ -63,24 +86,42 @@ struct Inner {
     armed: Cell<Option<Duration>>,
     /// Whether the timer has fired since `timer_fired` last asked.
     fired: Cell<bool>,
+    /// The timer that wakes the port when a wait's deadline comes, where
+    /// the system has one finer than the tick its own waits end at.
+    fine: Option<FineTimer>,
     /// How many operations the system has taken whose completions have not
     /// been delivered.
     in_flight: Cell<usize>,
+    /// How many operations have finished during the calls that started
+    /// them since the port was last turned.
+    at_once: Cell<u32>,
+    /// The operations in flight that were left to finish by themselves,
+    /// which no future's drop cancels.
+    detached: op::DetachedOps,
+    /// The operations in flight that are cancelled if they have not
+    /// completed by their deadlines.
+    deadlines: op::Deadlines,
+    /// The engine's handle of the AFD driver, opened as the first socket
+    /// waits to be ready on its thread.
+    afd: OnceCell<Arc<Afd>>,
     /// Whether the engine is being dropped, when completions wake nothing.
     closing: Cell<bool>,
     /// How long dropping the engine waits for the operations in flight.
     shutdown_timeout: Duration,
 }
 
-/// What an engine shares with its unparkers: the port, which the last of
-/// them to go closes, so that an unpark never posts to a handle that has
-/// been closed, whose value may name another object by then.
-struct Shared {
+/// What an engine shares with its unparkers and with the waits that other
+/// threads may hold: the port, which the last of them to go closes, so that
+/// an unpark never posts to a handle that has been closed, whose value may
+/// name another object by then.
+pub(crate) struct Shared {
     port: sys::Handle,
     /// Whether an unpark has posted a packet that no turn has taken yet. An
     /// unpark posts only if it sets this, so that several before a turn
     /// wake it once.
     notified: AtomicBool,
+    /// The waits whose packets are to post to the port, or lie in it.
+    pub(crate) waits: Waits,
 }
 
 // SAFETY: a completion port's handle may be used from any thread, and the
@@ -105,6 +146,11 @@ impl Shared {
             self.notified.store(false, Ordering::SeqCst);
         }
     }
+
+    /// The port.
+    pub(crate) fn port(&self) -> sys::Handle {
+        self.port
+    }
 }
 
 impl Drop for Shared {
@@ -117,7 +163,7 @@ impl Drop for Shared {
 
 /// The time on the engines' clock: a monotonic one, counted from its first
 /// reading.
-fn now() -> Duration {
+pub(crate) fn now() -> Duration {
     let epoch = *EPOCH.get_or_init(Instant::now);
     Instant::now().saturating_duration_since(epoch)
 }
@@ -131,6 +177,150 @@ fn milliseconds_until(deadline: Duration) -> u32 {
         .as_nanos()
         .div_ceil(1_000_000);
     u32::try_from(left).map_or(sys::INFINITE - 1, |ms| ms.min(sys::INFINITE - 1))
+}
+
+/// The earlier of two deadlines, times on the engines' clock, where none is
+/// never.
+fn earlier(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// A timer that ends a wait on the port when its deadline comes, rather
+/// than at the tick of Windows' timer after it, which may be 15 ms later:
+/// a high-resolution waitable timer, and the wait completion packet
+/// through which its expiry is posted to the port.
+///
+/// The packet waits for the timer, not for a deadline, so a timer that is
+/// set anew while the packet waits takes one call. Once the timer has
+/// expired, the packet lies in the port until a turn takes it, and is then
+/// associated again the next time the timer is set.
+struct FineTimer {
+    timer: sys::Handle,
+    packet: sys::Handle,
+    /// The deadline the timer is set for, while the packet waits for it or
+    /// lies in the port: `None` before the timer is first set, and once a
+    /// turn has taken the packet.
+    set: Cell<Option<Duration>>,
+}
+
+impl FineTimer {
+    /// A timer of the finest kind the system has, and a packet for it, or
+    /// `None` where the system has not both, as before Windows 10's
+    /// version 1803: waits there end at the ticks of Windows' timer.
+    fn new() -> Option<Self> {
+        // SAFETY: a timer with no name and the default security.
+        let timer = unsafe {
+            sys::CreateWaitableTimerExW(
+                ptr::null(),
+                ptr::null(),
+                sys::CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                sys::TIMER_ALL_ACCESS,
+            )
+        };
+        if timer.is_null() {
+            return None;
+        }
+        let mut packet = ptr::null_mut();
+        // SAFETY: the handle is written to `packet` during the call, and
+        // the packet gets the default attributes.
+        let status = unsafe {
+            sys::NtCreateWaitCompletionPacket(&mut packet, sys::GENERIC_ALL, ptr::null())
+        };
+        if status < sys::STATUS_SUCCESS || packet.is_null() {
+            // SAFETY: the timer was just made, and nothing else has it.
+            unsafe { sys::CloseHandle(timer) };
+            return None;
+        }
+        Some(Self {
+            timer,
+            packet,
+            set: Cell::new(None),
+        })
+    }
+
+    /// Sets the timer to post a packet to `port` at `deadline`, a time on
+    /// the engines' clock, unless it is set for it already, and says
+    /// whether the deadline came as it did, when no packet follows. A timer
+    /// the system fails to set is left as it was: the wait then ends by its
+    /// own timeout.
+    fn set(&self, port: sys::Handle, deadline: Duration) -> bool {
+        let waits = match self.set.get() {
+            Some(at) if at == deadline => return false,
+            // The packet waits for the timer, or lies in the port, where
+            // the next turn takes it, and the timer is then set again.
+            Some(_) => true,
+            None => false,
+        };
+        // In units of 100 ns, of which a timer from now takes one at least.
+        let left = deadline.saturating_sub(now()).as_nanos().div_ceil(100);
+        let due = -i64::try_from(left).unwrap_or(i64::MAX).max(1);
+        // SAFETY: the timer is open, and the time is read during the call;
+        // it has no period, no completion routine, and wakes no system.
+        let set =
+            unsafe { sys::SetWaitableTimer(self.timer, &due, 0, ptr::null(), ptr::null(), 0) };
+        if set == 0 {
+            return false;
+        }
+        if waits {
+            self.set.set(Some(deadline));
+            return false;
+        }
+        let mut signaled = 0;
+        // SAFETY: the packet, the port and the timer are open; the key is
+        // no pointer, and the packet carries nothing else; and `signaled`
+        // is written during the call.
+        let status = unsafe {
+            sys::NtAssociateWaitCompletionPacket(
+                self.packet,
+                port,
+                self.timer,
+                ptr::without_provenance_mut(TIMER),
+                ptr::null_mut(),
+                sys::STATUS_SUCCESS,
+                0,
+                &mut signaled,
+            )
+        };
+        if status < sys::STATUS_SUCCESS {
+            return false;
+        }
+        if signaled != 0 {
+            // The timer expired between the two calls. The packet it may
+            // have posted is taken back, so that the packet is free for
+            // the next deadline whether it was posted or not.
+            self.cancel();
+            return true;
+        }
+        self.set.set(Some(deadline));
+        false
+    }
+    /// Ends the packet's wait for the timer, and takes the packet it posted
+    /// out of the port, if no turn has taken it.
+    fn cancel(&self) {
+        // SAFETY: the packet is open. One that neither waits nor lies in a
+        // port is left as it is.
+        unsafe { sys::NtCancelWaitCompletionPacket(self.packet, 1) };
+    }
+
+    /// Records that a turn took the packet the timer posted, which is the
+    /// engine's to associate again.
+    fn taken(&self) {
+        self.set.set(None);
+    }
+}
+
+impl Drop for FineTimer {
+    fn drop(&mut self) {
+        // The packet waits for the timer no more before either is closed.
+        self.cancel();
+        // SAFETY: the packet is open, and the engine's alone.
+        unsafe { sys::CloseHandle(self.packet) };
+        // SAFETY: as for the packet.
+        unsafe { sys::CloseHandle(self.timer) };
+    }
 }
 
 impl Iocp {
@@ -149,11 +339,17 @@ impl Iocp {
                 shared: Arc::new(Shared {
                     port,
                     notified: AtomicBool::new(false),
+                    waits: Waits::default(),
                 }),
                 stash: RefCell::default(),
                 armed: Cell::new(None),
                 fired: Cell::new(false),
+                fine: FineTimer::new(),
                 in_flight: Cell::new(0),
+                at_once: Cell::new(0),
+                detached: op::DetachedOps::default(),
+                deadlines: op::Deadlines::default(),
+                afd: OnceCell::new(),
                 closing: Cell::new(false),
                 shutdown_timeout: builder.shutdown_timeout,
             }),
@@ -185,6 +381,45 @@ impl Iocp {
     pub(crate) fn started(&self) {
         let in_flight = &self.inner.in_flight;
         in_flight.set(in_flight.get() + 1);
+    }
+
+    /// Whether as many operations have finished during the calls that
+    /// started them as may between two turns of the port.
+    pub(crate) fn at_once_spent(&self) -> bool {
+        self.inner.at_once.get() >= AT_ONCE
+    }
+
+    /// Counts an operation that finished during the call that started it.
+    pub(crate) fn finished_at_once(&self) {
+        let at_once = &self.inner.at_once;
+        at_once.set(at_once.get() + 1);
+    }
+
+    /// The operations in flight that were left to finish by themselves.
+    pub(crate) fn detached(&self) -> &op::DetachedOps {
+        &self.inner.detached
+    }
+
+    /// The operations in flight that are cancelled if they have not
+    /// completed by their deadlines.
+    pub(crate) fn deadlines(&self) -> &op::Deadlines {
+        &self.inner.deadlines
+    }
+
+    /// What the engine shares with other threads.
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.inner.shared
+    }
+
+    /// The engine's handle of the AFD driver, which this opens if it has
+    /// not.
+    pub(crate) fn afd(&self) -> io::Result<Arc<Afd>> {
+        if let Some(afd) = self.inner.afd.get() {
+            return Ok(Arc::clone(afd));
+        }
+        let afd = Arc::new(Afd::open(self.inner.shared.port)?);
+        let _ = self.inner.afd.set(Arc::clone(&afd));
+        Ok(afd)
     }
 }
 
@@ -218,8 +453,10 @@ impl Inner {
         }
     }
 
-    /// Delivers completions taken from the port.
-    fn deliver(&self, entries: &[sys::OverlappedEntry]) {
+    /// Delivers completions taken from the port, and says how many there
+    /// were besides the fine timer's own packets.
+    fn deliver(&self, entries: &[sys::OverlappedEntry]) -> usize {
+        let mut delivered = entries.len();
         for entry in entries {
             match entry.completion_key {
                 WAKE => self.shared.notified.store(false, Ordering::SeqCst),
@@ -228,39 +465,87 @@ impl Inner {
                     // SAFETY: a completion under the key of the handles is
                     // that of an operation `op` started on one, which the
                     // port hands back once.
-                    unsafe { op::complete(entry, !self.closing.get()) };
+                    unsafe {
+                        op::complete(entry, &self.detached, &self.deadlines, !self.closing.get());
+                    }
+                }
+                TIMER => {
+                    if let Some(fine) = &self.fine {
+                        fine.taken();
+                    }
+                    delivered -= 1;
+                }
+                SIGNALED => self.shared.waits.signaled(entry.overlapped.addr()),
+                AFD => {
+                    self.in_flight.set(self.in_flight.get() - 1);
+                    // SAFETY: a completion under the key of the engine's
+                    // handle of the AFD driver is that of a poll `ready`
+                    // made through it, which the port hands back once.
+                    unsafe { ready::complete(entry) };
                 }
                 // Nothing posts under another key.
                 _ => {}
             }
         }
+        delivered
     }
 
     /// Delivers what a check for work took from the port and what the port
     /// has, waiting for a completion until `deadline`, a time on the
     /// engines' clock, or for ever if there is none, unless the check took
-    /// some already.
+    /// some already; then cancels the operations whose deadlines have come.
+    /// The first of those deadlines ends a wait too. A turn that would not
+    /// wait asks the port for nothing when the port can hold nothing for
+    /// it, which it cannot while an operation has a deadline.
     fn turn(&self, deadline: Option<Duration>) -> io::Result<()> {
-        let stashed = mem::take(&mut *self.stash.borrow_mut());
-        let deadline = if stashed.is_empty() {
-            deadline
-        } else {
+        self.at_once.set(0);
+        let mut deadline = earlier(deadline, self.deadlines.first());
+        if !self.stash.borrow().is_empty() {
+            let stashed = mem::take(&mut *self.stash.borrow_mut());
             self.deliver(&stashed);
-            Some(Duration::ZERO)
-        };
+            deadline = Some(Duration::ZERO);
+        }
+        // The clock is not read for a turn that asks for no wait at all,
+        // which is what the executor makes between its tasks.
+        if self.idle() && deadline.is_some_and(|deadline| deadline.is_zero() || deadline <= now()) {
+            self.check_timer();
+            return Ok(());
+        }
         let mut entries = [sys::OverlappedEntry::EMPTY; BATCH];
         loop {
             let milliseconds = deadline.map_or(sys::INFINITE, milliseconds_until);
+            // A wait with a deadline ends by the fine timer's packet when
+            // the deadline comes; its own timeout, which Windows counts in
+            // milliseconds from a tick of its timer, stands behind that.
+            if milliseconds > 0
+                && let (Some(fine), Some(deadline)) = (&self.fine, deadline)
+                && fine.set(self.shared.port, deadline)
+            {
+                continue;
+            }
             let taken = self.dequeue(&mut entries, milliseconds)?;
-            self.deliver(&entries[..taken]);
-            // A wait may end a little before its timeout, at a tick of
-            // Windows' timer, so one that took nothing waits out the rest.
-            if taken > 0 || milliseconds == 0 {
+            let delivered = self.deliver(&entries[..taken]);
+            // A wait may end a little before its deadline, at a tick of
+            // Windows' timer, or by a packet of the fine timer's from when
+            // it was set for another, so one that delivered nothing waits
+            // out the rest.
+            if delivered > 0 || milliseconds == 0 {
                 break;
             }
         }
         self.check_timer();
+        self.deadlines.expire();
         Ok(())
+    }
+
+    /// Whether the port holds nothing for a turn to deliver: no operation
+    /// is in flight, no wait's packet is to come, and no unpark has posted
+    /// a packet. A packet of the fine timer's may lie there, which is no
+    /// work, and which the next turn that waits takes.
+    fn idle(&self) -> bool {
+        self.in_flight.get() == 0
+            && self.shared.waits.count() == 0
+            && !self.shared.notified.load(Ordering::SeqCst)
     }
 
     /// Records that the timer fired, if its deadline has passed.
@@ -272,19 +557,41 @@ impl Inner {
             self.fired.set(true);
         }
     }
+
+    /// Whether the timer's deadline or an operation's has passed.
+    fn due(&self) -> bool {
+        earlier(self.armed.get(), self.deadlines.first()).is_some_and(|deadline| deadline <= now())
+    }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         // The operations still in flight are those whose futures were
-        // dropped, which cancelled them, and those forgotten. A completion
-        // frees the slot of an operation whose future was dropped, buffer
-        // and all; one that has not come by the timeout leaves its slot
-        // leaked, as the system may still write to its buffer.
+        // dropped, which cancelled them, those forgotten, and those left to
+        // finish by themselves, which are cancelled here. A completion frees
+        // the slot of an operation that no future has, buffer and all; one
+        // that has not come by the timeout leaves its slot leaked, as the
+        // system may still write to its buffer. What has come by then is
+        // delivered however short the timeout: past it, a turn takes what
+        // the port holds without waiting, until one delivers no operation.
+        // The waits and the polls that other threads may hold are cancelled
+        // too: their completions are delivered so, but for the waits whose
+        // packets the system takes back.
         self.closing.set(true);
+        self.detached.cancel();
+        self.shared.waits.cancel_all();
+        if let Some(afd) = self.afd.get() {
+            afd.cancel_all();
+        }
         let deadline = now().saturating_add(self.shutdown_timeout);
-        while self.in_flight.get() > 0 && now() < deadline {
+        let pending = || self.in_flight.get() + self.shared.waits.count();
+        while pending() > 0 {
+            let before = pending();
+            let waits = now() < deadline;
             if self.turn(Some(deadline)).is_err() {
+                break;
+            }
+            if !waits && pending() == before {
                 break;
             }
         }
@@ -312,19 +619,29 @@ impl Engine for Iocp {
         let inner = &self.inner;
         if inner.shared.notified.load(Ordering::SeqCst)
             || !inner.stash.borrow().is_empty()
-            || inner.armed.get().is_some_and(|deadline| deadline <= now())
+            || inner.due()
         {
             return true;
+        }
+        // No unpark has posted, so with no operation in flight and no wait's
+        // packet to come the port holds no work, and is not asked.
+        if inner.in_flight.get() == 0 && inner.shared.waits.count() == 0 {
+            return false;
         }
         let mut entries = [sys::OverlappedEntry::EMPTY; BATCH];
         match inner.dequeue(&mut entries, 0) {
             Ok(0) => false,
             Ok(taken) => {
-                inner
-                    .stash
-                    .borrow_mut()
-                    .extend_from_slice(&entries[..taken]);
-                true
+                let mut stash = inner.stash.borrow_mut();
+                for entry in &entries[..taken] {
+                    match (&inner.fine, entry.completion_key) {
+                        // The timer's packet is no work of its own: the
+                        // deadline it was set for is, once it has come.
+                        (Some(fine), TIMER) => fine.taken(),
+                        _ => stash.push(*entry),
+                    }
+                }
+                !stash.is_empty() || inner.due()
             }
             // The next turn meets the error again, and reports it.
             Err(_) => true,
@@ -333,11 +650,7 @@ impl Engine for Iocp {
 
     fn park(&self, timeout: Option<Duration>) -> io::Result<()> {
         let after = timeout.map(|timeout| now().saturating_add(timeout));
-        let until = match (after, self.inner.armed.get()) {
-            (Some(after), Some(armed)) => Some(after.min(armed)),
-            (after, armed) => after.or(armed),
-        };
-        self.inner.turn(until)
+        self.inner.turn(earlier(after, self.inner.armed.get()))
     }
 
     fn wake_at(&self, deadline: Duration) -> io::Result<()> {
@@ -404,8 +717,10 @@ impl Build for Builder {
     type Engine = Iocp;
 
     /// Sets how long dropping the engine waits for the operations still in
-    /// flight, which the drops of their futures cancelled, to complete,
-    /// before it leaks their buffers. The default is one second.
+    /// flight, which the drops of their futures cancelled, or the engine as
+    /// it is dropped, to complete, before it leaks their buffers. Those
+    /// that have completed by then are freed however short the timeout,
+    /// none at all included. The default is one second.
     fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
         self
@@ -460,6 +775,22 @@ impl fmt::Debug for Entered {
     }
 }
 
+/// Says that a test skips, as the system does not give the engine what it
+/// tests: its fine timer, or handles that skip the port.
+///
+/// # Panics
+///
+/// If `RUIO_REQUIRE_PORT_SHORTCUTS` is set, as CI sets it, so that a run
+/// that passes there ran the test.
+#[cfg(test)]
+pub(crate) fn skipped(reason: &str) {
+    assert!(
+        std::env::var_os("RUIO_REQUIRE_PORT_SHORTCUTS").is_none(),
+        "RUIO_REQUIRE_PORT_SHORTCUTS is set, but {reason}"
+    );
+    eprintln!("skipped: {reason}");
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -483,6 +814,46 @@ mod tests {
         let started = Instant::now();
         engine.park(Some(Duration::from_millis(20))).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn a_turn_that_does_not_wait_takes_the_packet_of_an_unpark() {
+        let engine = Builder::new().build().unwrap();
+        // Nothing is in flight and no unpark has posted: nothing to take.
+        engine.submit().unwrap();
+        assert!(!engine.has_work());
+        engine.unparker().unpark();
+        assert!(engine.has_work());
+        engine.submit().unwrap();
+        assert!(!engine.has_work());
+        // The packet is gone, so a park waits out its timeout.
+        let started = Instant::now();
+        engine.park(Some(Duration::from_millis(20))).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn a_turn_that_asks_the_port_for_nothing_still_notices_the_timer() {
+        let engine = Builder::new().build().unwrap();
+        engine.wake_at(Iocp::monotonic_now()).unwrap();
+        engine.submit().unwrap();
+        assert!(engine.timer_fired());
+        assert!(!engine.timer_fired());
+
+        // One that is due later is noticed once it is.
+        engine
+            .wake_at(Iocp::monotonic_now() + Duration::from_millis(5))
+            .unwrap();
+        engine.submit().unwrap();
+        assert!(!engine.timer_fired());
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(engine.has_work());
+        engine.submit().unwrap();
+        assert!(engine.timer_fired());
+        // A park whose timeout has passed is such a turn too.
+        engine.wake_at(Iocp::monotonic_now()).unwrap();
+        engine.park(Some(Duration::ZERO)).unwrap();
+        assert!(engine.timer_fired());
     }
 
     #[test]
@@ -511,5 +882,111 @@ mod tests {
         assert_eq!(Iocp::current().map(|e| e.id()), Some(outer.id()));
         drop(entered);
         assert!(Iocp::current().is_none());
+    }
+
+    /// Whether `engine` has a timer finer than the ticks of Windows' own,
+    /// which a system before Windows 10's version 1803 does not give it:
+    /// its parks then end at those ticks, and the tests of when they end
+    /// have nothing to test.
+    fn has_fine_timer(engine: &Iocp) -> bool {
+        let fine = engine.inner.fine.is_some();
+        if !fine {
+            super::skipped("the system gives the engine no high-resolution timer");
+        }
+        fine
+    }
+
+    /// How long `parks` parks of `each` take: the least of three tries, as
+    /// what else runs on the machine can only make them longer.
+    fn parks(engine: &Iocp, parks: u32, each: Duration) -> Duration {
+        (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                for _ in 0..parks {
+                    let before = Instant::now();
+                    engine.park(Some(each)).unwrap();
+                    assert!(before.elapsed() >= each, "a park ended early");
+                }
+                started.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    #[test]
+    fn parks_end_at_their_deadlines_and_not_at_the_ticks_after() {
+        let engine = Builder::new().build().unwrap();
+        if !has_fine_timer(&engine) {
+            return;
+        }
+        // Each park's packet is taken, and the timer's packet associated
+        // again for the next. Waits that end at the ticks of Windows'
+        // timer, 15.6 ms apart, would take 300 ms.
+        let took = parks(&engine, 20, Duration::from_millis(2));
+        assert!(
+            took < Duration::from_millis(150),
+            "20 parks of 2 ms took {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_timer_set_for_another_deadline_ends_the_park_at_the_new_one() {
+        let engine = Builder::new().build().unwrap();
+        if !has_fine_timer(&engine) {
+            return;
+        }
+        for _ in 0..3 {
+            // The park sets the timer for an hour from now, and is woken at
+            // once, with the packet still waiting for the timer.
+            engine.unparker().unpark();
+            engine.park(Some(Duration::from_secs(3600))).unwrap();
+            let took = parks(&engine, 1, Duration::from_millis(3));
+            assert!(
+                took < Duration::from_millis(15),
+                "a park of 3 ms took {took:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_packet_of_an_earlier_deadline_does_not_end_a_later_park() {
+        let engine = Builder::new().build().unwrap();
+        if !has_fine_timer(&engine) {
+            return;
+        }
+        // The park sets the timer for a millisecond from now and is woken
+        // at once; the timer then expires with no turn to take its packet.
+        engine.unparker().unpark();
+        engine.park(Some(Duration::from_millis(1))).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let started = Instant::now();
+        engine.park(Some(Duration::from_millis(40))).unwrap();
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(40), "the park took {took:?}");
+        // Long before the tick after it, which is as late as a wait that
+        // the timer does not end can be.
+        assert!(took < Duration::from_millis(50), "the park took {took:?}");
+    }
+
+    #[test]
+    fn the_timer_wakes_a_park_without_a_timeout_when_it_is_due() {
+        let engine = Builder::new().build().unwrap();
+        if !has_fine_timer(&engine) {
+            return;
+        }
+        let took = (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                engine
+                    .wake_at(Iocp::monotonic_now() + Duration::from_millis(3))
+                    .unwrap();
+                engine.park(None).unwrap();
+                assert!(engine.timer_fired());
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(took >= Duration::from_millis(3), "the park took {took:?}");
+        assert!(took < Duration::from_millis(15), "the park took {took:?}");
     }
 }

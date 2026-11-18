@@ -1,12 +1,12 @@
 //! The adapters, through the traits of `tokio::io`.
 
-#![cfg(feature = "tokio")]
+#![cfg(all(feature = "tokio", ruio_uring))]
 
 mod support;
 
 use std::io::{self, IoSlice};
 
-use ruio::net::{TcpListener, TcpStream, UnixStream};
+use ruio::net::UnixStream;
 use ruio_compat::Compat;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -40,6 +40,7 @@ async fn data_crosses_the_adapters_both_ways() -> io::Result<()> {
     cross_both_ways(Reads::Buffer(1000)).await
 }
 
+#[cfg(ruio_compat_ring)]
 #[ruio::test]
 async fn data_crosses_the_adapters_through_a_pool() -> io::Result<()> {
     cross_both_ways(Reads::Pool(4, 1000)).await
@@ -79,7 +80,12 @@ async fn vectored_writes_gather_their_buffers() -> io::Result<()> {
 /// receives and buffers.
 #[ruio::test]
 async fn lines_are_read_from_the_buffers() -> io::Result<()> {
-    for reads in [Reads::Buffer(5), Reads::Pool(2, 5)] {
+    let ways = [
+        Reads::Buffer(5),
+        #[cfg(ruio_compat_ring)]
+        Reads::Pool(2, 5),
+    ];
+    for reads in ways {
         let (writer, reader) = UnixStream::pair()?;
         let mut writer = Compat::new(writer);
         within(writer.write_all(b"one\ntwo\nthree, the last\n")).await?;
@@ -91,50 +97,5 @@ async fn lines_are_read_from_the_buffers() -> io::Result<()> {
         }
         assert_eq!(read, ["one", "two", "three, the last"], "{reads:?}");
     }
-    Ok(())
-}
-
-/// tokio's `copy_bidirectional` proxies a connection through the adapters,
-/// to a server that echoes it, and shuts each way down as it ends.
-#[ruio::test]
-async fn a_proxy_copies_both_ways() -> io::Result<()> {
-    let backend = TcpListener::bind("127.0.0.1:0")?;
-    let backend_addr = backend.local_addr()?;
-    let _backend = ruio::spawn(async move {
-        let (stream, _) = backend.accept().await?;
-        let mut stream = Compat::new(stream);
-        let mut buf = vec![0; 4096];
-        loop {
-            let read = stream.read(&mut buf).await?;
-            if read == 0 {
-                break;
-            }
-            stream.write_all(&buf[..read]).await?;
-        }
-        stream.shutdown().await
-    });
-    let proxy = TcpListener::bind("127.0.0.1:0")?;
-    let proxy_addr = proxy.local_addr()?;
-    let proxied = ruio::spawn(async move {
-        let (client, _) = proxy.accept().await?;
-        let mut client = Compat::new(client);
-        let mut server = Compat::new(TcpStream::connect(backend_addr).await?);
-        tokio::io::copy_bidirectional(&mut client, &mut server).await
-    });
-
-    let client = Compat::new(within(TcpStream::connect(proxy_addr)).await?);
-    let (mut reader, mut writer) = tokio::io::split(client);
-    let message = pattern(300 << 10, 9);
-    let sent = message.clone();
-    let sender = ruio::spawn(async move {
-        within(writer.write_all(&sent)).await?;
-        within(writer.shutdown()).await
-    });
-    let mut echo = Vec::new();
-    within(reader.read_to_end(&mut echo)).await?;
-    sender.await.unwrap()?;
-    assert!(echo == message);
-    let len = message.len() as u64;
-    assert_eq!(within(proxied).await.unwrap()?, (len, len));
     Ok(())
 }

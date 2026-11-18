@@ -1,18 +1,25 @@
 //! TCP sockets inside the runtime.
 
-#![cfg(ruio_uring)]
+#![cfg(any(ruio_uring, ruio_iocp))]
 
 mod support;
 
-use std::io::{self, ErrorKind, Write as _};
+#[cfg(ruio_uring)]
+use std::io::Write as _;
+use std::io::{self, ErrorKind};
 use std::net::Shutdown;
-use std::sync::{Barrier, Mutex, OnceLock, mpsc};
+#[cfg(ruio_uring)]
+use std::sync::mpsc;
+use std::sync::{Barrier, Mutex, OnceLock};
+#[cfg(ruio_uring)]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use ruio::buf::BufPool;
 use ruio::net::{TcpListener, TcpStream};
 use ruio::sync::oneshot;
+#[cfg(ruio_uring)]
 use ruio::uring::ops::Nop;
 
 use support::within;
@@ -149,6 +156,7 @@ async fn writes_behind_arrive_in_order() -> io::Result<()> {
 /// While the thread waits on one peer at a time, a large write behind goes
 /// as a chain of sends, which arrive in order, and the other writes wait
 /// for the last of them.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_large_write_behind_goes_as_a_chain_while_idle() -> io::Result<()> {
     let (client, server) = pair().await?;
@@ -176,6 +184,7 @@ async fn a_large_write_behind_goes_as_a_chain_while_idle() -> io::Result<()> {
 /// but the last buffer of a message, so that it hands over the first part
 /// before the rest. The change of the ask submits the receive again, and
 /// loses nothing.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_receive_asks_for_the_buffers_its_messages_take() -> io::Result<()> {
     const ROUNDS: usize = 16;
@@ -249,6 +258,10 @@ async fn writes_wait_for_the_write_behind_in_flight() -> io::Result<()> {
 /// A write behind that fails, here by timing out against a peer that does
 /// not read, fails every write after it, handing buffers back unsent, and
 /// the stream's shutdown.
+// On Windows the loopback interface takes so large a write whole and at
+// once, however little the peer reads, so the write neither stays in
+// flight nor times out there.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_failed_write_behind_fails_what_comes_after() -> io::Result<()> {
     let (client, _server) = pair().await?;
@@ -277,6 +290,10 @@ async fn a_failed_write_behind_fails_what_comes_after() -> io::Result<()> {
 
 /// Asked without waiting, a stream says nothing while a write behind is in
 /// flight, and how the writes went once none is.
+// On Windows the loopback interface takes so large a write whole and at
+// once, however little the peer reads, so the write neither stays in
+// flight nor times out there.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn try_flush_reports_only_what_is_known() -> io::Result<()> {
     let (client, server) = pair().await?;
@@ -314,7 +331,16 @@ async fn a_write_behind_cut_short_by_the_peer_fails() -> io::Result<()> {
     read?;
     // Closed with data unread, the socket resets the connection.
     drop(server);
-    let err = within(client.flush()).await.unwrap_err();
+    let err = match within(client.flush()).await {
+        Err(err) => err,
+        // Windows takes the whole write into the system before the peer
+        // reads it, and the reset fails only the writes after.
+        Ok(()) if cfg!(windows) => within(client.write_all(b"after".to_vec()))
+            .await
+            .0
+            .unwrap_err(),
+        Ok(()) => panic!("the write behind was not cut short"),
+    };
     assert!(
         matches!(
             err.kind(),
@@ -358,7 +384,7 @@ async fn write_all_vectored_sends_more_buffers_than_one_send_takes() -> io::Resu
 
 /// Listeners bound with `SO_REUSEPORT` share an address, which a listener
 /// without it cannot bind, and the kernel spreads the connections among
-/// them.
+/// them. On the completion port, they share one socket.
 #[ruio::test]
 async fn listeners_bound_with_reuseport_share_an_address() -> io::Result<()> {
     let first = TcpListener::bind_reuseport("127.0.0.1:0")?;
@@ -382,7 +408,15 @@ async fn listeners_bound_with_reuseport_share_an_address() -> io::Result<()> {
         }
     }
     assert_eq!(accepted.iter().sum::<usize>(), clients.len());
+    // The kernel deals each listener its share of the connections. On the
+    // completion port the listeners share one socket, so the first takes
+    // those that wait, and the cores share them out by how free each is to
+    // take them, as the next test has it.
+    #[cfg(ruio_uring)]
     assert!(accepted.iter().all(|&count| count > 0), "{accepted:?}");
+    let timeout = Duration::from_millis(10);
+    let err = first.accept().timeout(timeout).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut, "{err}");
     Ok(())
 }
 
@@ -461,7 +495,8 @@ fn a_server_on_several_cores_shares_out_the_connections() {
 }
 
 /// A connection accepted on one core moves to another, which serves it: as
-/// a plain descriptor, and as a direct one, from ring to ring.
+/// a plain descriptor, and, with io_uring, as a direct one, from ring to
+/// ring; with the completion port, from port to port.
 #[test]
 fn a_stream_moves_to_another_core() {
     let all = ruio::Cores::all().unwrap();
@@ -473,8 +508,13 @@ fn a_stream_moves_to_another_core() {
             if core.index() != 0 {
                 return Ok(());
             }
-            for direct in [false, true] {
+            #[cfg(ruio_uring)]
+            let kinds = [false, true];
+            #[cfg(not(ruio_uring))]
+            let kinds = [false];
+            for direct in kinds {
                 let listener = TcpListener::bind("127.0.0.1:0")?;
+                #[cfg(ruio_uring)]
                 listener.set_direct(direct);
                 let addr = listener.local_addr()?;
                 let head = pattern(8 << 20, usize::from(direct));
@@ -499,6 +539,7 @@ fn a_stream_moves_to_another_core() {
                 let sent = within(server.send_to(1)).await.map_err(|(err, _)| err)?;
                 let served = ruio::handle_of(1).spawn_with(move || async move {
                     let stream = sent.receive();
+                    #[cfg(ruio_uring)]
                     assert_eq!(stream.is_direct(), direct);
                     within(stream.write_all("tail")).await.0?;
                     let (read, buf) = within(stream.read_exact(Vec::with_capacity(4))).await;
@@ -527,11 +568,14 @@ async fn accept_reports_the_peer() -> io::Result<()> {
     assert_eq!(peer, client.local_addr().await?);
     assert_eq!(server.peer_addr().await?, peer);
     assert_eq!(server.local_addr().await?, addr);
+    #[cfg(ruio_uring)]
     assert!(!server.is_direct());
     assert!(!within(server.nodelay()).await?);
     within(server.set_nodelay(true)).await?;
     assert!(within(server.nodelay()).await?);
-    assert_eq!(within(server.ttl()).await?, 64);
+    // The system's default.
+    let ttl = if cfg!(windows) { 128 } else { 64 };
+    assert_eq!(within(server.ttl()).await?, ttl);
     within(server.set_ttl(100)).await?;
     assert_eq!(within(server.ttl()).await?, 100);
     assert_eq!(within(server.linger()).await?, None);
@@ -551,6 +595,31 @@ async fn connecting_to_a_closed_port_is_refused() {
         .unwrap();
     let err = within(TcpStream::connect(addr)).await.unwrap_err();
     assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
+}
+
+/// Sockets of the standard library's, taken with `from_std` and `From`,
+/// accept and carry data as the runtime's own do.
+#[ruio::test]
+async fn sockets_from_the_standard_library_carry_data() -> io::Result<()> {
+    let listener = TcpListener::from_std(std::net::TcpListener::bind("127.0.0.1:0")?);
+    let addr = listener.local_addr()?;
+    let client = TcpStream::from(std::net::TcpStream::connect(addr)?);
+    let (server, peer) = within(listener.accept()).await?;
+    assert_eq!(peer, client.local_addr().await?);
+    within(client.write_all(b"ping".to_vec())).await.0?;
+    let (read, buf) = within(server.read_exact(Vec::with_capacity(4))).await;
+    read?;
+    assert_eq!(buf, b"ping");
+
+    let listener = TcpListener::from(std::net::TcpListener::bind("127.0.0.1:0")?);
+    let client = ruio::spawn(TcpStream::connect(listener.local_addr()?));
+    let (server, _) = within(listener.accept()).await?;
+    let client = client.await.unwrap()?;
+    within(server.write_all(b"pong".to_vec())).await.0?;
+    let (read, buf) = within(client.read_exact(Vec::with_capacity(4))).await;
+    read?;
+    assert_eq!(buf, b"pong");
+    Ok(())
 }
 
 #[ruio::test]
@@ -600,6 +669,10 @@ async fn read_exact_fails_if_the_peer_shuts_down_first() -> io::Result<()> {
 /// The first send stops part of the way when the time is up, and the next
 /// one has no time left, which is what reports the timeout: the timeout
 /// bounds the whole write, not each send.
+// On Windows the loopback interface takes so large a write whole and at
+// once, however little the peer reads, so the write neither stays in
+// flight nor times out there.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_write_to_a_peer_that_stops_reading_times_out() -> io::Result<()> {
     let (client, _server) = pair().await?;
@@ -620,6 +693,7 @@ async fn a_write_to_a_peer_that_stops_reading_times_out() -> io::Result<()> {
 
 /// A direct stream whose ring is gone reaches nothing, not even the file in
 /// the same slot of the next ring.
+#[cfg(ruio_uring)]
 #[test]
 fn a_direct_stream_outliving_its_ring_reaches_nothing() {
     let direct_pair = || async {
@@ -651,6 +725,7 @@ fn a_direct_stream_outliving_its_ring_reaches_nothing() {
 
 /// More than the socket buffers hold, so that the send has to carry on as
 /// the peer reads.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_stream_sends_zero_copy() -> io::Result<()> {
     let (client, server) = pair().await?;
@@ -668,6 +743,7 @@ async fn a_stream_sends_zero_copy() -> io::Result<()> {
 /// A direct stream's options are set and read as a plain one's are, through
 /// the ring; its addresses, which only a file descriptor can ask for, come
 /// through one installed for the call.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_listener_accepts_direct_streams_on_request() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -713,6 +789,7 @@ async fn a_listener_accepts_direct_streams_on_request() -> io::Result<()> {
 /// A direct stream becomes a plain one through `into_plain`: the same
 /// connection, with a file descriptor of the process, and the writes behind
 /// it carried over.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn a_direct_stream_becomes_a_plain_one() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -748,8 +825,13 @@ async fn a_direct_stream_becomes_a_plain_one() -> io::Result<()> {
 
 #[ruio::test]
 async fn dropping_a_stream_closes_the_connection() -> io::Result<()> {
-    for direct in [false, true] {
+    #[cfg(ruio_uring)]
+    let kinds = [false, true];
+    #[cfg(not(ruio_uring))]
+    let kinds = [false];
+    for direct in kinds {
         let listener = TcpListener::bind("127.0.0.1:0")?;
+        #[cfg(ruio_uring)]
         listener.set_direct(direct);
         let client = ruio::spawn(TcpStream::connect(listener.local_addr()?));
         let (server, _) = within(listener.accept()).await?;
@@ -763,6 +845,7 @@ async fn dropping_a_stream_closes_the_connection() -> io::Result<()> {
 
 /// Once the file table is full, the kernel closes the connection it had no
 /// slot for, and the listener carries on with plain descriptors.
+#[cfg(ruio_uring)]
 #[test]
 fn incoming_carries_on_with_plain_streams_once_the_table_is_full() {
     let runtime = ruio::Runtime::builder().files(1).build().unwrap();
@@ -795,6 +878,7 @@ fn incoming_carries_on_with_plain_streams_once_the_table_is_full() {
 
 /// A connection's data arrives whole through a stream whose own pool the
 /// kernel consumes incrementally, many small writes to a buffer.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn an_incremental_stream_receives_everything() -> io::Result<()> {
     if !ruio::uring::Probe::current()?.supports_incremental_buffers() {

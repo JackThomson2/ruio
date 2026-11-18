@@ -1,7 +1,7 @@
 //! The portable sockets: `Send` and `Sync` streams and listeners, read and
 //! written with system calls made at once on whichever thread polls them.
 
-#![cfg(ruio_uring)]
+#![cfg(any(ruio_uring, ruio_iocp))]
 
 mod support;
 
@@ -9,13 +9,19 @@ use std::future::{Future, poll_fn};
 use std::io::{self, ErrorKind, IoSlice, Read as _, Write as _};
 use std::mem::MaybeUninit;
 use std::net::{Shutdown, SocketAddr};
+#[cfg(ruio_uring)]
 use std::os::fd::AsRawFd;
+#[cfg(ruio_uring)]
 use std::os::linux::net::SocketAddrExt;
+#[cfg(ruio_iocp)]
+use std::os::windows::io::AsRawSocket;
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
 
-use ruio::net::portable::{TcpListener, TcpStream, UnixListener, UnixStream};
+use ruio::net::portable::{TcpListener, TcpStream};
+#[cfg(ruio_uring)]
+use ruio::net::portable::{UnixListener, UnixStream};
 
 use support::within;
 
@@ -55,7 +61,9 @@ fn the_sockets_are_send_and_sync() {
     fn assert_types<T: Send + Sync + Unpin>() {}
     assert_types::<TcpStream>();
     assert_types::<TcpListener>();
+    #[cfg(ruio_uring)]
     assert_types::<UnixStream>();
+    #[cfg(ruio_uring)]
     assert_types::<UnixListener>();
 }
 
@@ -234,7 +242,10 @@ async fn shutdown_shows_the_end_and_a_peer_gone_fails_writes() -> io::Result<()>
     }
     let kind = failed.expect("a write to a peer gone fails").kind();
     assert!(
-        matches!(kind, ErrorKind::BrokenPipe | ErrorKind::ConnectionReset),
+        matches!(
+            kind,
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+        ),
         "{kind:?}"
     );
     Ok(())
@@ -298,6 +309,7 @@ async fn listeners_poll_for_connections() -> io::Result<()> {
 
 /// Unix streams: a pair, a listener at a path and one in the abstract
 /// namespace, with their addresses.
+#[cfg(ruio_uring)]
 #[ruio::test]
 async fn unix_streams_connect_by_path_and_by_abstract_name() -> io::Result<()> {
     let (one, other) = UnixStream::pair()?;
@@ -405,8 +417,10 @@ fn a_read_moved_to_another_core_mid_wait_completes_there() {
 #[ruio::test]
 async fn a_stream_dropped_on_another_thread_closes() -> io::Result<()> {
     let (client, server) = tcp_pair().await?;
-    let fd = client.as_raw_fd();
-    assert!(fd >= 0);
+    #[cfg(ruio_uring)]
+    assert!(client.as_raw_fd() >= 0);
+    #[cfg(ruio_iocp)]
+    assert_ne!(client.as_raw_socket(), u64::MAX);
     std::thread::spawn(move || drop(client)).join().unwrap();
     let (read, _) = within(server.read(Vec::with_capacity(8))).await;
     assert_eq!(read?, 0);

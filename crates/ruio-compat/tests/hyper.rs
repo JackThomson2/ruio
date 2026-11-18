@@ -3,7 +3,7 @@
 //! of the standard library's; and with ruio's timer, times out a request's
 //! head that is slow to come.
 
-#![cfg(feature = "hyper")]
+#![cfg(all(feature = "hyper", ruio_compat_ring))]
 
 mod support;
 

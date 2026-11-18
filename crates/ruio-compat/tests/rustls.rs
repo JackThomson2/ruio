@@ -2,7 +2,7 @@
 //! to hyper's client over tokio-rustls on ruio too, and to a blocking
 //! client of rustls's own.
 
-#![cfg(feature = "tokio")]
+#![cfg(all(feature = "tokio", any(ruio_compat_ring, ruio_compat_generic)))]
 
 mod support;
 
@@ -74,12 +74,17 @@ fn serve_one(
 }
 
 /// Bodies large and small cross a TLS connection kept alive both ways, the
-/// server receiving into a pool that holds less than a body, and the
-/// server's connection ends as the client's closes.
+/// server reading less at a time than a body holds, into a pool where the
+/// adapter has one, and the server's connection ends as the client's
+/// closes.
 #[ruio::test]
 async fn hyper_serves_https_through_the_adapters() -> io::Result<()> {
     let (server_config, client_config) = configs();
-    let (addr, server) = serve_one(server_config, Reads::Pool(8, 4096))?;
+    #[cfg(ruio_compat_ring)]
+    let reads = Reads::Pool(8, 4096);
+    #[cfg(not(ruio_compat_ring))]
+    let reads = Reads::Buffer(4096);
+    let (addr, server) = serve_one(server_config, reads)?;
     let stream = within(TcpStream::connect(addr)).await?;
     let name = ServerName::try_from("localhost").unwrap();
     let connector = TlsConnector::from(client_config);
